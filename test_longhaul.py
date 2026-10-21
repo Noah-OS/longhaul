@@ -2643,9 +2643,15 @@ class Index(unittest.TestCase):
         self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
         self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
         self.assertFalse((self.home / "index").exists(), "nothing written")
+        # The one refusal said in the log (review, Sprint 7, F9): the live
+        # check and a user's "why not" read it there; once for the plan
+        # above, once for the hook.
+        log = self.home / "longhaul.log"
+        self.assertEqual(log.read_text().count("index: skipped, unattended session\n"), 2)
         out = subprocess.run(Guard.HOOK, input=data, env={**self.env, "CLAUDE_CODE_SESSION_ATTENDED": "1"},
                              capture_output=True, text=True, timeout=10)
         self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(log.read_text().count("index: skipped, unattended session\n"), 2, "an attended one: not again")
         self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
         for program in self.MAPS:
             self.assertEqual(self.wait(program)["exit"], 0, program)

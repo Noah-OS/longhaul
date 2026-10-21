@@ -2636,11 +2636,17 @@ def index_plan(data: dict, index: str) -> list:
     index_top() accepts, each program found, with the path it was found
     at: the runner runs that path and looks nothing up again. Whether a
     program's map is there already is the state's question (index_due),
-    not this one's. Pure: nothing is started or written here."""
+    not this one's. Nothing is started or written here, and the one
+    refusal logged is the unattended session's (review, Sprint 7, F9: the
+    live check and a user's "why not" read it there); the others say
+    nothing."""
     if index != "on" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
         return []
-    if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
-        return []  # a subagent's start is not the session's; a `-p` run (a script's, a loop's) asked for no index
+    if data.get("agent_id") is not None:
+        return []  # a subagent's start is not the session's
+    if os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+        log("index: skipped, unattended session")  # a `-p` run (a script's, a loop's) asked for no index
+        return []
     top = index_top(data.get("cwd"))
     if top is None:
         return []
