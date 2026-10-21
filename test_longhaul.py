@@ -2509,15 +2509,17 @@ class Index(unittest.TestCase):
         saw of the environment, talks on both streams, makes its map, and
         is slow or fails when a marker file says so: slow before the map
         is made (a run in progress has none yet), failing after it (a
-        failed init leaves a half-built map). Its own PATH: sh has no
-        mkdir or sleep of its own, and the test's PATH holds the fakes
-        alone."""
+        failed init leaves a half-built map); with `.child`, it leaves a
+        child of its own running first and records its pid. Its own PATH:
+        sh has no mkdir or sleep of its own, and the test's PATH holds the
+        fakes alone."""
         path.write_text("#!/bin/sh\n"
                         "PATH=/bin:/usr/bin\n"
                         f"printf '%s %s\\n' \"$(pwd -P)\" \"$*\" >> '{self.tmp}/{name}.calls'\n"
                         f"printf '%s\\n' \"${{DO_NOT_TRACK-unset}}\" > '{self.tmp}/{name}.env'\n"
                         f"echo SECRET-OUTPUT-{name}\n"
                         f"echo SECRET-OUTPUT-{name} >&2\n"
+                        f"[ -e '{self.tmp}/{name}.child' ] && {{ sleep 30 & echo $! > '{self.tmp}/{name}.child.pid'; }}\n"
                         f"[ -e '{self.tmp}/{name}.slow' ] && sleep 3\n"
                         f"mkdir -p {self.MAPS[name]}\n"
                         f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
@@ -2848,6 +2850,35 @@ class Index(unittest.TestCase):
         self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))], "the state deleted: now")
         self.assertEqual(self.wait("codegraph")["exit"], 0)
         self.assertNotIn("why", self.state()["runs"]["codegraph"], "a clean exit has no why")
+
+    def test_the_timeout_kills_the_programs_children_too(self):
+        # Review, Sprint 7 (F6): the kill reached the program alone, and
+        # what it had started ran on past the timeout, holding its log.
+        for marker in ("slow", "child"):
+            (self.tmp / f"codegraph.{marker}").touch()
+        (self.bin / "trail").unlink()
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "1"}):
+            self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
+        entry = self.wait("codegraph")
+        self.assertEqual((entry["exit"], entry["why"]), (-1, "timeout"))
+        child = int((self.tmp / "codegraph.child.pid").read_text())
+
+        def kill():  # were it left running (the old kill), not for 30 s
+            with contextlib.suppress(OSError):
+                os.kill(child, signal.SIGKILL)
+
+        self.addCleanup(kill)
+
+        def gone():
+            for _ in range(100):  # a killed child is a zombie until its new parent reaps it
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    return True
+                time.sleep(0.05)
+            return False
+
+        self.assertTrue(gone(), "the program's child was killed with it")
 
     def test_a_half_built_map_of_longhauls_own_is_rebuilt_at_the_retry_and_a_strangers_map_never(self):
         # The review's "stale or incomplete index" (the owner, 2026-10-21):

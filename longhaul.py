@@ -2810,10 +2810,12 @@ def index_run(program: str, top: str, found: str) -> None:
     `found` that is not absolute, or whose real path is inside the top,
     is refused, a second belt. The environment as it is, its output in
     index/<key>.<program>.log alone (0600, append), never in longhaul.log
-    or on the hook's stdout. Past INDEX_TIMEOUT the program is killed and
-    counts as exit -1, why "timeout"; one that could not be run, and any
-    failure of the runner's own, as exit -1, why "error": every run ends
-    in an exit and a line (index_finish)."""
+    or on the hook's stdout. The program leads a process group of its
+    own: past INDEX_TIMEOUT the whole group is killed, the children it
+    started with it (review, Sprint 7, F6), and it counts as exit -1, why
+    "timeout"; one that could not be run, and any failure of the
+    runner's own, as exit -1, why "error": every run ends in an exit and
+    a line (index_finish)."""
     started, why = time.time(), "error"
     try:
         if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
@@ -2822,14 +2824,19 @@ def index_run(program: str, top: str, found: str) -> None:
             out = LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
             out.parent.mkdir(parents=True, exist_ok=True)
             with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
-                try:
-                    code = subprocess.run([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL,
-                                          stdout=f, stderr=subprocess.STDOUT, timeout=INDEX_TIMEOUT).returncode
-                    said, why = "", None
-                except subprocess.TimeoutExpired:
-                    code, said, why = -1, f" (killed at the {INDEX_TIMEOUT} s timeout)", "timeout"
+                try:  # its own process group, so the timeout's kill reaches what it started too
+                    proc = subprocess.Popen([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL,
+                                            stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
                 except OSError as e:
                     code, said = -1, f" (could not run: {e.strerror or e})"
+                else:
+                    try:
+                        code, said, why = proc.wait(timeout=INDEX_TIMEOUT), "", None
+                    except subprocess.TimeoutExpired:
+                        with contextlib.suppress(OSError):  # gone this instant, or zombies only (EPERM on macOS)
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                        code, said, why = -1, f" (killed at the {INDEX_TIMEOUT} s timeout)", "timeout"
     except Exception as e:  # the runner's own failure: a log it cannot open, an index/ that is a file
         code, said, why = -1, f" ({e!r})", "error"
     index_finish(program, top, code, time.time() - started, said, why)
