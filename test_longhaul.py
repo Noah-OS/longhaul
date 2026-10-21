@@ -1540,14 +1540,16 @@ class Plugin(unittest.TestCase):
             self.assertEqual(self.runs(body), [self.SUITE], (job, "the onboarding command, verbatim, and no other step"))
             self.assertNotIn("claude-code", body, (job, "no claude is installed: the suite runs on the fakes"))
 
-    def test_the_workflow_validates_the_plugin_with_todays_claude_code_without_failing_the_run(self):
-        # R3's optional smoke test: Claude Code itself reads the plugin, on
-        # the version npm gives that day. Whether `validate` runs signed out
-        # is unknown, so the job cannot fail the run until one has been read.
+    def test_the_workflow_validates_the_plugin_with_todays_claude_code_and_a_refusal_fails_the_run(self):
+        # R3's smoke test: Claude Code itself reads the plugin, on the version
+        # npm gives that day. The first run (2026-10-21) showed `validate` runs
+        # signed out on the runner, so a refusal fails the run.
         _, jobs = self.workflow()
         self.assertIn("validate", jobs)
         self.assertIn("runs-on: ubuntu-latest\n", jobs["validate"])
-        self.assertIn("continue-on-error: true\n", jobs["validate"])
+        # The first run showed `validate` runs signed out on the runner, so a
+        # refusal must fail the run: no continue-on-error any more.
+        self.assertNotIn("continue-on-error", jobs["validate"])
         self.assertEqual(self.runs(jobs["validate"]),
                          ["npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."])
 
