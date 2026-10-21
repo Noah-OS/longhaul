@@ -1,0 +1,51 @@
+# longhaul's folder holds your accounts, limits, usage and log next to the
+# code. Only the code is tracked: everything is ignored, and the code is let
+# back in by name, so a file nobody named here (a new account's data, a
+# session folder, a lock) stays out of git until someone decides otherwise.
+*
+!.gitignore
+!README.md
+!CHANGELOG.md
+!longhaul.py
+!test_longhaul.py
+!longhaul_vscode.py
+!longhaul-vscode
+!fake_claude.py
+!fake_stream.py
+!LICENSE
+!.claude-plugin/
+!.claude-plugin/plugin.json
+!.claude-plugin/marketplace.json
+!hooks/
+!hooks/hooks.json
+!bin/
+!bin/longhaul
+!skills/
+!skills/**
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+
+# Never tracked, even if a line above is widened one day: git obeys the last
+# line that matches, so these win over any "!" above.
+# The build-time agents and skills under .claude/, ATTRIBUTION.md that
+# credits their sources, and the planning docs under docs/ are the owner's
+# own tooling and are not shipped (the owner's decision, 2026-10-20); they
+# live in the owner's checkout only.
+.claude/
+ATTRIBUTION.md
+docs/
+accounts.json
+state.json
+labels.json
+ledger.jsonl
+auth-cache.json
+vscode.json
+usage/
+sessions/
+guard/
+checkpoints/
+*.log
+*.key
+*.lock
+__pycache__/

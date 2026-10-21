@@ -1,0 +1,13 @@
+{
+  "name": "longhaul",
+  "version": "0.1.0",
+  "description": "See where your Claude Code sessions' tokens go, and stop the waste; keeps long sessions running across your own subscriptions, opt-in.",
+  "author": {
+    "name": "Amr Adel",
+    "email": "amra.aadel@gmail.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/amradel55/longhaul",
+  "repository": "https://github.com/amradel55/longhaul",
+  "keywords": ["sessions", "usage", "supervisor"]
+}

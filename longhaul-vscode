@@ -1,0 +1,18 @@
+#!/bin/sh
+# The program set in VS Code as claudeCode.claudeProcessWrapper. The Claude
+# extension runs it with the bundled claude binary's path first, then
+# claude's arguments, for every chat and every short job. It hands them to
+# longhaul (longhaul_vscode.py -> longhaul.wrap). A broken wrapper must never
+# stop the panel: if longhaul is missing, or no Python here can even start,
+# Claude runs unchanged. Python runs isolated (-I) so an inherited PYTHONPATH
+# or PYTHONHOME cannot break it; each one is tried before it is trusted.
+# It finds longhaul_vscode.py beside itself, wherever this checkout is
+# (before Sprint 3 it was hard-coded to the owner's private folder).
+here=$(cd "$(dirname "$0")" && pwd -P)
+[ -f "$here/longhaul_vscode.py" ] || exec "$@"
+for py in /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if [ -x "$py" ] && "$py" -I -c 'import json, subprocess, threading, fcntl' >/dev/null 2>&1; then
+    exec "$py" -I "$here/longhaul_vscode.py" "$@"
+  fi
+done
+exec "$@"

@@ -1,0 +1,37 @@
+#!/bin/sh
+# What Claude may run of Longhaul from inside a session. Files in a
+# plugin's bin/ are on the Bash tool's PATH while the plugin is enabled
+# (the manifest reference documents it), so Claude could run this as a
+# bare command; the skills run it by its full path all the same, since
+# their allowed-tools rules name that path and a bare `longhaul ...`
+# would prompt. It runs the longhaul.py beside it, so an installed
+# plugin runs its own version. Only the read-only commands are allowed,
+# and `checkpoint save`, which writes one file under LONGHAUL_HOME/
+# checkpoints/ and nothing else: the supervisor starts and watches a
+# claude of its own, and the others change the accounts or the state, so
+# they belong in a terminal (the rule since the plugin layout was decided,
+# amended by the owner on 2026-10-20 to let the checkpoint through). The
+# model reads the refusal through the Bash tool, so it says what to ask
+# the user.
+# CDPATH is emptied: set, it would make cd print and could send it elsewhere.
+command -v python3 >/dev/null 2>&1 || {
+  printf '%s\n' "longhaul: python3 was not found on PATH; Longhaul needs Python 3. Ask the user to install it (on a Mac: xcode-select --install, or brew install python)." >&2
+  exit 2
+}
+here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+if [ $# -eq 0 ]; then
+  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, checkpoint save and -h run; for the rest, ask the user to run it in a terminal." >&2
+  exit 2
+fi
+case "$1" in
+  inspect|usage|status|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
+  checkpoint)
+    # With no action, checkpoint is the SessionStart hook, which prints the
+    # checkpoint named on stdin: from here only `checkpoint save` runs.
+    [ "$2" = save ] && exec python3 "$here/longhaul.py" "$@"
+    printf '%s\n' "longhaul: from here only \`checkpoint save\` runs; \`longhaul checkpoint\` with no action is the SessionStart hook, which the engine runs by itself." >&2
+    exit 2 ;;
+  *)
+    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, checkpoint save and -h run. Ask the user to run it in a terminal." >&2
+    exit 2 ;;
+esac

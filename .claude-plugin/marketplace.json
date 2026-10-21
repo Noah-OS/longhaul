@@ -1,0 +1,15 @@
+{
+  "name": "longhaul",
+  "description": "Longhaul's own marketplace: one plugin, this repository.",
+  "owner": {
+    "name": "Amr Adel"
+  },
+  "plugins": [
+    {
+      "name": "longhaul",
+      "source": "./",
+      "description": "See where your Claude Code sessions' tokens go, and stop the waste; keeps long sessions running across your own subscriptions, opt-in.",
+      "version": "0.1.0"
+    }
+  ]
+}
