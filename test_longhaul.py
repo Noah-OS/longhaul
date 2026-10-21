@@ -2009,9 +2009,10 @@ class Guard(unittest.TestCase):
 
     # The hook runs the module as an import, as hooks/hooks.json does: the
     # cached bytecode starts faster than the script (87-94 ms against
-    # 100-124 ms, measured).
-    HOOK = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
-                                  "sys.exit(longhaul.main(['guard']))", str(HERE)]
+    # 100-124 ms, measured); with -I, so the folder it runs in (the
+    # project) is not on sys.path (review, Sprint 7, F10).
+    HOOK = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                                        "sys.exit(longhaul.main(['guard']))", str(HERE)]
 
     def hook(self, tool, agent=None, session="s1", **tool_input):
         data = {"session_id": session, "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input,
@@ -3245,6 +3246,21 @@ class Index(unittest.TestCase):
                          rf"index: codegraph init in {re.escape(longhaul.home_path(top))} exit -1 after 0\.0 s "
                          r"\(could not run: not the program found\)\n")
 
+    def test_a_module_the_project_ships_is_never_imported_by_the_hook_or_the_runner(self):
+        # Review, Sprint 7 (F10): the hooks run `python3 -c` in the
+        # project, so its folder came first on sys.path, and a json.py
+        # there was imported ahead of the standard library's by every hook
+        # and by the runner, which starts in the hook's folder. `-I` keeps
+        # it off.
+        cwd = self.repo / "src"
+        (cwd / "json.py").write_text('raise ImportError("the json.py of the project was imported")\n')
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env=self.env, cwd=str(cwd),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, (program, "the runner too"))
+
     def test_a_repository_that_ships_a_map_folder_gets_no_init_and_no_note(self):
         # A shipped .codegraph/ or .trail/ is a map; what its hooks do is
         # between the user and the repository (the README's Limitations).
@@ -3640,18 +3656,22 @@ class Checkpoint(unittest.TestCase):
                                (starts["compact|clear|resume"], "checkpoint")):
             [handler] = entry["hooks"]
             self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
-            self.assertEqual(handler["args"][0], "-c")
-            self.assertIn("import longhaul", handler["args"][1])
-            self.assertIn(f"main(['{command}'])", handler["args"][1])
-            self.assertEqual(handler["args"][2], "${CLAUDE_PLUGIN_ROOT}")
+            # -I: the hook runs in the project, and without it the project's
+            # folder is first on sys.path (a json.py there would be imported).
+            self.assertEqual(handler["args"][:2], ["-I", "-c"])
+            self.assertIn("import longhaul", handler["args"][2])
+            self.assertIn(f"main(['{command}'])", handler["args"][2])
+            self.assertEqual(handler["args"][3], "${CLAUDE_PLUGIN_ROOT}")
             self.assertLessEqual(handler["timeout"], 10, "a slow hook is a tax on every call")
             self.assertIn(f"(longhaul {command})", handler["statusMessage"])
             handlers[command, entry["matcher"]] = handler
         # One command line run four ways: the checkpoint's differs from the guard's in the command alone.
         self.assertEqual(handlers["guard", "Read|Bash"]["args"], handlers["guard", "compact|clear"]["args"])
         self.assertEqual(handlers["guard", "Read|Bash"]["args"], handlers["guard", "startup"]["args"])
-        self.assertEqual(handlers["checkpoint", "compact|clear|resume"]["args"][1],
-                         handlers["guard", "Read|Bash"]["args"][1].replace("'guard'", "'checkpoint'"))
+        self.assertEqual(handlers["checkpoint", "compact|clear|resume"]["args"][2],
+                         handlers["guard", "Read|Bash"]["args"][2].replace("'guard'", "'checkpoint'"))
+        # The tests run the hook as the plugin does: Guard.HOOK is the guard's entry, the root aside.
+        self.assertEqual(Guard.HOOK[1:-1], handlers["guard", "Read|Bash"]["args"][:-1])
         # Each says what it is doing: a compaction runs three of them, and the
         # guard's SessionStart entry used to repeat the PreToolUse message.
         self.assertEqual(len({h["statusMessage"] for h in handlers.values()}), 4)

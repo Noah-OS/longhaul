@@ -2581,7 +2581,7 @@ INDEX_RETRY = 86_400  # seconds before a failed init is tried once more: at ever
 # Seconds of a clock's slack: a run is in progress up to INDEX_TIMEOUT and this after its start (the
 # runner's own start, its kill and its last write), and a start this far ahead of the clock is still now.
 INDEX_GRACE = 60
-# The runner, started by the hook as hooks.json starts the hook: an import, in its own process.
+# The runner, started by the hook as hooks.json starts the hook (`python3 -I -c`): an import, in its own process.
 INDEX_RUNNER = ("import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
                 "longhaul.index_run(sys.argv[2], sys.argv[3], sys.argv[4])")
 # What the model is told per init started, and nothing after it that reads as an instruction to install anything.
@@ -2754,11 +2754,16 @@ def index_due(program: str, top: str, entry, folder, now: float) -> bool:
 def index_spawn(program: str, top: str, found: str) -> int:
     """The runner, detached: in its own session, holding none of the
     hook's pipes, with the environment as it is, given the path the
-    program was found at. Returns its pid; the hook never waits for it."""
+    program was found at. Started as hooks.json starts the hook, with
+    `python3 -I`: it starts in the hook's folder, the project, and
+    without -I that folder is first on sys.path, where a json.py of the
+    repository's would be imported ahead of the standard library's
+    (review, Sprint 7, F10). Returns its pid; the hook never waits for
+    it."""
     here = str(Path(__file__).resolve().parent)
-    proc = subprocess.Popen([sys.executable, "-c", INDEX_RUNNER, here, program, top, found], start_new_session=True,
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            close_fds=True)
+    proc = subprocess.Popen([sys.executable, "-I", "-c", INDEX_RUNNER, here, program, top, found],
+                            start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, close_fds=True)
     pid = proc.pid
     with warnings.catch_warnings():  # the handle is dropped with the runner still running: that is the point
         warnings.simplefilter("ignore", ResourceWarning)

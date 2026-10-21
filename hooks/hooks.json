@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3",
-            "args": ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
             "timeout": 5,
             "statusMessage": "Checking this call (longhaul guard)"
           }
@@ -21,7 +21,7 @@
           {
             "type": "command",
             "command": "python3",
-            "args": ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
             "timeout": 5,
             "statusMessage": "Forgetting this session's reads (longhaul guard)"
           }
@@ -33,7 +33,7 @@
           {
             "type": "command",
             "command": "python3",
-            "args": ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
             "timeout": 5,
             "statusMessage": "Looking for a code index (longhaul guard)"
           }
@@ -45,7 +45,7 @@
           {
             "type": "command",
             "command": "python3",
-            "args": ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['checkpoint']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['checkpoint']))", "${CLAUDE_PLUGIN_ROOT}"],
             "timeout": 5,
             "statusMessage": "Looking for a checkpoint (longhaul checkpoint)"
           }
