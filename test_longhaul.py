@@ -5035,7 +5035,10 @@ class Pieces(unittest.TestCase):
     def test_a_repositories_field_that_is_not_a_list_of_absolute_paths_allows_nothing(self):
         tmp = self.tree()
         work = str(tmp / "work")
-        for junk in (work, "~/work", 42, True, {"path": work}, [work, "relative/one"], [work, None], [work, 7], [""]):
+        # A falsy junk value fails closed too (final review, Sprint 7): only an absent field, null or
+        # an empty list means unrestricted; "", {}, 0 and false are typos, never "anywhere".
+        for junk in (work, "~/work", 42, True, {"path": work}, [work, "relative/one"], [work, None], [work, 7], [""],
+                     "", {}, 0, False):
             acct = {"name": "Pro", "repositories": junk}
             self.assertIsNone(longhaul.repositories_of(acct), repr(junk))
             self.assertFalse(longhaul.account_allowed(acct, work), f"{junk!r} must fail closed, even naming work")
@@ -5044,6 +5047,8 @@ class Pieces(unittest.TestCase):
             self.assertEqual(longhaul.repositories_of({"name": "Pro", "repositories": ["~/work", "/x"]}),
                              [work, "/x"], "a list of absolute paths, ~ expanded")
         self.assertEqual(longhaul.repositories_of({"name": "Pro"}), [], "no field: unrestricted")
+        self.assertEqual(longhaul.repositories_of({"name": "Pro", "repositories": None}), [], "null: unrestricted")
+        self.assertEqual(longhaul.repositories_of({"name": "Pro", "repositories": []}), [], "[]: unrestricted")
 
     def test_eligible_keeps_the_files_order_and_the_denied_are_the_rest(self):
         tmp = self.tree()

@@ -578,7 +578,7 @@ def repositories_of(acct: dict):
     the account nowhere. A typo must fail closed, never open; a relative
     entry would resolve against whatever folder longhaul runs in."""
     found = acct.get("repositories")
-    if not found:
+    if found is None or found == []:  # only absent, null or [] is unrestricted: "", {}, 0, false fail closed
         return []
     if not isinstance(found, list):
         return None
