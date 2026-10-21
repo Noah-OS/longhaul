@@ -1924,6 +1924,20 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "resume"}))
         self.assertIn("already", self.context(self.check(self.hook("Read", file_path=str(self.small)))), "a resume keeps it")
 
+    def test_a_compaction_keeps_the_counts_and_the_bytes_and_forgets_the_reads_and_the_search_count(self):
+        # Review, Sprint 6: guard_forget() rewrites the record whole, so the
+        # counts it writes back must be the ones it read, or a compaction
+        # would take out of inspect's Guard section what the context cost.
+        self.assertIn("30,000 bytes", self.context(self.check(self.hook("Read", file_path=str(self.big)))))
+        self.check(self.hook("Bash", command="grep x a"))
+        before = self.record()
+        self.assertEqual((before["fired"]["big"], before["bytes"]["big"], before["searches"]), (1, 30_000, 1))
+        self.assertIsNone(self.check(self.start(source="compact")))
+        r = self.record()
+        self.assertEqual(r["fired"], before["fired"])
+        self.assertEqual(r["bytes"], before["bytes"])
+        self.assertEqual((r["reads"], r["searches"], r["nudged"]), ({}, 0, False))
+
     def test_at_startup_the_main_conversation_is_told_of_the_projects_codegraph_index(self):
         # Sprint 6, G3 (2): the plugin's third SessionStart entry runs the
         # guard at startup. The count found the installed index's tool called
@@ -2017,6 +2031,51 @@ class Guard(unittest.TestCase):
         for n in range(1, 20):
             self.assertIsNone(self.check(grep), f"search {n}")
         self.assertIn("20 searches", self.context(self.check(grep)), "once per context, and a compaction starts one")
+
+    def test_an_index_made_mid_session_is_named_at_the_next_search(self):
+        # The count is kept without an index, and the rule is "twenty or
+        # more", not "the twentieth": a `codegraph init` run in the middle
+        # of a session is named at the next search, not never.
+        grep = self.hook("Bash", command="grep -rn x src/")
+        for n in range(1, 26):
+            self.assertIsNone(self.check(grep), f"search {n}")
+        (self.tmp / ".codegraph").mkdir()
+        self.assertIn("26 searches", self.context(self.check(grep)))
+        self.assertIsNone(self.check(grep), "the 27th: once")
+        self.assertEqual((self.record()["searches"], self.record()["nudged"]), (27, True))
+
+    def test_a_subagents_record_is_reset_at_the_sessions_compaction_too(self):
+        # The engine sends the SessionStart for the session alone, and
+        # guard_forget() walks guard_records(sid), the session's record and
+        # its subagents': a subagent's count and note go with the session's.
+        (self.tmp / ".codegraph").mkdir()
+        grep = self.hook("Bash", agent="agent-1", command="grep x a")
+        for _ in range(19):
+            self.check(grep)
+        self.assertIn("20 searches", self.context(self.check(grep)))
+        self.assertIsNone(self.check(self.start(source="compact")))
+        r = self.record(agent="agent-1")
+        self.assertEqual((r["searches"], r["nudged"]), (0, False))
+        for n in range(1, 20):
+            self.assertIsNone(self.check(grep), f"search {n}")
+        self.assertIn("20 searches", self.context(self.check(grep)), "named again in the new context")
+
+    def test_a_corrupt_search_count_or_note_flag_in_the_record_reads_as_none_yet(self):
+        # A record another version wrote, or a hand edit: a count that is
+        # no number starts again at the next search, and a flag that is
+        # not True has the note still to come. Neither stops the hook.
+        (self.tmp / ".codegraph").mkdir()
+        folder = self.home / "guard"
+        folder.mkdir()
+        (folder / "s1.json").write_text(json.dumps(
+            {"reads": {}, "fired": dict.fromkeys(longhaul.GUARD_RULES, 0), "bytes": dict.fromkeys(longhaul.GUARD_RULES, 0),
+             "searches": "many", "nudged": "yes"}))
+        grep = self.hook("Bash", command="grep x a")
+        self.assertIsNone(self.check(grep))
+        self.assertEqual((self.record()["searches"], self.record()["nudged"]), (1, False))
+        for n in range(2, 20):
+            self.assertIsNone(self.check(grep), f"search {n}")
+        self.assertIn("20 searches", self.context(self.check(grep)))
 
     def test_a_record_that_cannot_be_rewritten_at_a_compaction_is_removed_so_block_mode_does_not_deny_wrongly(self):
         # Review, Sprint 4 (SF 6): a rewrite that failed left the reads in
