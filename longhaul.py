@@ -504,9 +504,17 @@ def update_state(change) -> dict:
 
 def load_state() -> dict:
     """Never raises: run() reads it outside any try, so a state.json a crash
-    or a hand left as a list, a string or junk is an empty state."""
-    state = read_json(LONGHAUL_HOME / "state.json")
-    state = state if isinstance(state, dict) else {}
+    or a hand left as a list, a string or junk is an empty state, said in
+    one log line that names the file and never its content; the next write
+    replaces the file."""
+    path = LONGHAUL_HOME / "state.json"
+    state = read_json(path)
+    if not isinstance(state, dict):
+        if state is not None or os.path.exists(path):  # None is also no file yet: nothing to say then
+            log(f"{home_path(str(path))} could not be read as an object; an empty state stands in until the next write")
+        state = {}
+    elif "limited_until" in state and not isinstance(state["limited_until"], dict):
+        log(f"limited_until in {home_path(str(path))} is not an object; no account is at a limit until the next write")
     state["limited_until"] = dict_at(state, "limited_until")
     return state
 

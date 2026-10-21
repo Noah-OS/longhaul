@@ -3720,6 +3720,32 @@ class Pieces(unittest.TestCase):
                 (tmp / "state.json").write_text(json.dumps(junk))
                 self.assertEqual(longhaul.load_state(), {"limited_until": {}}, repr(junk))
 
+    def test_load_state_says_in_the_log_when_the_state_file_is_not_an_object(self):
+        # Review, Sprint 6 (A6): T6 made a list or a string an empty state
+        # in silence (before T6, a traceback), and the next write replaced
+        # the file with no one the wiser. One log line names the file, never
+        # its content; a well-formed or a missing file gets none; pick()
+        # runs on the fallback either way.
+        tmp = Path(tempfile.mkdtemp())
+        log, state_file = tmp / "longhaul.log", tmp / "state.json"
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", tmp):
+            for junk in ([["Max", 1]], {"limited_until": [["Max", 1]]}):
+                log.unlink(missing_ok=True)
+                state_file.write_text(json.dumps(junk))
+                state = longhaul.load_state()
+                self.assertEqual(state["limited_until"], {}, repr(junk))
+                self.assertEqual(longhaul.pick(self.ACCOUNTS, state, 1)[0], 1, repr(junk))
+                text = log.read_text() if log.exists() else ""
+                self.assertEqual(text.count("\n"), 1, text or f"nothing logged for {junk!r}")
+                self.assertIn("state.json", text)
+                self.assertNotIn("Max", text, "the file's name, never its content")
+            log.unlink()
+            state_file.write_text(json.dumps({"limited_until": {"Pro": 1}}))
+            self.assertEqual(longhaul.load_state()["limited_until"], {"Pro": 1})
+            state_file.unlink()
+            self.assertEqual(longhaul.load_state(), {"limited_until": {}})
+            self.assertFalse(log.exists(), "nothing to say of a well-formed or a missing file")
+
     def test_a_chat_back_on_an_earlier_account_counts_in_full(self):
         rows = [{"at": 1, "session": "A", "account": "Max", "cost": 0.5, "proc": 11},
                 {"at": 2, "session": "A", "account": "Pro", "cost": 0.3, "proc": 12},
