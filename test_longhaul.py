@@ -1703,6 +1703,9 @@ class Plugin(unittest.TestCase):
         with self.subTest("the Claude Code range", first=first, last=last):
             self.assertEqual(set(re.findall(r"\b(\d+\.\d+\.\d+) to (\d+\.\d+\.\d+)\b", readme)), {(first, last)},
                              "the one version range the README gives is TESTED_VERSIONS")
+        with self.subTest("the CodeGraph install"):  # Sprint 6, G3: the paragraph repeats the advice line's constant
+            for key, text in longhaul.CODEGRAPH_INSTALL.items():
+                self.assertTrue(lines(readme, text), f"no README.md line holds CODEGRAPH_INSTALL[{key!r}]: {text}")
         _, jobs = self.workflow()
         with self.subTest("the test command"):
             fenced = re.findall(r"^```[^\n]*\n(.*?)\n```$", readme, re.M | re.S)
