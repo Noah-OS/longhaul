@@ -3885,10 +3885,6 @@ class Links(unittest.TestCase):
         self.assertEqual(watch._transcript(), (self.tmp / "live.jsonl").resolve())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StreamHarness(unittest.TestCase):
     """What the panel's tests and longhaul pipe's share: a scratch relay folder
     with two accounts, fake_stream.py as claude, and a reader that parses
@@ -5108,3 +5104,7 @@ class History(unittest.TestCase):
         hits = [f"{path} (added in {self.added_in(path)})" for path in leaked]
         self.maxDiff = None  # every hit by name, not the first 640 characters
         self.assertEqual(hits, [], f"{len(hits)} paths the never-tracked block of .gitignore names are in the history")
+
+
+if __name__ == "__main__":
+    unittest.main()
