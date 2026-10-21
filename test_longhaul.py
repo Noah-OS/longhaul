@@ -2649,6 +2649,23 @@ class Index(unittest.TestCase):
         (self.tmp / "wt" / ".git").write_text("gitdir: elsewhere\n")
         self.assertEqual(longhaul.index_top(str(self.tmp / "wt" / "src")), str(self.tmp / "wt"))
 
+    def test_the_switch_unset_or_off_starts_nothing_through_the_hook_or_guard_check(self):
+        # Review, Sprint 7 (F11): the switch as the hook reads it from its
+        # own environment, not only as index_plan() is handed it; both
+        # programs on PATH and a work tree with no map, so with the switch
+        # on both would start (the tests above).
+        self.assertIsNone(self.check(self.start(), index="off"))
+        for value in (None, "off"):
+            env = {k: v for k, v in self.env.items() if k != "LONGHAUL_INDEX"}
+            if value is not None:
+                env["LONGHAUL_INDEX"] = value
+            out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env=env, cwd=str(self.repo / "src"),
+                                 capture_output=True, text=True, timeout=10)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout, "", f"LONGHAUL_INDEX={value}")
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+
     def test_a_resume_compact_or_clear_never_starts_one(self):
         for source in ("resume", "compact", "clear"):
             self.assertEqual(self.plan(self.start(source=source)), [], source)
