@@ -1873,12 +1873,12 @@ def usage(opts) -> int:
 
 EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 SEARCHES = ("Grep", "Glob")
-SEARCH_PROGRAMS = ("grep", "rg", "ag", "find", "fd", "ls", "git")  # a Bash search, by program: git log counts as grep
+SEARCH_PROGRAMS = ("grep", "rg", "ag", "find", "fd")  # a Bash search, by program; git grep is uncounted (search_stats)
 SEARCH_BIG = 5_000  # characters: a search result over this is big (the count: 8% of them carry 38% of search output)
 SEARCH_HEAVY = 20  # searches in a conversation before the report advises a code index
 CODEGRAPH_INSTALL = {"link": "github.com/colbymchenry/codegraph",  # as its README gave them on 2026-10-21; ours repeats
                      "sh": "curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh",
-                     "npm": "npm i -g @colbymchenry/codegraph"}
+                     "npm": "npm i -g @colbymchenry/codegraph"}  # all three; the advice line names the link and npm
 TOKEN_KINDS = (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"),
                ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens"))
 
@@ -1962,14 +1962,18 @@ def codegraph_index_at(cwd) -> bool:
 def search_stats(events, calls, results, cwd) -> dict:
     """The search numbers (Sprint 6, G3), by the count's definition: a
     search is a Grep or Glob call, or a Bash whose program is one of
-    SEARCH_PROGRAMS (`git grep` cannot be told from `git log` by the
-    program alone, so every git counts, and the heading says so); a chain
-    is a run of consecutive searches in one context, replayed in time
-    order as the repeats are; a big result is over SEARCH_BIG characters.
-    A code index is seen as a tool name holding `codegraph`, or as a
-    `.codegraph/` folder at or above the transcript's first line's cwd;
-    with no absolute cwd that is None (unknown), not 0, and its record is
-    left out."""
+    SEARCH_PROGRAMS; `git grep` is not counted, because the program alone
+    cannot tell it from `git log` or `git status`, and twenty of those,
+    or of `ls`, are no search (review, Sprint 6: they nudged the model
+    about CodeGraph with no search made); a chain is a run of consecutive
+    searches in one context, replayed in time order as the repeats are; a
+    big result is over SEARCH_BIG characters. A code index is seen as a
+    call of a tool whose name holds `codegraph`, or a Bash running the
+    `codegraph` CLI, whose result was not an error (a call that failed
+    says nothing of an index in use and must not withhold the advice), or
+    as a `.codegraph/` folder at or above the transcript's first line's
+    cwd; with no absolute cwd that is None (unknown), not 0, and its
+    record is left out."""
     chains, open_run = [], collections.Counter()  # the closed runs; the run under way, per context
     searches, chars, big, big_chars = 0, 0, 0, 0
     for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
@@ -1990,22 +1994,26 @@ def search_stats(events, calls, results, cwd) -> dict:
             "search_chain_max": max(chains, default=0),
             "search_chain_mean": sum(chains) / len(chains) if chains else 0.0,
             "search_big": big, "search_big_share": big_chars / chars if chars else 0.0,
-            "codegraph_calls": sum("codegraph" in name for name, _ in calls.values()),
+            "codegraph_calls": sum(("codegraph" in name or (name == "Bash" and what == "codegraph"))
+                                   and not results.get(tid, (0, 0, False))[2] for tid, (name, what) in calls.items()),
             "codegraph_index": int(codegraph_index_at(cwd)) if isinstance(cwd, str) and os.path.isabs(cwd) else None}
 
 
 def search_advice(s: dict) -> str:
     """The one line `inspect` adds for a search-heavy conversation in which
     no index was seen: its numbers, what an index does, and CodeGraph's
-    install as its README gives it, with what the install does to the
-    project. Longhaul never installs it."""
+    npm install with what the install does to the project, as its README
+    says. Not the pipe-to-shell install its README also gives (the README
+    here repeats both): the report enters the model's context as tool
+    output through /longhaul:inspect, and a `curl ... | sh` line there is
+    a pattern to keep out (review, Sprint 6). Longhaul never installs it."""
     return (f"Search-heavy: {s['search_calls']:,} searches ({s['search_share']:.0%} of calls), the longest chain "
-            f"{s['search_chain_max']}, {s['search_big']:,} result{'' if s['search_big'] == 1 else 's'} over {SEARCH_BIG:,} characters "
-            f"({s['search_big_share']:.0%} of search output). A code index answers symbol and dependency questions "
-            f"in one call. CodeGraph ({CODEGRAPH_INSTALL['link']}, MIT): install with `{CODEGRAPH_INSTALL['sh']}` or "
-            f"`{CODEGRAPH_INSTALL['npm']}`, then `codegraph init` in the project; it writes `.codegraph/` there, may "
-            "add a section to your instructions file, and asks about telemetry. Longhaul never installs it; this line "
-            "is all it does.")
+            f"{s['search_chain_max']}, {s['search_big']:,} result{'s' * (s['search_big'] != 1)} over "
+            f"{SEARCH_BIG:,} characters ({s['search_big_share']:.0%} of search output). A code index answers symbol "
+            f"and dependency questions in one call. CodeGraph ({CODEGRAPH_INSTALL['link']}, MIT): install with "
+            f"`{CODEGRAPH_INSTALL['npm']}`, then run `codegraph init`. CodeGraph's installer asks about telemetry, "
+            "and its setup may add a section to your CLAUDE.md and allow its tools in Claude Code's permissions "
+            "unless told not to; `codegraph init` writes `.codegraph/` in the project. Longhaul installs nothing.")
 
 
 def inspect_transcript(path: Path) -> dict:
@@ -2145,7 +2153,9 @@ def inspect_transcript(path: Path) -> dict:
         "search": search_stats(events, calls, results, cwd),
         "tool_errors": dict(collections.Counter(calls.get(tid, ("?",))[0]
                                                 for tid, (_, _, error, _) in results.items() if error).most_common()),
-        "api_errors": dict(api_errors.most_common()), "unreadable": unreadable, "guard": guard_counts(path.stem),
+        "api_errors": dict(api_errors.most_common()),
+        "unreadable": unreadable,
+        "guard": guard_counts(path.stem),
     }
 
 
@@ -2235,19 +2245,21 @@ def inspect_lines(r: dict) -> list[str]:
     section("Tool calls [transcript, counted]",
             [f"  {t['tool']}: {t['calls']} call{'s' * (t['calls'] != 1)}, {t['chars']:,} chars{where(t)}"
              for t in r["by_tool"]])
-    s = r["search"]
+    search = r["search"]
     seen = {1: "a .codegraph/ index at or above the cwd", 0: "no .codegraph/ index at or above the cwd",
-            None: "no cwd in the transcript to look for an index"}[s["codegraph_index"]]
-    # The advice only when no index was seen: a folder at or above the cwd, or the tool called, means it is there to use.
-    advise = s["search_calls"] >= SEARCH_HEAVY and not s["codegraph_index"] and not s["codegraph_calls"]
+            None: "no cwd in the transcript to look for an index"}[search["codegraph_index"]]
+    # The advice only when no index was seen: a folder at or above the cwd,
+    # or the tool called and answering, means it is there to use.
+    advise = (search["search_calls"] >= SEARCH_HEAVY and not search["codegraph_index"]
+              and not search["codegraph_calls"])
     section(f"Search [transcript, counted: {', '.join(SEARCHES)}, and Bash {', '.join(SEARCH_PROGRAMS)}]",
-            [f"  {s['search_calls']:,} search{'es' * (s['search_calls'] != 1)}, {s['search_share']:.0%} of calls, "
-             f"{s['search_chars']:,} chars",
-             f"  longest chain {s['search_chain_max']}, mean {s['search_chain_mean']:.1f}",
-             f"  {s['search_big']:,} result{'s' * (s['search_big'] != 1)} over {SEARCH_BIG:,} chars, "
-             f"{s['search_big_share']:.0%} of search output",
-             f"  CodeGraph: {s['codegraph_calls']} call{'s' * (s['codegraph_calls'] != 1)}, {seen}"]
-            + (["  " + search_advice(s)] if advise else []))
+            [f"  {search['search_calls']:,} search{'es' * (search['search_calls'] != 1)}, "
+             f"{search['search_share']:.0%} of calls, {search['search_chars']:,} chars",
+             f"  longest chain {search['search_chain_max']}, mean {search['search_chain_mean']:.1f}",
+             f"  {search['search_big']:,} result{'s' * (search['search_big'] != 1)} over {SEARCH_BIG:,} chars, "
+             f"{search['search_big_share']:.0%} of search output",
+             f"  CodeGraph: {search['codegraph_calls']} call{'s' * (search['codegraph_calls'] != 1)}, {seen}"]
+            + (["  " + search_advice(search)] if advise else []))
     section("Read again, with no edit or compaction in between [transcript, inferred: "
             "files changed through Bash are not seen]",
             [f"  {x['path']}: {times(x['repeats'])}, {x['chars']:,} chars"

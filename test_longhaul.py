@@ -1203,41 +1203,45 @@ class Inspect(unittest.TestCase):
 
     def test_the_search_section_counts_searches_their_chains_and_their_big_results(self):
         # The count (BACKLOG, G3): a search is Grep, Glob, or a Bash whose
-        # program is grep, rg, ag, find, fd, ls or git (git log counts with
-        # git grep: the program alone cannot tell them apart); a chain is a
-        # run of consecutive searches in one context; a result is big over
-        # 5,000 characters. A cat piped into grep is a cat.
+        # program is grep, rg, ag, find or fd; a chain is a run of
+        # consecutive searches in one context; a result is big over 5,000
+        # characters. A cat piped into grep is a cat. git and ls are no
+        # search (review, Sprint 6: twenty `git status`es in an indexed
+        # project nudged the model about CodeGraph with no search made), so
+        # `git grep` goes uncounted: the program alone cannot tell it from
+        # `git log`.
         self.write(self.turn("t1", "Grep", "x" * 6000, pattern="main", path="/app")  # big
                    + self.turn("t2", "Bash", "x" * 5000, command="grep -rn main /app")  # 5,000 exactly: not big
-                   + self.turn("t3", "Bash", "x" * 125, command="rg main /app")
+                   + self.turn("t3", "Bash", "x" * 375, command="rg main /app")
                    + self.turn("t4", "Read", "x" * 900, file_path="/app/a.py")  # ends a chain of 3
                    + self.turn("t5", "Bash", "ok", command="make")
                    + self.turn("t6", "Glob", "x" * 125, pattern="**/*.py")
-                   + self.turn("t7", "Bash", "x" * 125, command="GIT_PAGER=cat /usr/bin/git log --oneline")
+                   + self.turn("t7", "Bash", "x" * 125, command="GIT_PAGER=cat /usr/bin/git log --oneline")  # no search
                    + self.turn("t8", "Bash", "x" * 900, command="cat /app/a.py | grep main")
                    + self.turn("t9", "Bash", "x" * 125, command="fd main /app")
-                   + self.turn("t10", "Bash", "x" * 125, command="ls /app")
-                   + self.turn("t11", "Bash", "x" * 125, command="ag main /app"))
+                   + self.turn("t10", "Bash", "x" * 125, command="ag main /app")
+                   + self.turn("t11", "Bash", "x" * 125, command="ls /app")  # no search: ends a chain of 2
+                   + self.turn("t12", "Bash", "x" * 125, command="ls -R /app"))
         self.agent(self.turn("x1", "Grep", "x" * 125, pattern="main", path="/app")  # its own chain of 2
                    + self.turn("x2", "Grep", "x" * 125, pattern="main", path="/app")
-                   + sum((self.turn(f"x{i}", "Read", "x", file_path=f"/app/{i}.py") for i in range(3, 10)), []))
+                   + sum((self.turn(f"x{i}", "Read", "x", file_path=f"/app/{i}.py") for i in range(3, 9)), []))
         self.assertEqual(longhaul.inspect_transcript(self.path)["search"],
-                         {"search_calls": 10, "search_share": 0.5, "search_chars": 12000, "search_chain_max": 3,
-                          "search_chain_mean": 2.5, "search_big": 1, "search_big_share": 0.5,
+                         {"search_calls": 8, "search_share": 0.4, "search_chars": 12000, "search_chain_max": 3,
+                          "search_chain_mean": 2.0, "search_big": 1, "search_big_share": 0.5,
                           "codegraph_calls": 0, "codegraph_index": None})
         out = self.cli("s1").stdout.splitlines()
-        head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd, ls, git]")
+        head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd]")
         self.assertGreater(head, out.index("Tool calls [transcript, counted]"))
         self.assertEqual(out[head + 1:head + 5],
-                         ["  10 searches, 50% of calls, 12,000 chars", "  longest chain 3, mean 2.5",
+                         ["  8 searches, 40% of calls, 12,000 chars", "  longest chain 3, mean 2.0",
                           "  1 result over 5,000 chars, 50% of search output",
                           "  CodeGraph: 0 calls, no cwd in the transcript to look for an index"])
         self.assertNotIn("Search-heavy", "\n".join(out))
         got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
                for x in self.records("s1")}
-        for metric, value, unit in (("search_calls", 10, "calls"), ("search_share", 0.5, "ratio"),
+        for metric, value, unit in (("search_calls", 8, "calls"), ("search_share", 0.4, "ratio"),
                                     ("search_chars", 12000, "chars"), ("search_chain_max", 3, "searches"),
-                                    ("search_chain_mean", 2.5, "searches"), ("search_big", 1, "results"),
+                                    ("search_chain_mean", 2.0, "searches"), ("search_big", 1, "results"),
                                     ("search_big_share", 0.5, "ratio"), ("codegraph_calls", 0, "calls")):
             self.assertEqual(got[(metric, "all", None)], (value, unit, "transcript", "counted"), metric)
         self.assertNotIn(("codegraph_index", "all", None), got, "no cwd: the record is left out, not 0")
@@ -1251,14 +1255,43 @@ class Inspect(unittest.TestCase):
         self.assertEqual(advice, [
             "  Search-heavy: 20 searches (100% of calls), the longest chain 20, 0 results over 5,000 characters "
             "(0% of search output). A code index answers symbol and dependency questions in one call. CodeGraph "
-            "(github.com/colbymchenry/codegraph, MIT): install with `curl -fsSL "
-            "https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh` or "
-            "`npm i -g @colbymchenry/codegraph`, then `codegraph init` in the project; it writes `.codegraph/` "
-            "there, may add a section to your instructions file, and asks about telemetry. Longhaul never installs "
-            "it; this line is all it does."])
-        head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd, ls, git]")
+            "(github.com/colbymchenry/codegraph, MIT): install with `npm i -g @colbymchenry/codegraph`, then run "
+            "`codegraph init`. CodeGraph's installer asks about telemetry, and its setup may add a section to your "
+            "CLAUDE.md and allow its tools in Claude Code's permissions unless told not to; `codegraph init` writes "
+            "`.codegraph/` in the project. Longhaul installs nothing."])
+        # The report enters the model's context as tool output through
+        # /longhaul:inspect, so the pipe-to-shell install CodeGraph's README
+        # also gives stays in ours and out of the report (review, Sprint 6).
+        self.assertNotIn("curl", "\n".join(out))
+        self.assertNotIn("| sh", "\n".join(out))
+        head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd]")
         self.assertEqual(out[head + 5], advice[0], "the advice is the Search section's last row")
         self.assertNotIn("Search-heavy", self.cli("s1", "--json").stdout, "the records carry numbers only")
+
+    def test_a_codegraph_call_counts_only_when_it_did_not_fail_and_the_cli_counts_too(self):
+        # A failed call (the MCP server down, no index yet) says nothing of
+        # an index in use, so it must not withhold the advice; the CLI,
+        # `codegraph explore` through Bash, is the same tool and no search.
+        failed = self.turn("c1", "mcp__codegraph__codegraph_explore", "no index", error=True, query="who calls X")
+        self.write(self.searching(20) + failed)
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual((r["search"]["search_calls"], r["search"]["codegraph_calls"]), (20, 0))
+        self.assertEqual(r["tool_errors"], {"mcp__codegraph__codegraph_explore": 1})
+        out = self.cli("s1").stdout
+        self.assertIn("CodeGraph: 0 calls, no cwd in the transcript to look for an index", out)
+        self.assertIn("Search-heavy", out, "a call that failed is no index in use")
+        for command in ('codegraph explore "who calls X"', "/opt/homebrew/bin/codegraph query X"):
+            self.write(self.searching(20) + self.turn("c2", "Bash", "ok", command=command))
+            r = longhaul.inspect_transcript(self.path)
+            self.assertEqual((r["search"]["search_calls"], r["search"]["codegraph_calls"]), (20, 1), command)
+            out = self.cli("s1").stdout
+            self.assertIn("CodeGraph: 1 call, no cwd in the transcript to look for an index", out)
+            self.assertNotIn("Search-heavy", out, command)
+        self.write(self.searching(20) + self.turn("c3", "Bash", "not found", error=True, command="codegraph explore X"))
+        self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["codegraph_calls"], 0, "the CLI failed")
+        self.assertIn("Search-heavy", self.cli("s1").stdout)
+        self.write(self.searching(20) + failed + self.turn("c4", "mcp__codegraph__codegraph_explore", "ok", query="X"))
+        self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["codegraph_calls"], 1, "one of two answered")
 
     def test_a_codegraph_call_or_an_index_under_the_cwd_is_seen_and_withholds_the_advice(self):
         self.write(self.searching(20) + self.turn("c1", "mcp__codegraph__codegraph_explore", "ok", query="who calls X"))
@@ -1553,9 +1586,11 @@ class Inspect(unittest.TestCase):
                                                                          "display_name": secret}}, None)
         out, records = self.cli("s1"), self.cli("s1", "--json")
         self.assertEqual((out.returncode, records.returncode), (0, 0), out.stderr + records.stderr)
-        self.assertIn("curl", out.stdout)
+        self.assertIn("curl", out.stdout)  # t1's program, which the report may name
         self.assertIn("curl", records.stdout)
         self.assertIn("Search-heavy", out.stdout, "the Search section and its advice line ran over those searches")
+        self.assertNotIn(longhaul.CODEGRAPH_INSTALL["sh"], out.stdout, "the advice carries no pipe-to-shell line")
+        self.assertNotIn("| sh", out.stdout)
         self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)
         self.assertNotIn("SECRET", longhaul.LEDGER.read_text() + (longhaul.USAGE_DIR / "sessions" / "s1.json").read_text())
 
