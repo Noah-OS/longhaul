@@ -25,6 +25,8 @@ In **warn** mode, the default, the call runs and the model gets the advice as co
 
 **The checkpoint.** Claude Code's own summary at compaction is made when the context is already full. `/longhaul:checkpoint` has the model save its own structured state at a moment you, or it, choose: the goal, the next action, the decisions, what is done, in progress and blocked, the files changed, and how to verify. Longhaul keeps it private under `~/.longhaul/checkpoints/` and puts it back after a compaction or a resume, with its age and which of the named files changed or went since. It is capped at 1,000 characters per text, 20 entries per list and 8,000 bytes in all, and a save that holds anything shaped like a credential is refused.
 
+**Recovery, as intended.** Save with `/longhaul:checkpoint` when the state is worth keeping (the model may do it on its own). Then: a compaction, automatic or `/compact`, brings the state back in the same session; `/exit` and later `claude --resume <id>` (or `longhaul -r <id>`) bring it back too, days later included. `/clear` does not: it starts a session with a new id, and the hook looks for that id's checkpoint and finds none; to carry on after a clear, resume the old session by id instead, or save a new checkpoint in the cleared one. A checkpoint is per session id, never per project.
+
 ## Measured
 
 Longhaul claims no saving it has not measured. The guard's block mode is being measured against warn mode and off on one repeatable task. The method is written here so that a stranger can run it again:
