@@ -2584,8 +2584,8 @@ def inspect(opts) -> int:
 # CLAUDE_CODE_SESSION_ATTENDED=0). Once per project: LONGHAUL_HOME/
 # index/<key>.json holds each program's start, pid, exit and seconds,
 # and why Longhaul ended a run (a timeout, with the timeout it was
-# killed at; an error); a run in progress
-# is left to run, up to its timeout; a map built and then gone is built
+# killed at; an error); a run in progress is left to run, up to its
+# timeout; a map built and then gone is built
 # again; a failure is tried again after a day (delete the file to try
 # now), a timeout never, whatever its map folder shows, and the map a
 # failure left half-built is then rebuilt, being Longhaul's own (the
