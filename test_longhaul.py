@@ -5817,6 +5817,26 @@ class Panel(StreamHarness):
         self.assertEqual(self.output(), b"fake job done")
         self.assertEqual(job.wait(10), 0)
 
+    def test_with_the_allowed_accounts_signed_in_wrong_a_chat_is_refused_not_run_on_claude(self):
+        # Final review, Sprint 7: with Max denied here and Pro, the one account
+        # allowed, signed in as someone else, choose_for_panel() found nothing and
+        # the wrapper ran Claude unchanged on ~/.claude, which can be the denied
+        # account or signed in as it. With any account denied the chat is refused,
+        # as run() and pipe() refuse; unchanged only when nothing is restricted.
+        work, personal = self.repositories()
+        self.restrict("Max", work)
+        self.emails[str(self.pro)] = "stranger@example.com"
+        p = self.start(cwd=personal, **self.fake_notifications())
+        self.assertEqual(p.wait(10), 1)
+        self.assertFalse((self.relay / "calls.jsonl").exists(), "no claude, not even the panel's own")
+        said = f"No account allowed in {self.shown(personal)} is signed in as expected"
+        self.assertIn(f"panel: {said}", self.log_text())
+        notes = self.notified()
+        self.assertEqual(len(notes), 2, notes)
+        self.assertTrue(notes[0].startswith("Pro should be"), "the sign-in check's own notice, as before")
+        self.assertTrue(notes[1].startswith(said), notes)
+        self.assertIn("(Max may not be used here)", notes[1])
+
 
 class PanelSwitching(StreamHarness):
     """Sprint 2, D3c: with switch_mid_session on, the panel moves a chat only

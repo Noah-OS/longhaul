@@ -3849,6 +3849,15 @@ def wrap(argv: list[str]) -> int:
                        f"(switching is {mode})")
         if idx is None:
             idx, _ = choose_for_panel(accounts, binary, wrong=set(denied))
+        if idx is None and denied:
+            # Not run unchanged: ~/.claude can be the denied account, or signed in
+            # as it, so the chat would run outside the policy (final review,
+            # Sprint 7); run() and pipe() refuse here too.
+            msg = (f"No account allowed in {home_path(top)} is signed in as expected "
+                   f"({', '.join(sorted(denied))} may not be used here); the chat is refused rather than run on ~/.claude")
+            log(f"panel: {msg}")
+            notify(msg)
+            return 1
         if idx is None:
             log("panel: no account is signed in as expected; running Claude as the extension asked")
             os.execv(binary, [binary] + args)
