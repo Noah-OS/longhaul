@@ -3799,17 +3799,17 @@ class Panel(StreamHarness):
         self.assertFalse((self.relay / "usage" / "Pro.json").exists())
 
     def test_if_the_relay_cannot_start_the_panel_still_gets_claude(self):
-        # a conversation file that vanishes under its link makes transcript_size fail in start()
-        broken = self.default / "projects" / "-tmp-proj"
-        broken.mkdir(parents=True)
-        (broken / "sid-gone.jsonl").symlink_to(self.tmp / "nowhere.jsonl")
+        # junk where state.json keeps handled_limits fails start() in Watch on every Python
+        # (a transcript link to nowhere did on 3.12+ alone: 3.11's Path.glob passes it over);
+        # claude is spawned by then and killed, so the chat the panel got is the last call
+        (self.relay / "state.json").write_text(json.dumps({"handled_limits": None}))
         self.plan(["reply"])
-        p = self.start([*self.EXT_ARGS, "--resume=sid-gone"])
+        p = self.start()
         self.initialize(p)
         self.wait_for(lambda m: m.get("type") == "control_response")
         u = self.user(p, "hello")
         self.assertEqual(self.wait_for(self.result_for(u))["result"], "reply to: hello")
-        self.assertIsNone(self.calls()[0]["config"])
+        self.assertIsNone(self.calls()[-1]["config"])
         self.assertIn("running Claude unchanged", (self.relay / "longhaul.log").read_text())
 
     def test_a_log_that_cannot_be_written_does_not_stop_the_wrapper(self):
