@@ -2570,8 +2570,9 @@ def inspect(opts) -> int:
 # is never touched, and one Longhaul's own run has not finished is not
 # named to the model. The program's output goes to
 # index/<key>.<program>.log alone, never to the hook's stdout or to
-# longhaul.log, and the environment is passed as it is: no telemetry
-# variable is added or removed.
+# longhaul.log. The program's environment is the hook's less the
+# session's own Claude variables (SESSION_ENV), which describe the
+# session and not the program; no telemetry variable is added or removed.
 
 INDEX_COMMANDS = {"codegraph": ("codegraph", "init", "-y"),
                   "trail": ("trail", "init", "--yes", "--no-global", "--no-statusline", "--no-agents")}
@@ -2768,7 +2769,7 @@ def index_due(program: str, top: str, entry, folder, now: float) -> bool:
 
 def index_spawn(program: str, top: str, found: str) -> int:
     """The runner, detached: in its own session, holding none of the
-    hook's pipes, with the environment as it is, given the path the
+    hook's pipes, with the hook's environment, given the path the
     program was found at. Started as hooks.json starts the hook, with
     `python3 -I`: it starts in the hook's folder, the project, and
     without -I that folder is first on sys.path, where a json.py of the
@@ -2843,7 +2844,9 @@ def index_run(program: str, top: str, found: str) -> None:
     in the top level, where a relative or empty entry ("." or "::")
     finds a program the repository ships (review, Sprint 7, F1). A
     `found` that is not absolute, or whose real path is inside the top,
-    is refused, a second belt. The environment as it is, its output in
+    is refused, a second belt. Its environment is the runner's less the
+    names in SESSION_ENV, the session's own and not the program's
+    (review, Sprint 7, F18), nothing else touched; its output in
     index/<key>.<program>.log alone (0600, append), never in longhaul.log
     or on the hook's stdout. The program leads a process group of its
     own: past INDEX_TIMEOUT the whole group is killed, the children it
@@ -2859,9 +2862,11 @@ def index_run(program: str, top: str, found: str) -> None:
             out = index_log(program, top)
             out.parent.mkdir(parents=True, exist_ok=True)
             with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
+                env = {k: v for k, v in os.environ.items() if k not in SESSION_ENV}
                 try:  # its own process group, so the timeout's kill reaches what it started too
-                    proc = subprocess.Popen([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL,
-                                            stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+                    proc = subprocess.Popen([found, *INDEX_COMMANDS[program][1:]], cwd=top, env=env,
+                                            stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
                 except OSError as e:
                     code, said = -1, f" (could not run: {e.strerror or e})"
                 else:

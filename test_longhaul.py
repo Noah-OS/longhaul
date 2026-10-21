@@ -2501,9 +2501,17 @@ class Index(unittest.TestCase):
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
                         LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_INDEX="on")
+        for name in self.TELEMETRY:  # what the programs read of their own telemetry is each test's
+            self.env.pop(name, None)
 
     def tearDown(self):
         longhaul.LONGHAUL_HOME = self.saved
+
+    # What the fakes record of their environment, one line each: the two
+    # telemetry switches, passed as they are, and two of the session's own
+    # variables (SESSION_ENV), which the runner strips.
+    TELEMETRY = ("DO_NOT_TRACK", "CODEGRAPH_TELEMETRY")
+    SEEN = TELEMETRY + ("CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ID")
 
     def fake(self, path: Path, name: str):
         """A program that records where and how it was called and what it
@@ -2514,10 +2522,11 @@ class Index(unittest.TestCase):
         child of its own running first and records its pid. Its own PATH:
         sh has no mkdir or sleep of its own, and the test's PATH holds the
         fakes alone."""
+        seen = " ".join(f'"${{{name}-unset}}"' for name in self.SEEN)
         path.write_text("#!/bin/sh\n"
                         "PATH=/bin:/usr/bin\n"
                         f"printf '%s %s\\n' \"$(pwd -P)\" \"$*\" >> '{self.tmp}/{name}.calls'\n"
-                        f"printf '%s\\n' \"${{DO_NOT_TRACK-unset}}\" > '{self.tmp}/{name}.env'\n"
+                        f"printf '%s\\n' {seen} > '{self.tmp}/{name}.env'\n"
                         f"echo SECRET-OUTPUT-{name}\n"
                         f"echo SECRET-OUTPUT-{name} >&2\n"
                         f"[ -e '{self.tmp}/{name}.child' ] && {{ sleep 30 & echo $! > '{self.tmp}/{name}.child.pid'; }}\n"
@@ -3107,7 +3116,8 @@ class Index(unittest.TestCase):
     def test_the_state_file_shape_mode_and_the_programs_output_never_reach_the_answer_or_the_log(self):
         # Through the hook as the engine runs it, so its stdout is seen too;
         # DO_NOT_TRACK stands for any variable: the environment goes as it is.
-        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env={**self.env, "DO_NOT_TRACK": "1"},
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()),
+                             env={**self.env, "DO_NOT_TRACK": "1", "CODEGRAPH_TELEMETRY": "0"},
                              capture_output=True, text=True, timeout=10)
         self.assertEqual(out.returncode, 0, out.stderr)
         for program in self.MAPS:
@@ -3137,9 +3147,23 @@ class Index(unittest.TestCase):
                          "SECRET-OUTPUT-codegraph\nSECRET-OUTPUT-codegraph\n")
         self.assertNotIn("SECRET", (self.home / "longhaul.log").read_text())
         self.assertNotIn("SECRET", self.state_path().read_text())
-        # The environment is passed as it is: no telemetry variable added or
+        # The telemetry variables are passed as they are: none added or
         # removed, so the program saw what the hook's environment held.
-        self.assertEqual((self.tmp / "codegraph.env").read_text(), "1\n")
+        self.assertEqual((self.tmp / "codegraph.env").read_text(), "1\n0\nunset\nunset\n")
+
+    def test_the_program_sees_no_telemetry_variable_added_and_none_of_the_sessions_own(self):
+        # Review, Sprint 7 (F12, F18): the other way round from the test
+        # above, neither telemetry variable set, so one added would show;
+        # and the session's own Claude variables (SESSION_ENV: its id, its
+        # messaging token) are not the program's, so the runner strips them.
+        env = {**self.env, "CLAUDE_CODE_MESSAGING_TOKEN": "tok", "CLAUDE_CODE_SESSION_ID": "sid"}
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env=env, capture_output=True, text=True,
+                             timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+            self.assertEqual((self.tmp / f"{program}.env").read_text(), "unset\nunset\nunset\nunset\n", program)
+        self.assertEqual(set(self.SEEN[2:]) - set(longhaul.SESSION_ENV), set(), "the names are SESSION_ENV's")
 
     def test_a_symlinked_cwd_keys_one_state_and_runs_in_the_path_given(self):
         # S1: the key is the real path's, so a project opened through a link
