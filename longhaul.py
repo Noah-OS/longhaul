@@ -2813,8 +2813,13 @@ def index_spawn(program: str, top: str, found: str) -> int:
     return pid
 
 
-def index_start(data: dict, index: str) -> list:
-    """For each (program, top, found) index_plan() gives, under the index
+def index_start(data: dict, index: str) -> tuple:
+    """Starts each init that is due and collects each failure that stands
+    for the user's message (final review, Sprint 7, G7): returns
+    (started, failed), the (program, top) pairs started and the
+    (program, top, entry) of each program not started whose last run is
+    a failure that stands (index_failed), which index_message() words.
+    For each (program, top, found) index_plan() gives, under the index
     lock, so that starts at the same moment decide one at a time: the
     state read, the decision made (index_due), the entry written with
     its start and no pid, the runner started on the path found, and its
@@ -2822,10 +2827,8 @@ def index_start(data: dict, index: str) -> list:
     (review, Sprint 7, F4); a runner that cannot be started is a failed
     run (index_finish), and a pid that cannot be written leaves an entry
     taken for a stopped runner. A skip writes nothing. One log line per
-    start, a program, a path and a pid. Returns the (program, top) pairs
-    started and the (program, top, entry) of each program not started
-    whose last run failed, for the user (index_message); what the state
-    cannot be read or written with is raised."""
+    start, a program, a path and a pid. What the state cannot be read or
+    written with is raised."""
     started, failed = [], []
     for program, top, found in index_plan(data, index):
         folder, problem = index_map(data["cwd"], program), None
