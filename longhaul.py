@@ -720,17 +720,18 @@ def note_session_account(sid: str, name: str) -> None:
 
 
 def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str, binary: str,
-                  unmanaged=()) -> int | None:
+                  unmanaged=(), top: str | None = None) -> int | None:
     """The index of the account a session resumed by id last ran on, for
     the panel wrapper and longhaul pipe (`who` names which in the log). In
     ask and never a session starts where it last ran, limited or not: there
     it stays at a limit anyway (decision 6 of the owner's record on
     switching without a terminal, not shipped). None when the caller picks
     instead: in auto, for a new session, with no record, or when the record
-    names an account not signed in as expected, or one in `unmanaged`
-    (pipe: no email, or ~/.claude). Each None but auto's and a new
-    session's has its line in the log: a session is never moved from where
-    it ran without a word (review, Sprint 5)."""
+    names an account not signed in as expected, one in `unmanaged`
+    (pipe: no email, or ~/.claude), or one that may not be used in the
+    repository `top` (the record never overrides a restriction). Each None
+    but auto's and a new session's has its line in the log: a session is
+    never moved from where it ran without a word (review, Sprint 5)."""
     if not resumed or mode == "auto":
         return None
     last = last_account(resumed, accounts)
@@ -738,14 +739,16 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
         log(f"{who}: no record of where {resumed[:8]} last ran; picking an account")
         return None
     idx = [a["name"] for a in accounts].index(last)
-    if last in unmanaged:
-        why = "not managed"
+    if top is not None and not account_allowed(accounts[idx], top):
+        why = f"may not be used in {home_path(top)}"
+    elif last in unmanaged:
+        why = "is not managed"
     elif not signed_in_cached(accounts[idx], binary):
-        why = "not signed in as expected"
+        why = "is not signed in as expected"
     else:
         log(f"{who}: {resumed[:8]} last ran on {last}; with switching set to {mode} it starts there")
         return idx
-    log(f"{who}: {resumed[:8]} last ran on {last}, which is {why}; picking an account")
+    log(f"{who}: {resumed[:8]} last ran on {last}, which {why}; picking an account")
     return None
 
 
@@ -3587,7 +3590,18 @@ def wrap(argv: list[str]) -> int:
         chat = is_chat(args)
         mode = panel_switch_mode() if chat else "never"
         resumed = resume_id(args) if chat else None
-        idx = resumed_index(resumed, accounts, mode, "panel", binary)  # a reopened chat: where it last ran
+        # A chat runs in the wrapper's folder, which its claude inherits. A
+        # short job is not a session and is chosen for as before.
+        top = repository_of(os.getcwd()) if chat else None
+        denied = denied_in(accounts, top) if chat else set()
+        if denied and all(a["name"] in denied for a in accounts):
+            # Refused, not run unchanged on ~/.claude: that would run the chat
+            # on whatever the panel is signed in to, outside the policy (Q3).
+            msg = no_account_text(top, accounts)
+            log(f"panel: {msg}")
+            notify(msg)
+            return 1
+        idx = resumed_index(resumed, accounts, mode, "panel", binary, top=top)  # a reopened chat: where it last ran
         if idx is not None:
             until = load_state()["limited_until"].get(accounts[idx]["name"], 0)
             if until > time.time():
@@ -3597,14 +3611,15 @@ def wrap(argv: list[str]) -> int:
                 notify(f"{accounts[idx]['name']} is at its limit until {clock(until)}; the chat stays on it "
                        f"(switching is {mode})")
         if idx is None:
-            idx, _ = choose_for_panel(accounts, binary)
+            idx, _ = choose_for_panel(accounts, binary, wrong=set(denied))
         if idx is None:
             log("panel: no account is signed in as expected; running Claude as the extension asked")
             os.execv(binary, [binary] + args)
         acct = accounts[idx]
         prepare(acct, chat)
         shown = " ".join(a for a in args if not a.startswith("--debug"))
-        log(f"panel {'chat' if chat else 'job'} on {acct['name']}: {shown[:240]}")
+        where = f" in {home_path(top)}" if chat else ""
+        log(f"panel {'chat' if chat else 'job'} on {acct['name']}{where}: {shown[:240]}")
         if resumed:
             # The record the next reopen reads (D3d). With switch_mid_session
             # off claude runs in this process's place and nothing of longhaul
@@ -3617,6 +3632,8 @@ def wrap(argv: list[str]) -> int:
         if not chat or vscode_config()["switch_mid_session"] is not True:  # "false" in the file is not on
             os.execve(binary, [binary] + args, wrapper_env(acct))
         relay = Relay(binary, args, accounts, idx, mode=mode)
+        relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
+        relay.denied = denied
         relay.start()
     except Exception as e:
         try:
@@ -3707,6 +3724,15 @@ def pipe(argv: list[str]) -> int:
         if opts.account and opts.account not in names:
             log(f"pipe: no account called {opts.account}; the accounts are {', '.join(names)}")
             return 2
+        # As run() does: the driver's folder is the one its claude runs in.
+        top = repository_of(os.getcwd())
+        denied = denied_in(accounts, top)
+        if opts.account in denied:
+            log(f"pipe: {may_not_text(accounts[names.index(opts.account)], top)}; longhaul did not start Claude")
+            return 2
+        if denied and all(name in denied for name in names):
+            log(f"pipe: {no_account_text(top, accounts)}")
+            return 1
         # An account with no email cannot be checked, and one with no folder
         # of its own is ~/.claude, the panel's sign-in: neither is an account
         # you gave longhaul, so a driven session never runs or moves there.
@@ -3722,9 +3748,9 @@ def pipe(argv: list[str]) -> int:
         if idx is None:
             # A resumed session: where it last ran, if that account is still
             # one longhaul manages. A new session (--session-id) is picked.
-            idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged)
+            idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged, top)
         if idx is None:
-            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged))
+            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied)
         if idx is None:
             log("pipe: no account is signed in as expected, so longhaul did not start Claude")
             return 1
@@ -3743,7 +3769,8 @@ def pipe(argv: list[str]) -> int:
         log(f"pipe: {opts.name or 'a session'} on {acct['name']}{at_limit}")
         relay = Relay(CLAUDE, args, accounts, idx, env=no_git_env if opts.no_git_sign_in else env_for,
                       swap=opts.swap, says=True, mode=mode)
-        relay.bad.update(unmanaged)  # switch() never moves the session onto an account in bad
+        relay.bad.update(unmanaged | denied)  # switch() never moves the session onto an account in bad
+        relay.denied = denied
         relay.start()
     except Exception as e:
         log(f"pipe: could not start: {e!r}")
@@ -3800,6 +3827,9 @@ class Relay:
         self.answered = threading.Event()
         self.switches = 0
         self.bad: set = set()
+        # Those of bad restricted to other repositories, for the wording: at a
+        # limit "no other account has room" was untrue when one had room.
+        self.denied: set = set()
         self.child = None
         self.watch = None
         self.limits: dict = {}
@@ -4167,8 +4197,8 @@ class Relay:
         if self.says and self.init_request is None:
             self.init_request = PIPE_INITIALIZE  # the driver sent none
         if nxt is None or until or nxt == here_idx or not sid or self.init_request is None:
-            log(f"panel: {here['name']} hit its {limit['kind']} limit; no other account has room, "
-                "so the chat stays as it is")
+            others = "no other account allowed here" if self.denied else "no other account"
+            log(f"panel: {here['name']} hit its {limit['kind']} limit; {others} has room, so the chat stays as it is")
             if self.says and (nxt is None or until or nxt == here_idx):
                 # Not for an unknown conversation id: other accounts may have room.
                 self.say_in_stream({"type": "longhaul", "subtype": "all_limited", "until": until})

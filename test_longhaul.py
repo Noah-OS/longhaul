@@ -4776,7 +4776,9 @@ class StreamHarness(unittest.TestCase):
     def plan(self, steps):
         (self.relay / "stream_plan.json").write_text(json.dumps(steps))
 
-    def start(self, args=None, launcher=None, command=None, **extra_env):
+    def start(self, args=None, launcher=None, command=None, cwd=None, **extra_env):
+        """The panel wrapper as the extension runs it; `cwd`: the folder it
+        runs in (default: the scratch folder)."""
         # LONGHAUL_SWITCH=auto: the panel tests written before Sprint 2 assert its
         # moves, which "auto" keeps (docs/adr/0002-switching-without-a-terminal.md).
         env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
@@ -4788,8 +4790,31 @@ class StreamHarness(unittest.TestCase):
         env.pop("CLAUDE_CONFIG_DIR", None)
         argv = [str(HERE / "fake_stream.py"), *(self.EXT_ARGS if args is None else args)]
         p = subprocess.Popen((command or [sys.executable, str(launcher or HERE / "longhaul_vscode.py")]) + argv,
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=self.tmp)
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                             cwd=cwd or self.tmp)
         return self.follow(p)
+
+    def repositories(self):
+        """work/.git and personal/.git under the scratch folder: (work, personal)."""
+        for name in ("work", "personal"):
+            (self.tmp / name / ".git").mkdir(parents=True)
+        return self.tmp / "work", self.tmp / "personal"
+
+    def restrict(self, name, *repos):
+        """`name` restricted to `repos` in accounts.json; the rest as they were."""
+        accounts = json.loads((self.relay / "accounts.json").read_text())
+        for a in accounts:
+            if a["name"] == name:
+                a["repositories"] = [str(r) for r in repos]
+        self.accounts(accounts)
+
+    def shown(self, folder):
+        """`folder` as longhaul names the session's: its real path, ~ for the home."""
+        return longhaul.home_path(os.path.realpath(folder))
+
+    def log_text(self):
+        log = self.relay / "longhaul.log"
+        return log.read_text() if log.exists() else ""
 
     def follow(self, p):
         """p's lines into self.lines (None at the end) and its stderr into
@@ -5248,6 +5273,71 @@ class Panel(StreamHarness):
         self.assertEqual(chat_runs_on("auto"), str(self.max), "auto picks an account with room")
         self.assertEqual(self.notified(wait=1), [], "nothing to say for a chat longhaul picked")
 
+    # Sprint 7, A2: a panel chat runs only on an account allowed in the
+    # folder the wrapper runs in, which is the folder its Claude runs in.
+
+    def chat_runs_in(self, folder, args=None, **env):
+        """A panel chat started in `folder`: the config folder its claude ran on."""
+        p = self.start(args, cwd=folder, **env)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertEqual(self.wait_for(self.result_for(self.user(p, "hello")))["result"], "reply to: hello")
+        p.stdin.close()
+        p.wait(10)
+        return self.calls()[-1]["config"]
+
+    def test_a_panel_chat_starts_only_on_an_account_allowed_in_its_folder(self):
+        work, personal = self.repositories()
+        self.restrict("Max", work)  # Max is first in order: choose_for_panel() alone picks it
+        self.plan(["reply"] * 3)
+        self.assertEqual(self.chat_runs_in(work), str(self.max))
+        self.assertEqual(self.chat_runs_in(personal), str(self.pro), "Max may not be used in personal")
+        self.switch_mid_session(False)
+        self.assertEqual(self.chat_runs_in(personal), str(self.pro), "the choice comes before the handover")
+        self.assertIn(f"panel chat on Pro in {self.shown(personal)}:", self.log_text(), "the log names the folder")
+
+    def test_a_panel_chat_reopened_by_id_leaves_a_recorded_account_not_allowed_here(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        (self.relay / "usage" / "sessions").mkdir(parents=True)
+        (self.relay / "usage" / "sessions" / "sid-c.json").write_text(json.dumps({"account": "Pro"}))
+        self.plan(["reply"])
+        self.assertEqual(self.chat_runs_in(personal, [*self.EXT_ARGS, "--resume=sid-c"], LONGHAUL_SWITCH="ask"),
+                         str(self.max))
+        self.assertIn(f"panel: sid-c last ran on Pro, which may not be used in {self.shown(personal)}; "
+                      "picking an account", self.log_text())
+
+    def test_a_panel_switch_never_lands_on_an_account_not_allowed_here(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        self.plan(["limit", "reply"])
+        p = self.start(cwd=personal)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        time.sleep(1.5)
+        self.assertEqual(len(self.calls()), 1, "no second claude on Pro")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "and now")))["is_error"], "the chat goes on")
+        self.assertIn("Max hit its session limit; no other account allowed here has room, so the chat stays as it is",
+                      self.log_text())
+
+    def test_with_no_allowed_account_the_panel_chat_is_refused_with_a_notification(self):
+        work, personal = self.repositories()
+        self.restrict("Max", work)
+        self.restrict("Pro", work)
+        p = self.start(cwd=personal, **self.fake_notifications())
+        self.assertEqual(p.wait(10), 1)
+        self.assertFalse((self.relay / "calls.jsonl").exists(), "no claude, not even the panel's own (Q3)")
+        said = f"No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work}."
+        self.assertIn(f"panel: {said}", self.log_text())
+        notes = self.notified()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertTrue(notes[0].startswith(said), notes)
+        # A short job is not a session: it runs as it does today.
+        job = self.start(["--version"], cwd=personal)
+        self.assertEqual(self.output(), b"fake job done")
+        self.assertEqual(job.wait(10), 0)
+
 
 class PanelSwitching(StreamHarness):
     """Sprint 2, D3c: with switch_mid_session on, the panel moves a chat only
@@ -5357,7 +5447,9 @@ class Pipe(StreamHarness):
     HEAD = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
     ARGS = [*HEAD, "--session-id", "sid-1", "--permission-mode", "default"]
 
-    def pipe(self, *flags, args=None, **extra_env):
+    def pipe(self, *flags, args=None, cwd=None, **extra_env):
+        """longhaul pipe as a driver runs it; `cwd`: the driver's folder
+        (default: the scratch folder)."""
         env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
                    LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_POLL_SECONDS="0.1",
                    LONGHAUL_NO_NOTIFY="1", LONGHAUL_AUTH_TTL="0", FAKE_EMAILS=json.dumps(self.emails),
@@ -5368,7 +5460,7 @@ class Pipe(StreamHarness):
         argv = [sys.executable, str(HERE / "longhaul.py"), "pipe", "--name", "api", *flags, "--",
                 *(self.ARGS if args is None else args)]
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=env, cwd=self.tmp)
+                             env=env, cwd=cwd or self.tmp)
         return self.follow(p)
 
     def calls_or_none(self):
@@ -5686,6 +5778,65 @@ class Pipe(StreamHarness):
         self.emails[str(self.pro)] = "stranger@example.com"
         starts_on(self.max, "--switch", "never")
         self.assertIn("pipe: sid-c last ran on Pro, which is not signed in as expected; picking an account", log())
+
+    # Sprint 7, A2: a driven session runs only on an account allowed in the
+    # driver's folder, which is the folder its Claude runs in.
+
+    def runs_on(self, *flags, cwd, args=None):
+        """The config folder a pipe session in `cwd` started on."""
+        p = self.pipe(*flags, args=args, cwd=cwd)
+        p.stdin.close()
+        self.assertEqual(p.wait(10), 0, self.log_text())
+        return self.calls()[-1]["config"]
+
+    def test_pipe_picks_only_an_account_allowed_in_the_drivers_folder(self):
+        work, personal = self.repositories()
+        self.restrict("Max", work)  # Max is first in order: choose_for_panel() alone picks it
+        self.assertEqual(self.runs_on(cwd=work), str(self.max))
+        self.assertEqual(self.runs_on(cwd=personal), str(self.pro), "Max may not be used in personal")
+        (work / "src").mkdir()
+        self.assertEqual(self.runs_on(cwd=work / "src"), str(self.max), "a folder inside the repository is the repository")
+
+    def test_pipe_exits_1_with_no_allowed_account(self):
+        work, personal = self.repositories()
+        self.restrict("Max", work)
+        self.restrict("Pro", work)
+        p = self.pipe(cwd=personal)
+        self.assertEqual(p.wait(10), 1)
+        self.assertEqual(self.calls_or_none(), [])
+        self.assertIn(f"pipe: No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work}. "
+                      f'Edit "repositories" in {self.relay / "accounts.json"}, or run from one of those.',
+                      self.log_text())
+
+    def test_pipe_refuses_account_for_a_folder_it_may_not_use(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        p = self.pipe("--account", "Pro", cwd=personal)
+        self.assertEqual(p.wait(10), 2)
+        self.assertEqual(self.calls_or_none(), [])
+        self.assertIn(f"pipe: Pro may not be used in {self.shown(personal)} (its repositories: {work}); "
+                      "longhaul did not start Claude", self.log_text())
+
+    def test_pipe_swaps_only_to_an_allowed_account(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        self.plan(["limit"])
+        p = self.pipe("--swap", cwd=personal)
+        self.wait_for(self.result_for(self.user(p, "build it")))
+        self.assertEqual(self.wait_for(lambda m: m.get("type") == "longhaul")["subtype"], "all_limited")
+        self.assertEqual(len(self.calls()), 1, "no claude on Pro")
+        self.assertIn("Max hit its session limit; no other account allowed here has room", self.log_text())
+
+    def test_pipe_leaves_a_recorded_account_not_allowed_here(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        (self.relay / "usage" / "sessions").mkdir(parents=True)
+        (self.relay / "usage" / "sessions" / "sid-c.json").write_text(json.dumps({"account": "Pro"}))
+        resumed = [*self.HEAD, "--resume", "sid-c", "--permission-mode", "default"]
+        self.assertEqual(self.runs_on("--switch", "ask", args=resumed, cwd=personal), str(self.max))
+        self.assertIn(f"pipe: sid-c last ran on Pro, which may not be used in {self.shown(personal)}; "
+                      "picking an account", self.log_text())
+        self.assertEqual(self.runs_on("--switch", "ask", args=resumed, cwd=work), str(self.pro), "allowed in work")
 
 
 class PanelPieces(unittest.TestCase):
