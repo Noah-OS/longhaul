@@ -2399,6 +2399,16 @@ class Index(unittest.TestCase):
     def plan(self, data, index="on"):
         return longhaul.index_plan(data, index)
 
+    def check(self, data, mode="warn", index="on"):
+        return longhaul.guard_check(data, mode, index=index)
+
+    def context(self, answer):
+        return (answer or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def note(self, program, top=None):
+        return longhaul.INDEX_NOTE.format(command=" ".join(longhaul.INDEX_COMMANDS[program]),
+                                          where=str(self.repo) if top is None else top, map=self.MAPS[program] + "/")
+
     def calls(self, program):
         path = self.tmp / f"{program}.calls"
         return path.read_text().splitlines() if path.exists() else []
@@ -2485,6 +2495,19 @@ class Index(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "1"}):
             self.assertEqual(self.plan(self.start()), both, "an interactive session")
         self.assertEqual(self.plan(self.start()), both, "unset, as an older Claude Code leaves it")
+        # The same through the hook, which reads its own environment.
+        data = json.dumps(self.start())
+        out = subprocess.run(Guard.HOOK, input=data, env={**self.env, "CLAUDE_CODE_SESSION_ATTENDED": "0"},
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+        out = subprocess.run(Guard.HOOK, input=data, env={**self.env, "CLAUDE_CODE_SESSION_ATTENDED": "1"},
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
 
     def test_a_mapped_project_is_left_alone_per_program(self):
         top, real = str(self.repo), os.path.realpath(self.repo)
@@ -2529,7 +2552,14 @@ class Index(unittest.TestCase):
 
     def test_a_new_session_in_an_unmapped_work_tree_starts_both_inits_in_the_top_level_and_answers_at_once(self):
         top, real = str(self.repo), os.path.realpath(self.repo)
-        self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        # The guard off does not stop the auto-init (the owner's question
+        # 1): LONGHAUL_INDEX alone governs it. The answer is one sentence
+        # per program started, and the hook has returned before either
+        # finished (the timing test measures that).
+        answer = self.check(self.start(), mode="off")
+        self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertEqual(self.context(answer), f"{self.note('codegraph')} {self.note('trail')}")
+        self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
         for program in self.MAPS:
             entry = self.wait(program)
             self.assertEqual(entry["exit"], 0, program)
@@ -2545,6 +2575,9 @@ class Index(unittest.TestCase):
         self.assertRegex(log, rf"index: codegraph init in {re.escape(top)} exit 0 after \d+\.\d s\n")
         self.assertRegex(log, rf"index: trail init in {re.escape(top)} exit 0 after \d+\.\d s\n")
         self.assertEqual(self.begin(self.start()), [], "the next session finds both maps")
+        self.assertEqual(self.context(self.check(self.start())), longhaul.GUARD_CODEGRAPH,
+                         "and the guard's own note of the CodeGraph index takes over")
+        self.assertIsNone(self.check(self.start(), mode="off"), "the guard off stays silent, with nothing to start")
 
     def test_a_second_start_while_the_first_runs_is_skipped(self):
         (self.tmp / "codegraph.slow").touch()
@@ -2671,10 +2704,15 @@ class Index(unittest.TestCase):
         self.assertEqual(listing(), before, "nothing new outside repo/ and index/")
 
     def test_the_state_file_shape_mode_and_the_programs_output_never_reach_the_answer_or_the_log(self):
-        with mock.patch.dict(os.environ, {"DO_NOT_TRACK": "1"}):  # any variable: the environment goes as it is
-            started = self.begin(self.start())
+        # Through the hook as the engine runs it, so its stdout is seen too;
+        # DO_NOT_TRACK stands for any variable: the environment goes as it is.
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env={**self.env, "DO_NOT_TRACK": "1"},
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
         for program in self.MAPS:
             self.wait(program)
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        self.assertNotIn("SECRET", out.stdout + out.stderr, "the hook's own streams")
         state = self.state()
         self.assertEqual(set(state), {"top", "runs"})
         self.assertEqual(state["top"], os.path.realpath(self.repo))
@@ -2697,7 +2735,6 @@ class Index(unittest.TestCase):
         self.assertEqual((self.home / "index" / f"{key}.codegraph.log").read_text(),
                          "SECRET-OUTPUT-codegraph\nSECRET-OUTPUT-codegraph\n")
         self.assertNotIn("SECRET", (self.home / "longhaul.log").read_text())
-        self.assertNotIn("SECRET", json.dumps(started))
         self.assertNotIn("SECRET", self.state_path().read_text())
         # The environment is passed as it is: no telemetry variable added or
         # removed, so the program saw what the hook's environment held.
@@ -2720,6 +2757,98 @@ class Index(unittest.TestCase):
         self.assertIn(f"index: started codegraph init in {link} (pid ", (self.home / "longhaul.log").read_text(),
                       "the log names the path given")
         self.assertTrue((self.repo / ".codegraph").is_dir() and (self.repo / ".trail").is_dir())
+
+    def test_the_note_is_one_sentence_per_program_and_names_no_install(self):
+        top = str(self.repo)
+        (self.bin / "trail").unlink()
+        answer = self.check(self.start())
+        self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        text = self.context(answer)
+        self.assertEqual(text, self.note("codegraph"))
+        self.assertEqual(text, f"Longhaul started `codegraph init -y` in {top} in the background; "
+                               "until .codegraph/ exists there, search as you would without an index.")
+        self.assertNotIn("install", text.lower())
+        self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        # With .codegraph/ there and trail started: the guard's note, then
+        # the Trail sentence, one answer.
+        self.fake(self.bin / "trail", "trail")
+        other = self.tmp / "other"
+        (other / ".git").mkdir(parents=True)
+        (other / ".codegraph").mkdir()
+        text = self.context(self.check(self.start(cwd=str(other))))
+        self.assertEqual(text, f"{longhaul.GUARD_CODEGRAPH} {self.note('trail', str(other))}")
+        self.assertEqual(self.wait("trail", str(other))["exit"], 0)
+        self.assertNotIn("install", text.lower())
+        self.assertIn(f"guard: named the CodeGraph index at {other} at startup", (self.home / "longhaul.log").read_text())
+        # `where` is by home_path: a project under the home folder shows as ~/...
+        third = self.tmp / "third"
+        (third / ".git").mkdir(parents=True)
+        with mock.patch.object(longhaul, "HOME", self.tmp):
+            text = self.context(self.check(self.start(cwd=str(third))))
+        self.assertTrue(text.startswith("Longhaul started `codegraph init -y` in ~/third in the background; "), text)
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program, str(third))["exit"], 0, program)
+
+    def test_the_hook_returns_well_inside_its_timeout_while_the_init_runs_on(self):
+        # The hook never waits: Popen only, in its own session, none of
+        # the hook's pipes inherited (a runner holding the hook's stdout
+        # would hold the engine too, until the init ended).
+        (self.tmp / "codegraph.slow").touch()
+        started = time.time()
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env=self.env, capture_output=True, text=True,
+                             timeout=10)
+        took = time.time() - started
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertLess(took, 1.5, "the hook returned with the init running on")
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        self.assertIsNone(self.state()["runs"]["codegraph"]["exit"], "still running when the hook had returned")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.wait("trail")["exit"], 0)
+
+    def test_a_program_found_through_a_relative_path_entry_or_inside_the_project_is_not_run(self):
+        # S1: a repository must not supply the program it is indexed with,
+        # and a relative PATH entry would resolve inside whatever folder
+        # the hook's process runs in (the project: the lead's probe).
+        top = str(self.repo)
+        (self.repo / "bin").mkdir()
+        self.fake(self.repo / "bin" / "codegraph", "codegraph")
+        with mock.patch.dict(os.environ, {"PATH": str(self.repo / "bin")}):
+            self.assertIsNone(longhaul.index_program("codegraph", top), "inside the project, by an absolute entry")
+            self.assertEqual(self.plan(self.start()), [])
+        (self.tmp / "links").mkdir()
+        (self.tmp / "links" / "codegraph").symlink_to(self.repo / "bin" / "codegraph")
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "links")}):
+            self.assertIsNone(longhaul.index_program("codegraph", top), "inside the project, through a link from outside")
+        # A relative entry, the hook's process in the project and then in
+        # the folder that holds the fake: neither is looked in.
+        for cwd in (self.repo / "bin", self.bin):
+            out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env={**self.env, "PATH": "."}, cwd=str(cwd),
+                                 capture_output=True, text=True, timeout=10)
+            self.assertEqual((out.returncode, out.stdout), (0, ""), (cwd, out.stderr))
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+        # The fake in bin/ behind a relative entry: found through the
+        # absolute one, and run from there.
+        with mock.patch.dict(os.environ, {"PATH": f".{os.pathsep}{self.bin}"}):
+            self.assertEqual(longhaul.index_program("codegraph", top), str(self.bin / "codegraph"))
+            self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+        self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"])
+
+    def test_a_repository_that_ships_a_map_folder_gets_no_init_and_no_note(self):
+        # A shipped .codegraph/ or .trail/ is a map; what its hooks do is
+        # between the user and the repository (the README's Limitations).
+        # The guard's own note of a CodeGraph index stays what it was.
+        (self.repo / ".trail").mkdir()
+        (self.bin / "codegraph").unlink()
+        self.assertIsNone(self.check(self.start()), "trail's map shipped, trail the only program: nothing")
+        (self.repo / ".codegraph").mkdir()
+        self.fake(self.bin / "codegraph", "codegraph")
+        self.assertEqual(self.context(self.check(self.start())), longhaul.GUARD_CODEGRAPH, "the guard's note alone")
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
 
 
 class Settings(unittest.TestCase):
@@ -2802,30 +2931,38 @@ class Settings(unittest.TestCase):
         # runs the real claude, against ~/.claude's sign-in and the onboarding
         # rule; this class did until Sprint 4's review, the guard's bad-size
         # test after it. A claude that leaves a mark goes first on PATH, the
-        # two classes that run commands whole go through unittest in a child
+        # classes that run commands whole go through unittest in a child
         # with no LONGHAUL_CLAUDE_BIN, and the mark must not appear. The
-        # child skips this test, or it would nest without end.
+        # child skips this test, or it would nest without end. Sprint 7,
+        # G4: the auto-init runs `codegraph` and `trail` from PATH, so the
+        # two are marked the same way and the Index class runs in the child.
         if os.environ.get("LONGHAUL_TEST_CHILD"):
             self.skipTest("the child run of this test")
-        bin_dir, mark = self.tmp / "bin", self.tmp / "claude-was-run"
+        bin_dir, mark = self.tmp / "bin", self.tmp / "was-run"
         bin_dir.mkdir()
-        (bin_dir / "claude").write_text("#!/bin/sh\n" f"printf '%s\\n' \"$*\" >> '{mark}'\n")
-        (bin_dir / "claude").chmod(0o755)
+        for name in ("claude", "codegraph", "trail"):
+            (bin_dir / name).write_text("#!/bin/sh\n" f"printf '%s\\n' \"{name} $*\" >> '{mark}'\n")
+            (bin_dir / name).chmod(0o755)
         env = {k: v for k, v in self.env.items() if k != "LONGHAUL_CLAUDE_BIN"}
         env.update(PATH=f"{bin_dir}{os.pathsep}{env.get('PATH', os.defpath)}", LONGHAUL_TEST_CHILD="1")
-        # The positive control (review, Sprint 5, G5): the marker claude is
-        # the one this PATH gives, and running it leaves the mark; without
-        # this, a mark that stayed empty proved nothing. Run by its path,
-        # never by name: a lookup that missed it (seen, with the marker not
-        # yet executable) resolves to the real claude on the owner's PATH.
-        self.assertEqual(shutil.which("claude", path=env["PATH"]), str(bin_dir / "claude"), "the marker claude is first on PATH")
-        control = subprocess.run([str(bin_dir / "claude"), "--version"], env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual((control.returncode, mark.read_text()), (0, "--version\n"), "the marker claude records its arguments")
+        # The positive control (review, Sprint 5, G5): the marker programs
+        # are the ones this PATH gives, and running each leaves the mark;
+        # without this, a mark that stayed empty proved nothing. Run by
+        # path, never by name: a lookup that missed one (seen, with the
+        # marker not yet executable) resolves to the real program on the
+        # owner's PATH.
+        for name in ("claude", "codegraph", "trail"):
+            self.assertEqual(shutil.which(name, path=env["PATH"]), str(bin_dir / name), f"the marker {name} is first on PATH")
+            control = subprocess.run([str(bin_dir / name), "--version"], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(control.returncode, 0, name)
+        self.assertEqual(mark.read_text(), "claude --version\ncodegraph --version\ntrail --version\n",
+                         "each marker records its name and arguments")
         mark.write_text("")
-        out = subprocess.run([sys.executable, "-m", "unittest", "test_longhaul.Settings", "test_longhaul.Guard", "-q"],
+        out = subprocess.run([sys.executable, "-m", "unittest", "test_longhaul.Settings", "test_longhaul.Guard",
+                              "test_longhaul.Index", "-q"],
                              cwd=HERE, env=env, capture_output=True, text=True, timeout=300)  # slow CI runners
+        self.assertEqual(mark.read_text(), "", "a test ran a program on PATH, with these arguments")
         self.assertEqual(out.returncode, 0, out.stderr[-1500:])
-        self.assertEqual(mark.read_text(), "", "a test ran the claude on PATH, with these arguments")
 
     def test_status_goes_on_with_the_version_unknown_when_claude_cannot_be_run(self):
         # The fail-safe the test above leans on: a claude that cannot start

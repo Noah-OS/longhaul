@@ -82,7 +82,11 @@ Usage:
                           Bash searches, never denying one: in a project with a
                           CodeGraph index it names the index at the twentieth.
                           SessionStart: names the index at startup; at compact and
-                          clear forgets the reads. LONGHAUL_GUARD=off does nothing
+                          clear forgets the reads. LONGHAUL_GUARD=off does nothing.
+                          With LONGHAUL_INDEX=on, at startup in a git work tree with
+                          no code map, starts `codegraph init` or `trail init` in
+                          the background, once per project (the README says what
+                          each writes); off unless set
   longhaul checkpoint save [ID] [--file PATH]
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
@@ -2451,6 +2455,9 @@ INDEX_TIMEOUT = setting("LONGHAUL_INDEX_TIMEOUT", 600, int, 1)  # seconds an ini
 INDEX_RETRY = 86_400  # seconds before a failed init is tried once more: at every start would be a storm, never would be silent
 # The runner, started by the hook as hooks.json starts the hook: an import, in its own process.
 INDEX_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.index_run(sys.argv[2], sys.argv[3])"
+# What the model is told per init started, and nothing after it that reads as an instruction to install anything.
+INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background; until {map} exists there, "
+              "search as you would without an index.")
 
 
 def index_mode() -> str:
@@ -2615,6 +2622,15 @@ def index_finish(program: str, top: str, code: int, seconds: float, why: str = "
     log(f"index: {program} init in {home_path(top)} exit {code} after {seconds:.1f} s{why}")
 
 
+def index_note(program: str, top: str) -> str:
+    """The one sentence the model is told for an init started: the
+    command, where (by home_path), and what to do until its map is
+    there. Once the map exists the guard's own note, at the next start
+    and at a context's twentieth search, takes over."""
+    return INDEX_NOTE.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top),
+                             map=INDEX_MAPS[program] + "/")
+
+
 # ---------------------------------------------------------------- guard
 #
 # `longhaul guard`: the plugin's hook (hooks/hooks.json), run before every
@@ -2637,7 +2653,9 @@ def index_finish(program: str, top: str, code: int, seconds: float, why: str = "
 # G3: the installed index's tool was called 0 times in five weeks of
 # sessions, 87% of whose searches ran inside subagents); it is context,
 # never a denial, the record keeps the count and never the pattern, and
-# without the index it says nothing of it.
+# without the index it says nothing of it. At startup the same hook
+# also runs the auto-init (the index region above) when LONGHAUL_INDEX
+# is on, whatever LONGHAUL_GUARD says: the two switches are independent.
 
 
 GUARD_BIG = setting("LONGHAUL_GUARD_BIG", 20_000, int, 1)  # bytes: a whole read above this is waste
@@ -2701,15 +2719,22 @@ def guard_targets(data: dict) -> list:
     return []
 
 
-def guard_startup(data: dict):
+def guard_startup(data: dict, mode: str, index: str):
     """A new session's SessionStart answer: the project's CodeGraph index
-    named to the main conversation, or None. A subagent's start is not
-    the session's, and without the index there is nothing to say here:
-    the install advice is the inspect report's, not every session's."""
-    if data.get("agent_id") is not None or not codegraph_index_at(data.get("cwd")):
+    named to the main conversation (the guard's note, with the guard
+    on), then one sentence per init the auto-init started (INDEX_NOTE,
+    with the index on; the two switches are independent), or None. A
+    subagent's start is not the session's, and without the index there
+    is nothing to say of it: the install advice is the inspect report's,
+    not every session's."""
+    notes = []
+    if mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd")):
+        log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
+        notes.append(GUARD_CODEGRAPH)
+    notes.extend(index_note(program, top) for program, top in index_start(data, index))
+    if not notes:
         return None
-    log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": GUARD_CODEGRAPH}}
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": " ".join(notes)}}
 
 
 def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float):
@@ -2762,22 +2787,26 @@ def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float)
     return notes, seen
 
 
-def guard_check(data, mode: str, now: float | None = None):
+def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     """The guard's answer for one hook input: the hook's JSON, or None to
-    let the call run unremarked. A SessionStart for compact or clear
-    empties the record's reads (guard_forget), and one for startup names
-    the project's CodeGraph index, if it has one (guard_startup). A
+    let the call run unremarked. A SessionStart for startup goes to
+    guard_startup() in any mode: it names the project's CodeGraph index,
+    if it has one and the guard is on, and starts the auto-init, if the
+    index switch (`index`, index_mode()) is on; with the guard on, one
+    for compact or clear empties the record's reads (guard_forget). A
     PreToolUse's files are judged by the rules (guard_rules) and
     recorded; a Bash search is counted and, once the context's count
     reaches GUARD_SEARCHES in an indexed project, answered once with the
     index."""
-    if mode == "off" or not isinstance(data, dict):
+    if not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
-        if data.get("source") in ("compact", "clear"):
+        if data.get("source") == "startup":
+            return guard_startup(data, mode, index)
+        if mode != "off" and data.get("source") in ("compact", "clear"):
             guard_forget(data)
-        elif data.get("source") == "startup":
-            return guard_startup(data)
+        return None
+    if mode == "off":
         return None
     # A search is a Bash whose first program is one of inspect's; its
     # program is not cat, so it has no targets. Of its command line only
@@ -2895,7 +2924,7 @@ def run_hook(check, name: str) -> int:
 
 def guard(_opts) -> int:
     """The hook command: stdin in, JSON or nothing out, exit 0 always."""
-    return run_hook(lambda data: guard_check(data, guard_mode()), "guard")
+    return run_hook(lambda data: guard_check(data, guard_mode(), index=index_mode()), "guard")
 
 
 # ----------------------------------------------------------- checkpoint
