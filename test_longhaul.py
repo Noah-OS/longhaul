@@ -2558,7 +2558,26 @@ class Index(unittest.TestCase):
 
     def begin(self, data):
         """What a session's start does of the index: the pairs started."""
-        return longhaul.index_start(data, "on")
+        return longhaul.index_start(data, "on")[0]
+
+    def said(self, answer):
+        """What the user is told: the answer's systemMessage, or None."""
+        return (answer or {}).get("systemMessage")
+
+    def told_started(self, program, top=None):
+        top = str(self.repo) if top is None else top
+        log = longhaul.home_path(str(self.home / "index" / f"{longhaul.index_key(top)}.{program}.log"))
+        return (f"longhaul: started `{' '.join(longhaul.INDEX_COMMANDS[program])}` in {longhaul.home_path(top)} "
+                f"in the background; the index is used from the next session (log: {log})")
+
+    def told_failed(self, program, reason, top=None, see=None):
+        top = str(self.repo) if top is None else top
+        entry = self.state(top)["runs"][program]
+        day = dt.datetime.fromtimestamp(entry["ended"]).strftime("%Y-%m-%d")
+        see = see or self.home / "index" / f"{longhaul.index_key(top)}.{program}.log"
+        return (f"longhaul: `{' '.join(longhaul.INDEX_COMMANDS[program])}` in {longhaul.home_path(top)} failed on "
+                f"{day} ({reason}); see {longhaul.home_path(str(see))}; delete "
+                f"{longhaul.home_path(str(self.state_path(top)))} and {self.MAPS[program]}/ together to retry")
 
     def state_path(self, top=None):
         return self.home / "index" / f"{longhaul.index_key(top or str(self.repo))}.json"
@@ -2844,6 +2863,9 @@ class Index(unittest.TestCase):
                          r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 1 s timeout\)\n")
         self.assertEqual(entry["why"], "timeout")
         self.assertEqual(self.begin(self.start()), [], "a failure: left alone")
+        answer = self.check(self.start())
+        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 1 s timeout"))
+        self.assertNotIn("hookSpecificOutput", answer, "nothing started, nothing for the model")
         # A timeout is no transient failure (review, Sprint 7, F17): a day
         # on it is not tried again; the user's deletion of the state (and
         # of a half-built map, were there one) is what retries it.
@@ -3260,6 +3282,43 @@ class Index(unittest.TestCase):
         self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
         for program in self.MAPS:
             self.assertEqual(self.wait(program)["exit"], 0, (program, "the runner too"))
+
+    def test_the_user_is_told_of_a_start_and_of_a_failure_that_stands(self):
+        # Review, Sprint 7 (F16): the model was told and the user was not.
+        # The systemMessage names the command, where, and the log; at a
+        # later start, a failure that stands (not tried again now) is said
+        # with its day and its reason, never the program's output.
+        answer = self.check(self.start())
+        self.assertEqual(self.said(answer), f"{self.told_started('codegraph')} {self.told_started('trail')}")
+        self.assertEqual(self.context(answer), f"{self.note('codegraph')} {self.note('trail')}", "the model's, unchanged")
+        for program in self.MAPS:
+            self.wait(program)
+        answer = self.check(self.start())
+        self.assertNotIn("systemMessage", answer, "built: nothing to say")
+        self.assertEqual(self.context(answer), longhaul.GUARD_CODEGRAPH)
+        # A failure.
+        other = self.tmp / "other"
+        (other / ".git").mkdir(parents=True)
+        (self.tmp / "codegraph.fail").touch()
+        (self.bin / "trail").unlink()
+        self.assertEqual(self.said(self.check(self.start(cwd=str(other)))), self.told_started("codegraph", str(other)))
+        self.assertEqual(self.wait("codegraph", str(other))["exit"], 1)
+        answer = self.check(self.start(cwd=str(other)))
+        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit 1", str(other)))
+        self.assertNotIn("SECRET", self.said(answer))
+        self.assertNotIn("hookSpecificOutput", answer, "the half-built map is not named, and nothing started")
+        self.assertIsNone(self.check(self.start(cwd=str(other), agent="agent-1")), "a subagent: nothing")
+        self.assertIsNone(self.check(self.start(cwd=str(other)), index="off"), "the index off: nothing")
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start(cwd=str(other))),
+                             env={**self.env, "LONGHAUL_INDEX": "off"}, capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        # A run that never ran says where its reason is: longhaul.log.
+        third = self.tmp / "third"
+        (third / ".git").mkdir(parents=True)
+        with mock.patch.object(longhaul, "index_spawn", side_effect=OSError(35, "Resource temporarily unavailable")):
+            self.assertIsNone(self.said(self.check(self.start(cwd=str(third)))), "no start, and no failure yet")
+        self.assertEqual(self.said(self.check(self.start(cwd=str(third)))),
+                         self.told_failed("codegraph", "exit -1, could not run", str(third), self.home / "longhaul.log"))
 
     def test_a_repository_that_ships_a_map_folder_gets_no_init_and_no_note(self):
         # A shipped .codegraph/ or .trail/ is a map; what its hooks do is

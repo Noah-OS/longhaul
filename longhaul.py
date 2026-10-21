@@ -2584,6 +2584,12 @@ INDEX_GRACE = 60
 # The runner, started by the hook as hooks.json starts the hook (`python3 -I -c`): an import, in its own process.
 INDEX_RUNNER = ("import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
                 "longhaul.index_run(sys.argv[2], sys.argv[3], sys.argv[4])")
+# What the user is told (the hook's systemMessage, review, Sprint 7, F16): each init started, and at a later
+# start each failure that stands, with its day and its reason from the entry; never a program's output.
+INDEX_STARTED = ("longhaul: started `{command}` in {where} in the background; the index is used from the next "
+                 "session (log: {log})")
+INDEX_FAILED = ("longhaul: `{command}` in {where} failed on {day} ({reason}); see {log}; delete {state} and {map} "
+                "together to retry")
 # What the model is told per init started, and nothing after it that reads as an instruction to install anything.
 INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background; until {map} exists there, "
               "search as you would without an index.")
@@ -2661,6 +2667,10 @@ def index_key(top: str) -> str:
     return f"{os.path.basename(real)}-{hashlib.sha256(real.encode()).hexdigest()[:12]}"
 
 
+def index_state_path(top: str) -> Path:
+    return LONGHAUL_HOME / "index" / f"{index_key(top)}.json"
+
+
 def index_state(top: str) -> tuple:
     """The project's state file, LONGHAUL_HOME/index/<key>.json, and what
     it holds: {"top": <realpath>, "runs": {<program>: {"started", "pid",
@@ -2669,7 +2679,7 @@ def index_state(top: str) -> tuple:
     object, its runs not one) is fresh too, said in one log line per read
     that names the file and never its content, as load_state() says of
     state.json; the next write replaces it."""
-    path = LONGHAUL_HOME / "index" / f"{index_key(top)}.json"
+    path = index_state_path(top)
     kept = read_json(path)
     if not (isinstance(kept, dict) and isinstance(kept.get("runs"), dict)):
         if kept is not None or os.path.exists(path):  # None is also no file yet: nothing to say then
@@ -2677,6 +2687,11 @@ def index_state(top: str) -> tuple:
         kept = {}
     runs = {k: v for k, v in dict_at(kept, "runs").items() if isinstance(v, dict)}
     return path, {"top": os.path.realpath(top), "runs": runs}
+
+
+def index_log(program: str, top: str) -> Path:
+    """Where a program's output goes: LONGHAUL_HOME/index/<key>.<program>.log."""
+    return LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
 
 
 def index_map(cwd, program: str):
@@ -2781,14 +2796,20 @@ def index_start(data: dict, index: str) -> list:
     run (index_finish), and a pid that cannot be written leaves an entry
     taken for a stopped runner. A skip writes nothing. One log line per
     start, a program, a path and a pid. Returns the (program, top) pairs
-    started; what the state cannot be read or written with is raised."""
-    started = []
+    started and the (program, top, entry) of each program not started
+    whose last run failed and was not rebuilt by hand since, for the
+    user (index_message); what the state cannot be read or written with
+    is raised."""
+    started, failed = [], []
     for program, top, found in index_plan(data, index):
         folder, problem = index_map(data["cwd"], program), None
         with locked("index"):
             path, state = index_state(top)
-            now = time.time()
-            if not index_due(program, top, state["runs"].get(program), folder, now):
+            now, entry = time.time(), state["runs"].get(program)
+            if not index_due(program, top, entry, folder, now):
+                if (entry is not None and as_number(entry.get("exit")) != 0 and not index_running(entry, now)
+                        and not index_by_hand(entry, folder)):
+                    failed.append((program, top, entry))
                 continue
             state["runs"][program] = {"started": round(now, 1), "pid": None, "exit": None, "ended": None,
                                       "seconds": None}
@@ -2802,14 +2823,17 @@ def index_start(data: dict, index: str) -> list:
                 try:
                     write_json(path, state)
                 except OSError as e:  # it runs all the same, and ends with its exit
-                    log(f"index: the pid of {program}'s run in {home_path(top)} could not be written ({e.strerror or e})")
+                    log(f"index: the pid of {program}'s run in {home_path(top)} could not be written "
+                        f"({e.strerror or e})")
         if problem is not None:  # outside the lock, which index_finish takes
-            said = f" (could not run: {problem.strerror or problem})" if isinstance(problem, OSError) else f" ({problem!r})"
+            said = f" ({problem!r})"
+            if isinstance(problem, OSError):
+                said = f" (could not run: {problem.strerror or problem})"
             index_finish(program, top, -1, 0.0, said, "error")
             continue
         log(f"index: started {program} init in {home_path(top)} (pid {pid})")
         started.append((program, top))
-    return started
+    return started, failed
 
 
 def index_run(program: str, top: str, found: str) -> None:
@@ -2832,7 +2856,7 @@ def index_run(program: str, top: str, found: str) -> None:
         if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
             code, said = -1, " (could not run: not the program found)"
         else:
-            out = LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
+            out = index_log(program, top)
             out.parent.mkdir(parents=True, exist_ok=True)
             with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
                 try:  # its own process group, so the timeout's kill reaches what it started too
@@ -2886,6 +2910,38 @@ def index_unfinished(cwd) -> bool:
     entry = index_state(top)[1]["runs"].get("codegraph") if top else None
     return (entry is not None and (as_number(entry.get("exit")) != 0 or "why" in entry)
             and not index_by_hand(entry, index_map(cwd, "codegraph")))
+
+
+def index_message(started: list, failed: list) -> str:
+    """What the user is told of the index at a session's start, "" for
+    nothing: INDEX_STARTED per init started, INDEX_FAILED per failure
+    that stands (index_start), joined by a space; paths by home_path.
+    The day is the run's end's (its start's without one) and the reason
+    the entry's: the exit, and why Longhaul ended it; a run that never
+    ran points to longhaul.log, where its reason is, the others to the
+    program's own log. Never the program's output."""
+    said = [INDEX_STARTED.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top),
+                                 log=home_path(str(index_log(program, top)))) for program, top in started]
+    for program, top, entry in failed:
+        code, why, seconds = as_number(entry.get("exit")), entry.get("why"), as_number(entry.get("seconds"))
+        if code is None:
+            reason = "no exit: its runner stopped"
+        elif why == "timeout":
+            reason = f"exit {code:g}, killed at the {f'{int(seconds)} s' if seconds else 'its'} timeout"
+        elif why == "error":
+            reason = f"exit {code:g}, could not run"
+        else:
+            reason = f"exit {code:g}"
+        when = as_number(entry.get("ended")) or as_number(entry.get("started"))
+        try:
+            day = dt.datetime.fromtimestamp(when).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError, OSError):  # none, or a time no date holds
+            day = "a day unknown"
+        log_file = LONGHAUL_HOME / "longhaul.log" if why == "error" else index_log(program, top)
+        said.append(INDEX_FAILED.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top), day=day,
+                                        reason=reason, log=home_path(str(log_file)),
+                                        state=home_path(str(index_state_path(top))), map=INDEX_MAPS[program] + "/"))
+    return " ".join(said)
 
 
 def index_note(program: str, top: str) -> str:
@@ -2991,14 +3047,17 @@ def guard_startup(data: dict, mode: str, index: str):
     on, unless the map is one Longhaul's own run left half-built or is
     still building: index_unfinished), then one sentence per init the
     auto-init started (INDEX_NOTE, with the index on; the two switches
-    are independent), or None. A subagent's start is not the session's,
-    and without the index there is nothing to say of it: the install
-    advice is the inspect report's, not every session's. What the
-    index's part raises is logged and costs nothing else."""
+    are independent); and for the user, a systemMessage of each init
+    started and each failure that stands (index_message); or None. A
+    subagent's start is not the session's, and without the index there
+    is nothing to say of it: the install advice is the inspect report's,
+    not every session's. What the index's part raises is logged and
+    costs nothing else."""
     named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
-    started = []
+    started, message = [], ""
     try:  # the index's part: whatever it raises (a full disk, a home it cannot write), the guard's note goes
-        started = index_start(data, index)
+        started, failed = index_start(data, index)
+        message = index_message(started, failed)
         named = named and not index_unfinished(data["cwd"])
     except Exception as e:
         log(f"index: not started ({e!r})")
@@ -3007,9 +3066,10 @@ def guard_startup(data: dict, mode: str, index: str):
         log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
         notes.append(GUARD_CODEGRAPH)
     notes.extend(index_note(program, top) for program, top in started)
-    if not notes:
-        return None
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": " ".join(notes)}}
+    answer = {"systemMessage": message} if message else {}
+    if notes:
+        answer["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": " ".join(notes)}
+    return answer or None
 
 
 def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float):
