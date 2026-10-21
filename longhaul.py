@@ -1944,6 +1944,17 @@ def output_size(content) -> tuple[int, int]:
             sum(b.get("type") == "image" for b in blocks))
 
 
+def codegraph_index_at(cwd) -> bool:
+    """Whether a CodeGraph index covers this folder: a .codegraph/ folder
+    at the absolute path cwd or in one of its parents, which is where
+    CodeGraph itself looks (the nearest index at or above the path; a
+    session opened in a subfolder of an indexed repository has one).
+    Anything but an absolute path is no index."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return False
+    return any(os.path.isdir(os.path.join(folder, ".codegraph")) for folder in (cwd, *map(str, Path(cwd).parents)))
+
+
 def search_stats(events, calls, results, cwd) -> dict:
     """The search numbers (Sprint 6, G3), by the count's definition: a
     search is a Grep or Glob call, or a Bash whose program is one of
@@ -1952,8 +1963,9 @@ def search_stats(events, calls, results, cwd) -> dict:
     is a run of consecutive searches in one context, replayed in time
     order as the repeats are; a big result is over SEARCH_BIG characters.
     A code index is seen as a tool name holding `codegraph`, or as a
-    `.codegraph/` folder under the transcript's first line's cwd; with no
-    cwd that is None (unknown), not 0, and its record is left out."""
+    `.codegraph/` folder at or above the transcript's first line's cwd;
+    with no absolute cwd that is None (unknown), not 0, and its record is
+    left out."""
     chains, open_run = [], collections.Counter()  # the closed runs; the run under way, per context
     searches, chars, big, big_chars = 0, 0, 0, 0
     for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
@@ -1975,7 +1987,7 @@ def search_stats(events, calls, results, cwd) -> dict:
             "search_chain_mean": sum(chains) / len(chains) if chains else 0.0,
             "search_big": big, "search_big_share": big_chars / chars if chars else 0.0,
             "codegraph_calls": sum("codegraph" in name for name, _ in calls.values()),
-            "codegraph_index": int(os.path.isdir(os.path.join(cwd, ".codegraph"))) if isinstance(cwd, str) else None}
+            "codegraph_index": int(codegraph_index_at(cwd)) if isinstance(cwd, str) and os.path.isabs(cwd) else None}
 
 
 def search_advice(s: dict) -> str:
@@ -2019,7 +2031,8 @@ def inspect_transcript(path: Path) -> dict:
                 if kind not in ("assistant", "user", "system"):
                     continue
                 lines += 1
-                cwd = line.get("cwd") if cwd is None and not n else cwd  # the first line's, looked under, never shown
+                if cwd is None and not n and isinstance(line.get("cwd"), str):
+                    cwd = line["cwd"]  # the main file's first, looked under for an index, never shown
                 when = parse_ts(line.get("timestamp")) or when
                 scope = "subagents" if n or line.get("isSidechain") else "main"
                 blocks = [b for b in msg.get("content") or [] if isinstance(b, dict)] \
@@ -2219,9 +2232,9 @@ def inspect_lines(r: dict) -> list[str]:
             [f"  {t['tool']}: {t['calls']} call{'s' * (t['calls'] != 1)}, {t['chars']:,} chars{where(t)}"
              for t in r["by_tool"]])
     s = r["search"]
-    seen = {1: "a .codegraph/ index under the cwd", 0: "no .codegraph/ index under the cwd",
+    seen = {1: "a .codegraph/ index at or above the cwd", 0: "no .codegraph/ index at or above the cwd",
             None: "no cwd in the transcript to look for an index"}[s["codegraph_index"]]
-    # The advice only when no index was seen: a folder under the cwd, or the tool called, means it is there to use.
+    # The advice only when no index was seen: a folder at or above the cwd, or the tool called, means it is there to use.
     advise = s["search_calls"] >= SEARCH_HEAVY and not s["codegraph_index"] and not s["codegraph_calls"]
     section(f"Search [transcript, counted: {', '.join(SEARCHES)}, and Bash {', '.join(SEARCH_PROGRAMS)}]",
             [f"  {s['search_calls']:,} search{'es' * (s['search_calls'] != 1)}, {s['search_share']:.0%} of calls, "
@@ -2429,13 +2442,6 @@ def guard_targets(data: dict) -> list:
     return []
 
 
-def guard_indexed(data: dict) -> bool:
-    """Whether the project the hook runs in has a CodeGraph index: a
-    .codegraph/ folder under the input's cwd."""
-    cwd = data.get("cwd")
-    return isinstance(cwd, str) and os.path.isabs(cwd) and os.path.isdir(os.path.join(cwd, ".codegraph"))
-
-
 def guard_check(data, mode: str, now: float | None = None):
     """The guard's answer for one hook input: the hook's JSON, or None to
     let the call run unremarked. A PreToolUse is checked and recorded, a
@@ -2448,7 +2454,7 @@ def guard_check(data, mode: str, now: float | None = None):
     if data.get("hook_event_name") == "SessionStart":
         if data.get("source") in ("compact", "clear"):
             guard_forget(data)
-        elif data.get("source") == "startup" and data.get("agent_id") is None and guard_indexed(data):
+        elif data.get("source") == "startup" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd")):
             # The main conversation only: a subagent's start is not the
             # session's. Without the index there is nothing to say here; the
             # install advice is the inspect report's, not every session's.
@@ -2472,7 +2478,7 @@ def guard_check(data, mode: str, now: float | None = None):
         fired = {k: as_int(dict_at(kept, "fired").get(k)) for k in GUARD_RULES}
         cost = {k: as_int(dict_at(kept, "bytes").get(k)) for k in GUARD_RULES}
         searches, nudged = as_int(kept.get("searches")) + (1 if search else 0), kept.get("nudged") is True
-        if search and searches >= GUARD_SEARCHES and not nudged and guard_indexed(data):
+        if search and searches >= GUARD_SEARCHES and not nudged and codegraph_index_at(data.get("cwd")):
             nudged = True  # once per context: the count goes on, the note does not
             nudge = f"{GUARD_CODEGRAPH} This context has made {searches} searches."
         notes, seen = [], {}

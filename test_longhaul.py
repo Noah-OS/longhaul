@@ -1267,24 +1267,34 @@ class Inspect(unittest.TestCase):
         out = self.cli("s1").stdout
         self.assertIn("CodeGraph: 1 call, no cwd in the transcript to look for an index", out)
         self.assertNotIn("Search-heavy", out, "the index is in use: nothing to install")
-        # The first line's cwd, with .codegraph/ under it and without.
+        # The first line's cwd, with .codegraph/ at it, above it (a session
+        # opened in a subfolder of an indexed repository) and without; a
+        # relative cwd is unknown, like none.
         project = self.tmp / "project"
         (project / ".codegraph").mkdir(parents=True)
         lines = self.searching(20)
         lines[0]["cwd"] = str(project)
         self.write(lines)
         out = self.cli("s1").stdout
-        self.assertIn("CodeGraph: 0 calls, a .codegraph/ index under the cwd", out)
+        self.assertIn("CodeGraph: 0 calls, a .codegraph/ index at or above the cwd", out)
         self.assertNotIn("Search-heavy", out)
         got = {x["metric"]: (x["value"], x["unit"], x["source"], x["confidence"]) for x in self.records("s1")}
         self.assertEqual(got["codegraph_index"], (1, "indexes", "transcript", "counted"))
         self.assertNotIn(str(project), out + self.cli("s1", "--json").stdout, "the cwd is looked under, never shown")
-        lines[0]["cwd"] = str(self.tmp / "elsewhere")
+        lines[0]["cwd"] = str(project / "src" / "deep")
         self.write(lines)
-        out = self.cli("s1").stdout
-        self.assertIn("CodeGraph: 0 calls, no .codegraph/ index under the cwd", out)
-        self.assertIn("Search-heavy", out)
-        self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["codegraph_index"], 0)
+        self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["codegraph_index"], 1, "a subfolder")
+        for cwd in (str(self.tmp / "elsewhere"), "project", 7):
+            lines[0]["cwd"] = cwd
+            self.write(lines)
+            out = self.cli("s1").stdout
+            self.assertIn("Search-heavy", out)
+            if cwd == str(self.tmp / "elsewhere"):
+                self.assertIn("CodeGraph: 0 calls, no .codegraph/ index at or above the cwd", out)
+                self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["codegraph_index"], 0)
+            else:
+                self.assertIn("no cwd in the transcript to look for an index", out)
+                self.assertIsNone(longhaul.inspect_transcript(self.path)["search"]["codegraph_index"], cwd)
 
     def test_tool_errors_are_counted_per_tool(self):
         self.write(self.turn("t1", "Bash", "Exit code 1", error=True, command="make")
@@ -1774,9 +1784,9 @@ class Guard(unittest.TestCase):
             data["agent_id"], data["agent_type"] = agent, "Explore"
         return data
 
-    def start(self, source="startup", agent=None, session="s1"):
-        data = {"session_id": session, "hook_event_name": "SessionStart", "source": source, "cwd": str(self.tmp),
-                "transcript_path": "/t/s1.jsonl"}
+    def start(self, source="startup", agent=None, session="s1", cwd=None):
+        data = {"session_id": session, "hook_event_name": "SessionStart", "source": source,
+                "cwd": str(self.tmp) if cwd is None else cwd, "transcript_path": "/t/s1.jsonl"}
         if agent:
             data["agent_id"], data["agent_type"] = agent, "Explore"
         return data
@@ -1933,6 +1943,13 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.check(self.start(source="resume")), "a resume is not a start")
         self.assertIsNone(self.check(self.start(), mode="off"))
         self.assertFalse((self.home / "guard").exists(), "nothing to record")
+        # The index is looked for at the cwd and above it, where CodeGraph
+        # itself looks: a session opened in a subfolder is told too. A
+        # relative or missing cwd is no index.
+        (self.tmp / "src").mkdir()
+        self.assertIsNotNone(self.check(self.start(cwd=str(self.tmp / "src"))), "a subfolder of the indexed project")
+        self.assertIsNone(self.check(self.start(cwd="src")), "a relative cwd")
+        self.assertIsNone(self.check({k: v for k, v in self.start().items() if k != "cwd"}), "no cwd")
         (self.tmp / ".codegraph").rmdir()
         (self.tmp / ".codegraph").write_text("not a folder")
         self.assertIsNone(self.check(self.start()), "a file of that name is no index")
