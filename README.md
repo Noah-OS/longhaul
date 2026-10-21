@@ -167,7 +167,7 @@ What the advanced feature writes outside `~/.longhaul` (the plugin writes none o
 ## Supported platforms and versions
 
 - **macOS**, where Longhaul was built and checked. The supervisor uses macOS pieces: notifications through `osascript`, `caffeinate` to keep the Mac awake while it runs, and the Keychain entry Claude Code keys to each account's folder.
-- **Linux:** the suite runs in CI (Ubuntu, Python 3.10 and the latest 3.x); not used in anger.
+- **Linux:** the suite passes in CI (Ubuntu, Python 3.10 and the latest 3.x, from the first release on); not used in anger.
 - **Claude Code.** The supervisor reads files Claude Code writes but does not document (the running process's `sessions/<pid>.json` and the conversation's transcript); it has been checked on 2.1.295 to 2.1.303. On a newer version `longhaul` says it "has not been checked" until it has seen a real limit there: Claude runs as normal, and if Longhaul does not switch accounts at a limit, that is why. The hooks, the shim and the skills were built against 2.1.304.
 - **Python 3.10 or later**, the oldest CI runs the suite on; standard library only; nothing is pip-installed. `python3` must be on PATH: the hooks and the plugin's `bin/longhaul` run it by name. Without it the hooks fail open (nothing is checked, nothing is put back) and the shim, which both skills run, stops with one line that says to install it (`xcode-select --install` or `brew install python` on a Mac).
 - **Where the plugin loads:** the terminal, the desktop app and VS Code. claude.ai and Cowork do not install a plugin that has a `bin/` folder, and Longhaul has one.

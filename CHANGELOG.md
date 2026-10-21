@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## 0.1.0 - YYYY-MM-DD
+## 0.1.0 - 2026-10-21
 
 The first release: a Claude Code plugin and a terminal command, in one Python file (plus a two-file VS Code launcher) with no dependencies, that show where a session's tokens go and stop the waste. Account switching ships opt-in.
 
