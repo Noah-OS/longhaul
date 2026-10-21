@@ -6015,6 +6015,61 @@ class Accounts(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual([a["name"] for a in self.accounts()], ["Team"])
 
+    # Sprint 7, A2: an account may be restricted to repositories.
+
+    def test_longhaul_add_repo_stores_the_paths_and_refuses_a_relative_one(self):
+        team, work = self.tmp / "team", self.tmp / "work"
+        work.mkdir()
+        self.emails[str(team)] = "team@example.com"
+        before = (self.relay / "accounts.json").read_bytes()
+        out = self.longhaul("add", "Team", "team@example.com", "--dir", str(team), "--repo", str(work), "--repo", "work")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("--repo work is not an absolute path; give the repository's full path, like ~/work/repo",
+                      out.stdout)
+        self.assertEqual((self.relay / "accounts.json").read_bytes(), before, "nothing written")
+        # HOME is the scratch folder, so work is ~/work; ~/later is not there.
+        out = self.longhaul("add", "Team", "team@example.com", "--dir", str(team), "--repo", str(work), "--repo", "~/later")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[-1], {"name": "Team", "config_dir": str(team), "email": "team@example.com",
+                                               "repositories": [str(work), "~/later"]}, "kept as given, as --dir is")
+        self.assertIn("--repo ~/later does not exist yet; kept for when it does", out.stdout)
+        self.assertIn(f"added Team (team@example.com), folder {team}, only in ~/work, ~/later; signing it in now",
+                      out.stdout)
+
+    def test_longhaul_status_shows_each_accounts_repositories(self):
+        (self.relay / "accounts.json").write_text(json.dumps([
+            {"name": "Max", "config_dir": str(self.max), "email": "first@example.com",
+             "repositories": [str(self.tmp / "work"), "~/other"]},
+            {"name": "Team", "config_dir": str(self.tmp / "team"), "email": "team@example.com", "repositories": "~/work"},
+            {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "pro@example.com"}]))
+        out = self.longhaul("status")
+        under, name = {}, None
+        for line in out.stdout.splitlines():  # each account's line, then its own indented ones
+            if not line.startswith(" "):
+                name = line.split(" ", 1)[0]
+            under.setdefault(name, []).append(line)
+        self.assertIn("       only in: ~/work, ~/other", under["Max"], out.stdout)
+        self.assertIn("       repositories is not a list of absolute paths; longhaul will not use this account anywhere",
+                      under["Team"], out.stdout)
+        self.assertFalse([l for l in under["Pro"] if "only in" in l or "repositories" in l], "Pro is unrestricted")
+
+    def test_remove_and_setup_keep_another_accounts_repositories(self):
+        team, new = self.tmp / "team", self.tmp / "new"
+        team.mkdir()
+        self.emails[str(new)] = "new@example.com"
+        restricted = {"name": "Team", "config_dir": str(team), "email": "team@example.com",
+                      "repositories": ["~/work/repo"], "note": "a key longhaul does not know"}
+        (self.relay / "accounts.json").write_text(json.dumps(self.accounts() + [restricted]))
+        out = self.longhaul("setup", "Max")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1], restricted)
+        out = self.longhaul("add", "New", "new@example.com", "--dir", str(new))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1:], [restricted, {"name": "New", "config_dir": str(new), "email": "new@example.com"}],
+                         "add writes back the list it read, and the field only when given")
+        self.assertEqual(self.longhaul("remove", "Max").returncode, 0)
+        self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
+
 
 class History(unittest.TestCase):
     """R2b: the public history never held the owner's own tooling. The

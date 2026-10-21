@@ -4386,8 +4386,11 @@ def setup(opts) -> int:
 
 
 def add(opts) -> int:
-    """longhaul add NAME EMAIL: a new account in its own folder, signed in once in
-    the browser. Only that email is accepted for it from then on."""
+    """longhaul add NAME EMAIL [--repo PATH]...: a new account in its own
+    folder, signed in once in the browser. Only that email is accepted for
+    it from then on. With --repo it is used only in those repositories (and
+    those inside them); without, anywhere, and its entry has no
+    "repositories" at all."""
     name, email = opts.name.strip(), opts.email.strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,30}", name):
         say("a name is letters and digits (and - or _), up to 31 of them")
@@ -4395,6 +4398,14 @@ def add(opts) -> int:
     if "@" not in email:
         say(f"{email} does not look like an email")
         return 2
+    repos = opts.repo or []
+    for r in repos:  # a relative path would be read against whatever folder longhaul runs in
+        if not os.path.isabs(os.path.expanduser(r)):
+            say(f"--repo {shown(r)} is not an absolute path; give the repository's full path, like ~/work/repo")
+            return 2
+    for r in repos:  # the clone may come later
+        if not os.path.exists(os.path.expanduser(r)):
+            say(f"--repo {home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
     folder = opts.dir or f"~/.claude-{name.lower()}"
     path = Path(os.path.expanduser(folder)).resolve()
     if path in (DEFAULT_CONFIG.resolve(), (HOME / ".claude").resolve()):
@@ -4415,9 +4426,13 @@ def add(opts) -> int:
             if a.get("config_dir") and config_of(a).resolve() == path:
                 say(f"{folder} is already the folder of {a['name']}")
                 return 2
-        accounts.append({"name": name, "config_dir": folder, "email": email})
+        entry = {"name": name, "config_dir": folder, "email": email}
+        if repos:  # kept as given, `~` included, as config_dir is; expanded at use
+            entry["repositories"] = repos
+        accounts.append(entry)
         write_json(LONGHAUL_HOME / "accounts.json", accounts)
-    say(f"added {name} ({email}), folder {folder}; signing it in now")
+    only = f", only in {', '.join(home_path(os.path.expanduser(r)) for r in repos)}" if repos else ""
+    say(f"added {name} ({email}), folder {folder}{only}; signing it in now")
     code = setup(argparse.Namespace(account=name, relogin=False))
     if code != 0:
         say(f"{name} is on the list but not signed in, so longhaul will not use it yet: run `longhaul setup {name}`")
@@ -4458,6 +4473,11 @@ def status(_opts) -> int:
         want = acct.get("email")
         if want and (a.get("email") or "").lower() != want.lower():
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
+        allowed = repositories_of(acct)
+        if allowed is None:
+            print("       repositories is not a list of absolute paths; longhaul will not use this account anywhere")
+        elif allowed:
+            print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
         if acct.get("config_dir"):
             broken = [i for i in SHARED if (DEFAULT_CONFIG / i).exists() and not (config_of(acct) / i).is_symlink()]
             if broken:
@@ -4522,6 +4542,9 @@ def main(argv: list[str]) -> int:
             p.add_argument("name", help="what to call it (Max, Pro, Team...)")
             p.add_argument("email", help="the only email longhaul will accept for it")
             p.add_argument("--dir", help="its folder (default: ~/.claude-<name>)")
+            p.add_argument("--repo", action="append", metavar="PATH",
+                           help="a repository it may be used in, and those inside it; repeat for more "
+                                "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
         if cmd == "setup":
