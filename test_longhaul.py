@@ -3211,6 +3211,30 @@ class Index(unittest.TestCase):
             self.assertEqual((self.tmp / f"{program}.env").read_text(), "unset\nunset\nunset\nunset\n", program)
         self.assertEqual(set(self.SEEN[2:]) - set(longhaul.SESSION_ENV), set(), "the names are SESSION_ENV's")
 
+    def test_the_walk_up_and_the_inside_test_are_one_each(self):
+        # Review, Sprint 7 (F14): map_at(), index_top() and index_map()
+        # walked the parents each their own way, and index_top(),
+        # index_program() and the runner each spelled "inside" their own
+        # way (one without the rstrip, so a top of "/" read as "//").
+        self.assertEqual(list(longhaul.above(f"{os.sep}a{os.sep}b")), [f"{os.sep}a{os.sep}b", f"{os.sep}a", os.sep])
+        for cwd in ("a/b", "", None, 5):
+            self.assertEqual(list(longhaul.above(cwd)), [], cwd)
+        for path, folder, expected in (("/a/b/c", "/a/b", True), ("/a/b/c", "/a/b/", True), ("/a/bc", "/a/b", False),
+                                       ("/a/b", "/a/b", False), ("/a/b", "/", True)):
+            self.assertEqual(longhaul.inside(path, folder), expected, (path, folder))
+
+    def test_the_hook_loads_no_hashlib_until_a_state_is_keyed(self):
+        # Review, Sprint 7 (F14): the guard hook imports longhaul at every
+        # tool call, and hashlib loads OpenSSL on 3.11 and later; only
+        # index_key() needs it, so only index_key() imports it.
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                 "print(sorted({'hashlib', '_hashlib'} & set(sys.modules))); longhaul.index_key(sys.argv[1]); "
+                 "print('hashlib' in sys.modules)")
+        out = subprocess.run([sys.executable, "-I", "-c", probe, str(HERE)], env=self.env, capture_output=True,
+                             text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "[]\nTrue\n")
+
     def test_a_symlinked_cwd_keys_one_state_and_runs_in_the_path_given(self):
         # S1: the key is the real path's, so a project opened through a link
         # and through its real path has one state, and a start through the

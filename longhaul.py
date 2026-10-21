@@ -116,7 +116,6 @@ import collections
 import contextlib
 import datetime as dt
 import fcntl
-import hashlib
 import heapq
 import json
 import math
@@ -2094,15 +2093,30 @@ def output_size(content) -> tuple[int, int]:
             sum(b.get("type") == "image" for b in blocks))
 
 
+def above(cwd):
+    """The absolute path cwd and each of its parents, nearest first, as
+    the indexers look for their maps and git for its work tree; nothing
+    for anything but an absolute path, which would be read against
+    whatever folder this runs in."""
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        yield cwd
+        yield from map(str, Path(cwd).parents)
+
+
+def inside(path: str, folder: str) -> bool:
+    """Whether path is below folder, both as the caller resolved them:
+    /a/bc is not inside /a/b, and a folder is not inside itself (but
+    everything is inside /)."""
+    return path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
 def map_at(cwd, folder: str) -> bool:
     """Whether a code map's folder (`.codegraph/`, `.trail/`) is at the
     absolute path cwd or in one of its parents, which is where the
     indexers themselves look (the nearest map at or above the path; a
     session opened in a subfolder of a mapped repository has one).
     Anything but an absolute path is no map."""
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        return False
-    return any(os.path.isdir(os.path.join(parent, folder)) for parent in (cwd, *map(str, Path(cwd).parents)))
+    return any(os.path.isdir(os.path.join(parent, folder)) for parent in above(cwd))
 
 
 def codegraph_index_at(cwd) -> bool:
@@ -2149,7 +2163,7 @@ def search_stats(events, calls, results, cwd) -> dict:
             big, big_chars = big + 1, big_chars + size
     chains.extend(n for n in open_run.values() if n)
 
-    def index_calls(is_tool) -> int:
+    def calls_of(is_tool) -> int:
         """The calls of an index's tools, by name, whose result was not an error."""
         return sum(is_tool(name, what) and not results.get(tid, (0, 0, False))[2]
                    for tid, (name, what) in calls.items())
@@ -2159,11 +2173,11 @@ def search_stats(events, calls, results, cwd) -> dict:
             "search_chain_max": max(chains, default=0),
             "search_chain_mean": sum(chains) / len(chains) if chains else 0.0,
             "search_big": big, "search_big_share": big_chars / chars if chars else 0.0,
-            "codegraph_calls": index_calls(lambda name, what: "codegraph" in name
-                                           or (name == "Bash" and what == "codegraph")),
+            "codegraph_calls": calls_of(lambda name, what: "codegraph" in name
+                                        or (name == "Bash" and what == "codegraph")),
             "codegraph_index": int(codegraph_index_at(cwd)) if located else None,
-            "trail_calls": index_calls(lambda name, what: "mcp__trail__" in name or name.startswith("trail_")
-                                       or (name == "Bash" and what == "trail")),
+            "trail_calls": calls_of(lambda name, what: "mcp__trail__" in name or name.startswith("trail_")
+                                    or (name == "Bash" and what == "trail")),
             "trail_index": int(map_at(cwd, ".trail")) if located else None}
 
 
@@ -2614,13 +2628,11 @@ def index_top(cwd):
     included: a dotfiles repository at `~` makes every folder a work
     tree, and there Trail's "repo" settings file would be the user's
     own."""
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        return None
-    top = next((p for p in (cwd, *map(str, Path(cwd).parents)) if os.path.exists(os.path.join(p, ".git"))), None)
+    top = next((p for p in above(cwd) if os.path.exists(os.path.join(p, ".git"))), None)
     if top is None:
         return None
     real, home = os.path.realpath(top), os.path.realpath(str(HOME))
-    if real == home or home.startswith(real.rstrip(os.sep) + os.sep):
+    if real == home or inside(home, real):
         return None
     return top
 
@@ -2634,7 +2646,7 @@ def index_program(name: str, top: str):
     found = shutil.which(name, path=os.pathsep.join(entries)) if entries else None
     if found is None:
         return None
-    return None if os.path.realpath(found).startswith(os.path.realpath(top) + os.sep) else found
+    return None if inside(os.path.realpath(found), os.path.realpath(top)) else found
 
 
 def index_plan(data: dict, index: str) -> list:
@@ -2665,6 +2677,10 @@ def index_plan(data: dict, index: str) -> list:
 def index_key(top: str) -> str:
     """<top's basename>-<the first 12 hex of sha256(realpath)>: a symlinked
     and a real path share one state."""
+    # Imported here, not at the top: the guard hook imports this module at
+    # every tool call, and hashlib loads OpenSSL on 3.11 and later (review,
+    # Sprint 7, F14).
+    import hashlib
     real = os.path.realpath(top)
     return f"{os.path.basename(real)}-{hashlib.sha256(real.encode()).hexdigest()[:12]}"
 
@@ -2699,9 +2715,7 @@ def index_log(program: str, top: str) -> Path:
 def index_map(cwd, program: str):
     """The program's map folder nearest at or above the absolute cwd, as
     map_at() looks for it, or None."""
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
-        return None
-    folders = (os.path.join(parent, INDEX_MAPS[program]) for parent in (cwd, *map(str, Path(cwd).parents)))
+    folders = (os.path.join(parent, INDEX_MAPS[program]) for parent in above(cwd))
     return next((folder for folder in folders if os.path.isdir(folder)), None)
 
 
@@ -2857,7 +2871,7 @@ def index_run(program: str, top: str, found: str) -> None:
     a line (index_finish)."""
     started, why = time.time(), "error"
     try:
-        if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
+        if not os.path.isabs(found) or inside(os.path.realpath(found), os.path.realpath(top)):
             code, said = -1, " (could not run: not the program found)"
         else:
             out = index_log(program, top)
