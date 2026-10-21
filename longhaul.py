@@ -2560,12 +2560,16 @@ def inspect(opts) -> int:
 # never for a subagent, a resume, a compaction or a clear, or an
 # unattended run (`claude -p`: its hook sees
 # CLAUDE_CODE_SESSION_ATTENDED=0). Once per project: LONGHAUL_HOME/
-# index/<key>.json holds each program's start, pid, exit and seconds; a
-# run in progress is left to run, a failure is tried again after a day
-# (delete the file to try now), and the map it left half-built is then
-# rebuilt, being Longhaul's own; a map folder the state knows nothing
-# of is someone else's and is never touched. The program's output goes
-# to index/<key>.<program>.log alone, never to the hook's stdout or to
+# index/<key>.json holds each program's start, pid, exit and seconds,
+# and why Longhaul ended a run (a timeout, an error); a run in progress
+# is left to run, up to its timeout; a map built and then gone is built
+# again; a failure is tried again after a day (delete the file to try
+# now), a timeout never, and the map a failure left half-built is then
+# rebuilt, being Longhaul's own, unless someone rebuilt it by hand
+# since; a map folder the state knows nothing of is someone else's and
+# is never touched, and one Longhaul's own run has not finished is not
+# named to the model. The program's output goes to
+# index/<key>.<program>.log alone, never to the hook's stdout or to
 # longhaul.log, and the environment is passed as it is: no telemetry
 # variable is added or removed.
 
@@ -2574,6 +2578,9 @@ INDEX_COMMANDS = {"codegraph": ("codegraph", "init", "-y"),
 INDEX_MAPS = {"codegraph": ".codegraph", "trail": ".trail"}  # each program's map folder, written in the top level
 INDEX_TIMEOUT = setting("LONGHAUL_INDEX_TIMEOUT", 600, int, 1)  # seconds an init may take: CodeGraph's own figure for 27k files is 100
 INDEX_RETRY = 86_400  # seconds before a failed init is tried once more: at every start would be a storm, never would be silent
+# Seconds of a clock's slack: a run is in progress up to INDEX_TIMEOUT and this after its start (the
+# runner's own start, its kill and its last write), and a start this far ahead of the clock is still now.
+INDEX_GRACE = 60
 # The runner, started by the hook as hooks.json starts the hook: an import, in its own process.
 INDEX_RUNNER = ("import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
                 "longhaul.index_run(sys.argv[2], sys.argv[3], sys.argv[4])")
@@ -2651,29 +2658,91 @@ def index_key(top: str) -> str:
 def index_state(top: str) -> tuple:
     """The project's state file, LONGHAUL_HOME/index/<key>.json, and what
     it holds: {"top": <realpath>, "runs": {<program>: {"started", "pid",
-    "exit", "ended", "seconds"}}}, fresh when missing or corrupt."""
+    "exit", "ended", "seconds", and "why" when Longhaul ended the run or
+    it never ran}}}, fresh when missing. A corrupt file (not JSON, not an
+    object, its runs not one) is fresh too, said in one log line per read
+    that names the file and never its content, as load_state() says of
+    state.json; the next write replaces it."""
     path = LONGHAUL_HOME / "index" / f"{index_key(top)}.json"
-    runs = {k: v for k, v in dict_at(read_json(path), "runs").items() if isinstance(v, dict)}
+    kept = read_json(path)
+    if not (isinstance(kept, dict) and isinstance(kept.get("runs"), dict)):
+        if kept is not None or os.path.exists(path):  # None is also no file yet: nothing to say then
+            log(f"index: {home_path(str(path))} could not be read; a fresh state stands in until the next write")
+        kept = {}
+    runs = {k: v for k, v in dict_at(kept, "runs").items() if isinstance(v, dict)}
     return path, {"top": os.path.realpath(top), "runs": runs}
 
 
-def index_due(entry, mapped: bool, now: float) -> bool:
-    """Whether a program's init is to be started now, from its state
-    entry and whether its map is at or above the cwd. With no entry: yes,
-    unless the map is there, which makes it someone else's (a repository
-    that ships one, an init run by hand) and never Longhaul's to touch.
-    A run in progress (exit null, the pid alive) and an exit of 0 are
-    left alone. A failure, or a runner that never wrote its exit (the
-    Mac slept, the runner was killed) and is dead, is tried once more
-    when INDEX_RETRY has passed since its start, map or no map: what it
-    left half-built is Longhaul's own. The file is deletable: a user who
-    has fixed the cause removes it to try now."""
-    if entry is None:
-        return not mapped
-    code = as_number(entry.get("exit"))
-    if (code is None and pid_alive(entry.get("pid"))) or code == 0:
+def index_map(cwd, program: str):
+    """The program's map folder nearest at or above the absolute cwd, as
+    map_at() looks for it, or None."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None
+    folders = (os.path.join(parent, INDEX_MAPS[program]) for parent in (cwd, *map(str, Path(cwd).parents)))
+    return next((folder for folder in folders if os.path.isdir(folder)), None)
+
+
+def index_running(entry: dict, now: float) -> bool:
+    """Whether an entry is a run in progress: no exit yet, its runner's pid
+    alive, and its start no more than INDEX_TIMEOUT and INDEX_GRACE ago,
+    nor more than INDEX_GRACE ahead. Past that bound the runner is dead
+    and the pid another process's (pids are reused): a failure."""
+    started = as_number(entry.get("started"))
+    return (as_number(entry.get("exit")) is None and as_int(entry.get("pid")) > 0 and pid_alive(entry["pid"])
+            and started is not None and -INDEX_GRACE <= now - started <= INDEX_TIMEOUT + INDEX_GRACE)
+
+
+def index_by_hand(entry: dict, folder) -> bool:
+    """Whether the map folder was written after the entry's run ended (by
+    more than a second: `ended` is rounded), which is someone's rebuild:
+    what the run itself left half-built was written before it ended. A
+    run with no `ended` cannot be told apart, and counts as not."""
+    ended = as_number(entry.get("ended"))
+    if folder is None or ended is None:
         return False
-    return now - (as_number(entry.get("started")) or 0) >= INDEX_RETRY
+    try:
+        return os.stat(folder).st_mtime > ended + 1
+    except OSError:
+        return False
+
+
+def index_due(program: str, top: str, entry, folder, now: float) -> bool:
+    """Whether a program's init is to be started now, from its state
+    entry and its map folder at or above the cwd (index_map; None for
+    none). With no entry: yes, unless the map is there, which makes it
+    someone else's (a repository that ships one, an init run by hand)
+    and never Longhaul's to touch. An exit of 0 is left alone while its
+    map is there; with the map gone (a `git clean -fdx`, a clone again at
+    the same path, a user's rm) it is built again now. A run in progress
+    (index_running) is left to run. A timeout is not tried again: a
+    program that ran past INDEX_TIMEOUT once will again, and the user's
+    deletion of the state (and of the map it left half-built) is what
+    retries it. Any other failure, or a runner that never wrote its exit
+    and is not running (the Mac slept, the runner was killed), is tried
+    once more when INDEX_RETRY has passed since its start, or at once
+    when its start is ahead of the clock by more than INDEX_GRACE (the
+    clock moved): the map it left half-built is Longhaul's own, and is
+    rebuilt, unless the map was written after the run ended
+    (index_by_hand), someone's rebuild, left alone. The file is
+    deletable: a user who has fixed the cause removes it to try now. The
+    map gone and the map rebuilt by hand are each said in one log line;
+    the state says the rest."""
+    if entry is None:
+        return folder is None
+    if as_number(entry.get("exit")) == 0:
+        if folder is not None:
+            return False
+        log(f"index: {program}'s map in {home_path(top)} is gone; rebuilding")
+        return True
+    if entry.get("why") == "timeout" or index_running(entry, now):
+        return False
+    started = as_number(entry.get("started"))
+    if started is not None and started - now <= INDEX_GRACE and now - started < INDEX_RETRY:
+        return False
+    if index_by_hand(entry, folder):
+        log(f"index: {program}'s map in {home_path(top)} was rebuilt by hand; left alone")
+        return False
+    return True
 
 
 def index_spawn(program: str, top: str, found: str) -> int:
@@ -2693,22 +2762,40 @@ def index_spawn(program: str, top: str, found: str) -> int:
 
 def index_start(data: dict, index: str) -> list:
     """For each (program, top, found) index_plan() gives, under the index
-    lock: the state read, the decision made (index_due), the runner
-    started on the path found and its start and pid written. A skip
-    writes and logs nothing: the state says why. One log line per start,
-    a program, a path and a pid. Returns the (program, top) pairs
-    started."""
+    lock, so that starts at the same moment decide one at a time: the
+    state read, the decision made (index_due), the entry written with
+    its start and no pid, the runner started on the path found, and its
+    pid written. The entry comes first, so no runner is ever without one
+    (review, Sprint 7, F4); a runner that cannot be started is a failed
+    run (index_finish), and a pid that cannot be written leaves an entry
+    taken for a stopped runner. A skip writes nothing. One log line per
+    start, a program, a path and a pid. Returns the (program, top) pairs
+    started; what the state cannot be read or written with is raised."""
     started = []
     for program, top, found in index_plan(data, index):
-        mapped = map_at(data["cwd"], INDEX_MAPS[program])
+        folder, problem = index_map(data["cwd"], program), None
         with locked("index"):
             path, state = index_state(top)
-            if not index_due(state["runs"].get(program), mapped, time.time()):
+            now = time.time()
+            if not index_due(program, top, state["runs"].get(program), folder, now):
                 continue
-            pid = index_spawn(program, top, found)
-            state["runs"][program] = {"started": round(time.time(), 1), "pid": pid, "exit": None, "ended": None,
+            state["runs"][program] = {"started": round(now, 1), "pid": None, "exit": None, "ended": None,
                                       "seconds": None}
             write_json(path, state)
+            try:
+                pid = index_spawn(program, top, found)
+            except Exception as e:
+                problem = e
+            else:
+                state["runs"][program]["pid"] = pid
+                try:
+                    write_json(path, state)
+                except OSError as e:  # it runs all the same, and ends with its exit
+                    log(f"index: the pid of {program}'s run in {home_path(top)} could not be written ({e.strerror or e})")
+        if problem is not None:  # outside the lock, which index_finish takes
+            said = f" (could not run: {problem.strerror or problem})" if isinstance(problem, OSError) else f" ({problem!r})"
+            index_finish(program, top, -1, 0.0, said, "error")
+            continue
         log(f"index: started {program} init in {home_path(top)} (pid {pid})")
         started.append((program, top))
     return started
@@ -2724,35 +2811,63 @@ def index_run(program: str, top: str, found: str) -> None:
     is refused, a second belt. The environment as it is, its output in
     index/<key>.<program>.log alone (0600, append), never in longhaul.log
     or on the hook's stdout. Past INDEX_TIMEOUT the program is killed and
-    counts as exit -1, as does one that could not be run at all."""
-    started, why = time.time(), ""
-    if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
-        index_finish(program, top, -1, time.time() - started, " (could not run: not the program found)")
-        return
-    out = LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    counts as exit -1, why "timeout"; one that could not be run, and any
+    failure of the runner's own, as exit -1, why "error": every run ends
+    in an exit and a line (index_finish)."""
+    started, why = time.time(), "error"
     try:
-        with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
-            code = subprocess.run([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL, stdout=f,
-                                  stderr=subprocess.STDOUT, timeout=INDEX_TIMEOUT).returncode
-    except subprocess.TimeoutExpired:
-        code, why = -1, f" (killed at the {INDEX_TIMEOUT} s timeout)"
+        if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
+            code, said = -1, " (could not run: not the program found)"
+        else:
+            out = LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
+                try:
+                    code = subprocess.run([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL,
+                                          stdout=f, stderr=subprocess.STDOUT, timeout=INDEX_TIMEOUT).returncode
+                    said, why = "", None
+                except subprocess.TimeoutExpired:
+                    code, said, why = -1, f" (killed at the {INDEX_TIMEOUT} s timeout)", "timeout"
+                except OSError as e:
+                    code, said = -1, f" (could not run: {e.strerror or e})"
+    except Exception as e:  # the runner's own failure: a log it cannot open, an index/ that is a file
+        code, said, why = -1, f" ({e!r})", "error"
+    index_finish(program, top, code, time.time() - started, said, why)
+
+
+def index_finish(program: str, top: str, code: int, seconds: float, said: str = "", why=None) -> None:
+    """The runner's last act: one log line with the exit code and the
+    time and `said`, never the program's output, written first, so a
+    state that cannot be written still leaves it (a second line says so);
+    then exit, ended and seconds into the program's entry, under the
+    lock, with `why` ("timeout", "error") when Longhaul ended the run or
+    it never ran, and none for the program's own exit, 0 or not."""
+    log(f"index: {program} init in {home_path(top)} exit {code} after {seconds:.1f} s{said}")
+    try:
+        with locked("index"):
+            path, state = index_state(top)
+            entry = state["runs"].get(program, {})
+            entry.pop("why", None)
+            entry.update(exit=code, ended=round(time.time(), 1), seconds=round(seconds, 1))
+            if why:
+                entry["why"] = why
+            state["runs"][program] = entry
+            write_json(path, state)
     except OSError as e:
-        code, why = -1, f" (could not run: {e.strerror or e})"
-    index_finish(program, top, code, time.time() - started, why)
+        log(f"index: {program}'s exit in {home_path(top)} could not be written ({e.strerror or e})")
 
 
-def index_finish(program: str, top: str, code: int, seconds: float, why: str = "") -> None:
-    """The runner's last act: exit, ended and seconds into the program's
-    entry, under the lock, and one log line with the exit code and the
-    time, never the program's output."""
-    with locked("index"):
-        path, state = index_state(top)
-        entry = state["runs"].get(program, {})
-        entry.update(exit=code, ended=round(time.time(), 1), seconds=round(seconds, 1))
-        state["runs"][program] = entry
-        write_json(path, state)
-    log(f"index: {program} init in {home_path(top)} exit {code} after {seconds:.1f} s{why}")
+def index_unfinished(cwd) -> bool:
+    """Whether the CodeGraph map at or above cwd is one a run of
+    Longhaul's has not finished well: the project's entry for codegraph
+    holds no exit 0, or a `why` (a run in progress, a failure, a
+    timeout), and the map was not rebuilt by hand since (index_by_hand).
+    The guard's note is then withheld at startup: the map is half-built
+    (review, Sprint 7, F17)."""
+    top = index_top(cwd)
+    entry = index_state(top)[1]["runs"].get("codegraph") if top else None
+    return (entry is not None and (as_number(entry.get("exit")) != 0 or "why" in entry)
+            and not index_by_hand(entry, index_map(cwd, "codegraph")))
 
 
 def index_note(program: str, top: str) -> str:
@@ -2855,16 +2970,25 @@ def guard_targets(data: dict) -> list:
 def guard_startup(data: dict, mode: str, index: str):
     """A new session's SessionStart answer: the project's CodeGraph index
     named to the main conversation (the guard's note, with the guard
-    on), then one sentence per init the auto-init started (INDEX_NOTE,
-    with the index on; the two switches are independent), or None. A
-    subagent's start is not the session's, and without the index there
-    is nothing to say of it: the install advice is the inspect report's,
-    not every session's."""
+    on, unless the map is one Longhaul's own run left half-built or is
+    still building: index_unfinished), then one sentence per init the
+    auto-init started (INDEX_NOTE, with the index on; the two switches
+    are independent), or None. A subagent's start is not the session's,
+    and without the index there is nothing to say of it: the install
+    advice is the inspect report's, not every session's. What the
+    index's part raises is logged and costs nothing else."""
+    named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    started = []
+    try:  # the index's part: whatever it raises (a full disk, a home it cannot write), the guard's note goes
+        started = index_start(data, index)
+        named = named and not index_unfinished(data["cwd"])
+    except Exception as e:
+        log(f"index: not started ({e!r})")
     notes = []
-    if mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd")):
+    if named:
         log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
         notes.append(GUARD_CODEGRAPH)
-    notes.extend(index_note(program, top) for program, top in index_start(data, index))
+    notes.extend(index_note(program, top) for program, top in started)
     if not notes:
         return None
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": " ".join(notes)}}

@@ -2727,15 +2727,62 @@ class Index(unittest.TestCase):
         self.assertTrue(longhaul.pid_alive(entry["pid"]), "the runner's pid")
         self.assertEqual(self.begin(self.start()), [], "a second session while it runs")
         self.assertEqual(self.begin(self.start(session="s2")), [], "any session: the state is the project's")
-        # However long ago it started: a run in progress is never doubled.
+        # Started up to its timeout ago, with its pid alive: a run in
+        # progress, never doubled (past the timeout it is a dead runner
+        # whose pid was reused: the next test).
         with longhaul.locked("index"):
             state = self.state()
-            state["runs"]["codegraph"]["started"] -= 86_401
+            state["runs"]["codegraph"]["started"] -= longhaul.INDEX_TIMEOUT - 10
             longhaul.write_json(self.state_path(), state)
-        self.assertEqual(self.begin(self.start()), [], "a run in progress since a day ago")
-        self.assertEqual(len(self.calls("codegraph")), 1)
+        self.assertEqual(self.begin(self.start()), [], "a run in progress, started within its timeout")
+        # The runs are counted once the first has ended: before it, its
+        # fake may not have written its line yet (seen in the child run of
+        # Settings.test_the_suite_never_runs_the_real_claude, under load).
         self.assertEqual(self.wait("codegraph")["exit"], 0)
         self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run")
+
+    def plant(self, program="codegraph", **entry):
+        """A state entry for the program in repo/, as a runner would have left it."""
+        path = self.state_path()
+        state = longhaul.read_json(path) or {"top": os.path.realpath(self.repo), "runs": {}}
+        state["runs"][program] = entry
+        longhaul.write_json(path, state)
+
+    def test_a_runner_past_its_timeout_or_started_in_the_future_is_not_taken_for_running(self):
+        # Review, Sprint 7 (F3): "exit null and the pid alive" was running
+        # for ever, and a pid is reused; past INDEX_TIMEOUT (and a minute)
+        # the runner is dead, and the failure's day counts from its start.
+        (self.bin / "trail").unlink()
+        top, now, alive = str(self.repo), time.time(), os.getpid()  # this process stands for the pid's new owner
+        self.plant(started=now - longhaul.INDEX_TIMEOUT - 120, pid=alive, exit=None, ended=None, seconds=None)
+        self.assertEqual(self.begin(self.start()), [], "past its timeout: a failure, under a day old")
+        self.plant(started=now - 86_401, pid=alive, exit=None, ended=None, seconds=None)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "a day on: once more, the pid alive or not")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        shutil.rmtree(self.repo / ".codegraph")
+        # A start more than a minute ahead of the clock is a clock that
+        # moved: a failure, due now, running or not.
+        for entry in ({"exit": 1, "pid": None}, {"exit": None, "pid": alive}):
+            self.plant(started=time.time() + 3600, ended=None, seconds=None, **entry)
+            self.assertEqual(self.begin(self.start()), [("codegraph", top)], entry)
+            self.assertEqual(self.wait("codegraph")["exit"], 0, entry)
+            shutil.rmtree(self.repo / ".codegraph")
+        self.assertEqual(len(self.calls("codegraph")), 3)
+
+    def test_a_map_gone_after_a_good_build_is_rebuilt_at_the_next_start(self):
+        # Review, Sprint 7 (F2): `git clean -fdx`, a clone again at the
+        # same path or a user's rm left an exit 0 and no map, for ever.
+        (self.bin / "trail").unlink()
+        top = str(self.repo)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)])
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.begin(self.start()), [], "the map there: nothing")
+        shutil.rmtree(self.repo / ".codegraph")
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "the map gone: at once")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(len(self.calls("codegraph")), 2)
+        self.assertIn(f"index: codegraph's map in {longhaul.home_path(top)} is gone; rebuilding\n",
+                      (self.home / "longhaul.log").read_text())
 
     def test_a_failed_init_is_not_retried_for_a_day_and_is_after(self):
         (self.tmp / "codegraph.fail").touch()
@@ -2743,6 +2790,7 @@ class Index(unittest.TestCase):
         self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
         self.wait("trail")
         self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertNotIn("why", self.state()["runs"]["codegraph"], "the program's own exit: no why of Longhaul's")
         self.assertEqual(self.begin(self.start()), [], "a failure under a day old is left alone")
         self.assertEqual(len(self.calls("codegraph")), 1)
         state = self.state()
@@ -2785,7 +2833,21 @@ class Index(unittest.TestCase):
         self.assertFalse((self.repo / ".codegraph").exists())
         self.assertRegex((self.home / "longhaul.log").read_text(),
                          r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 1 s timeout\)\n")
-        self.assertEqual(self.begin(self.start()), [], "a failure: left alone for a day")
+        self.assertEqual(entry["why"], "timeout")
+        self.assertEqual(self.begin(self.start()), [], "a failure: left alone")
+        # A timeout is no transient failure (review, Sprint 7, F17): a day
+        # on it is not tried again; the user's deletion of the state (and
+        # of a half-built map, were there one) is what retries it.
+        state = self.state()
+        state["runs"]["codegraph"]["started"] -= 86_401
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [], "a day on, a timeout still")
+        self.assertEqual(len(self.calls("codegraph")), 1)
+        self.state_path().unlink()
+        (self.tmp / "codegraph.slow").unlink()
+        self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))], "the state deleted: now")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertNotIn("why", self.state()["runs"]["codegraph"], "a clean exit has no why")
 
     def test_a_half_built_map_of_longhauls_own_is_rebuilt_at_the_retry_and_a_strangers_map_never(self):
         # The review's "stale or incomplete index" (the owner, 2026-10-21):
@@ -2810,6 +2872,147 @@ class Index(unittest.TestCase):
         self.assertEqual(self.begin(self.start()), [], "a stranger's map")
         self.assertFalse(self.state_path().exists(), "and nothing is written for it")
         self.assertEqual(len(self.calls("codegraph")), 2)
+
+    def test_a_map_rebuilt_by_hand_after_a_failed_run_is_left_alone(self):
+        # Review, Sprint 7 (F7): a failed entry and a map written after
+        # the run ended is a map someone rebuilt; a map no newer than the
+        # run's end is the one it left half-built, rebuilt as before.
+        (self.tmp / "codegraph.fail").touch()
+        (self.bin / "trail").unlink()
+        top, folder = str(self.repo), self.repo / ".codegraph"
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)])
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        (self.tmp / "codegraph.fail").unlink()
+        state = self.state()
+        for key in ("started", "ended"):  # the failure a day old
+            state["runs"]["codegraph"][key] -= 86_401
+        longhaul.write_json(self.state_path(), state)
+        os.utime(folder)  # written now: after the run ended
+        self.assertEqual(self.begin(self.start()), [], "rebuilt by hand: left alone")
+        self.assertEqual(len(self.calls("codegraph")), 1)
+        self.assertIn(f"index: codegraph's map in {longhaul.home_path(top)} was rebuilt by hand; left alone\n",
+                      (self.home / "longhaul.log").read_text())
+        ended = state["runs"]["codegraph"]["ended"]
+        os.utime(folder, (ended - 5, ended - 5))  # no newer than the run's end: what it left half-built
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "half-built: rebuilt")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(len(self.calls("codegraph")), 2)
+
+    def test_a_corrupt_state_file_is_said_once_per_read_and_a_corrupt_entry_is_the_retry_path(self):
+        # Review, Sprint 7 (F8): as load_state() does, one line that names
+        # the file, never its content, and a fresh state.
+        (self.bin / "trail").unlink()
+        top = str(self.repo)
+        said = f"index: {longhaul.home_path(str(self.state_path()))} could not be read; a fresh state stands in until the next write\n"
+        self.state_path().parent.mkdir(parents=True)
+        for n, junk in enumerate(("not json {", "[1, 2]", '{"top": "x", "runs": [1]}'), 1):
+            self.state_path().write_text(junk)
+            self.assertEqual(self.begin(self.start()), [("codegraph", top)], junk)
+            self.assertEqual(self.wait("codegraph")["exit"], 0, junk)
+            self.assertEqual((self.home / "longhaul.log").read_text().count(said), n, junk)
+            shutil.rmtree(self.repo / ".codegraph")
+        # An entry of junk values reads as a dead runner of unknown age,
+        # the retry path, and nothing raises on the way.
+        for entry in ({"pid": "abc", "exit": "0", "started": None},
+                      {"pid": True, "exit": [], "started": "x", "ended": {}, "seconds": "x", "why": 5},
+                      {"pid": 0, "exit": None, "started": float("nan")}):
+            self.plant(**entry)
+            self.assertEqual(self.begin(self.start()), [("codegraph", top)], entry)
+            self.assertEqual(self.wait("codegraph")["exit"], 0, entry)
+            shutil.rmtree(self.repo / ".codegraph")
+        self.assertEqual(len(self.calls("codegraph")), 6)
+        self.assertNotIn("not json", (self.home / "longhaul.log").read_text(), "never the file's content")
+
+    def test_a_state_that_cannot_be_written_starts_no_runner_and_the_guards_note_still_goes(self):
+        # Review, Sprint 7 (F4): the runner was started before its entry
+        # was written, and whatever the index raised cost the guard's note.
+        (self.repo / ".codegraph").mkdir()  # a map of someone's: the note is due; trail is the one to start
+        full = OSError(28, "No space left on device")
+        with mock.patch.object(longhaul, "write_json", side_effect=full):
+            answer = self.check(self.start())
+        self.assertEqual(self.context(answer), longhaul.GUARD_CODEGRAPH)
+        self.assertIn(f"index: not started ({full!r})\n", (self.home / "longhaul.log").read_text())
+        time.sleep(0.5)
+        self.assertEqual(self.calls("trail"), [], "no entry written, no runner started")
+        # The entry written and the pid not: the runner runs, once, and says so.
+        real, writes = longhaul.write_json, []
+
+        def second_fails(path, data):
+            writes.append(path)
+            if len(writes) == 2:
+                raise full
+            real(path, data)
+
+        with mock.patch.object(longhaul, "write_json", side_effect=second_fails):
+            self.assertEqual(self.context(self.check(self.start())),
+                             f"{longhaul.GUARD_CODEGRAPH} {self.note('trail')}")
+        self.assertEqual(self.wait("trail")["exit"], 0)
+        self.assertEqual(len(self.calls("trail")), 1)
+        self.assertIsNone(self.state()["runs"]["trail"]["pid"])
+        # A runner that cannot be started is a failed run, entry and line.
+        shutil.rmtree(self.repo / ".trail")
+        self.state_path().unlink()
+        with mock.patch.object(longhaul, "index_spawn", side_effect=OSError(35, "Resource temporarily unavailable")):
+            self.assertEqual(self.begin(self.start()), [])
+        entry = self.state()["runs"]["trail"]
+        self.assertEqual((entry["exit"], entry["why"], entry["seconds"]), (-1, "error", 0.0))
+        self.assertIn(f"index: trail init in {longhaul.home_path(str(self.repo))} exit -1 after 0.0 s "
+                      "(could not run: Resource temporarily unavailable)\n", (self.home / "longhaul.log").read_text())
+
+    def test_a_home_that_cannot_be_written_never_breaks_the_hook(self):
+        if os.geteuid() == 0:
+            self.skipTest("root writes where the mode says no")
+        self.home.chmod(0o500)
+        self.addCleanup(self.home.chmod, 0o700)
+        data = json.dumps(self.start())
+        out = subprocess.run(Guard.HOOK, input=data, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        (self.repo / ".codegraph").mkdir()
+        out = subprocess.run(Guard.HOOK, input=data, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.context(json.loads(out.stdout)), longhaul.GUARD_CODEGRAPH, "the guard's note still goes")
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+
+    def test_a_runner_that_fails_anywhere_leaves_its_line(self):
+        # Review, Sprint 7 (F5): the runner raised before its exit was
+        # written, and the run left no trace at all.
+        top = str(self.repo)
+        (self.home / "index").write_text("a file where the folder belongs")
+        longhaul.index_run("codegraph", top, str(self.bin / "codegraph"))  # raises nothing
+        self.assertRegex((self.home / "longhaul.log").read_text(),
+                         rf"index: codegraph init in {re.escape(longhaul.home_path(top))} exit -1 after \d+\.\d s "
+                         r"\(FileExistsError\(17, 'File exists'\)\)\n")
+        self.assertEqual(self.calls("codegraph"), [])
+        # The program gone between the hook's look and the run (it was on
+        # PATH, then uninstalled): could not run, exit -1.
+        (self.home / "index").unlink()
+        (self.bin / "codegraph").unlink()
+        longhaul.index_run("codegraph", top, str(self.bin / "codegraph"))
+        entry = self.state()["runs"]["codegraph"]
+        self.assertEqual((entry["exit"], entry["why"]), (-1, "error"))
+        self.assertIn(f"index: codegraph init in {longhaul.home_path(top)} exit -1 after ", (self.home / "longhaul.log").read_text())
+        self.assertRegex((self.home / "longhaul.log").read_text(), r"\(could not run: No such file or directory\)\n")
+
+    def test_a_half_built_codegraph_map_of_longhauls_own_is_not_named_to_the_model(self):
+        # Review, Sprint 7 (F17): with .codegraph/ there but Longhaul's own
+        # run of it failed or still going, the map is half-built, and the
+        # guard's note would send the model to it.
+        (self.tmp / "codegraph.fail").touch()
+        (self.bin / "trail").unlink()
+        self.assertEqual(self.context(self.check(self.start())), self.note("codegraph"))
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertTrue((self.repo / ".codegraph").is_dir(), "the half-built map")
+        self.assertNotIn(longhaul.GUARD_CODEGRAPH, self.context(self.check(self.start())), "a failed run's map")
+        # Running: the map appears before the build ends.
+        self.state_path().unlink()
+        shutil.rmtree(self.repo / ".codegraph")
+        (self.tmp / "codegraph.fail").unlink()
+        (self.tmp / "codegraph.slow").touch()
+        self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
+        (self.repo / ".codegraph").mkdir()
+        self.assertNotIn(longhaul.GUARD_CODEGRAPH, self.context(self.check(self.start())), "a run in progress")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.context(self.check(self.start())), longhaul.GUARD_CODEGRAPH, "built: named")
 
     def test_the_init_runs_in_the_top_level_and_writes_nothing_outside_it(self):
         # The review's boundary point: the init runs in the top level, not
