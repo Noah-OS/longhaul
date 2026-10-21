@@ -1228,23 +1228,26 @@ class Inspect(unittest.TestCase):
         self.assertEqual(longhaul.inspect_transcript(self.path)["search"],
                          {"search_calls": 8, "search_share": 0.4, "search_chars": 12000, "search_chain_max": 3,
                           "search_chain_mean": 2.0, "search_big": 1, "search_big_share": 0.5,
-                          "codegraph_calls": 0, "codegraph_index": None})
+                          "codegraph_calls": 0, "codegraph_index": None, "trail_calls": 0, "trail_index": None})
         out = self.cli("s1").stdout.splitlines()
         head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd]")
         self.assertGreater(head, out.index("Tool calls [transcript, counted]"))
-        self.assertEqual(out[head + 1:head + 5],
+        self.assertEqual(out[head + 1:head + 6],
                          ["  8 searches, 40% of calls, 12,000 chars", "  longest chain 3, mean 2.0",
                           "  1 result over 5,000 chars, 50% of search output",
-                          "  CodeGraph: 0 calls, no cwd in the transcript to look for an index"])
+                          "  CodeGraph: 0 calls, no cwd in the transcript to look for an index",
+                          "  Trail: 0 calls, no cwd in the transcript to look for a map"])
         self.assertNotIn("Search-heavy", "\n".join(out))
         got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
                for x in self.records("s1")}
         for metric, value, unit in (("search_calls", 8, "calls"), ("search_share", 0.4, "ratio"),
                                     ("search_chars", 12000, "chars"), ("search_chain_max", 3, "searches"),
                                     ("search_chain_mean", 2.0, "searches"), ("search_big", 1, "results"),
-                                    ("search_big_share", 0.5, "ratio"), ("codegraph_calls", 0, "calls")):
+                                    ("search_big_share", 0.5, "ratio"), ("codegraph_calls", 0, "calls"),
+                                    ("trail_calls", 0, "calls")):
             self.assertEqual(got[(metric, "all", None)], (value, unit, "transcript", "counted"), metric)
-        self.assertNotIn(("codegraph_index", "all", None), got, "no cwd: the record is left out, not 0")
+        for metric in ("codegraph_index", "trail_index"):
+            self.assertNotIn((metric, "all", None), got, "no cwd: the record is left out, not 0")
 
     def test_twenty_searches_bring_one_line_of_advice_and_nineteen_bring_none(self):
         self.write(self.searching(19))
@@ -1265,7 +1268,7 @@ class Inspect(unittest.TestCase):
         self.assertNotIn("curl", "\n".join(out))
         self.assertNotIn("| sh", "\n".join(out))
         head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd]")
-        self.assertEqual(out[head + 5], advice[0], "the advice is the Search section's last row")
+        self.assertEqual(out[head + 6], advice[0], "the advice is the Search section's last row, after the Trail line")
         self.assertNotIn("Search-heavy", self.cli("s1", "--json").stdout, "the records carry numbers only")
 
     def test_a_codegraph_call_counts_only_when_it_did_not_fail_and_the_cli_counts_too(self):
@@ -1328,6 +1331,63 @@ class Inspect(unittest.TestCase):
             else:
                 self.assertIn("no cwd in the transcript to look for an index", out)
                 self.assertIsNone(longhaul.inspect_transcript(self.path)["search"]["codegraph_index"], cwd)
+
+    def test_a_trail_map_or_a_trail_call_is_an_index_seen_and_withholds_the_advice(self):
+        # Sprint 7, G4 part 5: Trail-Code's map, `.trail/`, and its tools
+        # (`trail_find_code` and five more, named `mcp__trail__trail_*`
+        # under Claude Code; the `trail` CLI through Bash) are an index
+        # seen, counted as CodeGraph's are: a call only when it did not
+        # fail, the map when it is at or above the first line's cwd, and
+        # either withholds the advice. The Trail line follows the CodeGraph
+        # line; without a cwd the map is unknown and its record left out.
+        project = self.tmp / "project"
+        (project / ".trail").mkdir(parents=True)
+        lines = self.searching(20)
+        lines[0]["cwd"] = str(project / "src")  # a session opened in a subfolder of the mapped repository
+        self.write(lines)
+        s = longhaul.inspect_transcript(self.path)["search"]
+        self.assertEqual((s["codegraph_index"], s["codegraph_calls"], s["trail_index"], s["trail_calls"]), (0, 0, 1, 0))
+        out = self.cli("s1").stdout.splitlines()
+        head = out.index("Search [transcript, counted: Grep, Glob, and Bash grep, rg, ag, find, fd]")
+        self.assertEqual(out[head + 4:head + 6], ["  CodeGraph: 0 calls, no .codegraph/ index at or above the cwd",
+                                                  "  Trail: 0 calls, a .trail/ map at or above the cwd"])
+        self.assertTrue(out[head + 6].startswith("Read again"), "no advice: the Trail line is the section's last row")
+        self.assertNotIn("Search-heavy", "\n".join(out), "the map is there to use: nothing to install")
+        got = {x["metric"]: (x["value"], x["unit"], x["source"], x["confidence"]) for x in self.records("s1")}
+        self.assertEqual(got["trail_index"], (1, "indexes", "transcript", "counted"))
+        self.assertEqual(got["trail_calls"], (0, "calls", "transcript", "counted"))
+        self.assertNotIn(str(project), "\n".join(out) + self.cli("s1", "--json").stdout, "looked under, never shown")
+        lines[0]["cwd"] = str(self.tmp / "elsewhere")
+        self.write(lines)
+        out = self.cli("s1").stdout
+        self.assertIn("Trail: 0 calls, no .trail/ map at or above the cwd", out)
+        self.assertIn("Search-heavy", out, "no map, no call: the advice runs")
+        self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["trail_index"], 0)
+        # The calls: one of the six tools as Claude Code names it, one bare,
+        # and the CLI through Bash; each is one call and withholds the advice.
+        for name, args in (("mcp__trail__trail_find_code", {"query": "who calls X"}),
+                           ("trail_trace_calls", {"symbol": "X"}), ("Bash", {"command": "trail find-code X"}),
+                           ("Bash", {"command": "/opt/homebrew/bin/trail repo-map"})):
+            self.write(self.searching(20) + self.turn("c1", name, "ok", **args))
+            s = longhaul.inspect_transcript(self.path)["search"]
+            self.assertEqual((s["search_calls"], s["trail_calls"], s["codegraph_calls"], s["trail_index"]),
+                             (20, 1, 0, None), name)
+            out = self.cli("s1").stdout
+            self.assertIn("Trail: 1 call, no cwd in the transcript to look for a map", out)
+            self.assertNotIn("Search-heavy", out, name)
+        # A failed call (the server down, no map yet) says nothing of a map
+        # in use; a name that merely begins like Trail's is no Trail call.
+        for name, args in (("mcp__trail__trail_find_code", {"query": "X"}), ("Bash", {"command": "trail find-code X"})):
+            self.write(self.searching(20) + self.turn("c1", name, "no map", error=True, **args)
+                       + self.turn("c2", "mcp__trailhead__find", "ok", query="X")
+                       + self.turn("c3", "Bash", "ok", command="trailer --version"))
+            self.assertEqual(longhaul.inspect_transcript(self.path)["search"]["trail_calls"], 0, name)
+            out = self.cli("s1").stdout
+            self.assertIn("Trail: 0 calls, no cwd in the transcript to look for a map", out)
+            self.assertIn("Search-heavy", out, name)
+        got = {x["metric"] for x in self.records("s1")}
+        self.assertIn("trail_calls", got)
+        self.assertNotIn("trail_index", got, "no cwd: the record is left out, not 0")
 
     def test_tool_errors_are_counted_per_tool(self):
         self.write(self.turn("t1", "Bash", "Exit code 1", error=True, command="make")
@@ -1577,6 +1637,11 @@ class Inspect(unittest.TestCase):
                    + self.turn("t4", "Grep", secret, pattern=secret, path="/app")
                    + self.turn("t5", "WebFetch", secret, url=f"https://x/?k={secret}", prompt=secret)
                    + self.turn("t6", "Agent", secret, error=True, prompt=secret, subagent_type=secret)
+                   # Sprint 7: a Trail call, through its tool and its CLI, with the secret as its argument; both
+                   # failed, so that no map is seen and the advice line still runs over the searches below.
+                   # The tool's answer is the biggest output, so its row in the report names the tool.
+                   + self.turn("t7", "mcp__trail__trail_find_code", secret * 2, error=True, query=secret)
+                   + self.turn("t8", "Bash", secret, error=True, command=f"trail find-code {secret}")
                    + sum((self.turn(f"q{i}", "Bash", secret, command=f"grep -rn {secret} /app")  # the pattern is the
                           for i in range(18)), [])  # secret, and with t3 and t4 that is 20 searches: the advice runs
                    + [{"type": "user", "message": {"role": "user", "content": f"remember {secret}"}},
@@ -1589,6 +1654,7 @@ class Inspect(unittest.TestCase):
         self.assertIn("curl", out.stdout)  # t1's program, which the report may name
         self.assertIn("curl", records.stdout)
         self.assertIn("Search-heavy", out.stdout, "the Search section and its advice line ran over those searches")
+        self.assertIn("Trail: 0 calls", out.stdout, "the Trail line ran over t7 and t8")
         self.assertNotIn(longhaul.CODEGRAPH_INSTALL["sh"], out.stdout, "the advice carries no pipe-to-shell line")
         self.assertNotIn("| sh", out.stdout)
         self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)

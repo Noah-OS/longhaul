@@ -1998,7 +1998,14 @@ def search_stats(events, calls, results, cwd) -> dict:
     says nothing of an index in use and must not withhold the advice), or
     as a `.codegraph/` folder at or above the transcript's first line's
     cwd; with no absolute cwd that is None (unknown), not 0, and its
-    record is left out."""
+    record is left out. A Trail map is an index seen the same way (Sprint
+    7, G4): Trail-Code builds its code graph in `.trail/` in the
+    repository and answers through six tools, `trail_find_code`,
+    `trail_file_api`, `trail_trace_calls`, `trail_find_all`,
+    `trail_repo_map` and `trail_check_freshness` (under Claude Code,
+    `mcp__trail__trail_*`), and a `trail` CLI; a call of one of those that
+    was not an error, or the folder at or above the cwd, counts as
+    CodeGraph's do, with the same None without a cwd."""
     chains, open_run = [], collections.Counter()  # the closed runs; the run under way, per context
     searches, chars, big, big_chars = 0, 0, 0, 0
     for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
@@ -2015,13 +2022,23 @@ def search_stats(events, calls, results, cwd) -> dict:
         if size > SEARCH_BIG:
             big, big_chars = big + 1, big_chars + size
     chains.extend(n for n in open_run.values() if n)
+
+    def index_calls(is_tool) -> int:
+        """The calls of an index's tools, by name, whose result was not an error."""
+        return sum(is_tool(name, what) and not results.get(tid, (0, 0, False))[2]
+                   for tid, (name, what) in calls.items())
+
+    located = isinstance(cwd, str) and os.path.isabs(cwd)  # else the folders cannot be looked for: None, not 0
     return {"search_calls": searches, "search_share": searches / len(calls) if calls else 0.0, "search_chars": chars,
             "search_chain_max": max(chains, default=0),
             "search_chain_mean": sum(chains) / len(chains) if chains else 0.0,
             "search_big": big, "search_big_share": big_chars / chars if chars else 0.0,
-            "codegraph_calls": sum(("codegraph" in name or (name == "Bash" and what == "codegraph"))
-                                   and not results.get(tid, (0, 0, False))[2] for tid, (name, what) in calls.items()),
-            "codegraph_index": int(codegraph_index_at(cwd)) if isinstance(cwd, str) and os.path.isabs(cwd) else None}
+            "codegraph_calls": index_calls(lambda name, what: "codegraph" in name
+                                           or (name == "Bash" and what == "codegraph")),
+            "codegraph_index": int(codegraph_index_at(cwd)) if located else None,
+            "trail_calls": index_calls(lambda name, what: "mcp__trail__" in name or name.startswith("trail_")
+                                       or (name == "Bash" and what == "trail")),
+            "trail_index": int(map_at(cwd, ".trail")) if located else None}
 
 
 def search_advice(s: dict) -> str:
@@ -2274,17 +2291,21 @@ def inspect_lines(r: dict) -> list[str]:
     search = r["search"]
     seen = {1: "a .codegraph/ index at or above the cwd", 0: "no .codegraph/ index at or above the cwd",
             None: "no cwd in the transcript to look for an index"}[search["codegraph_index"]]
-    # The advice only when no index was seen: a folder at or above the cwd,
-    # or the tool called and answering, means it is there to use.
-    advise = (search["search_calls"] >= SEARCH_HEAVY and not search["codegraph_index"]
-              and not search["codegraph_calls"])
+    mapped = {1: "a .trail/ map at or above the cwd", 0: "no .trail/ map at or above the cwd",
+              None: "no cwd in the transcript to look for a map"}[search["trail_index"]]
+    # The advice only when no index was seen, CodeGraph's or Trail's: a
+    # folder at or above the cwd, or the tool called and answering, means
+    # it is there to use.
+    advise = (search["search_calls"] >= SEARCH_HEAVY
+              and not any(search[k] for k in ("codegraph_index", "codegraph_calls", "trail_index", "trail_calls")))
     section(f"Search [transcript, counted: {', '.join(SEARCHES)}, and Bash {', '.join(SEARCH_PROGRAMS)}]",
             [f"  {search['search_calls']:,} search{'es' * (search['search_calls'] != 1)}, "
              f"{search['search_share']:.0%} of calls, {search['search_chars']:,} chars",
              f"  longest chain {search['search_chain_max']}, mean {search['search_chain_mean']:.1f}",
              f"  {search['search_big']:,} result{'s' * (search['search_big'] != 1)} over {SEARCH_BIG:,} chars, "
              f"{search['search_big_share']:.0%} of search output",
-             f"  CodeGraph: {search['codegraph_calls']} call{'s' * (search['codegraph_calls'] != 1)}, {seen}"]
+             f"  CodeGraph: {search['codegraph_calls']} call{'s' * (search['codegraph_calls'] != 1)}, {seen}",
+             f"  Trail: {search['trail_calls']} call{'s' * (search['trail_calls'] != 1)}, {mapped}"]
             + (["  " + search_advice(search)] if advise else []))
     section("Read again, with no edit or compaction in between [transcript, inferred: "
             "files changed through Bash are not seen]",
@@ -2352,9 +2373,9 @@ def inspect_records(r: dict) -> list[dict]:
         add("tool_chars", t["chars"], "chars", t["scope"], "transcript", "counted", t["tool"])
     units = {"search_calls": "calls", "search_share": "ratio", "search_chars": "chars", "search_chain_max": "searches",
              "search_chain_mean": "searches", "search_big": "results", "search_big_share": "ratio",
-             "codegraph_calls": "calls", "codegraph_index": "indexes"}
+             "codegraph_calls": "calls", "codegraph_index": "indexes", "trail_calls": "calls", "trail_index": "indexes"}
     for metric, value in r["search"].items():
-        if value is not None:  # codegraph_index, when the transcript carries no cwd to look under
+        if value is not None:  # codegraph_index and trail_index, when the transcript carries no cwd to look under
             add(metric, value, units[metric], "all", "transcript", "counted")
     for x in r["rereads"]:
         add("repeated_reads", x["repeats"], "reads", x["scope"], "transcript", "inferred", x["path"])
