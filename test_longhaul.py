@@ -2795,6 +2795,35 @@ class Index(unittest.TestCase):
         self.assertEqual(self.wait("codegraph")["exit"], 0)
         self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run")
 
+    def test_six_starts_at_once_start_one_run(self):
+        # Review, Sprint 7 (F13): sessions opened together (a restored
+        # window of tabs) each run the hook at the same moment; the index
+        # lock makes them decide one at a time, so one starts the run and
+        # the rest find it running. Threads, each with a lock file of its
+        # own open, as six hooks would have.
+        (self.tmp / "codegraph.slow").touch()
+        (self.bin / "trail").unlink()
+        gate, started, errors = threading.Barrier(6), [], []
+
+        def session(n):
+            try:
+                gate.wait(timeout=10)
+                started.extend(self.begin(self.start(session=f"s{n}")))
+            except Exception as e:  # said below, not lost in the thread
+                errors.append(e)
+
+        threads = [threading.Thread(target=session, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+        self.assertEqual(errors, [])
+        self.assertEqual(started, [("codegraph", str(self.repo))], "one session started it")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run")
+        self.assertEqual(list(self.state()["runs"]), ["codegraph"], "one entry")
+        self.assertEqual((self.home / "longhaul.log").read_text().count("index: started codegraph init"), 1)
+
     def plant(self, program="codegraph", **entry):
         """A state entry for the program in repo/, as a runner would have left it."""
         path = self.state_path()
