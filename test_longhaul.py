@@ -3302,6 +3302,16 @@ class Index(unittest.TestCase):
         for path, folder, expected in (("/a/b/c", "/a/b", True), ("/a/b/c", "/a/b/", True), ("/a/bc", "/a/b", False),
                                        ("/a/b", "/a/b", False), ("/a/b", "/", True)):
             self.assertEqual(longhaul.inside(path, folder), expected, (path, folder))
+        # And the callers ask these two, never a spelling of their own
+        # (final review, Sprint 7, G4, G8): each helper counted per call.
+        top, work = str(self.repo), {"name": "Work", "repositories": [str(self.repo)]}
+        for caller, helper, call in (
+                ("account_allowed", "inside", lambda: longhaul.account_allowed(work, str(self.repo / "src"))),):
+            seen = []
+            real = getattr(longhaul, helper)
+            with mock.patch.object(longhaul, helper, lambda *args, real=real: seen.append(args) or real(*args)):
+                call()
+            self.assertNotEqual(seen, [], f"{caller}() asks {helper}()")
 
     def test_the_hook_loads_no_hashlib_until_a_state_is_keyed(self):
         # Review, Sprint 7 (F14): the guard hook imports longhaul at every

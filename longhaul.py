@@ -607,8 +607,7 @@ def account_allowed(acct: dict, top: str) -> bool:
     if not allowed:
         return True
     real = os.path.realpath(top)
-    return any(real == entry or real.startswith(entry.rstrip(os.sep) + os.sep)
-               for entry in map(os.path.realpath, allowed))
+    return any(real == entry or inside(real, entry) for entry in map(os.path.realpath, allowed))
 
 
 def eligible(accounts: list[dict], top: str) -> list[str]:
