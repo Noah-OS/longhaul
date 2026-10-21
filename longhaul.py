@@ -286,8 +286,18 @@ def files_of(paths) -> list[Path]:
     """The hits that are files. Path.glob() lists a link to nowhere on
     Python 3.12 and later and passes it over before (with a wildcard last
     part, on every version); is_file() follows the link, so a dead one is
-    left out everywhere and a transcript reached through a live one kept."""
-    return [p for p in paths if p.is_file()]
+    left out everywhere and a transcript reached through a live one kept.
+    A link into a folder that may not be read is left out too: is_file()
+    raises the permission error before Python 3.13 and answers False from
+    it on, and a launch must not stop over a file it could never read."""
+    hits = []
+    for p in paths:
+        try:
+            if p.is_file():
+                hits.append(p)
+        except OSError:  # the permission error through a link, before 3.13
+            pass
+    return hits
 
 
 def write_json(path: Path, data) -> None:
@@ -808,7 +818,9 @@ class Watch:
             return False
         sub = path.with_suffix("") / "subagents"
         now = time.time()
-        return any(now - p.stat().st_mtime < window for p in sub.glob("*.jsonl"))
+        # A link to nowhere in the folder is listed on every Python (the glob's
+        # last part is a wildcard), and its stat() raised at each poll.
+        return any(now - p.stat().st_mtime < window for p in files_of(sub.glob("*.jsonl")))
 
     def should_switch(self) -> bool:
         # After a limit stop Claude goes idle; give it LIMIT_BUSY_GRACE at
@@ -2018,7 +2030,8 @@ def search_advice(s: dict) -> str:
 
 def inspect_transcript(path: Path) -> dict:
     """The numbers `longhaul inspect` shows for the conversation in `path`."""
-    files = [path] + sorted(path.with_suffix("").glob("subagents/agent-*.jsonl"))
+    # files_of(): a link to nowhere among the subagents' is no transcript to open.
+    files = [path] + sorted(files_of(path.with_suffix("").glob("subagents/agent-*.jsonl")))
     responses: dict = {}  # message id -> (scope, model, usage), from the id's last line with usage
     calls: dict = {}      # tool_use id -> (tool, what it worked on)
     results: dict = {}    # tool_use id -> (characters, images, is_error, scope)

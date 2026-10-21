@@ -3737,12 +3737,15 @@ class Pieces(unittest.TestCase):
 
 
 class Links(unittest.TestCase):
-    """A transcript link to nowhere under the projects folder (T6).
+    """A transcript link to nowhere under the projects folder (T6), and
+    one into a folder that cannot be read (Sprint 6 review).
 
     Path.glob() with a literal last component lists a dangling link on
-    Python 3.12 and later and passes it over on 3.9 to 3.11, so each
-    reader of `projects/*/<sid>.jsonl` must leave it out itself: a dead
-    link is no transcript, on every Python."""
+    Python 3.12 and later and passes it over on 3.9 to 3.11 (with a
+    wildcard last component it is listed on every version), so each
+    reader of `projects/*/<sid>.jsonl` and of a transcript's
+    `subagents/*.jsonl` must leave it out itself: a dead link is no
+    transcript, on every Python."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -3750,10 +3753,23 @@ class Links(unittest.TestCase):
         self.folder = self.claude / "projects" / "p"
         self.folder.mkdir(parents=True)
         (self.folder / "sid-dead.jsonl").symlink_to(self.tmp / "gone.jsonl")
-        for name, value in (("DEFAULT_CONFIG", self.claude), ("USAGE_DIR", self.tmp / "relay" / "usage")):
+        relay = self.tmp / "relay"
+        for name, value in (("DEFAULT_CONFIG", self.claude), ("LONGHAUL_HOME", relay),
+                            ("USAGE_DIR", relay / "usage"), ("LEDGER", relay / "ledger.jsonl")):
             patcher = mock.patch.object(longhaul, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    LINE = {"type": "user", "message": {"role": "user", "content": "x"}}  # one transcript line inspect counts
+
+    def subagents(self, sid="sid-real"):
+        """A real transcript and its subagents folder, holding a link to nowhere."""
+        path = self.folder / f"{sid}.jsonl"
+        path.write_text(json.dumps(self.LINE) + "\n")
+        sub = path.with_suffix("") / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-dead.jsonl").symlink_to(self.tmp / "gone.jsonl")
+        return path, sub
 
     def test_the_launch_measures_no_transcript_behind_a_dead_link(self):
         self.assertEqual(longhaul.transcript_size("sid-dead"), {})
@@ -3773,13 +3789,74 @@ class Links(unittest.TestCase):
     def test_inspect_finds_no_transcript_behind_a_dead_link(self):
         self.assertIsNone(longhaul.find_transcript("sid-dead")[0])
 
+    def test_inspect_expands_a_short_id_past_a_dead_link(self):
+        # Review, Sprint 6 (A4): find_transcript()'s own files_of() site,
+        # pinned. With it reverted, the dead link beside the live transcript
+        # made "2 conversations start with sid-de" (transcript_hits(), fixed
+        # upstream, never saw the short id).
+        live = self.folder / "sid-de-live.jsonl"
+        live.write_text("x\n")
+        self.assertEqual(longhaul.find_transcript("sid-de"), (live, ""))
+
+    def test_a_link_into_a_folder_that_cannot_be_read_is_no_transcript_and_stops_nothing(self):
+        # Review, Sprint 6 (A1): is_file() raised the permission error
+        # before Python 3.13 and answers False from it on. The wildcard
+        # globs of full_session_id() and find_transcript() list the link on
+        # every version, so a launch by short id stopped on 3.9 to 3.12;
+        # the literal globs list it from 3.12 on (3.9 to 3.11 pass it over
+        # in the glob itself). Root reads any folder: nothing to see there.
+        if os.geteuid() == 0:
+            self.skipTest("root reads any folder")
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        (locked / "x.jsonl").write_text("x\n")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        (self.folder / "sid-locked.jsonl").symlink_to(locked / "x.jsonl")
+        self.assertEqual(longhaul.transcript_size("sid-locked"), {})
+        self.assertEqual(longhaul.full_session_id("sid-lo"), "sid-lo")
+        self.assertIsNone(longhaul.find_transcript("sid-lo")[0])
+        self.assertEqual(longhaul.transcript_hits("sid-locked"), [])
+        watch = longhaul.Watch({"name": "Max"}, 0, time.time(), False)
+        watch.sid = "sid-locked"
+        self.assertIsNone(watch._transcript())
+
+    def test_a_dead_link_among_the_subagents_does_not_stop_the_watch(self):
+        # Review, Sprint 6 (A2): agents_busy() globs subagents/*.jsonl, a
+        # wildcard, so the link was listed on every Python and p.stat()
+        # raised at every poll ("watch error" each POLL): no early move and
+        # no reconnect was decided while it was there.
+        _, sub = self.subagents()
+        watch = longhaul.Watch({"name": "Max"}, 0, time.time(), False)
+        watch.sid = "sid-real"
+        self.assertFalse(watch.agents_busy())
+        (sub / "agent-1.jsonl").write_text("{}\n")  # a live subagent beside it still counts
+        self.assertTrue(watch.agents_busy())
+
+    def test_inspect_passes_over_a_dead_link_among_the_subagents(self):
+        # Review, Sprint 6 (A3): inspect_transcript() opened every
+        # subagents/agent-*.jsonl hit, so `longhaul inspect` exited 1 with
+        # "could not read" over a link to nowhere. The main file and the
+        # live subagent beside it are read.
+        path, sub = self.subagents()
+        (sub / "agent-1.jsonl").write_text(json.dumps({**self.LINE, "isSidechain": True}) + "\n")
+        r = longhaul.inspect_transcript(path)
+        self.assertEqual((r["subagents"], r["lines"]), (1, 2))
+
     def test_a_link_to_a_transcript_that_exists_still_counts(self):
         # is_file() follows the link: a transcript reached through one, as
-        # under a shared projects folder, is a transcript.
+        # under a shared projects folder, is a transcript, at every site
+        # (a pin, not failing-first: the sites were right before it).
         (self.tmp / "live.jsonl").write_text("x\n")
-        (self.folder / "sid-live.jsonl").symlink_to(self.tmp / "live.jsonl")
+        link = self.folder / "sid-live.jsonl"
+        link.symlink_to(self.tmp / "live.jsonl")
         self.assertEqual(list(longhaul.transcript_size("sid-live").values()), [2])
         self.assertEqual(longhaul.full_session_id("sid-li"), "sid-live")
+        self.assertEqual(longhaul.transcript_hits("sid-live"), [link])
+        self.assertEqual(longhaul.find_transcript("sid-live"), (link, ""))
+        watch = longhaul.Watch({"name": "Max"}, 0, time.time(), False)
+        watch.sid = "sid-live"
+        self.assertEqual(watch._transcript(), (self.tmp / "live.jsonl").resolve())
 
 
 if __name__ == "__main__":
