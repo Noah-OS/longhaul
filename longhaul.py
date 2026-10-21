@@ -76,9 +76,13 @@ Usage:
                           default: the latest conversation in the ledger);
                           --json gives one record per number, with its source
   longhaul statusline           the status line command (set in ~/.claude/settings.json)
-  longhaul guard                the plugin's PreToolUse hook: warns about a file read
-                          again unchanged, or a whole read or cat of a big one;
-                          LONGHAUL_GUARD=block denies instead, =off does nothing
+  longhaul guard                the plugin's hooks. PreToolUse (Read, Bash): warns about
+                          a file read again unchanged, or a whole read or cat of a
+                          big one (LONGHAUL_GUARD=block denies instead), and counts
+                          Bash searches, never denying one: in a project with a
+                          CodeGraph index it names the index at the twentieth.
+                          SessionStart: names the index at startup; at compact and
+                          clear forgets the reads. LONGHAUL_GUARD=off does nothing
   longhaul checkpoint save [ID] [--file PATH]
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
@@ -2442,24 +2446,83 @@ def guard_targets(data: dict) -> list:
     return []
 
 
+def guard_startup(data: dict):
+    """A new session's SessionStart answer: the project's CodeGraph index
+    named to the main conversation, or None. A subagent's start is not
+    the session's, and without the index there is nothing to say here:
+    the install advice is the inspect report's, not every session's."""
+    if data.get("agent_id") is not None or not codegraph_index_at(data.get("cwd")):
+        return None
+    log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": GUARD_CODEGRAPH}}
+
+
+def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float):
+    """The three rules (GUARD_RULES) over the files a call would put into
+    the context: a repeat is a whole read of a file read in full before
+    and unchanged since; a cat and a big are a whole cat or Read of a
+    file over GUARD_BIG, the surer waste, a repeat, taken first. Each
+    firing adds one to fired and the file's size to cost under its rule.
+    Returns the notes for the model and, for each file read whole, the
+    stamp to record; whether a denied call's reads are kept is the
+    caller's."""
+    notes, seen = [], {}
+    for how, path, whole in targets:
+        try:
+            if not path.is_file():
+                continue
+            st = path.stat()
+        except OSError:
+            continue
+        size, shown = st.st_size, home_path(str(path))
+        # cp -p, rsync -a and touch -r keep the size and mtime of a file
+        # they change; the ctime they cannot. A record from before the
+        # ctime was kept has none, and is not a repeat once.
+        stamp = {"size": size, "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns}
+        before = reads.get(str(path), {})
+        if whole and all(before.get(k) == v for k, v in stamp.items()):
+            fired["repeat"] += 1
+            cost["repeat"] += size
+            at = as_number(before.get("at"))
+            if at is None:  # a corrupt time: still a repeat
+                when = "earlier"
+            else:
+                ago = max(0, int(now - at))
+                when = f"{ago // 60} min ago" if ago >= 60 else f"{ago} s ago"
+            notes.append(f"{shown} ({size:,} bytes) was read in full {when} and has not changed since: "
+                         "it is already in the context. For a part of it, use Read with offset and limit, or "
+                         "grep -n for the lines you need.")
+        elif whole and size > GUARD_BIG and how == "cat":
+            fired["cat"] += 1
+            cost["cat"] += size
+            notes.append(f"`cat` of {shown} ({size:,} bytes) puts the whole file into the context. "
+                         "Use head, sed -n with a range, or grep -n for the part you need.")
+        elif whole and size > GUARD_BIG and path.suffix.lower() not in GUARD_NO_PART:
+            fired["big"] += 1
+            cost["big"] += size
+            notes.append(f"{shown} is {size:,} bytes, and a whole Read puts all of it into the context. "
+                         "Read it with offset and limit, or grep -n for the part you need.")
+        if whole:
+            seen[str(path)] = {**stamp, "at": round(now, 1)}
+    return notes, seen
+
+
 def guard_check(data, mode: str, now: float | None = None):
     """The guard's answer for one hook input: the hook's JSON, or None to
-    let the call run unremarked. A PreToolUse is checked and recorded, a
-    Bash search counted and, at a context's GUARD_SEARCHES-th in an indexed
-    project, answered once with the index; a SessionStart for compact or
-    clear empties the record's reads, and one for startup names the
-    project's CodeGraph index, if it has one."""
+    let the call run unremarked. A SessionStart for compact or clear
+    empties the record's reads (guard_forget), and one for startup names
+    the project's CodeGraph index, if it has one (guard_startup). A
+    PreToolUse's files are judged by the rules (guard_rules) and
+    recorded; a Bash search is counted and, once the context's count
+    reaches GUARD_SEARCHES in an indexed project, answered once with the
+    index."""
     if mode == "off" or not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
         if data.get("source") in ("compact", "clear"):
             guard_forget(data)
-        elif data.get("source") == "startup" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd")):
-            # The main conversation only: a subagent's start is not the
-            # session's. Without the index there is nothing to say here; the
-            # install advice is the inspect report's, not every session's.
-            log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
-            return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": GUARD_CODEGRAPH}}
+        elif data.get("source") == "startup":
+            return guard_startup(data)
         return None
     # A search is a Bash whose first program is one of inspect's; its
     # program is not cat, so it has no targets. Of its command line only
@@ -2484,44 +2547,7 @@ def guard_check(data, mode: str, now: float | None = None):
         if search and searches >= GUARD_SEARCHES and not nudged and codegraph_index_at(data.get("cwd")):
             nudged = True  # once per context: the count goes on, the note does not
             nudge = f"{GUARD_CODEGRAPH} (This context has made {searches} searches so far.)"
-        notes, seen = [], {}
-        for how, path, whole in targets:
-            try:
-                if not path.is_file():
-                    continue
-                st = path.stat()
-            except OSError:
-                continue
-            size, shown = st.st_size, home_path(str(path))
-            # cp -p, rsync -a and touch -r keep the size and mtime of a file
-            # they change; the ctime they cannot. A record from before the
-            # ctime was kept has none, and is not a repeat once.
-            stamp = {"size": size, "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns}
-            before = reads.get(str(path), {})
-            if whole and all(before.get(k) == v for k, v in stamp.items()):
-                fired["repeat"] += 1
-                cost["repeat"] += size
-                at = as_number(before.get("at"))
-                if at is None:  # a corrupt time: still a repeat
-                    when = "earlier"
-                else:
-                    ago = max(0, int(now - at))
-                    when = f"{ago // 60} min ago" if ago >= 60 else f"{ago} s ago"
-                notes.append(f"{shown} ({size:,} bytes) was read in full {when} and has not changed since: "
-                             "it is already in the context. For a part of it, use Read with offset and limit, or "
-                             "grep -n for the lines you need.")
-            elif whole and size > GUARD_BIG and how == "cat":
-                fired["cat"] += 1
-                cost["cat"] += size
-                notes.append(f"`cat` of {shown} ({size:,} bytes) puts the whole file into the context. "
-                             "Use head, sed -n with a range, or grep -n for the part you need.")
-            elif whole and size > GUARD_BIG and path.suffix.lower() not in GUARD_NO_PART:
-                fired["big"] += 1
-                cost["big"] += size
-                notes.append(f"{shown} is {size:,} bytes, and a whole Read puts all of it into the context. "
-                             "Read it with offset and limit, or grep -n for the part you need.")
-            if whole:
-                seen[str(path)] = {**stamp, "at": round(now, 1)}
+        notes, seen = guard_rules(targets, reads, fired, cost, now)
         if not (mode == "block" and notes):  # a denied call read nothing
             reads.update(seen)
         if len(reads) > GUARD_KEEP:
