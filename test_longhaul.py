@@ -2559,7 +2559,7 @@ class Index(unittest.TestCase):
 
     def note(self, program, top=None):
         return longhaul.INDEX_NOTE.format(command=" ".join(longhaul.INDEX_COMMANDS[program]),
-                                          where=str(self.repo) if top is None else top, map=self.MAPS[program] + "/")
+                                          where=str(self.repo) if top is None else top)
 
     def calls(self, program):
         path = self.tmp / f"{program}.calls"
@@ -3190,8 +3190,10 @@ class Index(unittest.TestCase):
         self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
         text = self.context(answer)
         self.assertEqual(text, self.note("codegraph"))
-        self.assertEqual(text, f"Longhaul started `codegraph init -y` in {top} in the background; "
-                               "until .codegraph/ exists there, search as you would without an index.")
+        # The folder appears before the build ends, so the note names no
+        # folder to watch for (review, Sprint 7, F19).
+        self.assertEqual(text, f"Longhaul started `codegraph init -y` in {top} in the background for later sessions; "
+                               "in this session search as you would without an index.")
         self.assertNotIn("install", text.lower())
         self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
         self.assertEqual(self.wait("codegraph")["exit"], 0)
@@ -3211,7 +3213,7 @@ class Index(unittest.TestCase):
         (third / ".git").mkdir(parents=True)
         with mock.patch.object(longhaul, "HOME", self.tmp):
             text = self.context(self.check(self.start(cwd=str(third))))
-        self.assertTrue(text.startswith("Longhaul started `codegraph init -y` in ~/third in the background; "), text)
+        self.assertTrue(text.startswith("Longhaul started `codegraph init -y` in ~/third in the background "), text)
         for program in self.MAPS:
             self.assertEqual(self.wait(program, str(third))["exit"], 0, program)
 

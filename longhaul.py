@@ -2592,8 +2592,9 @@ INDEX_STARTED = ("longhaul: started `{command}` in {where} in the background; th
 INDEX_FAILED = ("longhaul: `{command}` in {where} failed on {day} ({reason}); see {log}; delete {state} and {map} "
                 "together to retry")
 # What the model is told per init started, and nothing after it that reads as an instruction to install anything.
-INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background; until {map} exists there, "
-              "search as you would without an index.")
+# It names no folder to wait for: the map folder appears before the build ends (review, Sprint 7, F19).
+INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background for later sessions; "
+              "in this session search as you would without an index.")
 
 
 def index_mode() -> str:
@@ -2951,11 +2952,10 @@ def index_message(started: list, failed: list) -> str:
 
 def index_note(program: str, top: str) -> str:
     """The one sentence the model is told for an init started: the
-    command, where (by home_path), and what to do until its map is
-    there. Once the map exists the guard's own note, at the next start
-    and at a context's twentieth search, takes over."""
-    return INDEX_NOTE.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top),
-                             map=INDEX_MAPS[program] + "/")
+    command, where (by home_path), and to search without an index in
+    this session. Once the map exists the guard's own note, at the next
+    start and at a context's twentieth search, takes over."""
+    return INDEX_NOTE.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top))
 
 
 # ---------------------------------------------------------------- guard
