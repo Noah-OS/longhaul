@@ -1944,6 +1944,14 @@ class Plugin(unittest.TestCase):
             pairs = readme.split("\n## Pairs well with CodeGraph and Trail-Code", 1)[1].split("\n## ", 1)[0]
             for name in ("CodeGraph", "Trail-Code", "self-reported"):
                 self.assertTrue(lines(pairs, name), f"the Pairs well section names {name}")
+        # Sprint 7, A2: an account's repositories, the field and the flag, where a reader looks.
+        with self.subTest("the files table names the repositories field"):
+            rows = [line for line in readme.splitlines() if line.startswith("| `accounts.json`")]
+            self.assertEqual(len(rows), 1, "one files-table row for accounts.json")
+            self.assertIn("repositories", rows[0], "the files table's accounts.json row names the field")
+        with self.subTest("the advanced section gives --repo"):
+            advanced = readme.split("\n## Advanced, experimental", 1)[1].split("\n## ", 1)[0]
+            self.assertTrue(lines(advanced, "--repo"), "the advanced section says how to restrict an account")
         _, jobs = self.workflow()
         with self.subTest("the test command"):
             fenced = re.findall(r"^```[^\n]*\n(.*?)\n```$", readme, re.M | re.S)

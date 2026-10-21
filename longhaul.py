@@ -65,7 +65,10 @@ Usage:
                           limit, and early when one is nearly full; never:
                           wait for the reset (or set LONGHAUL_SWITCH)
   longhaul -- --model opus      anything after -- goes to claude on every launch
-  longhaul add NAME EMAIL       a new account: its own folder, one browser sign-in
+  longhaul add NAME EMAIL [--repo PATH]...
+                          a new account: its own folder, one browser sign-in;
+                          with --repo, used only in those repositories and
+                          those inside them (repeat it for more)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
   longhaul setup [NAME]         sign each account in to its own folder (a browser
                           sign-in); only the emails in accounts.json count
