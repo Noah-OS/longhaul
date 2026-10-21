@@ -2731,23 +2731,37 @@ def index_running(entry: dict, now: float) -> bool:
             and started is not None and -INDEX_GRACE <= now - started <= INDEX_TIMEOUT + INDEX_GRACE)
 
 
+def index_failed(entry, now: float) -> bool:
+    """Whether a state entry is a failure that stands, the one answer
+    index_due(), index_start() and index_unfinished() share (final
+    review, Sprint 7, G2): an entry that is neither a run in progress
+    (index_running) nor a clean exit, an exit of 0 with no `why`. A
+    runner that never wrote its exit and is not running, a timeout, an
+    error, the program's own failing exit and an entry of junk values
+    are each one; an exit of 0 beside a `why` of Longhaul's, which
+    index_finish() never writes, is junk. No entry is none."""
+    return (entry is not None and not index_running(entry, now)
+            and not (as_number(entry.get("exit")) == 0 and "why" not in entry))
+
+
 def index_due(program: str, top: str, entry, folder, now: float) -> bool:
     """Whether a program's init is to be started now, from its state
     entry and its map folder at or above the cwd (index_map; None for
     none). With no entry: yes, unless the map is there, which makes it
     someone else's (a repository that ships one, an init run by hand)
-    and never Longhaul's to touch. An exit of 0 is left alone while its
-    map is there; with the map gone (a `git clean -fdx`, a clone again at
-    the same path, a user's rm) it is built again now. A run in progress
-    (index_running) is left to run. A timeout is not tried again: a
-    program that ran past INDEX_TIMEOUT once will again, and the user's
-    deletion of the state (and of the map it left half-built) is what
-    retries it. Any other failure, or a runner that never wrote its exit
-    and is not running (the Mac slept, the runner was killed), is tried
-    once more when INDEX_RETRY has passed since its start, or at once
-    when its start is ahead of the clock by more than INDEX_GRACE (the
-    clock moved): the map it left half-built is Longhaul's own, and is
-    rebuilt, whatever the folder shows. The folder's time is no sign of
+    and never Longhaul's to touch. A failure that stands (index_failed)
+    other than a timeout is tried once more when INDEX_RETRY has passed
+    since its start, a runner that never wrote its exit and is not
+    running (the Mac slept, the runner was killed) included; a timeout is
+    not tried again: a program that ran past INDEX_TIMEOUT once will
+    again, and the user's deletion of the state (and of the map it left
+    half-built) is what retries it. A run in progress (index_running) is
+    left to run. A clean exit is left alone while its map is there; with
+    the map gone (a `git clean -fdx`, a clone again at the same path, a
+    user's rm) it is built again now. A failure whose start is ahead of
+    the clock by more than INDEX_GRACE (the clock moved) is tried at once.
+    The map a failure left half-built is Longhaul's own, and is rebuilt,
+    whatever the folder shows. The folder's time is no sign of
     a rebuild by hand (final review, Sprint 7, G1): CodeGraph's own
     processes, its MCP server and `codegraph explore`, write in it when
     they open its store. A user who rebuilt a map by hand deletes the
@@ -2758,15 +2772,16 @@ def index_due(program: str, top: str, entry, folder, now: float) -> bool:
     the state says the rest."""
     if entry is None:
         return folder is None
-    if as_number(entry.get("exit")) == 0:
-        if folder is not None:
-            return False
-        log(f"index: {program}'s map in {home_path(top)} is gone; rebuilding")
-        return True
-    if entry.get("why") == "timeout" or index_running(entry, now):
+    if index_running(entry, now):  # asked first: a runner that ends between two asks is no clean exit
         return False
-    started = as_number(entry.get("started"))
-    return not (started is not None and started - now <= INDEX_GRACE and now - started < INDEX_RETRY)
+    if index_failed(entry, now):
+        started = as_number(entry.get("started"))
+        return entry.get("why") != "timeout" and not (
+            started is not None and started - now <= INDEX_GRACE and now - started < INDEX_RETRY)
+    if folder is not None:
+        return False
+    log(f"index: {program}'s map in {home_path(top)} is gone; rebuilding")
+    return True
 
 
 def index_spawn(program: str, top: str, found: str) -> int:
@@ -2809,7 +2824,7 @@ def index_start(data: dict, index: str) -> list:
             path, state = index_state(top)
             now, entry = time.time(), state["runs"].get(program)
             if not index_due(program, top, entry, folder, now):
-                if entry is not None and as_number(entry.get("exit")) != 0 and not index_running(entry, now):
+                if index_failed(entry, now):
                     failed.append((program, top, entry))
                 continue
             state["runs"][program] = {"started": round(now, 1), "pid": None, "exit": None, "ended": None,
@@ -2907,13 +2922,14 @@ def index_finish(program: str, top: str, code: int, seconds: float, said: str = 
 def index_unfinished(cwd) -> bool:
     """Whether the CodeGraph map at or above cwd is one a run of
     Longhaul's has not finished well: the project's entry for codegraph
-    holds no exit 0, or a `why` (a run in progress, a failure, a
-    timeout), whatever the folder shows (final review, Sprint 7, G1).
+    is a run in progress (index_running) or a failure that stands
+    (index_failed), whatever the folder shows (final review, Sprint 7,
+    G1).
     The guard's note is then withheld at startup: the map is half-built
     (review, Sprint 7, F17)."""
-    top = index_top(cwd)
+    top, now = index_top(cwd), time.time()
     entry = index_state(top)[1]["runs"].get("codegraph") if top else None
-    return entry is not None and (as_number(entry.get("exit")) != 0 or "why" in entry)
+    return entry is not None and (index_running(entry, now) or index_failed(entry, now))
 
 
 def index_message(started: list, failed: list) -> str:

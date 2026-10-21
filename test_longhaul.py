@@ -3039,6 +3039,44 @@ class Index(unittest.TestCase):
         self.assertFalse(self.state_path().exists(), "and nothing is written for it")
         self.assertTrue((self.repo / ".codegraph").is_dir())
 
+    def test_one_answer_per_entry_shape_to_a_failure_that_stands(self):
+        # Final review, Sprint 7 (G2): index_due(), index_start()'s
+        # failures for the user and index_unfinished() each spelled "a
+        # failure" their own way, and an exit of 0 beside a why of
+        # Longhaul's was a failure to one and a clean exit to the other
+        # two. index_failed() is the one answer. The map is there
+        # throughout, and nothing runs: the spawn is a stand-in.
+        (self.bin / "trail").unlink()
+        (self.repo / ".codegraph").mkdir()
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        now, alive, dead = time.time(), os.getpid(), gone.pid
+        top, folder, recent, old = str(self.repo), str(self.repo / ".codegraph"), now - 5, now - 86_460
+        # (shape, entry, a failure that stands, started now, told the user)
+        table = (
+            ("running", dict(started=recent, pid=alive, exit=None), False, False, False),
+            ("its pid alive past its timeout", dict(started=old, pid=alive, exit=None), True, True, False),
+            ("a dead pid", dict(started=recent, pid=dead, exit=None), True, False, True),
+            ("exit 0", dict(started=recent, pid=dead, exit=0, ended=recent), False, False, False),
+            ("exit 1, a day old", dict(started=old, pid=dead, exit=1, ended=old), True, True, False),
+            ("a timeout, a day old", dict(started=old, pid=dead, exit=-1, ended=old, why="timeout"), True, False, True),
+            ("an error", dict(started=recent, pid=None, exit=-1, ended=recent, why="error"), True, False, True),
+            ("corrupt", dict(pid="abc", exit="0", started=None), True, True, False),
+            ("exit 0 and a why", dict(started=recent, pid=dead, exit=0, ended=recent, why="error"), True, False, True),
+            ("exit 0 and a why, a day old", dict(started=old, pid=dead, exit=0, ended=old, why=5), True, True, False),
+        )
+        for shape, entry, failure, due, told in table:
+            with self.subTest(shape):
+                self.plant(**entry)
+                self.assertIs(longhaul.index_failed(entry, now), failure)
+                self.assertIs(longhaul.index_due("codegraph", top, entry, folder, now), due)
+                self.assertIs(longhaul.index_unfinished(str(self.repo / "src")), failure or shape == "running")
+                with mock.patch.object(longhaul, "index_spawn", return_value=dead):
+                    started, failed = longhaul.index_start(self.start(), "on")
+                self.assertEqual(started, [("codegraph", top)] if due else [])
+                self.assertEqual([(program, where) for program, where, _ in failed], [("codegraph", top)] if told else [])
+        self.assertEqual(self.calls("codegraph"), [], "nothing ran")
+
     def test_a_corrupt_state_file_is_said_once_per_read_and_a_corrupt_entry_is_the_retry_path(self):
         # Review, Sprint 7 (F8): as load_state() does, one line that names
         # the file, never its content, and a fresh state.
