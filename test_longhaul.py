@@ -2534,6 +2534,11 @@ class Index(unittest.TestCase):
     def plan(self, data, index="on"):
         return longhaul.index_plan(data, index)
 
+    def planned(self, *programs, top=None):
+        """The plan for these programs in the top (repo/ by default), each
+        with the fake index_program() found for it in bin/."""
+        return [(program, str(self.repo) if top is None else top, str(self.bin / program)) for program in programs]
+
     def check(self, data, mode="warn", index="on"):
         return longhaul.guard_check(data, mode, index=index)
 
@@ -2568,8 +2573,7 @@ class Index(unittest.TestCase):
         self.fail(f"{program}'s run did not end within 10 s")
 
     def test_nothing_starts_without_the_switch_on_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
-        top = str(self.repo)
-        both = [("codegraph", top), ("trail", top)]
+        both = self.planned("codegraph", "trail")
         self.assertEqual(self.plan(self.start()), both, "the control: a work tree with no map, both programs found")
         # Opt-in (the owner, 2026-10-21, after the outside review): "on" is
         # on; unset, "off" or anything else is off.
@@ -2624,7 +2628,7 @@ class Index(unittest.TestCase):
         # A `claude -p` run's hook sees CLAUDE_CODE_SESSION_ATTENDED=0 (the
         # lead's probe, 2026-10-21): a script's or a loop's run should not
         # index a repository on its own.
-        both = [("codegraph", str(self.repo)), ("trail", str(self.repo))]
+        both = self.planned("codegraph", "trail")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "0"}):
             self.assertEqual(self.plan(self.start()), [], "a -p run")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "1"}):
@@ -2646,7 +2650,7 @@ class Index(unittest.TestCase):
 
     def test_a_mapped_project_is_left_alone_per_program(self):
         top, real = str(self.repo), os.path.realpath(self.repo)
-        self.assertEqual(self.plan(self.start()), [("codegraph", top), ("trail", top)],
+        self.assertEqual(self.plan(self.start()), self.planned("codegraph", "trail"),
                          "the plan names every program found; a map present is the state's question")
         (self.repo / ".codegraph").mkdir()  # a map Longhaul did not make
         self.assertEqual(self.begin(self.start()), [("trail", top)], ".codegraph/ present: trail alone")
@@ -2674,9 +2678,8 @@ class Index(unittest.TestCase):
         self.assertFalse(self.state_path(str(third)).exists(), "no state file for a project with nothing to do")
 
     def test_a_missing_program_is_skipped_and_the_other_still_runs(self):
-        top = str(self.repo)
         (self.bin / "trail").unlink()
-        self.assertEqual(self.plan(self.start()), [("codegraph", top)])
+        self.assertEqual(self.plan(self.start()), self.planned("codegraph"))
         # On PATH but not executable: npm's trail link on the owner's Mac
         # (2026-10-21), which which() passes over as the shell would.
         (self.bin / "codegraph").chmod(0o644)
@@ -2971,6 +2974,36 @@ class Index(unittest.TestCase):
         for program in self.MAPS:
             self.assertEqual(self.wait(program)["exit"], 0, program)
         self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"])
+
+    def test_the_runner_runs_the_program_the_hook_found_by_its_path_and_never_one_in_the_project(self):
+        # Review, Sprint 7 (F1, high): the runner ran the bare name in the
+        # top level, and a relative or empty PATH entry resolves there, so
+        # a repository shipping its own `codegraph` at the top ran it with
+        # the user's privileges, though the hook had found the one in bin/.
+        top = str(self.repo)
+        for name in self.MAPS:  # a program of the repository's own under each name: never to be run
+            (self.repo / name).write_text(f"#!/bin/sh\necho ran >> '{self.tmp}/repo-{name}.ran'\nexit 0\n")
+            (self.repo / name).chmod(0o755)
+        for path in (f".{os.pathsep}{self.bin}", f"{os.pathsep}{self.bin}"):  # "." and "" both name the cwd
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)], path)
+            for program in self.MAPS:
+                self.assertEqual(self.wait(program)["exit"], 0, (path, program))
+                self.assertEqual(len(self.calls(program)), 1, (path, program, "the fake bin/ holds ran, once"))
+                self.assertFalse((self.tmp / f"repo-{program}.ran").exists(), (path, program, "the project's never"))
+                shutil.rmtree(self.repo / self.MAPS[program])
+                (self.tmp / f"{program}.calls").unlink()
+            self.state_path().unlink()
+        # The second belt: a path that is not absolute, or is inside the
+        # top, is refused by the runner itself, whatever the hook passed.
+        for found in (str(self.repo / "codegraph"), "codegraph", f".{os.sep}codegraph"):
+            longhaul.index_run("codegraph", top, found)
+            self.assertEqual(self.state()["runs"]["codegraph"]["exit"], -1, found)
+        self.assertFalse((self.tmp / "repo-codegraph.ran").exists(), "refused, not run")
+        self.assertEqual(self.calls("codegraph"), [], "nor the fake")
+        self.assertRegex((self.home / "longhaul.log").read_text(),
+                         rf"index: codegraph init in {re.escape(longhaul.home_path(top))} exit -1 after 0\.0 s "
+                         r"\(could not run: not the program found\)\n")
 
     def test_a_repository_that_ships_a_map_folder_gets_no_init_and_no_note(self):
         # A shipped .codegraph/ or .trail/ is a map; what its hooks do is

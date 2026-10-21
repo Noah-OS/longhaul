@@ -2555,9 +2555,10 @@ def inspect(opts) -> int:
 # returns at once; the model is told in one sentence per program.
 # Nothing is installed: a program is found on the hook's PATH (its
 # absolute entries alone, and never inside the repository itself) or
-# it is not. Never in the home folder, a parent of it, `/`, or outside
-# a git work tree; never for a subagent, a resume, a compaction or a
-# clear, or an unattended run (`claude -p`: its hook sees
+# it is not, and the runner runs it by the path it was found at. Never
+# in the home folder, a parent of it, `/`, or outside a git work tree;
+# never for a subagent, a resume, a compaction or a clear, or an
+# unattended run (`claude -p`: its hook sees
 # CLAUDE_CODE_SESSION_ATTENDED=0). Once per project: LONGHAUL_HOME/
 # index/<key>.json holds each program's start, pid, exit and seconds; a
 # run in progress is left to run, a failure is tried again after a day
@@ -2574,7 +2575,8 @@ INDEX_MAPS = {"codegraph": ".codegraph", "trail": ".trail"}  # each program's ma
 INDEX_TIMEOUT = setting("LONGHAUL_INDEX_TIMEOUT", 600, int, 1)  # seconds an init may take: CodeGraph's own figure for 27k files is 100
 INDEX_RETRY = 86_400  # seconds before a failed init is tried once more: at every start would be a storm, never would be silent
 # The runner, started by the hook as hooks.json starts the hook: an import, in its own process.
-INDEX_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.index_run(sys.argv[2], sys.argv[3])"
+INDEX_RUNNER = ("import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                "longhaul.index_run(sys.argv[2], sys.argv[3], sys.argv[4])")
 # What the model is told per init started, and nothing after it that reads as an instruction to install anything.
 INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background; until {map} exists there, "
               "search as you would without an index.")
@@ -2621,12 +2623,13 @@ def index_program(name: str, top: str):
 
 
 def index_plan(data: dict, index: str) -> list:
-    """The (program, top) pairs a session's start may build, or []: for a
-    `startup` SessionStart of the main conversation (no agent_id), with
+    """The (program, top, found) a session's start may build, or []: for
+    a `startup` SessionStart of the main conversation (no agent_id), with
     the index on, the session attended and the cwd in a work tree
-    index_top() accepts, each program found. Whether a program's map is
-    there already is the state's question (index_due), not this one's.
-    Pure: nothing is started or written here."""
+    index_top() accepts, each program found, with the path it was found
+    at: the runner runs that path and looks nothing up again. Whether a
+    program's map is there already is the state's question (index_due),
+    not this one's. Pure: nothing is started or written here."""
     if index != "on" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
         return []
     if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
@@ -2634,7 +2637,8 @@ def index_plan(data: dict, index: str) -> list:
     top = index_top(data.get("cwd"))
     if top is None:
         return []
-    return [(program, top) for program in INDEX_COMMANDS if index_program(program, top)]
+    found = {program: index_program(program, top) for program in INDEX_COMMANDS}
+    return [(program, top, found[program]) for program in INDEX_COMMANDS if found[program]]
 
 
 def index_key(top: str) -> str:
@@ -2672,12 +2676,12 @@ def index_due(entry, mapped: bool, now: float) -> bool:
     return now - (as_number(entry.get("started")) or 0) >= INDEX_RETRY
 
 
-def index_spawn(program: str, top: str) -> int:
+def index_spawn(program: str, top: str, found: str) -> int:
     """The runner, detached: in its own session, holding none of the
-    hook's pipes, with the environment as it is. Returns its pid; the
-    hook never waits for it."""
+    hook's pipes, with the environment as it is, given the path the
+    program was found at. Returns its pid; the hook never waits for it."""
     here = str(Path(__file__).resolve().parent)
-    proc = subprocess.Popen([sys.executable, "-c", INDEX_RUNNER, here, program, top], start_new_session=True,
+    proc = subprocess.Popen([sys.executable, "-c", INDEX_RUNNER, here, program, top, found], start_new_session=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             close_fds=True)
     pid = proc.pid
@@ -2688,19 +2692,20 @@ def index_spawn(program: str, top: str) -> int:
 
 
 def index_start(data: dict, index: str) -> list:
-    """For each pair index_plan() gives, under the index lock: the state
-    read, the decision made (index_due), the runner started and its
-    start and pid written. A skip writes and logs nothing: the state
-    says why. One log line per start, a program, a path and a pid.
-    Returns the pairs started."""
+    """For each (program, top, found) index_plan() gives, under the index
+    lock: the state read, the decision made (index_due), the runner
+    started on the path found and its start and pid written. A skip
+    writes and logs nothing: the state says why. One log line per start,
+    a program, a path and a pid. Returns the (program, top) pairs
+    started."""
     started = []
-    for program, top in index_plan(data, index):
+    for program, top, found in index_plan(data, index):
         mapped = map_at(data["cwd"], INDEX_MAPS[program])
         with locked("index"):
             path, state = index_state(top)
             if not index_due(state["runs"].get(program), mapped, time.time()):
                 continue
-            pid = index_spawn(program, top)
+            pid = index_spawn(program, top, found)
             state["runs"][program] = {"started": round(time.time(), 1), "pid": pid, "exit": None, "ended": None,
                                       "seconds": None}
             write_json(path, state)
@@ -2709,18 +2714,26 @@ def index_start(data: dict, index: str) -> list:
     return started
 
 
-def index_run(program: str, top: str) -> None:
+def index_run(program: str, top: str, found: str) -> None:
     """The detached runner, one per program: the init in the top level,
-    with the environment as it is, its output in index/<key>.<program>.log
-    alone (0600, append), never in longhaul.log or on the hook's stdout.
-    Past INDEX_TIMEOUT the program is killed and counts as exit -1, as
-    does one that could not be run at all."""
+    run by `found`, the absolute path the hook found the program at
+    (index_program), never by its name: a name is looked up on PATH again
+    in the top level, where a relative or empty entry ("." or "::")
+    finds a program the repository ships (review, Sprint 7, F1). A
+    `found` that is not absolute, or whose real path is inside the top,
+    is refused, a second belt. The environment as it is, its output in
+    index/<key>.<program>.log alone (0600, append), never in longhaul.log
+    or on the hook's stdout. Past INDEX_TIMEOUT the program is killed and
+    counts as exit -1, as does one that could not be run at all."""
+    started, why = time.time(), ""
+    if not os.path.isabs(found) or os.path.realpath(found).startswith(os.path.realpath(top).rstrip(os.sep) + os.sep):
+        index_finish(program, top, -1, time.time() - started, " (could not run: not the program found)")
+        return
     out = LONGHAUL_HOME / "index" / f"{index_key(top)}.{program}.log"
     out.parent.mkdir(parents=True, exist_ok=True)
-    started, why = time.time(), ""
     try:
         with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:
-            code = subprocess.run(INDEX_COMMANDS[program], cwd=top, stdin=subprocess.DEVNULL, stdout=f,
+            code = subprocess.run([found, *INDEX_COMMANDS[program][1:]], cwd=top, stdin=subprocess.DEVNULL, stdout=f,
                                   stderr=subprocess.STDOUT, timeout=INDEX_TIMEOUT).returncode
     except subprocess.TimeoutExpired:
         code, why = -1, f" (killed at the {INDEX_TIMEOUT} s timeout)"
