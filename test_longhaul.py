@@ -2863,7 +2863,12 @@ class Index(unittest.TestCase):
         (self.bin / "trail").unlink()
         top, now, alive = str(self.repo), time.time(), os.getpid()  # this process stands for the pid's new owner
         self.plant(started=now - longhaul.INDEX_TIMEOUT - 120, pid=alive, exit=None, ended=None, seconds=None)
-        self.assertEqual(self.begin(self.start()), [], "past its timeout: a failure, under a day old")
+        # Told apart from a run in progress, which starts nothing either
+        # (final review, Sprint 7, G8): a failure is in index_start()'s
+        # failures for the user, a run in progress is not.
+        started, failed = longhaul.index_start(self.start(), "on")
+        self.assertEqual((started, [(program, where) for program, where, _ in failed]), ([], [("codegraph", top)]),
+                         "past its timeout: a failure that stands, under a day old")
         self.plant(started=now - 86_401, pid=alive, exit=None, ended=None, seconds=None)
         self.assertEqual(self.begin(self.start()), [("codegraph", top)], "a day on: once more, the pid alive or not")
         self.assertEqual(self.wait("codegraph")["exit"], 0)
@@ -3324,8 +3329,14 @@ class Index(unittest.TestCase):
         # And the callers ask these two, never a spelling of their own
         # (final review, Sprint 7, G4, G8): each helper counted per call.
         top, work = str(self.repo), {"name": "Work", "repositories": [str(self.repo)]}
+        src = str(self.repo / "src")
         for caller, helper, call in (
-                ("account_allowed", "inside", lambda: longhaul.account_allowed(work, str(self.repo / "src"))),):
+                ("map_at", "above", lambda: longhaul.map_at(src, ".codegraph")),
+                ("index_map", "above", lambda: longhaul.index_map(src, "codegraph")),
+                ("index_top", "above", lambda: longhaul.index_top(src)),
+                ("index_top", "inside", lambda: longhaul.index_top(src)),
+                ("index_program", "inside", lambda: longhaul.index_program("codegraph", top)),
+                ("account_allowed", "inside", lambda: longhaul.account_allowed(work, src))):
             seen = []
             real = getattr(longhaul, helper)
             with mock.patch.object(longhaul, helper, lambda *args, real=real: seen.append(args) or real(*args)):
