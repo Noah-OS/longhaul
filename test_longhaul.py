@@ -2923,10 +2923,19 @@ class Index(unittest.TestCase):
         self.assertRegex((self.home / "longhaul.log").read_text(),
                          r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 1 s timeout\)\n")
         self.assertEqual(entry["why"], "timeout")
+        self.assertEqual(entry["timeout"], 1, "the timeout it was killed at, recorded at the kill")
         self.assertEqual(self.begin(self.start()), [], "a failure: left alone")
+        # The user is told the timeout, not the time the run took (final
+        # review, Sprint 7, G3): a loaded machine's 2.7 s says 1 s still.
+        state = self.state()
+        state["runs"]["codegraph"]["seconds"] = 2.7
+        longhaul.write_json(self.state_path(), state)
         answer = self.check(self.start())
         self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 1 s timeout"))
         self.assertNotIn("hookSpecificOutput", answer, "nothing started, nothing for the model")
+        del state["runs"]["codegraph"]["timeout"]  # an entry written before the timeout was recorded
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.said(self.check(self.start())), self.told_failed("codegraph", "exit -1, killed at its timeout"))
         # A timeout is no transient failure (review, Sprint 7, F17): a day
         # on it is not tried again; the user's deletion of the state (and
         # of a half-built map, were there one) is what retries it.

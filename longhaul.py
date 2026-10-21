@@ -2575,7 +2575,8 @@ def inspect(opts) -> int:
 # unattended run (`claude -p`: its hook sees
 # CLAUDE_CODE_SESSION_ATTENDED=0). Once per project: LONGHAUL_HOME/
 # index/<key>.json holds each program's start, pid, exit and seconds,
-# and why Longhaul ended a run (a timeout, an error); a run in progress
+# and why Longhaul ended a run (a timeout, with the timeout it was
+# killed at; an error); a run in progress
 # is left to run, up to its timeout; a map built and then gone is built
 # again; a failure is tried again after a day (delete the file to try
 # now), a timeout never, whatever its map folder shows, and the map a
@@ -2695,7 +2696,7 @@ def index_state(top: str) -> tuple:
     """The project's state file, LONGHAUL_HOME/index/<key>.json, and what
     it holds: {"top": <realpath>, "runs": {<program>: {"started", "pid",
     "exit", "ended", "seconds", and "why" when Longhaul ended the run or
-    it never ran}}}, fresh when missing. A corrupt file (not JSON, not an
+    it never ran, and "timeout" for a timeout}}}, fresh when missing. A corrupt file (not JSON, not an
     object, its runs not one) is fresh too, said in one log line per read
     that names the file and never its content, as load_state() says of
     state.json; the next write replaces it."""
@@ -2903,16 +2904,21 @@ def index_finish(program: str, top: str, code: int, seconds: float, said: str = 
     state that cannot be written still leaves it (a second line says so);
     then exit, ended and seconds into the program's entry, under the
     lock, with `why` ("timeout", "error") when Longhaul ended the run or
-    it never ran, and none for the program's own exit, 0 or not."""
+    it never ran, and none for the program's own exit, 0 or not; for a
+    timeout, `timeout` too: the INDEX_TIMEOUT it was killed at, the
+    runner's own, which the user is told (final review, Sprint 7, G3)."""
     log(f"index: {program} init in {home_path(top)} exit {code} after {seconds:.1f} s{said}")
     try:
         with locked("index"):
             path, state = index_state(top)
             entry = state["runs"].get(program, {})
             entry.pop("why", None)
+            entry.pop("timeout", None)
             entry.update(exit=code, ended=round(time.time(), 1), seconds=round(seconds, 1))
             if why:
                 entry["why"] = why
+            if why == "timeout":
+                entry["timeout"] = INDEX_TIMEOUT
             state["runs"][program] = entry
             write_json(path, state)
     except OSError as e:
@@ -2937,17 +2943,18 @@ def index_message(started: list, failed: list) -> str:
     nothing: INDEX_STARTED per init started, INDEX_FAILED per failure
     that stands (index_start), joined by a space; paths by home_path.
     The day is the run's end's (its start's without one) and the reason
-    the entry's: the exit, and why Longhaul ended it; a run that never
+    the entry's: the exit, and why Longhaul ended it, a timeout by the
+    timeout the entry records, not the time the run took; a run that never
     ran points to longhaul.log, where its reason is, the others to the
     program's own log. Never the program's output."""
     said = [INDEX_STARTED.format(command=" ".join(INDEX_COMMANDS[program]), where=home_path(top),
                                  log=home_path(str(index_log(program, top)))) for program, top in started]
     for program, top, entry in failed:
-        code, why, seconds = as_number(entry.get("exit")), entry.get("why"), as_number(entry.get("seconds"))
+        code, why, limit = as_number(entry.get("exit")), entry.get("why"), as_number(entry.get("timeout"))
         if code is None:
             reason = "no exit: its runner stopped"
         elif why == "timeout":
-            reason = f"exit {code:g}, killed at the {f'{int(seconds)} s' if seconds else 'its'} timeout"
+            reason = f"exit {code:g}, killed at {f'the {limit:g} s' if limit else 'its'} timeout"
         elif why == "error":
             reason = f"exit {code:g}, could not run"
         else:
