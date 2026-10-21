@@ -1984,7 +1984,7 @@ def search_advice(s: dict) -> str:
     install as its README gives it, with what the install does to the
     project. Longhaul never installs it."""
     return (f"Search-heavy: {s['search_calls']:,} searches ({s['search_share']:.0%} of calls), the longest chain "
-            f"{s['search_chain_max']}, {s['search_big']:,} results over {SEARCH_BIG:,} characters "
+            f"{s['search_chain_max']}, {s['search_big']:,} result{'' if s['search_big'] == 1 else 's'} over {SEARCH_BIG:,} characters "
             f"({s['search_big_share']:.0%} of search output). A code index answers symbol and dependency questions "
             f"in one call. CodeGraph ({CODEGRAPH_INSTALL['link']}, MIT): install with `{CODEGRAPH_INSTALL['sh']}` or "
             f"`{CODEGRAPH_INSTALL['npm']}`, then `codegraph init` in the project; it writes `.codegraph/` there, may "
@@ -2243,7 +2243,7 @@ def inspect_lines(r: dict) -> list[str]:
 
     g = r["guard"]
     if g is None:
-        out.append("Guard [longhaul guard: no record: the hook was off, or saw no whole Read or cat]")
+        out.append("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, cat or search]")
     else:
         section("Guard [longhaul guard, counted: calls it warned about or blocked]",
                 [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in

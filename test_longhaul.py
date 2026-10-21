@@ -1719,13 +1719,15 @@ class Plugin(unittest.TestCase):
         rows = [line for line in section.splitlines() if line.startswith("| `")]
         with self.subTest("the hooks table"):
             entries = [(event, entry) for event, entries in hooks["hooks"].items() for entry in entries]
-            self.assertEqual((len(entries), len(rows)), (3, 3), "one row per hook")
+            self.assertEqual(len(entries), 4, "the four hooks the README describes, and nothing else")
+            self.assertEqual(len(rows), len(entries), "one row per hook")
             timeouts = set()
             for event, entry in entries:
                 [handler] = entry["hooks"]
                 timeouts.add(handler["timeout"])
                 *rest, end = [f"`{matcher}`" for matcher in entry["matcher"].split("|")]
-                named = f"`{event}` on {', '.join(rest)} and {end}"
+                # "on `a`, `b` and `c`", or "on `a`" for a hook with one matcher
+                named = f"`{event}` on " + (f"{', '.join(rest)} and {end}" if rest else end)
                 matching = [row for row in rows if named in row]
                 self.assertEqual(len(matching), 1, (named, "one row names this hook by its event and matchers"))
                 self.assertIn(f'"{handler["statusMessage"]}"', matching[0], (named, "its row quotes its status message"))
@@ -2143,7 +2145,7 @@ class Guard(unittest.TestCase):
         # Review, Sprint 3: no record does not mean the hook was off.
         other = transcript.with_name("s7.jsonl")
         other.write_text(transcript.read_text())
-        self.assertIn("no record: the hook was off, or saw no whole Read or cat",
+        self.assertIn("no record: the hook was off, or saw no whole Read, cat or search",
                       "\n".join(longhaul.inspect_lines(longhaul.inspect_transcript(other))))
 
 
