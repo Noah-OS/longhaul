@@ -2352,16 +2352,19 @@ class Index(unittest.TestCase):
         (self.repo / ".git").mkdir(parents=True)  # a work tree, and no git needed
         (self.repo / "src").mkdir()
         # The fakes alone are on PATH, in this process and in a hook's; the
-        # variables a `-p` run or the owner's shell may set are each test's.
-        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        # auto-init is opt-in, so the switch is on here and off where a
+        # test says so; the runner is its own process and reads
+        # LONGHAUL_HOME at its import, so the environment names this home
+        # too; the variable a `-p` run sets is each test's.
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "LONGHAUL_INDEX": "on",
+                                               "LONGHAUL_HOME": str(self.home)})
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in ("CLAUDE_CODE_SESSION_ATTENDED", "LONGHAUL_INDEX"):
-            os.environ.pop(name, None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ATTENDED", None)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
-                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"))
+                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_INDEX="on")
 
     def tearDown(self):
         longhaul.LONGHAUL_HOME = self.saved
@@ -2369,8 +2372,10 @@ class Index(unittest.TestCase):
     def fake(self, path: Path, name: str):
         """A program that records where and how it was called and what it
         saw of the environment, talks on both streams, makes its map, and
-        is slow or fails when a marker file says so. Its own PATH: sh has
-        no mkdir or sleep of its own, and the test's PATH holds the fakes
+        is slow or fails when a marker file says so: slow before the map
+        is made (a run in progress has none yet), failing after it (a
+        failed init leaves a half-built map). Its own PATH: sh has no
+        mkdir or sleep of its own, and the test's PATH holds the fakes
         alone."""
         path.write_text("#!/bin/sh\n"
                         "PATH=/bin:/usr/bin\n"
@@ -2378,9 +2383,9 @@ class Index(unittest.TestCase):
                         f"printf '%s\\n' \"${{DO_NOT_TRACK-unset}}\" > '{self.tmp}/{name}.env'\n"
                         f"echo SECRET-OUTPUT-{name}\n"
                         f"echo SECRET-OUTPUT-{name} >&2\n"
-                        f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
                         f"[ -e '{self.tmp}/{name}.slow' ] && sleep 3\n"
                         f"mkdir -p {self.MAPS[name]}\n"
+                        f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
                         "exit 0\n")
         path.chmod(0o755)
 
@@ -2398,11 +2403,41 @@ class Index(unittest.TestCase):
         path = self.tmp / f"{program}.calls"
         return path.read_text().splitlines() if path.exists() else []
 
-    def test_nothing_starts_with_the_switch_off_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
+    def begin(self, data):
+        """What a session's start does of the index: the pairs started."""
+        return longhaul.index_start(data, "on")
+
+    def state_path(self, top=None):
+        return self.home / "index" / f"{longhaul.index_key(top or str(self.repo))}.json"
+
+    def state(self, top=None):
+        return json.loads(self.state_path(top).read_text())
+
+    def wait(self, program, top=None):
+        """The program's entry once its runner has written `ended`, within 10 s."""
+        for _ in range(200):
+            entry = dict((longhaul.read_json(self.state_path(top)) or {}).get("runs", {}).get(program) or {})
+            if entry.get("ended") is not None:
+                return entry
+            time.sleep(0.05)
+        self.fail(f"{program}'s run did not end within 10 s")
+
+    def test_nothing_starts_without_the_switch_on_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
         top = str(self.repo)
         both = [("codegraph", top), ("trail", top)]
         self.assertEqual(self.plan(self.start()), both, "the control: a work tree with no map, both programs found")
-        self.assertEqual(self.plan(self.start(), index="off"), [], "LONGHAUL_INDEX=off")
+        # Opt-in (the owner, 2026-10-21, after the outside review): "on" is
+        # on; unset, "off" or anything else is off.
+        self.assertEqual(longhaul.index_mode(), "on", "the fixture's environment")
+        for value in (None, "off", "", "1", "ON", "yes"):
+            with mock.patch.dict(os.environ):
+                if value is None:
+                    os.environ.pop("LONGHAUL_INDEX")
+                else:
+                    os.environ["LONGHAUL_INDEX"] = value
+                self.assertEqual(longhaul.index_mode(), "off", f"LONGHAUL_INDEX={value}")
+                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), [], f"LONGHAUL_INDEX={value}")
+        self.assertEqual(self.plan(self.start(), index="off"), [], "the mode as passed down")
         # Never in the home folder, in a subfolder of it, or in a work tree
         # the home folder is inside (a dotfiles repository at ~ makes every
         # folder one, and there Trail's "repo" settings file is the user's own).
@@ -2452,23 +2487,33 @@ class Index(unittest.TestCase):
         self.assertEqual(self.plan(self.start()), both, "unset, as an older Claude Code leaves it")
 
     def test_a_mapped_project_is_left_alone_per_program(self):
-        top = str(self.repo)
-        (self.repo / ".codegraph").mkdir()
-        self.assertEqual(self.plan(self.start()), [("trail", top)], ".codegraph/ present: trail alone")
+        top, real = str(self.repo), os.path.realpath(self.repo)
+        self.assertEqual(self.plan(self.start()), [("codegraph", top), ("trail", top)],
+                         "the plan names every program found; a map present is the state's question")
+        (self.repo / ".codegraph").mkdir()  # a map Longhaul did not make
+        self.assertEqual(self.begin(self.start()), [("trail", top)], ".codegraph/ present: trail alone")
+        self.assertEqual(self.wait("trail")["exit"], 0)
+        self.assertNotIn("codegraph", self.state()["runs"], "nothing written for a map that is not Longhaul's")
         (self.repo / ".codegraph").rmdir()
-        (self.repo / ".trail").mkdir()
-        self.assertEqual(self.plan(self.start()), [("codegraph", top)], ".trail/ present: codegraph alone")
-        (self.repo / ".codegraph").mkdir()
-        self.assertEqual(self.plan(self.start()), [], "both present")
-        (self.repo / ".codegraph").rmdir()
-        (self.repo / ".trail").rmdir()
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], ".trail/ present: codegraph alone")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.begin(self.start()), [], "both present")
+        self.assertEqual(self.calls("codegraph"), [f"{real} init -y"])
+        self.assertEqual(self.calls("trail"), [f"{real} init --yes --no-global --no-statusline --no-agents"])
         # The map is looked for at the cwd and above it, where the programs
-        # themselves look: one in the cwd below the top level counts, and a
-        # file of a map's name is no map.
-        (self.repo / "src" / ".codegraph").mkdir()
-        self.assertEqual(self.plan(self.start()), [("trail", top)], "a map in the cwd, below the top level")
-        (self.repo / ".trail").write_text("not a folder")
-        self.assertEqual(self.plan(self.start()), [("trail", top)], "a file of the map's name")
+        # themselves look: one in the cwd below the top level counts.
+        other = self.tmp / "other"
+        (other / ".git").mkdir(parents=True)
+        (other / "src" / ".codegraph").mkdir(parents=True)
+        self.assertEqual(self.begin(self.start(cwd=str(other / "src"))), [("trail", str(other))], "a map in the cwd")
+        self.assertEqual(self.wait("trail", str(other))["exit"], 0)
+        self.assertFalse((other / ".codegraph").exists())
+        # Both present and no state: nothing, and no state file.
+        third = self.tmp / "third"
+        for folder in (".git", ".codegraph", ".trail"):
+            (third / folder).mkdir(parents=True)
+        self.assertEqual(self.begin(self.start(cwd=str(third))), [], "a repository that ships both maps")
+        self.assertFalse(self.state_path(str(third)).exists(), "no state file for a project with nothing to do")
 
     def test_a_missing_program_is_skipped_and_the_other_still_runs(self):
         top = str(self.repo)
@@ -2481,6 +2526,200 @@ class Index(unittest.TestCase):
         (self.bin / "codegraph").chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": ""}):
             self.assertEqual(self.plan(self.start()), [], "no PATH at all")
+
+    def test_a_new_session_in_an_unmapped_work_tree_starts_both_inits_in_the_top_level_and_answers_at_once(self):
+        top, real = str(self.repo), os.path.realpath(self.repo)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        for program in self.MAPS:
+            entry = self.wait(program)
+            self.assertEqual(entry["exit"], 0, program)
+            self.assertIsInstance(entry["seconds"], float, program)
+            self.assertTrue((self.repo / self.MAPS[program]).is_dir(), (program, "its map, in the top level"))
+        # Each ran once, in the top level (pwd -P: the real path), with the
+        # one command line the README gives for it.
+        self.assertEqual(self.calls("codegraph"), [f"{real} init -y"])
+        self.assertEqual(self.calls("trail"), [f"{real} init --yes --no-global --no-statusline --no-agents"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn(f"index: started codegraph init in {top} (pid ", log)
+        self.assertIn(f"index: started trail init in {top} (pid ", log)
+        self.assertRegex(log, rf"index: codegraph init in {re.escape(top)} exit 0 after \d+\.\d s\n")
+        self.assertRegex(log, rf"index: trail init in {re.escape(top)} exit 0 after \d+\.\d s\n")
+        self.assertEqual(self.begin(self.start()), [], "the next session finds both maps")
+
+    def test_a_second_start_while_the_first_runs_is_skipped(self):
+        (self.tmp / "codegraph.slow").touch()
+        top = str(self.repo)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        self.wait("trail")
+        entry = self.state()["runs"]["codegraph"]
+        self.assertIsNone(entry["exit"], "still running")
+        self.assertTrue(longhaul.pid_alive(entry["pid"]), "the runner's pid")
+        self.assertEqual(self.begin(self.start()), [], "a second session while it runs")
+        self.assertEqual(self.begin(self.start(session="s2")), [], "any session: the state is the project's")
+        # However long ago it started: a run in progress is never doubled.
+        with longhaul.locked("index"):
+            state = self.state()
+            state["runs"]["codegraph"]["started"] -= 86_401
+            longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [], "a run in progress since a day ago")
+        self.assertEqual(len(self.calls("codegraph")), 1)
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run")
+
+    def test_a_failed_init_is_not_retried_for_a_day_and_is_after(self):
+        (self.tmp / "codegraph.fail").touch()
+        top = str(self.repo)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        self.wait("trail")
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertEqual(self.begin(self.start()), [], "a failure under a day old is left alone")
+        self.assertEqual(len(self.calls("codegraph")), 1)
+        state = self.state()
+        state["runs"]["codegraph"]["started"] -= 86_401
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "a day on: once more")
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertEqual(len(self.calls("codegraph")), 2)
+        # A runner that never wrote its exit (the Mac slept, the runner was
+        # killed) is a failure once its pid is dead, on the same clock.
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        state = self.state()
+        state["runs"]["codegraph"].update(exit=None, ended=None, seconds=None, pid=gone.pid)
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [], "a dead runner under a day old")
+        state["runs"]["codegraph"]["started"] -= 86_401
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "and a day on")
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertEqual(len(self.calls("codegraph")), 3)
+        # The file is deletable: a user who has fixed the cause removes it,
+        # and the half-built map with it (a map with no entry is someone
+        # else's: the half-built test), to try now.
+        self.state_path().unlink()
+        shutil.rmtree(self.repo / ".codegraph")
+        (self.tmp / "codegraph.fail").unlink()
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "the state removed: now")
+        self.assertEqual(self.wait("codegraph")["exit"], 0)
+        self.assertTrue((self.repo / ".codegraph").is_dir())
+
+    def test_a_run_over_the_timeout_is_killed_and_counts_as_a_failure(self):
+        (self.tmp / "codegraph.slow").touch()
+        (self.bin / "trail").unlink()
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "1"}):  # the runner reads it at its import
+            self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
+        entry = self.wait("codegraph")
+        self.assertEqual(entry["exit"], -1)
+        self.assertLess(entry["seconds"], 3, "killed at the timeout, not waited for")
+        self.assertFalse((self.repo / ".codegraph").exists())
+        self.assertRegex((self.home / "longhaul.log").read_text(),
+                         r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 1 s timeout\)\n")
+        self.assertEqual(self.begin(self.start()), [], "a failure: left alone for a day")
+
+    def test_a_half_built_map_of_longhauls_own_is_rebuilt_at_the_retry_and_a_strangers_map_never(self):
+        # The review's "stale or incomplete index" (the owner, 2026-10-21):
+        # the retry keys on Longhaul's own state, not on the map folder. A
+        # map an init of Longhaul's left half-built is rebuilt at the
+        # retry; a map the state knows nothing of is someone else's.
+        (self.tmp / "codegraph.fail").touch()  # the fake makes its map, then fails
+        (self.bin / "trail").unlink()
+        top = str(self.repo)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)])
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertTrue((self.repo / ".codegraph").is_dir(), "half-built, and present")
+        self.assertEqual(self.begin(self.start()), [], "under a day old")
+        state = self.state()
+        state["runs"]["codegraph"]["started"] -= 86_401
+        longhaul.write_json(self.state_path(), state)
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "a day on, the folder present: Longhaul's own")
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        self.assertEqual(len(self.calls("codegraph")), 2)
+        # The same folder with no entry of Longhaul's is someone else's.
+        self.state_path().unlink()
+        self.assertEqual(self.begin(self.start()), [], "a stranger's map")
+        self.assertFalse(self.state_path().exists(), "and nothing is written for it")
+        self.assertEqual(len(self.calls("codegraph")), 2)
+
+    def test_the_init_runs_in_the_top_level_and_writes_nothing_outside_it(self):
+        # The review's boundary point: the init runs in the top level, not
+        # in the session's cwd, and nothing of the run lands beside the
+        # repository or anywhere but Longhaul's index/ folder.
+        sibling = self.tmp / "sibling"
+        sibling.mkdir()
+        (sibling / "keep.txt").write_text("x")
+        for name in self.MAPS:  # the fakes' own records, and Longhaul's log and lock: there before and after
+            (self.tmp / f"{name}.calls").touch()
+            (self.tmp / f"{name}.env").touch()
+        (self.home / "longhaul.log").touch()
+        (self.home / ".index.lock").touch()
+
+        def listing():
+            return sorted(str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*")
+                          if not str(p).startswith((str(self.repo) + os.sep, str(self.home / "index"))))
+
+        before = listing()
+        self.assertIn("sibling/keep.txt", before)
+        self.assertEqual(self.begin(self.start(cwd=str(self.repo / "src"))),
+                         [("codegraph", str(self.repo)), ("trail", str(self.repo))])
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+        real = os.path.realpath(self.repo)
+        self.assertEqual(self.calls("codegraph"), [f"{real} init -y"], "run in the top level, not in the cwd")
+        self.assertEqual(self.calls("trail"), [f"{real} init --yes --no-global --no-statusline --no-agents"])
+        self.assertFalse((self.repo / "src" / ".codegraph").exists())
+        self.assertTrue((self.repo / ".codegraph").is_dir() and (self.repo / ".trail").is_dir())
+        self.assertEqual(listing(), before, "nothing new outside repo/ and index/")
+
+    def test_the_state_file_shape_mode_and_the_programs_output_never_reach_the_answer_or_the_log(self):
+        with mock.patch.dict(os.environ, {"DO_NOT_TRACK": "1"}):  # any variable: the environment goes as it is
+            started = self.begin(self.start())
+        for program in self.MAPS:
+            self.wait(program)
+        state = self.state()
+        self.assertEqual(set(state), {"top", "runs"})
+        self.assertEqual(state["top"], os.path.realpath(self.repo))
+        self.assertEqual(set(state["runs"]), {"codegraph", "trail"})
+        for program, entry in state["runs"].items():
+            self.assertEqual(list(entry), ["started", "pid", "exit", "ended", "seconds"], program)
+            self.assertIsInstance(entry["started"], float, program)
+            self.assertIsInstance(entry["pid"], int, program)
+            self.assertEqual(entry["exit"], 0, program)
+            self.assertGreaterEqual(entry["ended"], entry["started"], program)
+            self.assertIsInstance(entry["seconds"], float, program)
+        key = longhaul.index_key(str(self.repo))
+        self.assertRegex(key, r"^repo-[0-9a-f]{12}$")
+        self.assertEqual(sorted(p.name for p in (self.home / "index").iterdir()),
+                         [f"{key}.codegraph.log", f"{key}.json", f"{key}.trail.log"])
+        for file in (self.home / "index").iterdir():
+            self.assertEqual(oct(file.stat().st_mode & 0o777), oct(0o600), file.name)
+        self.assertTrue((self.home / ".index.lock").exists(), "the README's lock row")
+        # The program's output, both streams, goes to its own log and nowhere else.
+        self.assertEqual((self.home / "index" / f"{key}.codegraph.log").read_text(),
+                         "SECRET-OUTPUT-codegraph\nSECRET-OUTPUT-codegraph\n")
+        self.assertNotIn("SECRET", (self.home / "longhaul.log").read_text())
+        self.assertNotIn("SECRET", json.dumps(started))
+        self.assertNotIn("SECRET", self.state_path().read_text())
+        # The environment is passed as it is: no telemetry variable added or
+        # removed, so the program saw what the hook's environment held.
+        self.assertEqual((self.tmp / "codegraph.env").read_text(), "1\n")
+
+    def test_a_symlinked_cwd_keys_one_state_and_runs_in_the_path_given(self):
+        # S1: the key is the real path's, so a project opened through a link
+        # and through its real path has one state, and a start through the
+        # one sees a run in progress through the other.
+        link = self.tmp / "link"
+        link.symlink_to(self.repo)
+        (self.tmp / "codegraph.slow").touch()
+        self.assertEqual(self.begin(self.start(cwd=str(link / "src"))), [("codegraph", str(link)), ("trail", str(link))])
+        self.wait("trail", str(link))
+        self.assertEqual(self.begin(self.start()), [], "a start at the real path while the link's runs")
+        self.assertEqual(self.wait("codegraph", str(link))["exit"], 0)
+        self.assertEqual([p.name for p in (self.home / "index").glob("*.json")], [f"{longhaul.index_key(str(self.repo))}.json"])
+        self.assertEqual(self.state()["top"], os.path.realpath(self.repo), "the state names the real path")
+        self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run, in the physical folder")
+        self.assertIn(f"index: started codegraph init in {link} (pid ", (self.home / "longhaul.log").read_text(),
+                      "the log names the path given")
+        self.assertTrue((self.repo / ".codegraph").is_dir() and (self.repo / ".trail").is_dir())
 
 
 class Settings(unittest.TestCase):
