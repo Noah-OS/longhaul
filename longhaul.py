@@ -278,6 +278,14 @@ def dict_at(entry, key) -> dict:
     return found if isinstance(found, dict) else {}
 
 
+def files_of(paths) -> list[Path]:
+    """The hits that are files. Path.glob() lists a link to nowhere on
+    Python 3.12 and later and passes it over before (with a wildcard last
+    part, on every version); is_file() follows the link, so a dead one is
+    left out everywhere and a transcript reached through a live one kept."""
+    return [p for p in paths if p.is_file()]
+
+
 def write_json(path: Path, data) -> None:
     """Write whole or not at all. The temporary file is unique per write:
     on 2026-10-16 two sessions' status lines saved Max.json at the same
@@ -678,7 +686,7 @@ def transcript_size(sid) -> dict:
     its limit stop) is taken for the new one's."""
     if not sid:
         return {}
-    return {p: p.stat().st_size for p in (DEFAULT_CONFIG / "projects").glob(f"*/{sid}.jsonl")}
+    return {p: p.stat().st_size for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{sid}.jsonl"))}
 
 
 def pid_alive(pid) -> bool:
@@ -748,7 +756,7 @@ class Watch:
         found = self.paths.get(self.sid)
         if found and found.exists():
             return found
-        hits = list((self.cfg / "projects").glob(f"*/{self.sid}.jsonl"))
+        hits = files_of((self.cfg / "projects").glob(f"*/{self.sid}.jsonl"))
         self.paths[self.sid] = hits[0].resolve() if hits else None
         return self.paths[self.sid]
 
@@ -1279,7 +1287,7 @@ def full_session_id(prefix: str) -> str:
     exactly one conversation starts with it."""
     if not prefix or len(prefix) >= 36:
         return prefix
-    hits = {p.stem for p in (DEFAULT_CONFIG / "projects").glob(f"*/{prefix}*.jsonl")}
+    hits = {p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{prefix}*.jsonl"))}
     return hits.pop() if len(hits) == 1 else prefix
 
 
@@ -1784,7 +1792,7 @@ def transcript_hits(sid) -> list[Path]:
     recorded = last.get("transcript") if isinstance(last, dict) else None
     if isinstance(recorded, str) and Path(recorded).is_file():
         return [Path(recorded)]
-    return sorted((DEFAULT_CONFIG / "projects").glob(f"*/{sid}.jsonl"))
+    return sorted(files_of((DEFAULT_CONFIG / "projects").glob(f"*/{sid}.jsonl")))
 
 
 def task_name(sid: str, labels: dict) -> str:
@@ -2081,7 +2089,7 @@ def find_transcript(target: str | None) -> tuple[Path | None, str]:
     if target:
         if not re.fullmatch(plain, target):
             return None, f"{target!r} is neither a conversation ID nor a transcript's path."
-        known = ({p.stem for p in (DEFAULT_CONFIG / "projects").glob(f"*/{target}*.jsonl")}
+        known = ({p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{target}*.jsonl"))}
                  | {p.stem for p in (USAGE_DIR / "sessions").glob(f"{target}*.json")})
         if target not in known and len(known) > 1:
             return None, f"{len(known)} conversations start with {target}; give more of the ID."

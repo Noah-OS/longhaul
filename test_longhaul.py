@@ -3377,6 +3377,52 @@ class Pieces(unittest.TestCase):
         self.assertFalse(r.paused)
 
 
+class Links(unittest.TestCase):
+    """A transcript link to nowhere under the projects folder (T6).
+
+    Path.glob() with a literal last component lists a dangling link on
+    Python 3.12 and later and passes it over on 3.9 to 3.11, so each
+    reader of `projects/*/<sid>.jsonl` must leave it out itself: a dead
+    link is no transcript, on every Python."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.claude = self.tmp / "claude"
+        self.folder = self.claude / "projects" / "p"
+        self.folder.mkdir(parents=True)
+        (self.folder / "sid-dead.jsonl").symlink_to(self.tmp / "gone.jsonl")
+        for name, value in (("DEFAULT_CONFIG", self.claude), ("USAGE_DIR", self.tmp / "relay" / "usage")):
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_the_launch_measures_no_transcript_behind_a_dead_link(self):
+        self.assertEqual(longhaul.transcript_size("sid-dead"), {})
+
+    def test_the_watch_sees_no_transcript_behind_a_dead_link_and_its_poll_passes(self):
+        watch = longhaul.Watch({"name": "Max"}, 0, time.time(), False)
+        watch.sid = "sid-dead"
+        self.assertIsNone(watch._transcript())
+        watch._read_transcript()  # one poll of the supervisor: nothing to read, nothing raised
+
+    def test_the_usage_records_list_no_transcript_behind_a_dead_link(self):
+        self.assertEqual(longhaul.transcript_hits("sid-dead"), [])
+
+    def test_a_short_id_is_not_expanded_to_a_dead_link(self):
+        self.assertEqual(longhaul.full_session_id("sid-de"), "sid-de")
+
+    def test_inspect_finds_no_transcript_behind_a_dead_link(self):
+        self.assertIsNone(longhaul.find_transcript("sid-dead")[0])
+
+    def test_a_link_to_a_transcript_that_exists_still_counts(self):
+        # is_file() follows the link: a transcript reached through one, as
+        # under a shared projects folder, is a transcript.
+        (self.tmp / "live.jsonl").write_text("x\n")
+        (self.folder / "sid-live.jsonl").symlink_to(self.tmp / "live.jsonl")
+        self.assertEqual(list(longhaul.transcript_size("sid-live").values()), [2])
+        self.assertEqual(longhaul.full_session_id("sid-li"), "sid-live")
+
+
 if __name__ == "__main__":
     unittest.main()
 
