@@ -1817,6 +1817,18 @@ class Plugin(unittest.TestCase):
         with self.subTest("the CodeGraph install"):  # Sprint 6, G3: the paragraph repeats the advice line's constant
             for key, text in longhaul.CODEGRAPH_INSTALL.items():
                 self.assertTrue(lines(readme, text), f"no README.md line holds CODEGRAPH_INSTALL[{key!r}]: {text}")
+        with self.subTest("the index commands"):  # Sprint 7, G4: the README quotes each init command as the code runs it
+            section = readme.split("\n## A code index, built for you", 1)[1].split("\n## ", 1)[0]
+            for program, command in longhaul.INDEX_COMMANDS.items():
+                self.assertTrue(lines(section, f"`{' '.join(command)}`"), f"the section quotes {program}'s command verbatim")
+                self.assertTrue(lines(section, f"`{longhaul.INDEX_MAPS[program]}/`"), f"the section names {program}'s map folder")
+            self.assertTrue(lines(section, "`LONGHAUL_INDEX=on`"), "the section names the switch")
+            self.assertTrue(lines(section, "24 hours"), "the section states the retry rule")
+            self.assertTrue(lines(readme, "| `index/<key>.json`, `index/<key>.<program>.log` |"), "the files table has the index row")
+            self.assertTrue(lines(readme, "`.index.lock`"), "the files table names the index lock")
+            pairs = readme.split("\n## Pairs well with CodeGraph and Trail-Code", 1)[1].split("\n## ", 1)[0]
+            for name in ("CodeGraph", "Trail-Code", "self-reported"):
+                self.assertTrue(lines(pairs, name), f"the Pairs well section names {name}")
         _, jobs = self.workflow()
         with self.subTest("the test command"):
             fenced = re.findall(r"^```[^\n]*\n(.*?)\n```$", readme, re.M | re.S)
