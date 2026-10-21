@@ -1610,7 +1610,10 @@ def run(opts) -> int:
                 break
             wrong.add(accounts[idx]["name"])
         if idx is None:
-            say("No account is signed in as expected. Run `longhaul status`, then `longhaul setup`.")
+            # "allowed here" with any account denied, as the panel's refusal says:
+            # a denied account may well be signed in as expected (final review, Sprint 7, G5).
+            which = "No account allowed here" if denied else "No account"
+            say(f"{which} is signed in as expected. Run `longhaul status`, then `longhaul setup`.")
             return 1
         if until:
             which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
@@ -4003,8 +4006,9 @@ def pipe(argv: list[str]) -> int:
             idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged, top)
         if idx is None:
             idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied)
-        if idx is None:
-            log("pipe: no account is signed in as expected, so longhaul did not start Claude")
+        if idx is None:  # "allowed here" with any account denied, as run() says (final review, Sprint 7, G5)
+            which = "no account allowed here" if denied else "no account"
+            log(f"pipe: {which} is signed in as expected, so longhaul did not start Claude")
             return 1
         acct = accounts[idx]
         prepare(acct, True)

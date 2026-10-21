@@ -845,6 +845,25 @@ class Loop(unittest.TestCase):
         self.assertIn(f"No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work / 'sub'}. "
                       f'Edit "repositories" in {self.home / "accounts.json"}, or run from one of those.', out.stdout)
 
+    def test_with_the_allowed_account_signed_in_wrong_the_denied_one_is_never_launched(self):
+        # Final review, Sprint 7 (G5): Pro, signed in as expected, may not be
+        # used here, and Max, the one allowed, is signed in as someone else.
+        # Nothing starts, and the line says the accounts allowed here, as
+        # the panel's refusal does: "No account is signed in" read as false.
+        work, personal = self.repositories()
+        self.pin_emails()
+        self.restrict("Pro", work)
+        out, calls = self.run_longhaul(["exit"], runs=1, FAKE_EMAIL_MAX="stranger@example.com",
+                                       FAKE_EMAIL_PRO="second@example.com", cwd=personal)
+        self.assertEqual((out.returncode, calls), (1, []), out.stdout)
+        self.assertIn("No account allowed here is signed in as expected. Run `longhaul status`, then `longhaul setup`.",
+                      out.stdout)
+        out, calls = self.run_longhaul(["exit"], runs=1, FAKE_EMAIL_MAX="stranger@example.com",
+                                       FAKE_EMAIL_PRO="stranger@example.com", cwd=work)
+        self.assertEqual((out.returncode, calls), (1, []), out.stdout)
+        self.assertIn("No account is signed in as expected. Run `longhaul status`, then `longhaul setup`.",
+                      out.stdout, "nothing denied in work: as before")
+
     def test_a_session_started_through_a_symlink_to_an_allowed_repository_is_allowed(self):
         work, _ = self.repositories()
         link = self.tmp / "link"
@@ -6382,6 +6401,18 @@ class Pipe(StreamHarness):
         self.assertEqual(self.calls_or_none(), [])
         self.assertIn(f"pipe: No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work}. "
                       f'Edit "repositories" in {self.relay / "accounts.json"}, or run from one of those.',
+                      self.log_text())
+
+    def test_pipe_with_the_allowed_account_signed_in_wrong_never_launches_the_denied_one(self):
+        # Final review, Sprint 7 (G5): Max, signed in as expected, may not be
+        # used here, and Pro, the one allowed, is signed in as someone else.
+        work, personal = self.repositories()
+        self.restrict("Max", work)
+        self.emails[str(self.pro)] = "stranger@example.com"
+        p = self.pipe(cwd=personal)
+        self.assertEqual(p.wait(10), 1)
+        self.assertEqual(self.calls_or_none(), [], "Max is never launched")
+        self.assertIn("pipe: no account allowed here is signed in as expected, so longhaul did not start Claude",
                       self.log_text())
 
     def test_pipe_refuses_account_for_a_folder_it_may_not_use(self):
