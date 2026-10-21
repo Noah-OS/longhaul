@@ -2388,8 +2388,8 @@ GUARD_KEEP = 500  # reads kept per record; the oldest go first
 GUARD_NO_PART = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf"}  # offset and limit are no advice
 GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symbol or dependency question (who calls X, "
                    "what does Y depend on, where is Z defined), `codegraph explore \"<question>\"` or the "
-                   "codegraph_explore tool answers in one call with the source and the call paths; keep grep and rg "
-                   "for plain text.")
+                   "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
+                   "source and the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
 
 
@@ -2477,10 +2477,13 @@ def guard_check(data, mode: str, now: float | None = None):
         reads = {k: v for k, v in dict_at(kept, "reads").items() if isinstance(v, dict)}
         fired = {k: as_int(dict_at(kept, "fired").get(k)) for k in GUARD_RULES}
         cost = {k: as_int(dict_at(kept, "bytes").get(k)) for k in GUARD_RULES}
+        # The count is kept with or without an index, so an index made in
+        # the middle of a session (a `codegraph init`) is named at the very
+        # next search: the rule is "twenty or more", not "the twentieth".
         searches, nudged = as_int(kept.get("searches")) + (1 if search else 0), kept.get("nudged") is True
         if search and searches >= GUARD_SEARCHES and not nudged and codegraph_index_at(data.get("cwd")):
             nudged = True  # once per context: the count goes on, the note does not
-            nudge = f"{GUARD_CODEGRAPH} This context has made {searches} searches."
+            nudge = f"{GUARD_CODEGRAPH} (This context has made {searches} searches so far.)"
         notes, seen = [], {}
         for how, path, whole in targets:
             try:

@@ -1950,7 +1950,8 @@ class Guard(unittest.TestCase):
         self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
         text = self.context(answer)
         self.assertTrue(text.startswith("This project has a CodeGraph index (.codegraph/). "), text)
-        self.assertIn('`codegraph explore "<question>"` or the codegraph_explore tool', text)
+        self.assertIn('`codegraph explore "<question>"` or the codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`)',
+                      text, "the tool named in full: the model knows it by that name")
         self.assertTrue(text.endswith("keep grep and rg for plain text."), text)
         self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
         self.assertIsNone(self.check(self.start(agent="agent-1")), "a subagent's start")
@@ -1984,8 +1985,10 @@ class Guard(unittest.TestCase):
         self.assertEqual(out["hookEventName"], "PreToolUse")
         self.assertNotIn("permissionDecision", out, "block mode never denies a search")
         self.assertTrue(out["additionalContext"].startswith("This project has a CodeGraph index (.codegraph/). "), out)
-        self.assertTrue(out["additionalContext"].endswith("keep grep and rg for plain text. This context has made 20 searches."),
-                        out)
+        # The count is a neutral parenthetical at the end, not a reproach
+        # that could send the model off its chain (review, Sprint 6).
+        self.assertTrue(out["additionalContext"].endswith("keep grep and rg for plain text. "
+                                                          "(This context has made 20 searches so far.)"), out)
         self.assertIsNone(self.check(grep, mode="block"), "the 21st: once")
         self.assertIsNone(self.check(self.hook("Bash", command="rg -n x | head -5")), "the program is the search, piped or not")
         r = self.record()
@@ -2008,7 +2011,7 @@ class Guard(unittest.TestCase):
         self.check(self.hook("Bash", command="grep x a"))
         for n in range(1, 20):
             self.assertIsNone(self.check(self.hook("Bash", agent="agent-1", command="grep x a")), f"search {n}")
-        self.assertIn("This context has made 20 searches.",
+        self.assertIn("(This context has made 20 searches so far.)",
                       self.context(self.check(self.hook("Bash", agent="agent-1", command="grep x a"))))
         self.assertEqual(self.record()["searches"], 1, "the main conversation's own count")
         self.assertEqual(self.record(agent="agent-1")["searches"], 20)
