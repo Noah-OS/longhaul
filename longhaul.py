@@ -570,6 +570,12 @@ def readings(accounts: list[dict]) -> dict:
 # session's record says. The helpers below are pure, realpath() their only
 # I/O; each entry point words its own refusal.
 
+# What every place that names an account's unusable "repositories" says of
+# it: the log, `longhaul status`, the --account refusal and the no-account
+# line (final review, Sprint 7, G6: four spellings before).
+REPOSITORIES_JUNK = "its repositories field is not a list of absolute paths"
+
+
 def repositories_of(acct: dict):
     """The paths in an account's "repositories", `~` expanded as config_dir
     is: [] for none (absent, null or an empty list: unrestricted), None
@@ -622,8 +628,8 @@ def denied_in(accounts: list[dict], top: str) -> set[str]:
     field is not a list of absolute paths is named in one log line."""
     for a in accounts:
         if repositories_of(a) is None:
-            log(f"{a['name']}: repositories in {home_path(str(LONGHAUL_HOME / 'accounts.json'))} is not a list of "
-                "absolute paths; longhaul will not use this account anywhere")
+            log(f"{a['name']} in {home_path(str(LONGHAUL_HOME / 'accounts.json'))}: {REPOSITORIES_JUNK}; "
+                "longhaul will not use this account anywhere")
     return {a["name"] for a in accounts} - set(eligible(accounts, top))
 
 
@@ -632,7 +638,7 @@ def where_allowed(acct: dict) -> str:
     "nowhere (...)" for a field that is not a list of paths; "anywhere"."""
     allowed = repositories_of(acct)
     if allowed is None:
-        return "nowhere (its repositories field is not a list of paths)"
+        return f"nowhere ({REPOSITORIES_JUNK})"
     return "only in " + ", ".join(home_path(p) for p in allowed) if allowed else "anywhere"
 
 
@@ -641,7 +647,7 @@ def may_not_text(acct: dict, top: str) -> str:
     "Pro may not be used in ~/personal/x (its repositories: ~/work/repo)"."""
     allowed = repositories_of(acct)
     why = ("its repositories: " + ", ".join(home_path(p) for p in allowed) if allowed
-           else "its repositories field is not a list of paths")
+           else REPOSITORIES_JUNK)
     return f"{acct['name']} may not be used in {home_path(top)} ({why})"
 
 
@@ -4731,7 +4737,7 @@ def status(_opts) -> int:
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
         allowed = repositories_of(acct)
         if allowed is None:
-            print("       repositories is not a list of absolute paths; longhaul will not use this account anywhere")
+            print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
         elif allowed:
             print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
         if acct.get("config_dir"):

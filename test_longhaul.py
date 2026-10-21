@@ -5158,8 +5158,18 @@ class Pieces(unittest.TestCase):
             self.assertEqual(longhaul.denied_in(accounts, work), {"Team", "Odd"})
             log = (tmp / "relay" / "longhaul.log").read_text()
         self.assertEqual(log.count("\n"), 1, log)
-        self.assertIn("Odd: repositories in ", log)
-        self.assertIn("accounts.json is not a list of absolute paths; longhaul will not use this account anywhere", log)
+        self.assertIn(f"Odd in {longhaul.home_path(str(tmp / 'relay' / 'accounts.json'))}: {longhaul.REPOSITORIES_JUNK}; "
+                      "longhaul will not use this account anywhere\n", log)
+
+    def test_a_repositories_field_that_is_not_a_list_of_paths_is_said_one_way(self):
+        # Final review, Sprint 7 (G6): the log, `longhaul status`, the
+        # --account refusal and the no-account line spelled it four ways
+        # ("absolute" in two, "field" in two); REPOSITORIES_JUNK is the one.
+        self.assertEqual(longhaul.REPOSITORIES_JUNK, "its repositories field is not a list of absolute paths")
+        odd = {"name": "Odd", "repositories": "junk"}
+        self.assertEqual(longhaul.where_allowed(odd), f"nowhere ({longhaul.REPOSITORIES_JUNK})")
+        self.assertEqual(longhaul.may_not_text(odd, "/x"), f"Odd may not be used in /x ({longhaul.REPOSITORIES_JUNK})")
+        self.assertIn(f"Odd nowhere ({longhaul.REPOSITORIES_JUNK}). ", longhaul.no_account_text("/x", [odd]))
 
 
 class Links(unittest.TestCase):
@@ -6656,7 +6666,7 @@ class Accounts(unittest.TestCase):
                 name = line.split(" ", 1)[0]
             under.setdefault(name, []).append(line)
         self.assertIn("       only in: ~/work, ~/other", under["Max"], out.stdout)
-        self.assertIn("       repositories is not a list of absolute paths; longhaul will not use this account anywhere",
+        self.assertIn(f"       {longhaul.REPOSITORIES_JUNK}; longhaul will not use this account anywhere",
                       under["Team"], out.stdout)
         self.assertFalse([l for l in under["Pro"] if "only in" in l or "repositories" in l], "Pro is unrestricted")
 
