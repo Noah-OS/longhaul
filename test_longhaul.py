@@ -1933,6 +1933,11 @@ class Plugin(unittest.TestCase):
             for key, text in longhaul.CODEGRAPH_INSTALL.items():
                 self.assertTrue(lines(readme, text), f"no README.md line holds CODEGRAPH_INSTALL[{key!r}]: {text}")
         with self.subTest("the index commands"):  # Sprint 7, G4: the README quotes each init command as the code runs it
+            # The headings the two sections are found by, said as such when
+            # one is renamed, not an IndexError (review, Sprint 7, F15).
+            headings = re.findall(r"^## .*$", readme, re.M)
+            for heading in ("## A code index, built for you", "## Pairs well with CodeGraph and Trail-Code"):
+                self.assertIn(heading, headings, "the README's heading the subtest splits on")
             section = readme.split("\n## A code index, built for you", 1)[1].split("\n## ", 1)[0]
             for program, command in longhaul.INDEX_COMMANDS.items():
                 self.assertTrue(lines(section, f"`{' '.join(command)}`"), f"the section quotes {program}'s command verbatim")
@@ -2559,7 +2564,7 @@ class Index(unittest.TestCase):
 
     def note(self, program, top=None):
         return longhaul.INDEX_NOTE.format(command=" ".join(longhaul.INDEX_COMMANDS[program]),
-                                          where=str(self.repo) if top is None else top)
+                                          where=longhaul.home_path(str(self.repo) if top is None else top))
 
     def calls(self, program):
         path = self.tmp / f"{program}.calls"
@@ -2762,10 +2767,11 @@ class Index(unittest.TestCase):
         self.assertEqual(self.calls("codegraph"), [f"{real} init -y"])
         self.assertEqual(self.calls("trail"), [f"{real} init --yes --no-global --no-statusline --no-agents"])
         log = (self.home / "longhaul.log").read_text()
-        self.assertIn(f"index: started codegraph init in {top} (pid ", log)
-        self.assertIn(f"index: started trail init in {top} (pid ", log)
-        self.assertRegex(log, rf"index: codegraph init in {re.escape(top)} exit 0 after \d+\.\d s\n")
-        self.assertRegex(log, rf"index: trail init in {re.escape(top)} exit 0 after \d+\.\d s\n")
+        where = longhaul.home_path(top)  # as the log names it: ~/... were the scratch tree under the home folder
+        self.assertIn(f"index: started codegraph init in {where} (pid ", log)
+        self.assertIn(f"index: started trail init in {where} (pid ", log)
+        self.assertRegex(log, rf"index: codegraph init in {re.escape(where)} exit 0 after \d+\.\d s\n")
+        self.assertRegex(log, rf"index: trail init in {re.escape(where)} exit 0 after \d+\.\d s\n")
         self.assertEqual(self.begin(self.start()), [], "the next session finds both maps")
         self.assertEqual(self.context(self.check(self.start())), longhaul.GUARD_CODEGRAPH,
                          "and the guard's own note of the CodeGraph index takes over")
@@ -3132,10 +3138,15 @@ class Index(unittest.TestCase):
     def test_the_init_runs_in_the_top_level_and_writes_nothing_outside_it(self):
         # The review's boundary point: the init runs in the top level, not
         # in the session's cwd, and nothing of the run lands beside the
-        # repository or anywhere but Longhaul's index/ folder.
-        sibling = self.tmp / "sibling"
+        # repository or anywhere but Longhaul's index/ folder. The home
+        # folder is in the scratch tree too, for this process and for the
+        # runner and the programs, so a write under it would be listed
+        # (review, Sprint 7, F15).
+        sibling, user = self.tmp / "sibling", self.tmp / "user"
         sibling.mkdir()
         (sibling / "keep.txt").write_text("x")
+        user.mkdir()
+        (user / "keep.txt").write_text("x")
         for name in self.MAPS:  # the fakes' own records, and Longhaul's log and lock: there before and after
             (self.tmp / f"{name}.calls").touch()
             (self.tmp / f"{name}.env").touch()
@@ -3148,10 +3159,12 @@ class Index(unittest.TestCase):
 
         before = listing()
         self.assertIn("sibling/keep.txt", before)
-        self.assertEqual(self.begin(self.start(cwd=str(self.repo / "src"))),
-                         [("codegraph", str(self.repo)), ("trail", str(self.repo))])
-        for program in self.MAPS:
-            self.assertEqual(self.wait(program)["exit"], 0, program)
+        self.assertIn("user/keep.txt", before)
+        with mock.patch.object(longhaul, "HOME", user), mock.patch.dict(os.environ, {"HOME": str(user)}):
+            self.assertEqual(self.begin(self.start(cwd=str(self.repo / "src"))),
+                             [("codegraph", str(self.repo)), ("trail", str(self.repo))])
+            for program in self.MAPS:
+                self.assertEqual(self.wait(program)["exit"], 0, program)
         real = os.path.realpath(self.repo)
         self.assertEqual(self.calls("codegraph"), [f"{real} init -y"], "run in the top level, not in the cwd")
         self.assertEqual(self.calls("trail"), [f"{real} init --yes --no-global --no-statusline --no-agents"])
@@ -3249,7 +3262,8 @@ class Index(unittest.TestCase):
         self.assertEqual([p.name for p in (self.home / "index").glob("*.json")], [f"{longhaul.index_key(str(self.repo))}.json"])
         self.assertEqual(self.state()["top"], os.path.realpath(self.repo), "the state names the real path")
         self.assertEqual(self.calls("codegraph"), [f"{os.path.realpath(self.repo)} init -y"], "one run, in the physical folder")
-        self.assertIn(f"index: started codegraph init in {link} (pid ", (self.home / "longhaul.log").read_text(),
+        self.assertIn(f"index: started codegraph init in {longhaul.home_path(str(link))} (pid ",
+                      (self.home / "longhaul.log").read_text(),
                       "the log names the path given")
         self.assertTrue((self.repo / ".codegraph").is_dir() and (self.repo / ".trail").is_dir())
 
@@ -3262,8 +3276,8 @@ class Index(unittest.TestCase):
         self.assertEqual(text, self.note("codegraph"))
         # The folder appears before the build ends, so the note names no
         # folder to watch for (review, Sprint 7, F19).
-        self.assertEqual(text, f"Longhaul started `codegraph init -y` in {top} in the background for later sessions; "
-                               "in this session search as you would without an index.")
+        self.assertEqual(text, f"Longhaul started `codegraph init -y` in {longhaul.home_path(top)} in the background "
+                               "for later sessions; in this session search as you would without an index.")
         self.assertNotIn("install", text.lower())
         self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
         self.assertEqual(self.wait("codegraph")["exit"], 0)
@@ -3277,7 +3291,8 @@ class Index(unittest.TestCase):
         self.assertEqual(text, f"{longhaul.GUARD_CODEGRAPH} {self.note('trail', str(other))}")
         self.assertEqual(self.wait("trail", str(other))["exit"], 0)
         self.assertNotIn("install", text.lower())
-        self.assertIn(f"guard: named the CodeGraph index at {other} at startup", (self.home / "longhaul.log").read_text())
+        self.assertIn(f"guard: named the CodeGraph index at {longhaul.home_path(str(other))} at startup",
+                      (self.home / "longhaul.log").read_text())
         # `where` is by home_path: a project under the home folder shows as ~/...
         third = self.tmp / "third"
         (third / ".git").mkdir(parents=True)
@@ -3297,7 +3312,10 @@ class Index(unittest.TestCase):
                              timeout=10)
         took = time.time() - started
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertLess(took, 1.5, "the hook returned with the init running on")
+        # Under the fake's 3 s sleep, so the hook did not wait for it; the
+        # proof is the exit still None below, not a tighter figure, which
+        # a loaded machine's slow start would break (review, Sprint 7, F15).
+        self.assertLess(took, 3, "the hook returned with the init running on")
         self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
         self.assertIsNone(self.state()["runs"]["codegraph"]["exit"], "still running when the hook had returned")
         self.assertEqual(self.wait("codegraph")["exit"], 0)
