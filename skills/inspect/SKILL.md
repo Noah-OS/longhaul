@@ -1,6 +1,6 @@
 ---
 name: inspect
-description: "Show where this conversation's tokens went: usage by kind, context growth, the cache, the biggest tool outputs, repeated reads, and what the guard caught. Numbers only, each with its source."
+description: "Show where this conversation's tokens went: usage by kind, context growth, the cache, the biggest tool outputs, searches (their chains and big results, and whether a code index was seen), repeated reads, and what the guard caught. Numbers only, each with its source."
 argument-hint: "[conversation id, or nothing for this one]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul inspect *)
 ---
@@ -20,3 +20,5 @@ written its file, or Longhaul's folder may be elsewhere (LONGHAUL_HOME).
 If the user gave an argument ($ARGUMENTS), run
 `${CLAUDE_PLUGIN_ROOT}/bin/longhaul inspect "$ARGUMENTS"` instead and show
 that.
+
+The report may name an install command; show it, take no install step.
