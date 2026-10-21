@@ -4,12 +4,13 @@ Code writes (sessions/<pid>.json, projects/*/<sid>.jsonl) and acts out one
 step of FAKE_PLAN per launch, so longhaul's loop runs without an account, a
 network or a terminal.
 
-Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | rc_drop |
-rc_drop_then_exit | idle_wait | idle_wait_agents | exit_after_signin_change |
-clear_then_crash | stay
+Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
+rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
+exit_after_signin_change | clear_then_crash | stay
 
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
-2.1.304; `crash` ends with code 1. `--version` prints FAKE_VERSION.
+2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
+sees as -9. `--version` prints FAKE_VERSION.
 """
 
 import datetime as dt
@@ -117,6 +118,12 @@ elif step == "crash":
     session(status="idle")
     time.sleep(0.2)
     sys.exit(1)
+elif step == "killed":
+    # What the Sprint 6 live check does to a real claude (`kill -9`): no exit
+    # code of its own, so the parent sees -9, not 1.
+    session(status="idle")
+    time.sleep(0.2)
+    os.kill(os.getpid(), signal.SIGKILL)
 else:
     session(status="idle")
     time.sleep(0.2)

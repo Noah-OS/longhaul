@@ -391,6 +391,16 @@ class Loop(unittest.TestCase):
         self.assertEqual(len(calls), 4, out.stdout + out.stderr)
         self.assertEqual(out.returncode, 0)
 
+    def test_a_claude_killed_by_a_signal_is_reopened_and_the_signal_is_said(self):
+        # Sprint 6, R5: a real crash's exit code has not been observed, and the
+        # live check kills claude with SIGKILL, so the suite has that case first.
+        # The code is -9, not 1: the log must say which.
+        out, calls = self.run_longhaul(["killed", "exit"], runs=2)
+        self.assertEqual(len(calls), 2, out.stdout + out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertIn("Max ended: crashed (session sid-1, exit -9)", (self.home / "longhaul.log").read_text())
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)  # MAX_RUNS reached
+
     def test_a_conversation_another_longhaul_supervises_is_refused(self):
         held = longhaul_lock(self.home, "sid-held")
         out, calls = self.run_longhaul(["exit"], "-r", "sid-held", runs=1)
