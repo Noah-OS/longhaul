@@ -257,8 +257,10 @@ CARRY_ON_SAME = (
     "reopened this conversation on it. Carry on from where you stopped. Background "
     "agents started before the stop have stopped; resume any that were still working."
 )
+# {every}: "every account", or "every account allowed here" when the rest
+# were not at their limits but restricted to other repositories.
 CARRY_ON_AFTER_WAIT = (
-    "The {old} account hit its {kind} limit while every account was at its limit, "
+    "The {old} account hit its {kind} limit while {every} was at its limit, "
     "so longhaul waited for the {new} account to reset and reopened this conversation. "
     "Carry on from where you stopped. Background agents started before the stop "
     "have stopped; resume any that were still working."
@@ -624,6 +626,32 @@ def denied_in(accounts: list[dict], top: str) -> set[str]:
     return {a["name"] for a in accounts} - set(eligible(accounts, top))
 
 
+def where_allowed(acct: dict) -> str:
+    """An account's restriction in words: "only in ~/work/repo, ~/other";
+    "nowhere (...)" for a field that is not a list of paths; "anywhere"."""
+    allowed = repositories_of(acct)
+    if allowed is None:
+        return "nowhere (its repositories field is not a list of paths)"
+    return "only in " + ", ".join(home_path(p) for p in allowed) if allowed else "anywhere"
+
+
+def may_not_text(acct: dict, top: str) -> str:
+    """The refusal of --account NAME where NAME may not be used (Q1):
+    "Pro may not be used in ~/personal/x (its repositories: ~/work/repo)"."""
+    allowed = repositories_of(acct)
+    why = ("its repositories: " + ", ".join(home_path(p) for p in allowed) if allowed
+           else "its repositories field is not a list of paths")
+    return f"{acct['name']} may not be used in {home_path(top)} ({why})"
+
+
+def no_account_text(top: str, accounts: list[dict]) -> str:
+    """The one line said when no account may be used in `top`: each
+    account's restriction, the file to edit, the other way out."""
+    each = ", ".join(f"{a['name']} {where_allowed(a)}" for a in accounts)
+    return (f"No account may be used in {home_path(top)}: {each}. "
+            f'Edit "repositories" in {home_path(str(LONGHAUL_HOME / "accounts.json"))}, or run from one of those.')
+
+
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
          seen: dict | None = None):
     """The account to launch on.
@@ -632,8 +660,9 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     among them the one whose unused allowance expires soonest; ties (and no
     readings at all) go in order from `start`. Returns (index, None), or
     (index, until) when every account is at a limit: the one that resets
-    first, and when. Accounts in `skip` (signed in to the wrong email) are
-    never picked; (None, None) when none is left.
+    first, and when. Accounts in `skip` (signed in to the wrong email, or
+    restricted to other repositories) are never picked; (None, None) when
+    none is left.
     """
     now = time.time() if now is None else now
     seen = seen or {}
@@ -1420,6 +1449,17 @@ def run(opts) -> int:
     if opts.account and opts.account not in names:
         say(f"no account called {opts.account}; the accounts are {', '.join(names)}")
         return 2
+    # An account restricted to other repositories is never used here: an
+    # explicit --account that contradicts the policy fails loudly (Q1), and
+    # with no account allowed longhaul stops before any launch.
+    top = repository_of(os.getcwd())
+    denied = denied_in(accounts, top)
+    if opts.account in denied:
+        say(f"{may_not_text(accounts[names.index(opts.account)], top)}; longhaul has not started Claude")
+        return 2
+    if denied and all(name in denied for name in names):
+        say(no_account_text(top, accounts))
+        return 1
     idx = names.index(opts.account) if opts.account else 0
     resume, cont, prompt = full_session_id(opts.resume), opts.cont, None
     if opts.first is not None:
@@ -1517,7 +1557,13 @@ def run(opts) -> int:
     stay: str | None = None
     if resume and mode != "auto" and not forced:
         stay = last_account(resume, accounts)
-        if stay:
+        if stay in denied:
+            # Checked before the wait below: longhaul must not wait for a
+            # reset it would then refuse. The record stays as it is: it
+            # still says where the conversation ran.
+            say(f"{resume[:8]} last ran on {stay}, which may not be used in {home_path(top)}; picking an account")
+            stay = None
+        elif stay:
             say(f"{resume[:8]} last ran on {stay}; with switching set to {mode} it starts there "
                 "(use --account to choose, --switch auto to let longhaul pick)")
         else:
@@ -1531,8 +1577,9 @@ def run(opts) -> int:
         # Checked before every launch, not once: on 2026-10-15 a sign-in in
         # VS Code moved ~/.claude to the second account while longhaul waited for
         # a reset, and a check made only at start would have carried on as
-        # "Max" on the wrong account.
-        wrong: set[str] = set()
+        # "Max" on the wrong account. Seeded with the accounts restricted to
+        # other repositories: pick(), the limit and the early move skip them.
+        wrong: set[str] = set(denied)
         chosen = False
         if stay:
             # Within the margin too: a question unanswered until the reset
@@ -1562,7 +1609,8 @@ def run(opts) -> int:
             say("No account is signed in as expected. Run `longhaul status`, then `longhaul setup`.")
             return 1
         if until:
-            if not wait_until(until + RESET_MARGIN, "Every account is at its limit"):
+            which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
+            if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
                 return 0
             continue
         acct = accounts[idx]
@@ -1648,6 +1696,7 @@ def run(opts) -> int:
             nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong,
                              seen=readings(accounts))
             new = accounts[nxt]["name"]
+            every = "every account allowed here" if denied else "every account"
             msg = f"{acct['name']} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])})."
             # The person at this terminal is the front end, so consent is
             # given. With every account at its limit there is nowhere to
@@ -1665,7 +1714,7 @@ def run(opts) -> int:
                 return 0
             if answer == "yes":  # always, in "auto"
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
-                    old=acct["name"], kind=w.limit["kind"], new=new)
+                    old=acct["name"], kind=w.limit["kind"], new=new, every=every)
                 if mode == "ask":  # the question has said the rest
                     msg = f"Moving to {new}: reopening this conversation there with a carry-on message."
                 elif not wait:
@@ -1675,7 +1724,7 @@ def run(opts) -> int:
                 notify(msg)
             else:  # "ask" without a yes, or "never": the reset, on this account
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
-                    old=acct["name"], kind=w.limit["kind"], new=acct["name"])
+                    old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
                 log(msg)  # the wait at the top of the loop says it, with the time
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to

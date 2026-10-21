@@ -57,9 +57,10 @@ class Loop(unittest.TestCase):
         (self.home / "accounts.json").write_text(json.dumps(
             [{"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(self.pro)}]))
 
-    def run_longhaul(self, plan, *argv, runs=2, timeout=30, answer=None, **env):
+    def run_longhaul(self, plan, *argv, runs=2, timeout=30, answer=None, cwd=None, **env):
         """longhaul against the fake Claude. `answer`: keys typed, again and again,
-        at a terminal longhaul gets as its stdin; without it there is no terminal."""
+        at a terminal longhaul gets as its stdin; without it there is no terminal.
+        `cwd`: the folder longhaul runs in (default: the scratch folder)."""
         (self.home / "plan.json").write_text(json.dumps(plan))
         # LONGHAUL_SWITCH=auto: the tests written before Sprint 1 assert today's
         # moves, which became the "auto" mode when "ask" became the default.
@@ -86,7 +87,7 @@ class Loop(unittest.TestCase):
         try:
             # Its own process group: killed on a timeout, longhaul cannot stop the
             # Claude it started, which then holds the pipes open (review, Sprint 1).
-            proc = subprocess.Popen(cmd, env=full, cwd=self.tmp,
+            proc = subprocess.Popen(cmd, env=full, cwd=cwd or self.tmp,
                                     stdin=slave if slave is not None else subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                     start_new_session=True)
@@ -741,6 +742,120 @@ class Loop(unittest.TestCase):
         self.assertEqual(len(calls), 1, out.stderr)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertNotIn("Traceback", out.stderr)
+
+    # Sprint 7, A2: an account restricted to repositories ("repositories" in
+    # accounts.json) is never started, resumed or moved to outside them,
+    # whatever --account or the session's record says.
+
+    def repositories(self):
+        """work/.git and personal/.git under the scratch folder: (work, personal)."""
+        for name in ("work", "personal"):
+            (self.tmp / name / ".git").mkdir(parents=True)
+        return self.tmp / "work", self.tmp / "personal"
+
+    def restrict(self, name, *repos):
+        """`name` restricted to `repos` in accounts.json; the rest as they were."""
+        accounts = json.loads((self.home / "accounts.json").read_text())
+        for a in accounts:
+            if a["name"] == name:
+                a["repositories"] = [str(r) for r in repos]
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
+
+    def shown(self, folder):
+        """`folder` as longhaul names the session's: its real path (what
+        os.getcwd() gives, /private/var for /var on a Mac), ~ for the home."""
+        return longhaul.home_path(os.path.realpath(folder))
+
+    def favour_pro(self):
+        """Readings with which pick() prefers Pro: its weekly room is lost first."""
+        self.reading("Max", five=50, five_in=7200)
+        self.reading("Pro", five=10, week=40, week_in=1200)
+
+    def test_a_new_session_in_an_allowed_repository_may_use_the_restricted_account(self):
+        work, _ = self.repositories()
+        self.restrict("Pro", work)
+        self.favour_pro()
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=work)
+        self.assertEqual(calls[0]["config"], str(self.pro), out.stdout)
+
+    def test_a_new_session_in_another_repository_never_uses_the_restricted_account(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        self.favour_pro()
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=personal)
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertIsNone(calls[0]["config"], "Pro may not be used in personal, so Max")
+
+    def test_a_limit_moves_only_to_an_account_allowed_in_the_repository(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        started = time.time()
+        out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], cwd=personal)
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
+        self.assertGreaterEqual(time.time() - started, 2, "Max waited for its own reset")
+        self.assertIn(f"Every account allowed in {self.shown(personal)} is at its limit", out.stdout)
+        # Pro was not at its limit, only not allowed here: the carry-on must
+        # not tell Claude that every account was.
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            "The Max account hit its session limit while every account allowed here was at its limit, "
+            "so longhaul waited for the Max account to reset"), calls[1]["args"][-1])
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], cwd=work)
+        self.assertEqual([c["config"] for c in calls[-2:]], [None, str(self.pro)], "in work it moves to Pro")
+
+    def test_a_nearly_full_idle_session_never_moves_early_to_an_account_not_allowed_here(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        self.reading("Max", five=96)
+        out, calls = self.run_longhaul(["idle_wait"], "--account", "Max", runs=1, LONGHAUL_IDLE_MOVE_SECONDS="0",
+                                       cwd=personal)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("Max ended: move", log)
+
+    def test_a_resumed_conversation_whose_recorded_account_is_no_longer_allowed_is_not_resumed_there(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        self.transcript("sid-old")
+        self.record("sid-old", "Pro")
+        # Pro at its limit: the record check comes before the wait, or
+        # longhaul would wait for a reset it then refuses.
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 10}}))
+        started = time.time()
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="ask", cwd=personal)
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertEqual((calls[0]["config"], calls[0]["args"][:2]), (None, ["--resume", "sid-old"]), "Max, picked")
+        self.assertLess(time.time() - started, 10, "no wait for Pro's reset")
+        self.assertIn(f"sid-old last ran on Pro, which may not be used in {self.shown(personal)}; picking an account",
+                      out.stdout)
+
+    def test_the_account_flag_is_refused_where_the_account_may_not_be_used(self):
+        work, personal = self.repositories()
+        self.restrict("Pro", work)
+        out, calls = self.run_longhaul(["exit"], "--account", "Pro", runs=1, cwd=personal)
+        self.assertEqual((out.returncode, calls), (2, []), out.stdout)
+        self.assertIn(f"Pro may not be used in {self.shown(personal)} (its repositories: {work}); "
+                      "longhaul has not started Claude", out.stdout)
+
+    def test_with_no_account_allowed_in_the_repository_longhaul_stops_before_starting_claude(self):
+        work, personal = self.repositories()
+        self.restrict("Max", work)
+        self.restrict("Pro", work / "sub")
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=personal)
+        self.assertEqual((out.returncode, calls), (1, []), out.stdout)
+        self.assertIn(f"No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work / 'sub'}. "
+                      f'Edit "repositories" in {self.home / "accounts.json"}, or run from one of those.', out.stdout)
+
+    def test_a_session_started_through_a_symlink_to_an_allowed_repository_is_allowed(self):
+        work, _ = self.repositories()
+        link = self.tmp / "link"
+        link.symlink_to(work)
+        self.favour_pro()
+        self.restrict("Pro", link)
+        _, calls = self.run_longhaul(["exit"], runs=1, cwd=work)
+        self.assertEqual(calls[-1]["config"], str(self.pro), "an entry that is a link to the repository")
+        self.restrict("Pro", work)
+        _, calls = self.run_longhaul(["exit"], runs=1, cwd=link)
+        self.assertEqual(calls[-1]["config"], str(self.pro), "a session started through a link to it")
 
 
 class Usage(unittest.TestCase):
