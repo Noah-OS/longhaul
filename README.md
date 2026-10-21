@@ -143,9 +143,9 @@ Nothing but the checkpoint file, and the skill's state file until the save takes
 
 Longhaul never edits `~/.claude/settings.json` or `~/.claude.json`. Two things touch them, and both are yours: installing the plugin, Claude Code's own step, which records the plugin as enabled in your settings; and the status line, which you point at `longhaul statusline` in your own settings. The advanced feature writes elsewhere, and its section says where. Its one exception is the promotion that section describes: a `settings.json`, `keybindings.json` or `CLAUDE.md` you changed in a chat on another account becomes the shared file, and the one before is kept beside it.
 
-## Advanced: carry on across your subscriptions (opt-in)
+## Advanced, experimental: carry on across your subscriptions (opt-in)
 
-Off unless you turn it on. It moves one person's own conversation between that person's own subscriptions, never an account between people; read your subscriptions' terms and decide for yourself.
+Off unless you turn it on, and experimental: the supervisor's behaviour at a real usage limit, after a real crash and across a real account change has been exercised against a fake Claude and in short live checks, not yet end to end on real sessions (see Limitations). It moves one person's own conversation between that person's own subscriptions, never an account between people; read your subscriptions' terms and decide for yourself.
 
 If you have more than one Claude subscription, `longhaul`, the terminal command, not the plugin, runs `claude` in your terminal with Remote Control on and watches it. At a usage limit it closes Claude, and then:
 
