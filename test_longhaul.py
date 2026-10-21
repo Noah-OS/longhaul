@@ -4369,6 +4369,108 @@ class Pieces(unittest.TestCase):
         r.end_swap()
         self.assertFalse(r.paused)
 
+    # Sprint 7, A2: an account restricted to repositories ("repositories"
+    # in accounts.json). The helpers are pure; realpath() is their only I/O,
+    # on a scratch tree of the test's own.
+
+    def tree(self):
+        """work/.git; work/sub/.git (a repository nested in work); work/deep/er;
+        work2/.git (a sibling whose name starts with work's); personal/.git;
+        link -> work; and work/vendor -> personal, a link inside work to a
+        repository elsewhere."""
+        tmp = Path(tempfile.mkdtemp())
+        for repo in ("work", "work/sub", "work2", "personal"):
+            (tmp / repo / ".git").mkdir(parents=True)
+        (tmp / "work" / "deep" / "er").mkdir(parents=True)
+        (tmp / "link").symlink_to(tmp / "work")
+        (tmp / "work" / "vendor").symlink_to(tmp / "personal")
+        return tmp
+
+    def allowed(self, top, *repos):
+        """Whether an account restricted to `repos` may be used in `top`."""
+        return longhaul.account_allowed({"name": "Pro", "repositories": [str(r) for r in repos]}, str(top))
+
+    def test_account_allowed_with_no_repositories_field_or_an_empty_list_allows_everywhere(self):
+        for acct in ({"name": "Max"}, {"name": "Max", "repositories": None}, {"name": "Max", "repositories": []}):
+            for top in ("/anywhere/at/all", "/", str(Path.home())):
+                self.assertTrue(longhaul.account_allowed(acct, top), (acct, top))
+
+    def test_account_allowed_compares_real_paths_on_both_sides(self):
+        tmp = self.tree()
+        work = tmp / "work"
+        with mock.patch.dict(os.environ, {"HOME": str(tmp)}):
+            self.assertTrue(self.allowed(work, "~/work"), "a ~ entry, expanded as config_dir is")
+        self.assertTrue(self.allowed(work, f"{work}/"), "a trailing slash")
+        self.assertTrue(self.allowed(work, tmp / "link"), "an entry that is a link to the repository")
+        self.assertTrue(self.allowed(tmp / "link", work), "a session folder reached through a link")
+        # On a Mac mkdtemp's folder is under /var, itself a link to
+        # /private/var: the real path on either side still agrees.
+        self.assertTrue(self.allowed(os.path.realpath(work), work))
+        self.assertTrue(self.allowed(work, os.path.realpath(work)))
+        self.assertFalse(self.allowed(tmp / "personal", work), "another repository")
+
+    def test_a_nested_repository_is_allowed_by_an_entry_for_its_parent_and_not_the_reverse(self):
+        tmp = self.tree()
+        work = tmp / "work"
+        self.assertTrue(self.allowed(work / "sub", work), "work/sub/.git is inside work (Q2: nested ones inherit)")
+        self.assertTrue(self.allowed(work / "deep" / "er", work), "any folder inside it")
+        self.assertFalse(self.allowed(work, work / "sub"), "an entry for the nested one, a session at the outer root")
+        self.assertFalse(self.allowed(tmp / "work2", work), "a sibling whose name starts with the entry's")
+
+    def test_a_symlink_inside_an_allowed_repository_to_another_repository_is_denied(self):
+        tmp = self.tree()
+        work = tmp / "work"
+        top = longhaul.repository_of(str(work / "vendor"))
+        self.assertEqual(top, str(work / "vendor"), "the link shows personal's .git, so the walk stops at it")
+        self.assertFalse(self.allowed(top, work), "its real top is personal, wherever you came from")
+        self.assertTrue(self.allowed(top, tmp / "personal"))
+
+    def test_repository_of_is_the_nearest_git_top_or_the_folder_itself(self):
+        tmp = self.tree()
+        work = tmp / "work"
+        self.assertEqual(longhaul.repository_of(str(work / "deep" / "er")), str(work), "a subfolder")
+        self.assertEqual(longhaul.repository_of(str(work / "sub")), str(work / "sub"), "the nearest .git wins")
+        (tmp / "wt").mkdir()
+        (tmp / "wt" / ".git").write_text(f"gitdir: {work}/.git/worktrees/wt\n")
+        self.assertEqual(longhaul.repository_of(str(tmp / "wt")), str(tmp / "wt"), "a worktree's .git file")
+        (tmp / "plain" / "deeper").mkdir(parents=True)
+        self.assertEqual(longhaul.repository_of(str(tmp / "plain" / "deeper")), str(tmp / "plain" / "deeper"),
+                         "no .git at or above it: the folder itself")
+        home = tmp / "home"
+        (home / ".git").mkdir(parents=True)
+        (home / "proj").mkdir()
+        with mock.patch.object(longhaul, "HOME", home):
+            self.assertEqual(longhaul.repository_of(str(home / "proj")), str(home / "proj"),
+                             "a dotfiles repository at ~ is declined by index_top(): the folder itself")
+
+    def test_a_repositories_field_that_is_not_a_list_of_absolute_paths_allows_nothing(self):
+        tmp = self.tree()
+        work = str(tmp / "work")
+        for junk in (work, "~/work", 42, True, {"path": work}, [work, "relative/one"], [work, None], [work, 7], [""]):
+            acct = {"name": "Pro", "repositories": junk}
+            self.assertIsNone(longhaul.repositories_of(acct), repr(junk))
+            self.assertFalse(longhaul.account_allowed(acct, work), f"{junk!r} must fail closed, even naming work")
+            self.assertFalse(longhaul.account_allowed(acct, "/anywhere"), repr(junk))
+        with mock.patch.dict(os.environ, {"HOME": str(tmp)}):
+            self.assertEqual(longhaul.repositories_of({"name": "Pro", "repositories": ["~/work", "/x"]}),
+                             [work, "/x"], "a list of absolute paths, ~ expanded")
+        self.assertEqual(longhaul.repositories_of({"name": "Pro"}), [], "no field: unrestricted")
+
+    def test_eligible_keeps_the_files_order_and_the_denied_are_the_rest(self):
+        tmp = self.tree()
+        work, personal = str(tmp / "work"), str(tmp / "personal")
+        accounts = [{"name": "Team", "repositories": [personal]}, {"name": "Max"},
+                    {"name": "Pro", "repositories": [work]}, {"name": "Odd", "repositories": "junk"}]
+        self.assertEqual(longhaul.eligible(accounts, work), ["Max", "Pro"])
+        self.assertEqual(longhaul.eligible(accounts, personal), ["Team", "Max"])
+        self.assertEqual(longhaul.eligible(accounts, str(tmp)), ["Max"])
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", tmp / "relay"):
+            self.assertEqual(longhaul.denied_in(accounts, work), {"Team", "Odd"})
+            log = (tmp / "relay" / "longhaul.log").read_text()
+        self.assertEqual(log.count("\n"), 1, log)
+        self.assertIn("Odd: repositories in ", log)
+        self.assertIn("accounts.json is not a list of absolute paths; longhaul will not use this account anywhere", log)
+
 
 class Links(unittest.TestCase):
     """A transcript link to nowhere under the projects folder (T6), and

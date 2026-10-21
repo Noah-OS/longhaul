@@ -559,6 +559,71 @@ def readings(accounts: list[dict]) -> dict:
     return {a["name"]: read_json(USAGE_DIR / f"{a['name']}.json") for a in accounts}
 
 
+# An account may be restricted to repositories (Sprint 7, A2): an optional
+# "repositories": ["~/work/repo", ...] in accounts.json; absent, null or []
+# is unrestricted, today's behaviour exactly. Outside its repositories an
+# account is never started, resumed or moved to, whatever --account or a
+# session's record says. The helpers below are pure, realpath() their only
+# I/O; each entry point words its own refusal.
+
+def repositories_of(acct: dict):
+    """The paths in an account's "repositories", `~` expanded as config_dir
+    is: [] for none (absent, null or an empty list: unrestricted), None
+    when the value is not a list of absolute paths (a string, a number, an
+    object, or a relative, empty or null entry in the list), which allows
+    the account nowhere. A typo must fail closed, never open; a relative
+    entry would resolve against whatever folder longhaul runs in."""
+    found = acct.get("repositories")
+    if not found:
+        return []
+    if not isinstance(found, list):
+        return None
+    paths = [os.path.expanduser(p) if isinstance(p, str) else "" for p in found]
+    return paths if all(os.path.isabs(p) for p in paths) else None
+
+
+def repository_of(cwd: str) -> str:
+    """The repository a session in `cwd` is in: the git work tree's top
+    (index_top(): the nearest `.git` entry at or above the folder), or the
+    folder itself outside any work tree, and under a repository at `~`,
+    which index_top() declines."""
+    return index_top(cwd) or cwd
+
+
+def account_allowed(acct: dict, top: str) -> bool:
+    """Whether `acct` may be used in the repository `top`: always, with no
+    "repositories"; else when an entry is the repository or a parent of
+    it, by real path on both sides. So a repository or a worktree nested
+    in an allowed one needs no entry of its own, an entry that is a link to
+    the repository counts, ~/work/repo2 never matches ~/work/repo, and a
+    link inside an allowed repository to one elsewhere is that one."""
+    allowed = repositories_of(acct)
+    if allowed is None:
+        return False
+    if not allowed:
+        return True
+    real = os.path.realpath(top)
+    return any(real == entry or real.startswith(entry.rstrip(os.sep) + os.sep)
+               for entry in map(os.path.realpath, allowed))
+
+
+def eligible(accounts: list[dict], top: str) -> list[str]:
+    """The names of the accounts that may be used in `top`, in the file's order."""
+    return [a["name"] for a in accounts if account_allowed(a, top)]
+
+
+def denied_in(accounts: list[dict], top: str) -> set[str]:
+    """The names the choosers skip in `top`, for the skip set each has
+    already (pick's `skip`, choose_for_panel's `wrong`, Relay.bad): the
+    list is never filtered, so no index into it shifts. An account whose
+    field is not a list of absolute paths is named in one log line."""
+    for a in accounts:
+        if repositories_of(a) is None:
+            log(f"{a['name']}: repositories in {home_path(str(LONGHAUL_HOME / 'accounts.json'))} is not a list of "
+                "absolute paths; longhaul will not use this account anywhere")
+    return {a["name"] for a in accounts} - set(eligible(accounts, top))
+
+
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
          seen: dict | None = None):
     """The account to launch on.
