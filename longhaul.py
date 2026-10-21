@@ -2346,19 +2346,23 @@ def inspect(opts) -> int:
 # ---------------------------------------------------------------- guard
 #
 # `longhaul guard`: the plugin's hook (hooks/hooks.json), run before every
-# Read and Bash call, and on SessionStart after a compaction or a clear.
-# It reads the hook's JSON on stdin and answers with JSON, or with nothing
-# (code.claude.com/docs/en/hooks, read 2026-10-20). In warn mode, the
-# default, it adds context and the call runs; in block mode
-# (LONGHAUL_GUARD=block) it denies with the same text; off, it does
-# nothing. Whatever goes wrong it prints nothing and exits 0: the engine
-# lets a call run on any exit but 2, and a guard must never stop a call it
-# did not mean to stop. Its record holds numbers only: file paths, sizes,
-# times and counts; never a command line or a file's text. A subagent is
-# its own context (the hook input names it), so its first read of a file
-# is never a repeat of the main conversation's. After a compaction or a
-# clear nothing read before is in the context, so the record forgets its
-# reads and keeps its counts.
+# Read and Bash call, on SessionStart after a compaction or a clear, and
+# at a session's start. It reads the hook's JSON on stdin and answers
+# with JSON, or with nothing (code.claude.com/docs/en/hooks, read
+# 2026-10-20). In warn mode, the default, it adds context and the call
+# runs; in block mode (LONGHAUL_GUARD=block) it denies with the same
+# text; off, it does nothing. Whatever goes wrong it prints nothing and
+# exits 0: the engine lets a call run on any exit but 2, and a guard must
+# never stop a call it did not mean to stop. Its record holds numbers
+# only: file paths, sizes, times and counts; never a command line or a
+# file's text. A subagent is its own context (the hook input names it),
+# so its first read of a file is never a repeat of the main
+# conversation's. After a compaction or a clear nothing read before is in
+# the context, so the record forgets its reads and keeps its counts.
+# In a project with a CodeGraph index (.codegraph/) the guard also names
+# the index to the model at startup (Sprint 6, G3: the installed index's
+# tool was called 0 times in five weeks of sessions); it is context,
+# never a denial, and without the index it says nothing of it.
 
 
 GUARD_BIG = setting("LONGHAUL_GUARD_BIG", 20_000, int, 1)  # bytes: a whole read above this is waste
@@ -2366,6 +2370,10 @@ GUARD_RULES = ("repeat", "big", "cat")
 GUARD_ID = r"[A-Za-z0-9_-]{1,100}"  # a session's or an agent's id; "+" joins them in a record's name
 GUARD_KEEP = 500  # reads kept per record; the oldest go first
 GUARD_NO_PART = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf"}  # offset and limit are no advice
+GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symbol or dependency question (who calls X, "
+                   "what does Y depend on, where is Z defined), `codegraph explore \"<question>\"` or the "
+                   "codegraph_explore tool answers in one call with the source and the call paths; keep grep and rg "
+                   "for plain text.")
 
 
 def guard_mode() -> str:
@@ -2417,15 +2425,29 @@ def guard_targets(data: dict) -> list:
     return []
 
 
+def guard_indexed(data: dict) -> bool:
+    """Whether the project the hook runs in has a CodeGraph index: a
+    .codegraph/ folder under the input's cwd."""
+    cwd = data.get("cwd")
+    return isinstance(cwd, str) and os.path.isabs(cwd) and os.path.isdir(os.path.join(cwd, ".codegraph"))
+
+
 def guard_check(data, mode: str, now: float | None = None):
     """The guard's answer for one hook input: the hook's JSON, or None to
     let the call run unremarked. A PreToolUse is checked and recorded; a
-    SessionStart for compact or clear empties the record's reads."""
+    SessionStart for compact or clear empties the record's reads, and one
+    for startup names the project's CodeGraph index, if it has one."""
     if mode == "off" or not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
         if data.get("source") in ("compact", "clear"):
             guard_forget(data)
+        elif data.get("source") == "startup" and data.get("agent_id") is None and guard_indexed(data):
+            # The main conversation only: a subagent's start is not the
+            # session's. Without the index there is nothing to say here; the
+            # install advice is the inspect report's, not every session's.
+            log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
+            return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": GUARD_CODEGRAPH}}
         return None
     targets = guard_targets(data)
     record = guard_record_path(data) if targets else None

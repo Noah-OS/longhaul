@@ -105,12 +105,13 @@ Python 3.10 or later.
 
 ## What the hooks do, and how to turn them off
 
-`hooks/hooks.json` registers three hooks. Each runs the plugin's own `longhaul.py` with `python3`, has a 5-second timeout, and shows a status message while it runs.
+`hooks/hooks.json` registers four hooks. Each runs the plugin's own `longhaul.py` with `python3`, has a 5-second timeout, and shows a status message while it runs.
 
 | Hook | When | What it does |
 |---|---|---|
 | `PreToolUse` on `Read` and `Bash` | before every `Read` and every `Bash` call | `longhaul guard`. Reads the call from the hook's JSON on stdin: the tool, a `Read`'s file path and whether it is a part, or a `Bash` command's first program and its file arguments, and only when that program is `cat`. Checks each file's size and change times against the session's record and answers with advice (warn), a denial (block), or nothing. Writes `~/.longhaul/guard/<session>.json` (a subagent's record is `<session>+<agent>.json`). The command line itself is never kept. Status message: "Checking this call (longhaul guard)". |
 | `SessionStart` on `compact` and `clear` | after a compaction or a clear | `longhaul guard` again: empties the record's list of reads, since nothing read before is in the context now, and keeps its counts. "Forgetting this session's reads (longhaul guard)". |
+| `SessionStart` on `startup` | when a session starts | `longhaul guard` a third time: when the project folder holds a CodeGraph index (`.codegraph/`), puts one note into the main conversation's context naming `codegraph explore` for symbol and dependency questions and leaving `grep` and `rg` for plain text; without the index, nothing. Writes nothing but one log line. "Looking for a code index (longhaul guard)". |
 | `SessionStart` on `compact`, `clear` and `resume` | after a compaction, a clear or a resume | `longhaul checkpoint`: reads `~/.longhaul/checkpoints/<session>.json` if there is one and puts its text back into the context, with its age and which of the files it names changed since. Writes nothing but one log line. "Looking for a checkpoint (longhaul checkpoint)". |
 
 Every hook fails open. Whatever goes wrong, it prints nothing, writes at most a line per record to `~/.longhaul/longhaul.log`, and exits 0. Claude Code lets a call run on any exit but 2 and when a hook overruns its 5 seconds, so a guard never stops a call it did not mean to stop, and a session start is never stopped by its checkpoint. Measured warm on one Mac, the guard takes 87–94 ms per call. Once the plugin is enabled its hooks run in every session of every project; Claude Code has no switch per hook.
@@ -118,7 +119,7 @@ Every hook fails open. Whatever goes wrong, it prints nothing, writes at most a 
 Without `python3` on PATH the hooks cannot start; Claude Code then shows its own hook-error notice with the first line of stderr, lets the call run, and the skills' shell steps stop the skill with the shim's message.
 
 - **The guard off:** `LONGHAUL_GUARD=off` in the environment Claude Code starts with. `warn` is the default; `block` denies. The deny text never names the off switch: that is for you, not the model.
-- **The checkpoint hook** has no switch of its own. Disabling the plugin turns all three hooks off together: `/plugin`, the Installed tab, select Longhaul, Disable plugin; or `claude plugin disable longhaul@longhaul` in a shell; it applies at `/reload-plugins` or the next session.
+- **The checkpoint hook** has no switch of its own. Disabling the plugin turns all four hooks off together: `/plugin`, the Installed tab, select Longhaul, Disable plugin; or `claude plugin disable longhaul@longhaul` in a shell; it applies at `/reload-plugins` or the next session.
 
 ## What is written where
 

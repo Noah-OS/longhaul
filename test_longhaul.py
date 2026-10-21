@@ -1772,6 +1772,13 @@ class Guard(unittest.TestCase):
             data["agent_id"], data["agent_type"] = agent, "Explore"
         return data
 
+    def start(self, source="startup", agent=None, session="s1"):
+        data = {"session_id": session, "hook_event_name": "SessionStart", "source": source, "cwd": str(self.tmp),
+                "transcript_path": "/t/s1.jsonl"}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "Explore"
+        return data
+
     def check(self, data, mode="warn"):
         return longhaul.guard_check(data, mode)
 
@@ -1905,6 +1912,29 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "resume"}))
         self.assertIn("already", self.context(self.check(self.hook("Read", file_path=str(self.small)))), "a resume keeps it")
 
+    def test_at_startup_the_main_conversation_is_told_of_the_projects_codegraph_index(self):
+        # Sprint 6, G3 (2): the plugin's third SessionStart entry runs the
+        # guard at startup. The count found the installed index's tool called
+        # 0 times in five weeks. Without an index there is nothing to say
+        # here: the install advice is the inspect report's, not every
+        # session's; and a subagent's start is not the session's.
+        self.assertIsNone(self.check(self.start()), "no .codegraph/ under cwd")
+        (self.tmp / ".codegraph").mkdir()
+        answer = self.check(self.start())
+        self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        text = self.context(answer)
+        self.assertTrue(text.startswith("This project has a CodeGraph index (.codegraph/). "), text)
+        self.assertIn('`codegraph explore "<question>"` or the codegraph_explore tool', text)
+        self.assertTrue(text.endswith("keep grep and rg for plain text."), text)
+        self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
+        self.assertIsNone(self.check(self.start(agent="agent-1")), "a subagent's start")
+        self.assertIsNone(self.check(self.start(source="resume")), "a resume is not a start")
+        self.assertIsNone(self.check(self.start(), mode="off"))
+        self.assertFalse((self.home / "guard").exists(), "nothing to record")
+        (self.tmp / ".codegraph").rmdir()
+        (self.tmp / ".codegraph").write_text("not a folder")
+        self.assertIsNone(self.check(self.start()), "a file of that name is no index")
+
     def test_a_record_that_cannot_be_rewritten_at_a_compaction_is_removed_so_block_mode_does_not_deny_wrongly(self):
         # Review, Sprint 4 (SF 6): a rewrite that failed left the reads in
         # place, and block mode then denied a read of a file the compaction
@@ -2014,8 +2044,10 @@ class Guard(unittest.TestCase):
         # this only catches a hook that hangs or crawls (review, Sprint 3:
         # a tight wall-clock bound is flaky under load).
         data = json.dumps(self.hook("Read", file_path=str(self.small)))
+        (self.tmp / ".codegraph").mkdir()
+        start = json.dumps(self.start())  # Sprint 6, G3: the startup entry runs the same command
         took = []
-        for raw in (data, data, data, "not json", "", json.dumps({"tool_name": "Read"})):
+        for raw in (data, data, data, start, "not json", "", json.dumps({"tool_name": "Read"})):
             started = time.time()
             out = subprocess.run(self.HOOK, input=raw, env=self.env, capture_output=True, text=True, timeout=10)
             took.append(time.time() - started)
@@ -2024,6 +2056,8 @@ class Guard(unittest.TestCase):
                 json.loads(out.stdout)  # anything it prints is JSON the engine can read
         self.assertIn("already in the context", subprocess.run(
             self.HOOK, input=data, env=self.env, capture_output=True, text=True, timeout=10).stdout)
+        self.assertIn("CodeGraph index", subprocess.run(
+            self.HOOK, input=start, env=self.env, capture_output=True, text=True, timeout=10).stdout)
         self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
 
     def test_inspect_reports_what_the_guard_counted(self):
@@ -2404,20 +2438,22 @@ class Checkpoint(unittest.TestCase):
         self.assertIn(self.S, self.process(data).stdout)
         self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
 
-    def test_the_plugin_registers_the_guard_for_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
+    def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
         self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart"}, "these two events and nothing else")
         [calls] = hooks["hooks"]["PreToolUse"]
-        self.assertEqual(len(hooks["hooks"]["SessionStart"]), 2)
+        self.assertEqual(len(hooks["hooks"]["SessionStart"]), 3)
         starts = {entry["matcher"]: entry for entry in hooks["hooks"]["SessionStart"]}
         self.assertEqual(calls["matcher"], "Read|Bash")
-        # The guard forgets its reads after a compaction or a clear; the
+        # The guard names the project's code index at startup (Sprint 6, G3)
+        # and forgets its reads after a compaction or a clear; the
         # checkpoint comes back after a compaction or a resume (the clear
         # in its matcher is kept: it is harmless, and the live check will
         # say whether a /clear keeps the id).
-        self.assertEqual(set(starts), {"compact|clear", "compact|clear|resume"})
+        self.assertEqual(set(starts), {"startup", "compact|clear", "compact|clear|resume"})
         handlers = {}
-        for entry, command in ((calls, "guard"), (starts["compact|clear"], "guard"), (starts["compact|clear|resume"], "checkpoint")):
+        for entry, command in ((calls, "guard"), (starts["startup"], "guard"), (starts["compact|clear"], "guard"),
+                               (starts["compact|clear|resume"], "checkpoint")):
             [handler] = entry["hooks"]
             self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
             self.assertEqual(handler["args"][0], "-c")
@@ -2427,13 +2463,15 @@ class Checkpoint(unittest.TestCase):
             self.assertLessEqual(handler["timeout"], 10, "a slow hook is a tax on every call")
             self.assertIn(f"(longhaul {command})", handler["statusMessage"])
             handlers[command, entry["matcher"]] = handler
-        # One command line run three ways: the checkpoint's differs from the guard's in the command alone.
+        # One command line run four ways: the checkpoint's differs from the guard's in the command alone.
         self.assertEqual(handlers["guard", "Read|Bash"]["args"], handlers["guard", "compact|clear"]["args"])
+        self.assertEqual(handlers["guard", "Read|Bash"]["args"], handlers["guard", "startup"]["args"])
         self.assertEqual(handlers["checkpoint", "compact|clear|resume"]["args"][1],
                          handlers["guard", "Read|Bash"]["args"][1].replace("'guard'", "'checkpoint'"))
-        # Each says what it is doing: a compaction runs all three, and the
+        # Each says what it is doing: a compaction runs three of them, and the
         # guard's SessionStart entry used to repeat the PreToolUse message.
-        self.assertEqual(len({h["statusMessage"] for h in handlers.values()}), 3)
+        self.assertEqual(len({h["statusMessage"] for h in handlers.values()}), 4)
+        self.assertIn("Looking for a code index", handlers["guard", "startup"]["statusMessage"])
         self.assertIn("Forgetting this session's reads", handlers["guard", "compact|clear"]["statusMessage"])
         # It flashes at every compaction and resume, most often with nothing
         # to put back (review, A17).

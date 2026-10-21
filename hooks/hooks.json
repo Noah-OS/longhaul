@@ -28,6 +28,18 @@
         ]
       },
       {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['guard']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Looking for a code index (longhaul guard)"
+          }
+        ]
+      },
+      {
         "matcher": "compact|clear|resume",
         "hooks": [
           {
