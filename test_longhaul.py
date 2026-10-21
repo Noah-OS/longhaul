@@ -1935,6 +1935,70 @@ class Guard(unittest.TestCase):
         (self.tmp / ".codegraph").write_text("not a folder")
         self.assertIsNone(self.check(self.start()), "a file of that name is no index")
 
+    def test_the_twentieth_search_of_a_context_in_an_indexed_project_is_nudged_once_and_never_denied(self):
+        # Sprint 6, G3 (3): the count found nearly all search is Bash grep,
+        # in chains, 87% of it inside subagents, and the installed index's
+        # tool called 0 times. The rule is model-facing and only where the
+        # index is: one note at a context's twentieth search, in any mode,
+        # and never a denial.
+        (self.tmp / ".codegraph").mkdir()
+        secret = "sk-ant-SECRET" + "Q" * 40
+        grep = self.hook("Bash", command=f"grep -rn {secret} src/")
+        for n in range(1, 20):
+            self.assertIsNone(self.check(grep, mode="block"), f"search {n}")
+        answer = self.check(grep, mode="block")
+        out = answer["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "PreToolUse")
+        self.assertNotIn("permissionDecision", out, "block mode never denies a search")
+        self.assertTrue(out["additionalContext"].startswith("This project has a CodeGraph index (.codegraph/). "), out)
+        self.assertTrue(out["additionalContext"].endswith("keep grep and rg for plain text. This context has made 20 searches."),
+                        out)
+        self.assertIsNone(self.check(grep, mode="block"), "the 21st: once")
+        self.assertIsNone(self.check(self.hook("Bash", command="rg -n x | head -5")), "the program is the search, piped or not")
+        r = self.record()
+        self.assertEqual((r["searches"], r["nudged"]), (22, True))
+        self.assertEqual(r["fired"], {"repeat": 0, "big": 0, "cat": 0}, "a search fires no rule")
+        self.assertEqual(r["reads"], {}, "and is no read")
+        # The record holds the count, never the pattern; nor does the log or the answer.
+        self.assertNotIn("SECRET", json.dumps(answer))
+        for file in self.home.rglob("*"):
+            self.assertNotIn("SECRET", file.read_text() if file.is_file() else "", file.name)
+
+    def test_without_an_index_a_search_is_counted_and_never_nudged(self):
+        grep = self.hook("Bash", command="grep -rn x src/")
+        for n in range(1, 201):
+            self.assertIsNone(self.check(grep), f"search {n}")
+        self.assertEqual((self.record()["searches"], self.record()["nudged"]), (200, False))
+
+    def test_a_subagents_searches_are_counted_in_its_own_record(self):
+        (self.tmp / ".codegraph").mkdir()
+        self.check(self.hook("Bash", command="grep x a"))
+        for n in range(1, 20):
+            self.assertIsNone(self.check(self.hook("Bash", agent="agent-1", command="grep x a")), f"search {n}")
+        self.assertIn("This context has made 20 searches.",
+                      self.context(self.check(self.hook("Bash", agent="agent-1", command="grep x a"))))
+        self.assertEqual(self.record()["searches"], 1, "the main conversation's own count")
+        self.assertEqual(self.record(agent="agent-1")["searches"], 20)
+
+    def test_a_piped_cat_into_grep_is_neither_a_dump_nor_a_search(self):
+        # The operator rule: a filtered cat is cheap, and its program is cat.
+        (self.tmp / ".codegraph").mkdir()
+        for n in range(1, 26):
+            self.assertIsNone(self.check(self.hook("Bash", command=f"cat {self.big} | grep x"), mode="block"), n)
+        self.assertFalse((self.home / "guard" / "s1.json").exists(), "nothing recorded")
+
+    def test_a_compaction_resets_the_search_count_with_the_reads(self):
+        (self.tmp / ".codegraph").mkdir()
+        grep = self.hook("Bash", command="grep x a")
+        for _ in range(19):
+            self.check(grep)
+        self.assertIn("20 searches", self.context(self.check(grep)))
+        self.assertIsNone(self.check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}))
+        self.assertEqual((self.record()["searches"], self.record()["nudged"]), (0, False))
+        for n in range(1, 20):
+            self.assertIsNone(self.check(grep), f"search {n}")
+        self.assertIn("20 searches", self.context(self.check(grep)), "once per context, and a compaction starts one")
+
     def test_a_record_that_cannot_be_rewritten_at_a_compaction_is_removed_so_block_mode_does_not_deny_wrongly(self):
         # Review, Sprint 4 (SF 6): a rewrite that failed left the reads in
         # place, and block mode then denied a read of a file the compaction

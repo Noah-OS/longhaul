@@ -2360,9 +2360,12 @@ def inspect(opts) -> int:
 # conversation's. After a compaction or a clear nothing read before is in
 # the context, so the record forgets its reads and keeps its counts.
 # In a project with a CodeGraph index (.codegraph/) the guard also names
-# the index to the model at startup (Sprint 6, G3: the installed index's
-# tool was called 0 times in five weeks of sessions); it is context,
-# never a denial, and without the index it says nothing of it.
+# the index to the model, at startup and once a context's Bash searches
+# (SEARCH_PROGRAMS, inspect's definition) reach GUARD_SEARCHES (Sprint 6,
+# G3: the installed index's tool was called 0 times in five weeks of
+# sessions, 87% of whose searches ran inside subagents); it is context,
+# never a denial, the record keeps the count and never the pattern, and
+# without the index it says nothing of it.
 
 
 GUARD_BIG = setting("LONGHAUL_GUARD_BIG", 20_000, int, 1)  # bytes: a whole read above this is waste
@@ -2374,6 +2377,7 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "what does Y depend on, where is Z defined), `codegraph explore \"<question>\"` or the "
                    "codegraph_explore tool answers in one call with the source and the call paths; keep grep and rg "
                    "for plain text.")
+GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
 
 
 def guard_mode() -> str:
@@ -2434,9 +2438,11 @@ def guard_indexed(data: dict) -> bool:
 
 def guard_check(data, mode: str, now: float | None = None):
     """The guard's answer for one hook input: the hook's JSON, or None to
-    let the call run unremarked. A PreToolUse is checked and recorded; a
-    SessionStart for compact or clear empties the record's reads, and one
-    for startup names the project's CodeGraph index, if it has one."""
+    let the call run unremarked. A PreToolUse is checked and recorded, a
+    Bash search counted and, at a context's GUARD_SEARCHES-th in an indexed
+    project, answered once with the index; a SessionStart for compact or
+    clear empties the record's reads, and one for startup names the
+    project's CodeGraph index, if it has one."""
     if mode == "off" or not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
@@ -2449,17 +2455,26 @@ def guard_check(data, mode: str, now: float | None = None):
             log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
             return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": GUARD_CODEGRAPH}}
         return None
+    # A search is a Bash whose first program is one of inspect's; its
+    # program is not cat, so it has no targets. Of its command line only
+    # the program is looked at, and the record keeps the count alone.
+    search = data.get("tool_name") == "Bash" and program(dict_at(data, "tool_input").get("command")) in SEARCH_PROGRAMS
     targets = guard_targets(data)
-    record = guard_record_path(data) if targets else None
+    record = guard_record_path(data) if targets or search else None
     if record is None:
         return None
     now = time.time() if now is None else now
+    nudge = None
     with locked("guard"):  # parallel tool calls run their hooks at once
         kept = read_json(record)
         kept = kept if isinstance(kept, dict) else {}  # corrupt or missing: a fresh record
         reads = {k: v for k, v in dict_at(kept, "reads").items() if isinstance(v, dict)}
         fired = {k: as_int(dict_at(kept, "fired").get(k)) for k in GUARD_RULES}
         cost = {k: as_int(dict_at(kept, "bytes").get(k)) for k in GUARD_RULES}
+        searches, nudged = as_int(kept.get("searches")) + (1 if search else 0), kept.get("nudged") is True
+        if search and searches >= GUARD_SEARCHES and not nudged and guard_indexed(data):
+            nudged = True  # once per context: the count goes on, the note does not
+            nudge = f"{GUARD_CODEGRAPH} This context has made {searches} searches."
         notes, seen = [], {}
         for how, path, whole in targets:
             try:
@@ -2502,7 +2517,10 @@ def guard_check(data, mode: str, now: float | None = None):
             reads.update(seen)
         if len(reads) > GUARD_KEEP:
             reads = dict(sorted(reads.items(), key=lambda kv: as_number(kv[1].get("at")) or 0)[-GUARD_KEEP:])
-        write_json(record, {"reads": reads, "fired": fired, "bytes": cost})  # mkstemp makes it 0600
+        write_json(record, {"reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged})
+    if nudge:  # a search fires no rule, so the note is the whole answer; in block mode too, it is never a denial
+        log(f"guard: {record.stem} was told of the CodeGraph index after {searches} searches")
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": nudge}}
     if not notes:
         return None
     if mode == "block":  # how to turn the guard off is for the user, not the model
@@ -2521,19 +2539,22 @@ def guard_records(sid: str) -> list:
 
 def guard_forget(data: dict) -> None:
     """After a compaction or a clear: the session's records, its subagents'
-    too, forget their reads and keep their counts. A record that cannot be
-    rewritten is removed instead, counts and all: kept, its reads would
-    have block mode deny a read of a file no longer in the context."""
+    too, forget their reads and their search count (the note goes with it:
+    the new context has made none) and keep their counts. A record that
+    cannot be rewritten is removed instead, counts and all: kept, its
+    reads would have block mode deny a read of a file no longer in the
+    context."""
     sid = data.get("session_id")
     if not isinstance(sid, str) or not re.fullmatch(GUARD_ID, sid):
         return
     with locked("guard"):
         for file in guard_records(sid):
             kept = read_json(file) if file.is_file() else None
-            if not (isinstance(kept, dict) and dict_at(kept, "reads")):
+            if not (isinstance(kept, dict) and (dict_at(kept, "reads") or kept.get("searches") or kept.get("nudged"))):
                 continue
             try:
-                write_json(file, {"reads": {}, "fired": dict_at(kept, "fired"), "bytes": dict_at(kept, "bytes")})
+                write_json(file, {"reads": {}, "fired": dict_at(kept, "fired"), "bytes": dict_at(kept, "bytes"),
+                                  "searches": 0, "nudged": False})
                 continue
             except OSError as e:
                 problem = e.strerror or e
@@ -2547,8 +2568,9 @@ def guard_forget(data: dict) -> None:
 
 def guard_counts(sid: str):
     """What the guard counted for a conversation, its subagents included;
-    None when it kept no record (the hook was off, or saw no whole Read
-    or cat)."""
+    None when it kept no record (the hook was off, or saw no whole Read,
+    cat or search). The search count is the record's own: inspect counts
+    searches from the transcript, so it is not passed on here."""
     if not re.fullmatch(GUARD_ID, sid or ""):
         return None
     total = {k: 0 for k in GUARD_RULES}
