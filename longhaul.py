@@ -489,8 +489,11 @@ def update_state(change) -> dict:
 
 
 def load_state() -> dict:
-    state = read_json(LONGHAUL_HOME / "state.json") or {}
-    state.setdefault("limited_until", {})
+    """Never raises: run() reads it outside any try, so a state.json a crash
+    or a hand left as a list, a string or junk is an empty state."""
+    state = read_json(LONGHAUL_HOME / "state.json")
+    state = state if isinstance(state, dict) else {}
+    state["limited_until"] = dict_at(state, "limited_until")
     return state
 
 

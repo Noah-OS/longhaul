@@ -714,6 +714,16 @@ class Loop(unittest.TestCase):
         self.run_longhaul(["exit"], "-r", "sid-1", "--account", "Max", runs=1)
         self.assertEqual(json.loads(path.read_text()), {"account": "Max", "cost": 0.5})
 
+    def test_a_state_file_that_is_a_list_still_launches_claude(self):
+        # T6: run() reads state.json outside any try, so a file a crash or a
+        # hand left as a list stopped the supervisor with a traceback before
+        # any launch (an empty list passed: `[] or {}` is {}).
+        (self.home / "state.json").write_text(json.dumps(["junk"]))
+        out, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+
 
 class Usage(unittest.TestCase):
     """The status line reading, the ledger and `longhaul usage`."""
@@ -3360,6 +3370,16 @@ class Pieces(unittest.TestCase):
         procs = [subprocess.Popen([sys.executable, "-c", code, str(HERE), f"w{n}"], env=env) for n in range(4)]
         self.assertEqual([p.wait(60) for p in procs], [0, 0, 0, 0])
         self.assertEqual(len(json.loads((tmp / "state.json").read_text())["limited_until"]), 240)
+
+    def test_load_state_tolerates_a_state_file_that_is_a_list_or_a_string(self):
+        # T6: `.setdefault` on a list or a string raised AttributeError, and
+        # run() calls load_state() outside any try. A non-object is an empty
+        # state; a limited_until that is not an object is empty too.
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", tmp):
+            for junk in ([], ["junk"], "x", {"limited_until": []}):
+                (tmp / "state.json").write_text(json.dumps(junk))
+                self.assertEqual(longhaul.load_state(), {"limited_until": {}}, repr(junk))
 
     def test_a_chat_back_on_an_earlier_account_counts_in_full(self):
         rows = [{"at": 1, "session": "A", "account": "Max", "cost": 0.5, "proc": 11},
