@@ -2419,6 +2419,86 @@ def inspect(opts) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- index
+#
+# Longhaul builds a repository's code map itself (Sprint 7, G4): at a new
+# session's start in a git work tree with no map, the guard's startup
+# hook starts `codegraph init -y`, or `trail init --yes --no-global
+# --no-statusline --no-agents`, or both, in the work tree's top level,
+# detached, and returns at once; the model is told in one sentence per
+# program. Nothing is installed: a program is found on the hook's PATH
+# (its absolute entries alone, and never inside the repository itself)
+# or it is not. Never in the home folder, a parent of it, `/`, or
+# outside a git work tree; never for a subagent, a resume, a compaction
+# or a clear, or an unattended run (`claude -p`: its hook sees
+# CLAUDE_CODE_SESSION_ATTENDED=0). Once per project: LONGHAUL_HOME/
+# index/<key>.json holds each program's start, pid, exit and seconds; a
+# run in progress is left to run, a failure is tried again after a day
+# (delete the file to try now). The program's output goes to
+# index/<key>.<program>.log alone, never to the hook's stdout or to
+# longhaul.log, and the environment is passed as it is: no telemetry
+# variable is added or removed. LONGHAUL_INDEX=off turns all of it off.
+
+INDEX_COMMANDS = {"codegraph": ("codegraph", "init", "-y"),
+                  "trail": ("trail", "init", "--yes", "--no-global", "--no-statusline", "--no-agents")}
+INDEX_MAPS = {"codegraph": ".codegraph", "trail": ".trail"}  # each program's map folder, written in the top level
+
+
+def index_mode() -> str:
+    """LONGHAUL_INDEX, read at call time as guard_mode() is: "off" is
+    off, anything else on."""
+    return "off" if os.environ.get("LONGHAUL_INDEX") == "off" else "on"
+
+
+def index_top(cwd):
+    """The git work tree's top level: the nearest folder at or above the
+    absolute cwd with a `.git` entry (a folder, or a worktree's file),
+    walked as map_at() walks, so no `git` runs at a session's start.
+    None when there is none (a bare repository has no `.git` entry) and
+    when its real path is the home folder's or a parent of it, `/`
+    included: a dotfiles repository at `~` makes every folder a work
+    tree, and there Trail's "repo" settings file would be the user's
+    own."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None
+    top = next((p for p in (cwd, *map(str, Path(cwd).parents)) if os.path.exists(os.path.join(p, ".git"))), None)
+    if top is None:
+        return None
+    real, home = os.path.realpath(top), os.path.realpath(str(HOME))
+    if real == home or home.startswith(real.rstrip(os.sep) + os.sep):
+        return None
+    return top
+
+
+def index_program(name: str, top: str):
+    """Where `name` is on PATH, by its absolute entries alone (a relative
+    one would resolve inside whatever folder the hook runs in), or None;
+    None too when the hit's real path is inside the top's: a repository
+    must not supply the program it is indexed with."""
+    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(p)]
+    found = shutil.which(name, path=os.pathsep.join(entries)) if entries else None
+    if found is None:
+        return None
+    return None if os.path.realpath(found).startswith(os.path.realpath(top) + os.sep) else found
+
+
+def index_plan(data: dict, index: str) -> list:
+    """The (program, top) pairs a session's start should build, or []:
+    for a `startup` SessionStart of the main conversation (no agent_id),
+    with the index on, the session attended and the cwd in a work tree
+    index_top() accepts, each program found whose map is missing at or
+    above the cwd. Pure: nothing is started or written here."""
+    if index == "off" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
+        return []
+    if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+        return []  # a subagent's start is not the session's; a `-p` run (a script's, a loop's) asked for no index
+    top = index_top(data.get("cwd"))
+    if top is None:
+        return []
+    return [(program, top) for program, folder in INDEX_MAPS.items()
+            if not map_at(data["cwd"], folder) and index_program(program, top)]
+
+
 # ---------------------------------------------------------------- guard
 #
 # `longhaul guard`: the plugin's hook (hooks/hooks.json), run before every

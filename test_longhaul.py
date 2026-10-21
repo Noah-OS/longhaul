@@ -2329,6 +2329,160 @@ class Guard(unittest.TestCase):
                       "\n".join(longhaul.inspect_lines(longhaul.inspect_transcript(other))))
 
 
+class Index(unittest.TestCase):
+    """The auto-init (Sprint 7, G4): at a new session's start in a git work
+    tree with no code map, the guard's startup hook starts `codegraph init`
+    or `trail init`, or both, in the top level, detached, and returns at
+    once. Two fakes stand for the programs; the real ones never run
+    (Settings.test_the_suite_never_runs_the_real_claude marks them)."""
+
+    MAPS = {"codegraph": ".codegraph", "trail": ".trail"}  # what each real program writes in the top level
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        for name in self.MAPS:
+            self.fake(self.bin / name, name)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)  # a work tree, and no git needed
+        (self.repo / "src").mkdir()
+        # The fakes alone are on PATH, in this process and in a hook's; the
+        # variables a `-p` run or the owner's shell may set are each test's.
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("CLAUDE_CODE_SESSION_ATTENDED", "LONGHAUL_INDEX"):
+            os.environ.pop(name, None)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"))
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def fake(self, path: Path, name: str):
+        """A program that records where and how it was called and what it
+        saw of the environment, talks on both streams, makes its map, and
+        is slow or fails when a marker file says so. Its own PATH: sh has
+        no mkdir or sleep of its own, and the test's PATH holds the fakes
+        alone."""
+        path.write_text("#!/bin/sh\n"
+                        "PATH=/bin:/usr/bin\n"
+                        f"printf '%s %s\\n' \"$(pwd -P)\" \"$*\" >> '{self.tmp}/{name}.calls'\n"
+                        f"printf '%s\\n' \"${{DO_NOT_TRACK-unset}}\" > '{self.tmp}/{name}.env'\n"
+                        f"echo SECRET-OUTPUT-{name}\n"
+                        f"echo SECRET-OUTPUT-{name} >&2\n"
+                        f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
+                        f"[ -e '{self.tmp}/{name}.slow' ] && sleep 3\n"
+                        f"mkdir -p {self.MAPS[name]}\n"
+                        "exit 0\n")
+        path.chmod(0o755)
+
+    def start(self, source="startup", agent=None, session="s1", cwd=None):
+        data = {"session_id": session, "hook_event_name": "SessionStart", "source": source,
+                "cwd": str(self.repo / "src") if cwd is None else cwd, "transcript_path": "/t/s1.jsonl"}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "Explore"
+        return data
+
+    def plan(self, data, index="on"):
+        return longhaul.index_plan(data, index)
+
+    def calls(self, program):
+        path = self.tmp / f"{program}.calls"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_nothing_starts_with_the_switch_off_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
+        top = str(self.repo)
+        both = [("codegraph", top), ("trail", top)]
+        self.assertEqual(self.plan(self.start()), both, "the control: a work tree with no map, both programs found")
+        self.assertEqual(self.plan(self.start(), index="off"), [], "LONGHAUL_INDEX=off")
+        # Never in the home folder, in a subfolder of it, or in a work tree
+        # the home folder is inside (a dotfiles repository at ~ makes every
+        # folder one, and there Trail's "repo" settings file is the user's own).
+        home = self.tmp / "h"
+        (home / ".git").mkdir(parents=True)
+        (home / "sub").mkdir()
+        with mock.patch.object(longhaul, "HOME", home):
+            self.assertEqual(self.plan(self.start(cwd=str(home))), [], "the home folder")
+            self.assertEqual(self.plan(self.start(cwd=str(home / "sub"))), [], "a subfolder of the home folder")
+            self.assertEqual(self.plan(self.start()), both, "another work tree is fine")
+            (home / ".git").rmdir()
+            (self.tmp / ".git").mkdir()  # the home folder is now inside this work tree
+            self.assertEqual(self.plan(self.start(cwd=str(home / "sub"))), [], "a parent of the home folder")
+            (self.tmp / ".git").rmdir()
+            real_exists = os.path.exists
+            with mock.patch.object(os.path, "exists", lambda p: p == os.path.join(os.sep, ".git") or real_exists(p)):
+                self.assertIsNone(longhaul.index_top(os.sep), "the root, were it a work tree")
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assertEqual(self.plan(self.start(cwd=str(plain))), [], "no .git at or above the cwd")
+        self.assertEqual(self.plan(self.start(cwd=os.sep)), [], "the root")
+        self.assertEqual(self.plan(self.start(cwd="repo/src")), [], "a relative cwd")
+        self.assertEqual(self.plan({k: v for k, v in self.start().items() if k != "cwd"}), [], "no cwd")
+        self.assertEqual(self.plan(self.start(agent="agent-1")), [], "a subagent")
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+        # A worktree's `.git` is a file; the folder holding it is a top level of its own.
+        (self.tmp / "wt" / "src").mkdir(parents=True)
+        (self.tmp / "wt" / ".git").write_text("gitdir: elsewhere\n")
+        self.assertEqual(longhaul.index_top(str(self.tmp / "wt" / "src")), str(self.tmp / "wt"))
+
+    def test_a_resume_compact_or_clear_never_starts_one(self):
+        for source in ("resume", "compact", "clear"):
+            self.assertEqual(self.plan(self.start(source=source)), [], source)
+        self.assertEqual(self.plan({**self.start(), "hook_event_name": "PreToolUse"}), [], "not a SessionStart")
+        self.assertEqual(self.plan({**self.start(), "source": None}), [], "no source")
+
+    def test_an_unattended_run_never_starts_one(self):
+        # A `claude -p` run's hook sees CLAUDE_CODE_SESSION_ATTENDED=0 (the
+        # lead's probe, 2026-10-21): a script's or a loop's run should not
+        # index a repository on its own.
+        both = [("codegraph", str(self.repo)), ("trail", str(self.repo))]
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "0"}):
+            self.assertEqual(self.plan(self.start()), [], "a -p run")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "1"}):
+            self.assertEqual(self.plan(self.start()), both, "an interactive session")
+        self.assertEqual(self.plan(self.start()), both, "unset, as an older Claude Code leaves it")
+
+    def test_a_mapped_project_is_left_alone_per_program(self):
+        top = str(self.repo)
+        (self.repo / ".codegraph").mkdir()
+        self.assertEqual(self.plan(self.start()), [("trail", top)], ".codegraph/ present: trail alone")
+        (self.repo / ".codegraph").rmdir()
+        (self.repo / ".trail").mkdir()
+        self.assertEqual(self.plan(self.start()), [("codegraph", top)], ".trail/ present: codegraph alone")
+        (self.repo / ".codegraph").mkdir()
+        self.assertEqual(self.plan(self.start()), [], "both present")
+        (self.repo / ".codegraph").rmdir()
+        (self.repo / ".trail").rmdir()
+        # The map is looked for at the cwd and above it, where the programs
+        # themselves look: one in the cwd below the top level counts, and a
+        # file of a map's name is no map.
+        (self.repo / "src" / ".codegraph").mkdir()
+        self.assertEqual(self.plan(self.start()), [("trail", top)], "a map in the cwd, below the top level")
+        (self.repo / ".trail").write_text("not a folder")
+        self.assertEqual(self.plan(self.start()), [("trail", top)], "a file of the map's name")
+
+    def test_a_missing_program_is_skipped_and_the_other_still_runs(self):
+        top = str(self.repo)
+        (self.bin / "trail").unlink()
+        self.assertEqual(self.plan(self.start()), [("codegraph", top)])
+        # On PATH but not executable: npm's trail link on the owner's Mac
+        # (2026-10-21), which which() passes over as the shell would.
+        (self.bin / "codegraph").chmod(0o644)
+        self.assertEqual(self.plan(self.start()), [], "a program that cannot be run is not found")
+        (self.bin / "codegraph").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            self.assertEqual(self.plan(self.start()), [], "no PATH at all")
+
+
 class Settings(unittest.TestCase):
     """The LONGHAUL_* numbers read at import (Sprint 4, T5): a typo in any
     one is ignored and said, never a stop."""
