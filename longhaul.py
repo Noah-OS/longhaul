@@ -1869,6 +1869,12 @@ def usage(opts) -> int:
 
 EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 SEARCHES = ("Grep", "Glob")
+SEARCH_PROGRAMS = ("grep", "rg", "ag", "find", "fd", "ls", "git")  # a Bash search, by program: git log counts as grep
+SEARCH_BIG = 5_000  # characters: a search result over this is big (the count: 8% of them carry 38% of search output)
+SEARCH_HEAVY = 20  # searches in a conversation before the report advises a code index
+CODEGRAPH_INSTALL = {"link": "github.com/colbymchenry/codegraph",  # as its README gave them on 2026-10-21; ours repeats
+                     "sh": "curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh",
+                     "npm": "npm i -g @colbymchenry/codegraph"}
 TOKEN_KINDS = (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"),
                ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens"))
 
@@ -1938,6 +1944,54 @@ def output_size(content) -> tuple[int, int]:
             sum(b.get("type") == "image" for b in blocks))
 
 
+def search_stats(events, calls, results, cwd) -> dict:
+    """The search numbers (Sprint 6, G3), by the count's definition: a
+    search is a Grep or Glob call, or a Bash whose program is one of
+    SEARCH_PROGRAMS (`git grep` cannot be told from `git log` by the
+    program alone, so every git counts, and the heading says so); a chain
+    is a run of consecutive searches in one context, replayed in time
+    order as the repeats are; a big result is over SEARCH_BIG characters.
+    A code index is seen as a tool name holding `codegraph`, or as a
+    `.codegraph/` folder under the transcript's first line's cwd; with no
+    cwd that is None (unknown), not 0, and its record is left out."""
+    chains, open_run = [], collections.Counter()  # the closed runs; the run under way, per context
+    searches, chars, big, big_chars = 0, 0, 0, 0
+    for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
+        if what != "call":
+            continue
+        name, tid = item[1], item[3]
+        if name not in SEARCHES and not (name == "Bash" and calls[tid][1] in SEARCH_PROGRAMS):
+            if open_run[ctx]:
+                chains.append(open_run.pop(ctx))
+            continue
+        open_run[ctx] += 1
+        size = results.get(tid, (0,))[0]
+        searches, chars = searches + 1, chars + size
+        if size > SEARCH_BIG:
+            big, big_chars = big + 1, big_chars + size
+    chains.extend(n for n in open_run.values() if n)
+    return {"search_calls": searches, "search_share": searches / len(calls) if calls else 0.0, "search_chars": chars,
+            "search_chain_max": max(chains, default=0),
+            "search_chain_mean": sum(chains) / len(chains) if chains else 0.0,
+            "search_big": big, "search_big_share": big_chars / chars if chars else 0.0,
+            "codegraph_calls": sum("codegraph" in name for name, _ in calls.values()),
+            "codegraph_index": int(os.path.isdir(os.path.join(cwd, ".codegraph"))) if isinstance(cwd, str) else None}
+
+
+def search_advice(s: dict) -> str:
+    """The one line `inspect` adds for a search-heavy conversation in which
+    no index was seen: its numbers, what an index does, and CodeGraph's
+    install as its README gives it, with what the install does to the
+    project. Longhaul never installs it."""
+    return (f"Search-heavy: {s['search_calls']:,} searches ({s['search_share']:.0%} of calls), the longest chain "
+            f"{s['search_chain_max']}, {s['search_big']:,} results over {SEARCH_BIG:,} characters "
+            f"({s['search_big_share']:.0%} of search output). A code index answers symbol and dependency questions "
+            f"in one call. CodeGraph ({CODEGRAPH_INSTALL['link']}, MIT): install with `{CODEGRAPH_INSTALL['sh']}` or "
+            f"`{CODEGRAPH_INSTALL['npm']}`, then `codegraph init` in the project; it writes `.codegraph/` there, may "
+            "add a section to your instructions file, and asks about telemetry. Longhaul never installs it; this line "
+            "is all it does.")
+
+
 def inspect_transcript(path: Path) -> dict:
     """The numbers `longhaul inspect` shows for the conversation in `path`."""
     files = [path] + sorted(path.with_suffix("").glob("subagents/agent-*.jsonl"))
@@ -1945,7 +1999,7 @@ def inspect_transcript(path: Path) -> dict:
     calls: dict = {}      # tool_use id -> (tool, what it worked on)
     results: dict = {}    # tool_use id -> (characters, images, is_error, scope)
     events = []           # per file, in its order: (time, file, "call" or "compact", (scope, tool, input, id))
-    compactions, api_errors, unreadable, lines = [], collections.Counter(), 0, 0
+    compactions, api_errors, unreadable, lines, cwd = [], collections.Counter(), 0, 0, None
     tool_calls, tool_chars = collections.Counter(), collections.Counter()  # (scope, tool) -> calls, output characters
     for n, file in enumerate(files):
         events.append([])
@@ -1965,6 +2019,7 @@ def inspect_transcript(path: Path) -> dict:
                 if kind not in ("assistant", "user", "system"):
                     continue
                 lines += 1
+                cwd = line.get("cwd") if cwd is None and not n else cwd  # the first line's, looked under, never shown
                 when = parse_ts(line.get("timestamp")) or when
                 scope = "subagents" if n or line.get("isSidechain") else "main"
                 blocks = [b for b in msg.get("content") or [] if isinstance(b, dict)] \
@@ -2070,11 +2125,10 @@ def inspect_transcript(path: Path) -> dict:
         "rereads": sorted(rereads.values(), key=lambda x: (-x["chars"], -x["repeats"], x["path"])),
         "searches": [{"tool": name, "where": what, "repeats": c, "scope": scope}
                      for (scope, name, what), c in sorted(searches.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "search": search_stats(events, calls, results, cwd),
         "tool_errors": dict(collections.Counter(calls.get(tid, ("?",))[0]
                                                 for tid, (_, _, error, _) in results.items() if error).most_common()),
-        "api_errors": dict(api_errors.most_common()),
-        "unreadable": unreadable,
-        "guard": guard_counts(path.stem),
+        "api_errors": dict(api_errors.most_common()), "unreadable": unreadable, "guard": guard_counts(path.stem),
     }
 
 
@@ -2164,6 +2218,19 @@ def inspect_lines(r: dict) -> list[str]:
     section("Tool calls [transcript, counted]",
             [f"  {t['tool']}: {t['calls']} call{'s' * (t['calls'] != 1)}, {t['chars']:,} chars{where(t)}"
              for t in r["by_tool"]])
+    s = r["search"]
+    seen = {1: "a .codegraph/ index under the cwd", 0: "no .codegraph/ index under the cwd",
+            None: "no cwd in the transcript to look for an index"}[s["codegraph_index"]]
+    # The advice only when no index was seen: a folder under the cwd, or the tool called, means it is there to use.
+    advise = s["search_calls"] >= SEARCH_HEAVY and not s["codegraph_index"] and not s["codegraph_calls"]
+    section(f"Search [transcript, counted: {', '.join(SEARCHES)}, and Bash {', '.join(SEARCH_PROGRAMS)}]",
+            [f"  {s['search_calls']:,} search{'es' * (s['search_calls'] != 1)}, {s['search_share']:.0%} of calls, "
+             f"{s['search_chars']:,} chars",
+             f"  longest chain {s['search_chain_max']}, mean {s['search_chain_mean']:.1f}",
+             f"  {s['search_big']:,} result{'s' * (s['search_big'] != 1)} over {SEARCH_BIG:,} chars, "
+             f"{s['search_big_share']:.0%} of search output",
+             f"  CodeGraph: {s['codegraph_calls']} call{'s' * (s['codegraph_calls'] != 1)}, {seen}"]
+            + (["  " + search_advice(s)] if advise else []))
     section("Read again, with no edit or compaction in between [transcript, inferred: "
             "files changed through Bash are not seen]",
             [f"  {x['path']}: {times(x['repeats'])}, {x['chars']:,} chars"
@@ -2228,6 +2295,12 @@ def inspect_records(r: dict) -> list[dict]:
     for t in r["by_tool"]:
         add("tool_calls", t["calls"], "calls", t["scope"], "transcript", "counted", t["tool"])
         add("tool_chars", t["chars"], "chars", t["scope"], "transcript", "counted", t["tool"])
+    units = {"search_calls": "calls", "search_share": "ratio", "search_chars": "chars", "search_chain_max": "searches",
+             "search_chain_mean": "searches", "search_big": "results", "search_big_share": "ratio",
+             "codegraph_calls": "calls", "codegraph_index": "indexes"}
+    for metric, value in r["search"].items():
+        if value is not None:  # codegraph_index, when the transcript carries no cwd to look under
+            add(metric, value, units[metric], "all", "transcript", "counted")
     for x in r["rereads"]:
         add("repeated_reads", x["repeats"], "reads", x["scope"], "transcript", "inferred", x["path"])
         add("repeated_read_chars", x["chars"], "chars", x["scope"], "transcript", "inferred", x["path"])
