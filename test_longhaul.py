@@ -401,6 +401,14 @@ class Loop(unittest.TestCase):
         self.assertIn("Max ended: crashed (session sid-1, exit -9)", (self.home / "longhaul.log").read_text())
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)  # MAX_RUNS reached
 
+    def test_a_claude_killed_on_the_last_run_still_ends_longhaul_with_exit_0(self):
+        # The killed run is the one that reaches MAX_RUNS, so its -9 is what
+        # exit_code() gets: the default comes back, not -9 (247 to the shell).
+        out, calls = self.run_longhaul(["killed"], runs=1)
+        self.assertEqual(len(calls), 1, out.stdout + out.stderr)
+        self.assertIn("Max ended: crashed (session sid-1, exit -9)", (self.home / "longhaul.log").read_text())
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
     def test_a_conversation_another_longhaul_supervises_is_refused(self):
         held = longhaul_lock(self.home, "sid-held")
         out, calls = self.run_longhaul(["exit"], "-r", "sid-held", runs=1)
