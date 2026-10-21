@@ -1968,15 +1968,20 @@ def output_size(content) -> tuple[int, int]:
             sum(b.get("type") == "image" for b in blocks))
 
 
-def codegraph_index_at(cwd) -> bool:
-    """Whether a CodeGraph index covers this folder: a .codegraph/ folder
-    at the absolute path cwd or in one of its parents, which is where
-    CodeGraph itself looks (the nearest index at or above the path; a
-    session opened in a subfolder of an indexed repository has one).
-    Anything but an absolute path is no index."""
+def map_at(cwd, folder: str) -> bool:
+    """Whether a code map's folder (`.codegraph/`, `.trail/`) is at the
+    absolute path cwd or in one of its parents, which is where the
+    indexers themselves look (the nearest map at or above the path; a
+    session opened in a subfolder of a mapped repository has one).
+    Anything but an absolute path is no map."""
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
         return False
-    return any(os.path.isdir(os.path.join(folder, ".codegraph")) for folder in (cwd, *map(str, Path(cwd).parents)))
+    return any(os.path.isdir(os.path.join(parent, folder)) for parent in (cwd, *map(str, Path(cwd).parents)))
+
+
+def codegraph_index_at(cwd) -> bool:
+    """Whether a CodeGraph index covers this folder (Sprint 6, G3)."""
+    return map_at(cwd, ".codegraph")
 
 
 def search_stats(events, calls, results, cwd) -> dict:
