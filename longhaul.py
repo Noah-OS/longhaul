@@ -2578,11 +2578,13 @@ def inspect(opts) -> int:
 # and why Longhaul ended a run (a timeout, an error); a run in progress
 # is left to run, up to its timeout; a map built and then gone is built
 # again; a failure is tried again after a day (delete the file to try
-# now), a timeout never, and the map a failure left half-built is then
-# rebuilt, being Longhaul's own, unless someone rebuilt it by hand
-# since; a map folder the state knows nothing of is someone else's and
-# is never touched, and one Longhaul's own run has not finished is not
-# named to the model. The program's output goes to
+# now), a timeout never, whatever its map folder shows, and the map a
+# failure left half-built is then rebuilt, being Longhaul's own (the
+# folder's time says nothing: CodeGraph's own processes write in it when
+# they open its store; a user who rebuilt a map by hand deletes the
+# state file); a map folder the state knows nothing of is someone else's
+# and is never touched, and one Longhaul's own run has not finished well
+# is not named to the model. The program's output goes to
 # index/<key>.<program>.log alone, never to the hook's stdout or to
 # longhaul.log. The program's environment is the hook's less the
 # session's own Claude variables (SESSION_ENV), which describe the
@@ -2729,20 +2731,6 @@ def index_running(entry: dict, now: float) -> bool:
             and started is not None and -INDEX_GRACE <= now - started <= INDEX_TIMEOUT + INDEX_GRACE)
 
 
-def index_by_hand(entry: dict, folder) -> bool:
-    """Whether the map folder was written after the entry's run ended (by
-    more than a second: `ended` is rounded), which is someone's rebuild:
-    what the run itself left half-built was written before it ended. A
-    run with no `ended` cannot be told apart, and counts as not."""
-    ended = as_number(entry.get("ended"))
-    if folder is None or ended is None:
-        return False
-    try:
-        return os.stat(folder).st_mtime > ended + 1
-    except OSError:
-        return False
-
-
 def index_due(program: str, top: str, entry, folder, now: float) -> bool:
     """Whether a program's init is to be started now, from its state
     entry and its map folder at or above the cwd (index_map; None for
@@ -2759,10 +2747,14 @@ def index_due(program: str, top: str, entry, folder, now: float) -> bool:
     once more when INDEX_RETRY has passed since its start, or at once
     when its start is ahead of the clock by more than INDEX_GRACE (the
     clock moved): the map it left half-built is Longhaul's own, and is
-    rebuilt, unless the map was written after the run ended
-    (index_by_hand), someone's rebuild, left alone. The file is
-    deletable: a user who has fixed the cause removes it to try now. The
-    map gone and the map rebuilt by hand are each said in one log line;
+    rebuilt, whatever the folder shows. The folder's time is no sign of
+    a rebuild by hand (final review, Sprint 7, G1): CodeGraph's own
+    processes, its MCP server and `codegraph explore`, write in it when
+    they open its store. A user who rebuilt a map by hand deletes the
+    state file, which makes the map someone else's; a re-run over a good
+    map is harmless all the same (CodeGraph rebuilds it, Trail's init
+    merges its blocks). The file is deletable: a user who has fixed the
+    cause removes it to try now. The map gone is said in one log line;
     the state says the rest."""
     if entry is None:
         return folder is None
@@ -2774,12 +2766,7 @@ def index_due(program: str, top: str, entry, folder, now: float) -> bool:
     if entry.get("why") == "timeout" or index_running(entry, now):
         return False
     started = as_number(entry.get("started"))
-    if started is not None and started - now <= INDEX_GRACE and now - started < INDEX_RETRY:
-        return False
-    if index_by_hand(entry, folder):
-        log(f"index: {program}'s map in {home_path(top)} was rebuilt by hand; left alone")
-        return False
-    return True
+    return not (started is not None and started - now <= INDEX_GRACE and now - started < INDEX_RETRY)
 
 
 def index_spawn(program: str, top: str, found: str) -> int:
@@ -2813,9 +2800,8 @@ def index_start(data: dict, index: str) -> list:
     taken for a stopped runner. A skip writes nothing. One log line per
     start, a program, a path and a pid. Returns the (program, top) pairs
     started and the (program, top, entry) of each program not started
-    whose last run failed and was not rebuilt by hand since, for the
-    user (index_message); what the state cannot be read or written with
-    is raised."""
+    whose last run failed, for the user (index_message); what the state
+    cannot be read or written with is raised."""
     started, failed = [], []
     for program, top, found in index_plan(data, index):
         folder, problem = index_map(data["cwd"], program), None
@@ -2823,8 +2809,7 @@ def index_start(data: dict, index: str) -> list:
             path, state = index_state(top)
             now, entry = time.time(), state["runs"].get(program)
             if not index_due(program, top, entry, folder, now):
-                if (entry is not None and as_number(entry.get("exit")) != 0 and not index_running(entry, now)
-                        and not index_by_hand(entry, folder)):
+                if entry is not None and as_number(entry.get("exit")) != 0 and not index_running(entry, now):
                     failed.append((program, top, entry))
                 continue
             state["runs"][program] = {"started": round(now, 1), "pid": None, "exit": None, "ended": None,
@@ -2923,13 +2908,12 @@ def index_unfinished(cwd) -> bool:
     """Whether the CodeGraph map at or above cwd is one a run of
     Longhaul's has not finished well: the project's entry for codegraph
     holds no exit 0, or a `why` (a run in progress, a failure, a
-    timeout), and the map was not rebuilt by hand since (index_by_hand).
+    timeout), whatever the folder shows (final review, Sprint 7, G1).
     The guard's note is then withheld at startup: the map is half-built
     (review, Sprint 7, F17)."""
     top = index_top(cwd)
     entry = index_state(top)[1]["runs"].get("codegraph") if top else None
-    return (entry is not None and (as_number(entry.get("exit")) != 0 or "why" in entry)
-            and not index_by_hand(entry, index_map(cwd, "codegraph")))
+    return entry is not None and (as_number(entry.get("exit")) != 0 or "why" in entry)
 
 
 def index_message(started: list, failed: list) -> str:

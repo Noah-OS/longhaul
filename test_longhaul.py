@@ -2994,30 +2994,50 @@ class Index(unittest.TestCase):
         self.assertFalse(self.state_path().exists(), "and nothing is written for it")
         self.assertEqual(len(self.calls("codegraph")), 2)
 
-    def test_a_map_rebuilt_by_hand_after_a_failed_run_is_left_alone(self):
-        # Review, Sprint 7 (F7): a failed entry and a map written after
-        # the run ended is a map someone rebuilt; a map no newer than the
-        # run's end is the one it left half-built, rebuilt as before.
+    def test_a_failed_entry_follows_its_retry_rule_whatever_its_map_folder_shows(self):
+        # Final review, Sprint 7 (G1): a map folder written after a failed
+        # run ended read as a rebuild by hand, but CodeGraph's own
+        # processes (its MCP server, `codegraph explore`) write in
+        # .codegraph/ when they open its SQLite store, so a half-built map
+        # looked rebuilt: never rebuilt, and named to the model. The entry
+        # alone decides now; a user who rebuilt the map deletes the state.
         (self.tmp / "codegraph.fail").touch()
         (self.bin / "trail").unlink()
         top, folder = str(self.repo), self.repo / ".codegraph"
         self.assertEqual(self.begin(self.start()), [("codegraph", top)])
         self.assertEqual(self.wait("codegraph")["exit"], 1)
         (self.tmp / "codegraph.fail").unlink()
+        later = self.state()["runs"]["codegraph"]["ended"] + 30
+        os.utime(folder, (later, later))  # written after the run ended, as a store opened by CodeGraph is
+        answer = self.check(self.start())
+        self.assertNotIn(longhaul.GUARD_CODEGRAPH, self.context(answer), "the half-built map is not named")
+        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit 1"), "the failure stands")
+        self.assertEqual(len(self.calls("codegraph")), 1, "under a day old: not yet")
         state = self.state()
-        for key in ("started", "ended"):  # the failure a day old
+        for key in ("started", "ended"):  # the failure a day old, the folder still newer
             state["runs"]["codegraph"][key] -= 86_401
         longhaul.write_json(self.state_path(), state)
-        os.utime(folder)  # written now: after the run ended
-        self.assertEqual(self.begin(self.start()), [], "rebuilt by hand: left alone")
-        self.assertEqual(len(self.calls("codegraph")), 1)
-        self.assertIn(f"index: codegraph's map in {longhaul.home_path(top)} was rebuilt by hand; left alone\n",
-                      (self.home / "longhaul.log").read_text())
-        ended = state["runs"]["codegraph"]["ended"]
-        os.utime(folder, (ended - 5, ended - 5))  # no newer than the run's end: what it left half-built
-        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "half-built: rebuilt")
+        self.assertEqual(self.begin(self.start()), [("codegraph", top)], "a day on: retried")
         self.assertEqual(self.wait("codegraph")["exit"], 0)
         self.assertEqual(len(self.calls("codegraph")), 2)
+        self.assertEqual(self.context(self.check(self.start())), longhaul.GUARD_CODEGRAPH, "built: named")
+
+    def test_a_map_whose_state_file_was_deleted_is_someone_elses_untouched_and_named(self):
+        # Final review, Sprint 7 (G1): what a user who rebuilt a map by
+        # hand does to tell Longhaul. The map stays, nothing is started or
+        # written for it, and the guard names it.
+        (self.tmp / "codegraph.fail").touch()
+        (self.bin / "trail").unlink()
+        self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
+        self.assertEqual(self.wait("codegraph")["exit"], 1)
+        (self.tmp / "codegraph.fail").unlink()
+        self.state_path().unlink()
+        answer = self.check(self.start())
+        self.assertEqual(self.context(answer), longhaul.GUARD_CODEGRAPH, "named, and no init's note")
+        self.assertIsNone(self.said(answer), "nothing to tell the user")
+        self.assertEqual(len(self.calls("codegraph")), 1, "never run again")
+        self.assertFalse(self.state_path().exists(), "and nothing is written for it")
+        self.assertTrue((self.repo / ".codegraph").is_dir())
 
     def test_a_corrupt_state_file_is_said_once_per_read_and_a_corrupt_entry_is_the_retry_path(self):
         # Review, Sprint 7 (F8): as load_state() does, one line that names
