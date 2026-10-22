@@ -4212,32 +4212,65 @@ def advisor_stand_in(data) -> bool:
         return True
     prompt = dict_at(data, "tool_input").get("prompt")
     lines = prompt.splitlines() if isinstance(prompt, str) else []
-    first = next((line.strip() for line in lines if line.strip()), "")
-    return re.match(r"trigger\s*:", first, re.IGNORECASE) is not None
+    first = next((line for line in map(advisor_unmarked, lines) if line), "")
+    return re.match(r"trigger[\s*`]*:", first, re.IGNORECASE) is not None
+
+
+def advisor_unmarked(line: str) -> str:
+    """A line with what Markdown or an editor may put before its first
+    word set aside (F19): a byte-order mark, #, *, -, >, backticks and
+    spaces. A line of those alone (a fence, a rule) is left empty."""
+    return re.sub(r"^[﻿\s#*>`-]+", "", line).rstrip()
 
 
 def advisor_follow_up(data) -> bool:
     """F2: a message to an advisor, which would resume it past every
     check. The second probe (2.1.307) saw SendMessage's `to` hold the
     advisor's agent id; its `recipient`, whose value it did not log, is
-    checked too when it is text, and a ` [ref]` after a name is set
-    aside. Either names an advisor when it is the agent type's own name,
-    an agent id advisor-result kept in any session's record, or one whose
-    meta.json beside the session's transcript has the advisor's agent
-    type. The fields are checked, never the tool's name."""
-    tool = dict_at(data, "tool_input")
-    names = [re.sub(r"\s*\[[^\]]*\]\s*$", "", tool[key]).strip() for key in ("to", "recipient")
-             if isinstance(tool.get(key), str)]
+    checked too, each in the shapes advisor_targets() reads. Either names
+    an advisor when it is the agent type's own name, an agent id
+    advisor-result kept in any session's record, or one whose meta.json
+    beside the session's transcript has the advisor's agent type, in any
+    case (F19). The fields are checked, never the tool's name."""
+    names = advisor_targets(dict_at(data, "tool_input"))
     if any(map(advisor_named, names)):
         return True
-    agents = [agent for agent in map(advisor_id, names) if agent]
+    agents = {name for name in names if advisor_id(name)}
     if not agents:
         return False
-    path = data.get("transcript_path")
-    folder = Path(path).with_suffix("") / "subagents" if isinstance(path, str) and path else None
-    kept = advisor_agents()
-    return any(agent in kept or (folder is not None and advisor_named(agent_type(folder / f"agent-{agent}.jsonl")))
-               for agent in agents)
+    if agents & {agent.lower() for agent in advisor_agents()}:
+        return True
+    return any(advisor_named(agent_type(transcript)) for agent, transcript in advisor_subagents(data.get("transcript_path"))
+               if agent.lower() in agents)
+
+
+def advisor_targets(tool: dict) -> set:
+    """What a message's `to` and `recipient` name, as the follow-up check
+    reads them: each one's text, a list's items and an object's values
+    that are text (F19), lowercased, with a ` [ref]` after a name set
+    aside, and each once more without an `agent-` in front."""
+    found = set()
+    for key in ("to", "recipient"):
+        value = tool.get(key)
+        for item in value.values() if isinstance(value, dict) else value if isinstance(value, list) else [value]:
+            if isinstance(item, str):
+                name = re.sub(r"\s*\[[^\]]*\]\s*$", "", item).strip().lower()
+                found |= {name, re.sub(r"^agent-", "", name)}
+    return found
+
+
+def advisor_subagents(path) -> list:
+    """The subagents beside the session's transcript `path`, as (its agent
+    id, its transcript) for each meta.json there (agent-<id>.meta.json),
+    or [] when there is no folder to look in."""
+    if not (isinstance(path, str) and path):
+        return []
+    try:
+        found = files_of(Path(path).with_suffix("").glob("subagents/agent-*.meta.json"))
+    except (OSError, ValueError):  # a path with a NUL in it
+        return []
+    return [(meta.name[len("agent-"):-len(".meta.json")], meta.with_name(meta.name[:-len(".meta.json")] + ".jsonl"))
+            for meta in found]
 
 
 def advisor_agents() -> set:

@@ -4387,8 +4387,8 @@ class Advisor(unittest.TestCase):
         # keeps its agent id: the Agent tool's response names it (agentId, on
         # 2.1.307), and so does the subagent's meta.json whose toolUseId is
         # the call's; a meta.json of the advisor's agent type names one too.
-        # Its to, or its recipient when that is text, is checked. Outside the
-        # order, and whether or not it is on.
+        # Its to and its recipient are checked (their other shapes: F19).
+        # Outside the order, and whether or not it is on.
         data = self.call(tool_id="toolu_f1")
         self.admitted(data)
         meta = self.subagent("a1f2e3", "toolu_f1", model="opus")
@@ -4412,8 +4412,8 @@ class Advisor(unittest.TestCase):
         before = self.trace()
         for to in ("b77", "main", "researcher", "worker [3fa9c1]", "zz", "../c9", "", None, 7, "other:advisor"):
             self.assertIsNone(self.decide(self.message(to)), to)
-        self.assertIsNone(self.decide(self.message("main", recipient={"id": "a1f2e3"}, recipient_kind="agent")),
-                          "a recipient that is not text is not read")
+        self.assertIsNone(self.decide(self.message("main", recipient={"id": "b77"}, recipient_kind="agent")),
+                          "an object's values are read, and b77 is no advisor")
         self.assertIsNone(self.decide({**self.message("c9"), "transcript_path": None}), "no folder to look in")
         self.assertEqual(self.trace(), before, "nothing written for a message that passes")
         self.assertIsNone(self.result(self.message("a1f2e3"), self.reply("ok")))
@@ -4453,6 +4453,43 @@ class Advisor(unittest.TestCase):
         self.assertIn("denied (follow-up)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
         out = self.run_hook(self.HOOK, self.call())
         self.assertIn("denied (error)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_a_message_names_its_target_in_any_of_its_shapes(self):
+        # F19: to as a list (each text in it), recipient as an object (its
+        # values that are text), in any case, with agent- in front or a
+        # [ref] after. The record names one advisor and a meta.json another.
+        data = self.call(tool_id="toolu_f19")
+        self.admitted(data)
+        self.result(data, self.reply("Verdict: proceed\nConfidence: high", agent="abeef7f4ab1007404"))
+        self.subagent("c9d8", "toolu_never")
+        self.subagent("b77", "toolu_other", agent_type="Explore")
+        for to, fields in ((["main", "abeef7f4ab1007404"], {}), (["b77", " C9D8 [3fa9c1]"], {}), ([7, None, "c9d8"], {}),
+                           (["ADVISOR"], {}), ("main", {"recipient": {"id": "abeef7f4ab1007404", "kind": "agent"}}),
+                           ("main", {"recipient": {"id": "b77", "name": "Longhaul:Advisor"}}),
+                           ("ABEEF7F4AB1007404", {}), ("agent-abeef7f4ab1007404", {}), ("Agent-C9D8", {}),
+                           ("AGENT-c9d8 [3fa9c1]", {}), ("main", {"recipient": "Agent-ABEEF7F4AB1007404"})):
+            self.denied(self.message(to, **fields), "follow-up", LONGHAUL_ADVISOR=None)
+        before = self.trace()
+        for to, fields in ((["main", "b77"], {}), ([], {}), ({"x": 7}, {}), ("agent-b77", {}), ("agent-", {}),
+                           ("main", {"recipient": {"id": "B77", "n": 7}}), ("main", {"recipient": ["worker", None]})):
+            self.assertIsNone(self.decide(self.message(to, **fields)), (to, fields))
+        self.assertEqual(self.trace(), before, "nothing written for a message that passes")
+
+    def test_a_brief_in_markdown_or_after_a_byte_order_mark_is_still_a_stand_in(self):
+        # F19: a byte-order mark and any #, *, -, >, backtick or space before
+        # the first non-empty line's Trigger: are set aside, and a line of
+        # those alone (a fence, a rule) is passed over. The fail-closed
+        # choice: Markdown's emphasis between the word and its colon too.
+        for first in ("﻿Trigger: stuck", "## Trigger: stuck", "**Trigger:** stuck", "**Trigger**: stuck",
+                      "- Trigger: done", "> Trigger: early", "`Trigger: change`", "```\nTrigger: stuck",
+                      "---\n\n> **Trigger:** stuck", "﻿\n  # trigger : done", "*`-> Trigger:"):
+            brief = first + "\nTask: x\nQuestion: y"
+            for env in ({}, {"LONGHAUL_ADVISOR": None}):
+                self.denied(self.call(brief, agent="Explore"), "stand-in", **env)
+        before = self.trace()
+        for prompt in ("## Notes\nTrigger: stuck", "Triggers: stuck", "`code` Trigger: stuck", "#Trigger stuck", "```"):
+            self.assertIsNone(self.decide(self.call(prompt, agent="Explore")), prompt)
+        self.assertEqual(self.trace(), before)
 
     def test_only_the_calls_known_fields_reach_claude_code(self):
         # F4: any other field (a background run, an isolation, a name) would
