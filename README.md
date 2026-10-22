@@ -315,11 +315,11 @@ An experiment, off unless you turn it on, and built to be measured before it is 
 A hook checks every consultation before it runs. It denies the consultation, with a reason the executor can act on, unless all of these hold:
 
 - the switch is on and you have enabled it from a terminal;
-- Longhaul's folder is an absolute path outside the repository, so a repository's settings cannot supply a probe record or a key of their own;
+- Longhaul's folder is an absolute path outside the session's folder and its repository. That way a repository's own settings cannot point it at a probe record or key the repository ships. A session started in your home folder itself is refused for the same reason;
 - a capability probe has passed on the Claude Code version running, read from the session's own transcript. The record is `~/.longhaul/advisor/probe.json`. It has passed on 2.1.307 only, so any other version, an update included, is refused until a probe passes there;
 - the executor's model has a stronger advisor. Haiku and Sonnet get Opus, Opus gets Fable, and an unavailable advisor is never replaced by another;
 - that advisor model's switch has been seen working by the probe;
-- no Claude Code setting forces the subagent's model: `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` and `CLAUDE_CODE_COORDINATOR_FORCE_WORKER_INHERIT_MODEL` are all unset;
+- no Claude Code setting forces the subagent's model: `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` and `CLAUDE_CODE_COORDINATOR_FORCE_WORKER_INHERIT_MODEL` are all unset (set but empty counts as set);
 - the account may be used in this repository, by the restrictions in this Longhaul folder and in `~/.longhaul` both;
 - the call holds no field the hook does not know, and does not ask to run in the background;
 - the brief is at most 8,000 characters, in its fixed lines, with no credential in it;
