@@ -5085,6 +5085,7 @@ class Advisor(unittest.TestCase):
         state, trace = self.home / "advisor" / "state.json", self.home / "advisor" / "trace.jsonl"
         first = self.call(prompt="p1")
         self.admitted(first)
+        self.subagent("f1", first["tool_use_id"], model="opus")  # on the model admitted: F15 marks no mismatch
         self.result(first, None)  # it failed: counted all the same
         self.admitted(self.call(prompt="p1"))
         state.unlink()
@@ -5323,13 +5324,14 @@ class Advisor(unittest.TestCase):
     def test_advisor_result_traces_the_outcome_and_never_the_reply(self):
         data = self.call(tool_id="toolu_r1")
         self.admitted(data)
+        self.subagent("r1", "toolu_r1", model="opus")  # it ran on the model admitted (F15: else the session is marked)
         text = f"Verdict: adjust\nWhy: the fixture is stale {self.S}\nRisks: none\nNext step: rebuild it\nConfidence: medium"
         self.assertIsNone(self.result(data, self.reply(text), now=self.now + 12.34))
         line = self.trace()[-1]
         self.assertEqual(list(line), list(self.OUTCOME))
         self.assertEqual({k: v for k, v in line.items() if k != "t"},
                          {"id": "toolu_r1", "session": "s1", "event": "outcome", "outcome": "ok", "verdict": "adjust",
-                          "confidence": "medium", "reply_chars": len(text), "seconds": 12.3, "model_seen": "unknown"})
+                          "confidence": "medium", "reply_chars": len(text), "seconds": 12.3, "model_seen": "opus"})
         for response, outcome, verdict, confidence in (
                 (self.reply("**Verdict:** stop\nConfidence: high"), "ok", "stop", "high"),
                 (self.reply("\nVerdict: Proceed\n"), "ok", "proceed", None),
@@ -5354,11 +5356,28 @@ class Advisor(unittest.TestCase):
         self.assertEqual(self.trace(), before, "another agent type: nothing written")
         self.assertEqual(len(self.counted()), 1, "a failed consultation still counts")
 
+    def test_a_consultation_that_failed_before_any_model_answered_marks_nothing(self):
+        # F15 keeps D2.6: a consultation that failed with no model to read
+        # (no transcript line, no model in a meta.json) is unknown but marks
+        # nothing, so the one retry after a rate limit stays possible; the
+        # same unknown on a reply is a mismatch, as the next test says.
+        data = self.call(prompt="p1", tool_id="toolu_x1")
+        self.admitted(data)
+        self.result(data, {"status": "error", "content": []})
+        self.assertEqual((self.trace()[-1]["outcome"], self.trace()[-1]["model_seen"]), ("failed", "unknown"))
+        self.assertNotIn("mismatch", self.state()["sessions"]["s1"])
+        data = self.call(prompt="p2", tool_id="toolu_x2")
+        self.admitted(data)
+        self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
+        self.assertEqual(self.state()["sessions"]["s1"]["mismatch"], {"decided": "opus", "seen": "unknown"})
+        self.denied(self.call(prompt="p3"), "model-mismatch")
+
     def test_an_advisor_that_ran_on_another_family_blocks_the_rest_of_the_session(self):
-        # F5: advisor-result reads the model in the advisor's meta.json, as a
-        # family. Another family than the one admitted marks the session,
-        # in the state and in the trace, so either one alone keeps the mark;
-        # unknown (no meta.json, or no model in it) is recorded only.
+        # F5, closed by F15: advisor-result reads the model the advisor ran
+        # on, as a family (its own transcript first, the next test's; here
+        # its meta.json alone). Another family than the one admitted marks
+        # the session, in the state and in the trace, so either one alone
+        # keeps the mark; so does unknown (no meta.json, or no model in it).
         def ran(tool_id, prompt, session="s1", **meta):
             data = self.call(session=session, prompt=prompt, tool_id=tool_id)
             self.admitted(data)
@@ -5367,9 +5386,6 @@ class Advisor(unittest.TestCase):
             self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
             return self.trace()[-1]["model_seen"]
         self.assertEqual(ran("toolu_m1", "p1", model="opus"), "opus")
-        self.assertEqual(ran("toolu_m2", "p2"), "unknown", "no meta.json")
-        self.assertEqual(ran("toolu_m3", "p3", spawnDepth=1), "unknown", "no model in it")
-        self.assertEqual(ran("toolu_m4", "p4", model=None), "unknown", "null, as the probe saw for a call not rewritten")
         self.assertEqual([longhaul.advisor_seen({"model": junk}) for junk in (7, "", " ", ["opus"])], ["unknown"] * 4)
         self.assertNotIn("mismatch", self.state()["sessions"]["s1"])
         self.assertEqual(ran("toolu_m5", "p5", model="claude-sonnet-4-5"), "sonnet")
@@ -5394,9 +5410,66 @@ class Advisor(unittest.TestCase):
         # would (inherit), is another family: other.
         self.assertEqual(ran("toolu_n1", "p1", session="s3", model="inherit"), "other")
         self.denied(self.call(session="s3", prompt="p2"), "model-mismatch")
+        # F15: unknown on an admitted consultation is a mismatch too (fail
+        # closed), each case in a session of its own.
+        for session, meta, why in (("u1", {}, "no meta.json"), ("u2", {"spawnDepth": 1}, "no model in it"),
+                                   ("u3", {"model": None}, "null, as the probe saw for a call not rewritten")):
+            self.assertEqual(ran(f"toolu_{session}", "p1", session=session, **meta), "unknown", why)
+            self.assertEqual(self.state()["sessions"][session]["mismatch"], {"decided": "opus", "seen": "unknown"}, why)
+            reason = self.denied(self.call(session=session, prompt="p2"), "model-mismatch")
+            self.assertIn("a model that could not be read", reason)
+            self.assertIn("the opus advisor", reason)
+        state.unlink()
+        self.denied(self.call(session="u1", prompt="p3"), "model-mismatch")  # the trace alone keeps unknown's mark
+        # An advisor that ran with no admitted decision has no model to be
+        # matched: it is flagged unadmitted (F1), and its unknown marks nothing.
+        self.result(self.call(session="u4", tool_id="toolu_u4"), self.reply("Verdict: proceed"))
+        self.assertEqual((self.trace()[-1]["outcome"], self.trace()[-1]["model_seen"]), ("unadmitted", "unknown"))
+        self.admitted(self.call(session="u4", prompt="p2"))
         self.executor("claude-opus-4-5")
         self.assertEqual(ran("toolu_f1", "p1", session="s4", model="fable"), "fable")
         self.admitted(self.call(session="s4", prompt="p2"))
+
+    def test_the_model_seen_is_the_one_the_advisor_s_own_transcript_ran_on(self):
+        # F15: the advisor's own transcript (agent-<id>.jsonl beside its
+        # meta.json, every line a sidechain one) names the model that ran,
+        # as a full id: its last assistant line decides, over the model the
+        # call set in meta.json, which is read only when the transcript
+        # names none. Only the transcript's tail is read, as the executor's is.
+        subagents = self.transcript.with_suffix("") / "subagents"
+
+        def line(model, sidechain=True):
+            return {"type": "assistant", **({"isSidechain": True} if sidechain else {}),
+                    "message": {"model": model, "role": "assistant", "content": [{"type": "text", "text": self.S}]}}
+
+        def ran(session, lines, meta_model="opus", head=b""):
+            tool_id = f"toolu_{session}"
+            data = self.call(session=session, tool_id=tool_id)
+            self.admitted(data)
+            self.subagent(session, tool_id, **({} if meta_model is None else {"model": meta_model}))
+            (subagents / f"agent-{session}.jsonl").write_bytes(
+                head + "".join((raw if isinstance(raw, str) else json.dumps(raw)) + "\n" for raw in lines).encode())
+            self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
+            return self.trace()[-1]["model_seen"], self.state()["sessions"][session].get("mismatch")
+
+        self.assertEqual(ran("t1", [line("claude-fable-5-1")]), ("fable", {"decided": "opus", "seen": "fable"}),
+                         "the call set opus; the advisor ran on Fable")
+        self.assertIn("ran on fable", self.denied(self.call(session="t1", prompt="p2"), "model-mismatch"))
+        self.assertEqual(ran("t2", [line("claude-sonnet-4-5"), line("claude-opus-4-5")], meta_model="fable"),
+                         ("opus", None), "the transcript's last line beats meta.json")
+        self.admitted(self.call(session="t2", prompt="p2"))
+        self.assertEqual(ran("t3", [line("claude-opus-4-5"), line("claude-sonnet-4-5", sidechain=False)]),
+                         ("sonnet", {"decided": "opus", "seen": "sonnet"}), "the last one, not the first")
+        no_model = [{"type": "user", "isSidechain": True, "message": {"role": "user", "content": "go"}},
+                    line("<synthetic>"), "not json {", {"type": "assistant", "isSidechain": True, "message": {"model": 7}}]
+        self.assertEqual(ran("t4", no_model), ("opus", None), "no model in the transcript: meta.json's")
+        self.assertEqual(ran("t5", no_model, meta_model=None), ("unknown", {"decided": "opus", "seen": "unknown"}))
+        self.assertEqual(ran("t6", []), ("opus", None), "an empty transcript: meta.json's")
+        # A model line beyond the tail is never read: meta.json's model decides.
+        head = (json.dumps(line("claude-sonnet-4-5")) + "\n").encode() + b" " * longhaul.ADVISOR_TAIL + b"\n"
+        self.assertEqual(ran("t7", [], head=head), ("opus", None), "the head of a long transcript is not read")
+        written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertNotIn(self.S, written, "the advisor's text is never kept")
 
     def test_one_round_trip_across_the_regions(self):
         # F11, item 2: what Region B writes is what Region A reads. A
@@ -5407,10 +5480,7 @@ class Advisor(unittest.TestCase):
         with mock.patch.dict(os.environ, self.env, clear=True):
             answer = longhaul.advisor_decide(data, self.now)
         self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "allow")
-        self.assertIsNone(longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse",
-                                                    "tool_response": self.reply(f"Verdict: adjust\nWhy: {self.S}")},
-                                                   self.now + 7))
-        self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
+        # The advisor's transcript and meta.json, there when PostToolUse runs (F12 d).
         subagents = self.transcript.with_suffix("") / "subagents"
         subagents.mkdir(parents=True)
         usage = {"input_tokens": 3, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 50, "output_tokens": 40}
@@ -5420,6 +5490,11 @@ class Advisor(unittest.TestCase):
                          "content": [{"type": "text", "text": f"Verdict: adjust {self.S}"}]}}) + "\n")
         (subagents / "agent-a1.meta.json").write_text(json.dumps(
             {"agentType": longhaul.ADVISOR_TYPE, "toolUseId": "toolu_trip", "model": "opus"}))
+        self.assertIsNone(longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse",
+                                                    "tool_response": self.reply(f"Verdict: adjust\nWhy: {self.S}")},
+                                                   self.now + 7))
+        self.assertEqual(self.trace()[-1]["model_seen"], "opus")
+        self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
         r = longhaul.inspect_transcript(self.transcript)
         c = r["consultations"]
         self.assertEqual({k: c[k] for k in ("attempts", "admitted", "denied", "outcomes", "verdicts", "transcripts")},

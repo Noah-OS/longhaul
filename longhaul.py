@@ -4173,7 +4173,8 @@ def advisor_asked_version(real: str):
 def advisor_tail(path) -> list:
     """The last ADVISOR_TAIL bytes of the session's transcript, as lines (a
     cut first line is no line), or [] when it cannot be read. Read once a
-    call, for the version and the executor both (F7)."""
+    call, for the version and the executor both (F7); and of the advisor's
+    own transcript after it ran, for the model it ran on (F15)."""
     if not isinstance(path, str) or not path:
         return []
     try:
@@ -4196,16 +4197,19 @@ def advisor_executor(tail: list):
     return None
 
 
-def advisor_model_of(raw: bytes):
+def advisor_model_of(raw: bytes, sidechain: bool = False):
     """An assistant line's model, or None: also for a subagent's line in
-    the main transcript (isSidechain) and the engine's own (<synthetic>)."""
+    the main transcript (isSidechain), unless `sidechain`, for a
+    subagent's own transcript, every line of which is one (F15); and for
+    the engine's own (<synthetic>)."""
     if b'"assistant"' not in raw:
         return None
     try:
         entry = json.loads(raw)
     except (ValueError, RecursionError):  # nested past the limit: 3.9's json raises this
         return None
-    if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") is True:
+    if not isinstance(entry, dict) or entry.get("type") != "assistant" \
+            or (entry.get("isSidechain") is True and not sidechain):
         return None
     model = dict_at(entry, "message").get("model")
     return model if isinstance(model, str) and model and not model.startswith("<") else None
@@ -4324,9 +4328,11 @@ def advisor_agents() -> set:
 
 def advisor_subagent(path, tool_id):
     """The subagent the call `tool_id` started, as (its agent id, its
-    meta.json), or None: of the meta.json files beside the session's
-    subagent transcripts (read by Region A's agent_meta()), the one whose
-    toolUseId is the call's. The id is the file's: agent-<id>.meta.json."""
+    meta.json, its own transcript's path or None when that is no file),
+    or None: of the meta.json files beside the session's subagent
+    transcripts (read by Region A's agent_meta()), the one whose toolUseId
+    is the call's. The id is the file's: agent-<id>.meta.json, beside
+    agent-<id>.jsonl."""
     if tool_id is None or not (isinstance(path, str) and path):
         return None
     try:
@@ -4335,9 +4341,10 @@ def advisor_subagent(path, tool_id):
         return None
     for meta_path in found:
         agent = meta_path.name[len("agent-"):-len(".meta.json")]
-        meta = agent_meta(meta_path.with_name(f"agent-{agent}.jsonl"))
+        transcript = meta_path.with_name(f"agent-{agent}.jsonl")
+        meta = agent_meta(transcript)
         if meta.get("toolUseId") == tool_id:
-            return advisor_id(agent), meta
+            return advisor_id(agent), meta, str(transcript) if files_of([transcript]) else None
     return None
 
 
@@ -4604,24 +4611,31 @@ def advisor_traced(sid: str) -> list:
 
 def advisor_mark_ok(mark) -> bool:
     """F5's mark in its shape: the advisor model a consultation was
-    admitted with, and the family its subagent ran on instead."""
+    admitted with, and the family its subagent ran on instead, or unknown
+    when that could not be read (F15)."""
     return (isinstance(mark, dict) and isinstance(mark.get("decided"), str) and mark["decided"] in ADVISOR_SESSION_CAP_PER_MODEL
-            and isinstance(mark.get("seen"), str) and mark["seen"] in ADVISOR_FAMILIES + ("other",))
+            and isinstance(mark.get("seen"), str) and mark["seen"] in ADVISOR_FAMILIES + ("other", "unknown"))
 
 
 def advisor_mismatch(entry: dict, sid: str):
     """F5: model-mismatch, once an advisor of this session ran on another
-    family than the one it was admitted with: the session's mark in the
-    state or, the state deleted since, in the trace."""
+    family than the one it was admitted with, or on one that could not be
+    read (F15): the session's mark in the state or, the state deleted
+    since, in the trace."""
     mark = entry.get("mismatch") or advisor_traced_mismatch(sid)
-    return advisor_denial("model-mismatch", **mark) if mark else None
+    if not mark:
+        return None
+    seen = "a model that could not be read" if mark["seen"] == "unknown" else mark["seen"]
+    return advisor_denial("model-mismatch", decided=mark["decided"], seen=seen)
 
 
 def advisor_traced_mismatch(sid: str):
     """The mark as the trace keeps it: the first of the session's outcome
     lines whose model_seen is another family than its admitted decision's
-    advisor, as {"decided", "seen"}, else None. unknown marks nothing, and
-    a line that is not JSON is passed over."""
+    advisor, unknown included (F15), as {"decided", "seen"}, else None. An
+    outcome with no admitted decision marks nothing, nor does one that
+    failed before any model answered (advisor_unread()), and a line that
+    is not JSON is passed over."""
     decided, seen = {}, []
     for raw in advisor_lines():
         if sid not in raw:
@@ -4634,10 +4648,17 @@ def advisor_traced_mismatch(sid: str):
             continue
         if entry.get("event") == "decision" and entry.get("decision") == "allow":
             decided[entry["id"]] = entry.get("advisor")
-        elif entry.get("event") == "outcome":
+        elif entry.get("event") == "outcome" and not advisor_unread(entry.get("model_seen"), entry.get("outcome")):
             seen.append((entry["id"], entry.get("model_seen")))
     marks = ({"decided": decided.get(tool_id), "seen": family} for tool_id, family in seen)
     return next((mark for mark in marks if advisor_mark_ok(mark) and mark["seen"] != mark["decided"]), None)
+
+
+def advisor_unread(model_seen, outcome) -> bool:
+    """A consultation that failed with no model to read: unknown, but no
+    mark, since no model answered (D2.6's one retry after a rate limit
+    stays possible). Unknown on a reply is a mismatch (F15)."""
+    return model_seen == "unknown" and outcome == "failed"
 
 
 def advisor_tally(admitted: list) -> collections.Counter:
@@ -4899,8 +4920,8 @@ def advisor_outcome(data, now: float | None = None) -> None:
         started = as_number(decided.get("t")) if decided else None
         line["outcome"] = "unadmitted" if decided is None else line["outcome"]
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
-        found, meta = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
-        line["model_seen"] = advisor_seen(meta)
+        found, meta, transcript = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {}, None)
+        line["model_seen"] = advisor_seen(meta, transcript)
         advisor_trace(line, now)
         named = advisor_id(dict_at(data, "tool_response").get("agentId"))  # the response names it on 2.1.307
         advisor_keep(line, [agent for agent in dict.fromkeys((named, found)) if agent], now)
@@ -4909,12 +4930,21 @@ def advisor_outcome(data, now: float | None = None) -> None:
     return None
 
 
-def advisor_seen(meta: dict) -> str:
-    """F5's cross-check: the family of the model the advisor's meta.json
-    names, or "unknown" when it names none (the second probe saw null for
-    a call not rewritten). An alias the rewrite did not take, such as
-    inherit, names no family: other, so it is a mismatch. The response's
-    resolvedModel is not read: its shape is not yet probed."""
+def advisor_seen(meta: dict, transcript=None) -> str:
+    """F5's cross-check, F15's source first: the family of the model the
+    advisor ran on, from the last assistant line of its own transcript
+    (`transcript`, read from its tail alone by advisor_tail(), a full id
+    such as claude-fable-5-1), else of the model its meta.json names (the
+    one the call set), else "unknown": no such file, or no model in either
+    (the second probe saw null in meta.json for a call not rewritten). On
+    an admitted consultation, unknown is a mismatch too (advisor_keep()).
+    An alias the rewrite did not take, such as inherit, names no family:
+    other, so it is a mismatch. The response's resolvedModel is not read:
+    its shape is not yet probed."""
+    for raw in reversed(advisor_tail(transcript)):
+        model = advisor_model_of(raw, sidechain=True)
+        if model:
+            return advisor_family(model)
     model = meta.get("model")
     return advisor_family(model) if isinstance(model, str) and model.strip() else "unknown"
 
@@ -4924,12 +4954,14 @@ def advisor_keep(line: dict, agents: list, now: float) -> None:
     ids (the response's agentId, and its meta.json's), for the follow-up
     rule (F2), whether or not it was admitted, since a message to it is a
     follow-up either way; and F5's mark when the consultation the state
-    admitted with this id ran on another family (unknown marks nothing).
-    A record that cannot be read or written keeps nothing, said in the
-    log by the error's kind: the outcome is traced already, the trace
-    keeps the mark too, a message to the advisor is still found by its
+    admitted with this id ran on another family, or on one that could not
+    be read (unknown, F15: fail closed), unless it failed before any model
+    answered (D2.6's one retry after a rate limit stays possible). A
+    record that cannot be read or written keeps nothing, said in the log
+    by the error's kind: the outcome is traced already, the trace keeps
+    the mark too, a message to the advisor is still found by its
     meta.json, and a state that cannot be read denies every consultation."""
-    if line["session"] is None or (not agents and line["model_seen"] == "unknown"):
+    if line["session"] is None:
         return
     try:
         state = advisor_state()
@@ -4939,7 +4971,8 @@ def advisor_keep(line: dict, agents: list, now: float) -> None:
         if new:
             entry["agents"] = entry.get("agents", []) + new
         decided = next((a["advisor"] for a in entry["admitted"] if a["id"] == line["id"]), None)
-        if decided and line["model_seen"] not in ("unknown", decided) and not entry.get("mismatch"):
+        unread = advisor_unread(line["model_seen"], line.get("outcome"))
+        if decided and line["model_seen"] != decided and not unread and not entry.get("mismatch"):
             entry["mismatch"] = {"decided": decided, "seen": line["model_seen"]}
         if kept != {k: entry.get(k) for k in ("agents", "mismatch")}:
             advisor_save(state, line["session"], entry, now)
