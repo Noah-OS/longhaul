@@ -4151,24 +4151,27 @@ def advisor_stand_in(data) -> bool:
 
 
 def advisor_follow_up(data) -> bool:
-    """F2: a message to an advisor (SendMessage's `to`, a ` [ref]` after
-    it aside), which would resume it past every check: the agent type's
-    own name, an agent id advisor-result kept in any session's record,
-    or one whose meta.json beside the session's transcript has the
-    advisor's agent type. The hook's input for this tool is unprobed, so
-    the field alone is checked, never the tool's name."""
-    to = dict_at(data, "tool_input").get("to")
-    if not isinstance(to, str):
-        return False
-    name = re.sub(r"\s*\[[^\]]*\]\s*$", "", to).strip()
-    if advisor_named(name):
+    """F2: a message to an advisor, which would resume it past every
+    check. The second probe (2.1.307) saw SendMessage's `to` hold the
+    advisor's agent id; its `recipient`, whose value it did not log, is
+    checked too when it is text, and a ` [ref]` after a name is set
+    aside. Either names an advisor when it is the agent type's own name,
+    an agent id advisor-result kept in any session's record, or one whose
+    meta.json beside the session's transcript has the advisor's agent
+    type. The fields are checked, never the tool's name."""
+    tool = dict_at(data, "tool_input")
+    names = [re.sub(r"\s*\[[^\]]*\]\s*$", "", tool[key]).strip() for key in ("to", "recipient")
+             if isinstance(tool.get(key), str)]
+    if any(map(advisor_named, names)):
         return True
-    agent = advisor_id(name)
-    if agent is None:
+    agents = [agent for agent in map(advisor_id, names) if agent]
+    if not agents:
         return False
     path = data.get("transcript_path")
     folder = Path(path).with_suffix("") / "subagents" if isinstance(path, str) and path else None
-    return agent in advisor_agents() or (folder is not None and advisor_named(agent_type(folder / f"agent-{agent}.jsonl")))
+    kept = advisor_agents()
+    return any(agent in kept or (folder is not None and advisor_named(agent_type(folder / f"agent-{agent}.jsonl")))
+               for agent in agents)
 
 
 def advisor_agents() -> set:
@@ -4744,10 +4747,11 @@ def advisor_outcome(data, now: float | None = None) -> None:
         started = as_number(decided.get("t")) if decided else None
         line["outcome"] = "unadmitted" if decided is None else line["outcome"]
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
-        agent, meta = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
+        found, meta = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
         line["model_seen"] = advisor_seen(meta)
         advisor_trace(line, now)
-        advisor_keep(line, agent, now)
+        named = advisor_id(dict_at(data, "tool_response").get("agentId"))  # the response names it on 2.1.307
+        advisor_keep(line, [agent for agent in dict.fromkeys((named, found)) if agent], now)
     if decided is None:
         log("advisor-result hook: an advisor ran with no admitted decision (unadmitted)")
     return None
@@ -4755,31 +4759,34 @@ def advisor_outcome(data, now: float | None = None) -> None:
 
 def advisor_seen(meta: dict) -> str:
     """F5's cross-check: the family of the model the advisor's meta.json
-    names, or "unknown" when it names none. An alias the rewrite did not
-    take, such as inherit, names no family: other, so it is a mismatch."""
+    names, or "unknown" when it names none (the second probe saw null for
+    a call not rewritten). An alias the rewrite did not take, such as
+    inherit, names no family: other, so it is a mismatch. The response's
+    resolvedModel is not read: its shape is not yet probed."""
     model = meta.get("model")
     return advisor_family(model) if isinstance(model, str) and model.strip() else "unknown"
 
 
-def advisor_keep(line: dict, agent, now: float) -> None:
+def advisor_keep(line: dict, agents: list, now: float) -> None:
     """What the session's record keeps of the advisor that ran: its agent
-    id, from its meta.json, for the follow-up rule (F2), whether or not it
-    was admitted, since a message to it is a follow-up either way; and
-    F5's mark when the consultation the state admitted with this id ran
-    on another family (unknown marks nothing). A record that cannot be
-    read or written keeps nothing, said in the log by the error's kind:
-    the outcome is traced already, the trace keeps the mark too, a
-    message to the advisor is still found by its meta.json, and a state
-    that cannot be read denies them all."""
-    if line["session"] is None or (agent is None and line["model_seen"] == "unknown"):
+    ids (the response's agentId, and its meta.json's), for the follow-up
+    rule (F2), whether or not it was admitted, since a message to it is a
+    follow-up either way; and F5's mark when the consultation the state
+    admitted with this id ran on another family (unknown marks nothing).
+    A record that cannot be read or written keeps nothing, said in the
+    log by the error's kind: the outcome is traced already, the trace
+    keeps the mark too, a message to the advisor is still found by its
+    meta.json, and a state that cannot be read denies them all."""
+    if line["session"] is None or (not agents and line["model_seen"] == "unknown"):
         return
     try:
         state = advisor_state()
         entry = advisor_entry(state, line["session"])
         kept = {k: entry.get(k) for k in ("agents", "mismatch")}
-        if agent is not None and agent not in entry.get("agents", []):
-            entry["agents"] = entry.get("agents", []) + [agent]
-        decided = next((a["advisor"] for a in entry["admitted"] if line["id"] and a["id"] == line["id"]), None)
+        new = [agent for agent in agents if agent not in entry.get("agents", [])]
+        if new:
+            entry["agents"] = entry.get("agents", []) + new
+        decided = next((a["advisor"] for a in entry["admitted"] if a["id"] == line["id"]), None)
         if decided and line["model_seen"] not in ("unknown", decided) and not entry.get("mismatch"):
             entry["mismatch"] = {"decided": decided, "seen": line["model_seen"]}
         if kept != {k: entry.get(k) for k in ("agents", "mismatch")}:

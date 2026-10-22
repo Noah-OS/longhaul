@@ -4279,23 +4279,28 @@ class Advisor(unittest.TestCase):
         self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_a_message_to_an_advisor_is_denied_and_any_other_passes(self):
-        # F2: a SendMessage resumes the advisor past every check. Its agent id
-        # is kept by advisor-result, from the subagent's meta.json whose
-        # toolUseId is the call's; a meta.json of the advisor's agent type
-        # names one too. Outside the order, and whether or not it is on.
+        # F2: a SendMessage resumes the advisor past every check. advisor-result
+        # keeps its agent id: the Agent tool's response names it (agentId, on
+        # 2.1.307), and so does the subagent's meta.json whose toolUseId is
+        # the call's; a meta.json of the advisor's agent type names one too.
+        # Its to, or its recipient when that is text, is checked. Outside the
+        # order, and whether or not it is on.
         data = self.call(tool_id="toolu_f1")
         self.admitted(data)
         meta = self.subagent("a1f2e3", "toolu_f1", model="opus")
         self.subagent("b77", "toolu_other", agent_type="Explore")
         self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
         self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["a1f2e3"])
-        self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
-        self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["a1f2e3"], "kept once")
-        meta.unlink()  # the record alone names it now
-        for to, session in (("a1f2e3", "s1"), (" a1f2e3 ", "s1"), ("a1f2e3 [3fa9c1]", "s1"), ("a1f2e3", "s2")):
+        for agent in ("abeef7f4ab1007404", "../x", 7, None):
+            self.result(data, self.reply("Verdict: proceed\nConfidence: high", agent=agent))
+        self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["a1f2e3", "abeef7f4ab1007404"], "each kept once")
+        meta.unlink()  # the record alone names them now
+        for to, session in (("a1f2e3", "s1"), (" a1f2e3 ", "s1"), ("a1f2e3 [3fa9c1]", "s1"), ("a1f2e3", "s2"),
+                            ("abeef7f4ab1007404", "s1")):
             reason = self.denied(self.message(to, session), "follow-up", LONGHAUL_ADVISOR=None)
             self.assertIn("/longhaul:advise", reason)
             self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.denied(self.message("main", recipient="abeef7f4ab1007404"), "follow-up")
         self.subagent("c9", "toolu_never")  # an advisor whose result was never traced
         self.denied(self.message("c9"), "follow-up")
         for to in ("longhaul:advisor", " Advisor "):  # the agent type's own name, as a consultation is named
@@ -4303,6 +4308,8 @@ class Advisor(unittest.TestCase):
         before = self.trace()
         for to in ("b77", "main", "researcher", "worker [3fa9c1]", "zz", "../c9", "", None, 7, "other:advisor"):
             self.assertIsNone(self.decide(self.message(to)), to)
+        self.assertIsNone(self.decide(self.message("main", recipient={"id": "a1f2e3"}, recipient_kind="agent")),
+                          "a recipient that is not text is not read")
         self.assertIsNone(self.decide({**self.message("c9"), "transcript_path": None}), "no folder to look in")
         self.assertEqual(self.trace(), before, "nothing written for a message that passes")
         self.assertIsNone(self.result(self.message("a1f2e3"), self.reply("ok")))
