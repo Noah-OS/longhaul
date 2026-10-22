@@ -4356,6 +4356,69 @@ class Advisor(unittest.TestCase):
         self.assertEqual(mark.read_text(), "--version\n")
         self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
 
+    OUTCOME = ("t", "id", "session", "event", "outcome", "verdict", "confidence", "reply_chars", "seconds")
+
+    def reply(self, text):
+        """The Agent tool's response to the executor, as PostToolUse gets it."""
+        return {"status": "completed", "content": [{"type": "text", "text": text}], "totalDurationMs": 1_000}
+
+    def result(self, data, response, now=None):
+        return longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse", "tool_response": response}, now)
+
+    def test_advisor_result_traces_the_outcome_and_never_the_reply(self):
+        data = self.call(tool_id="toolu_r1")
+        self.admitted(data)
+        text = f"Verdict: adjust\nWhy: the fixture is stale {self.S}\nRisks: none\nNext step: rebuild it\nConfidence: medium"
+        self.assertIsNone(self.result(data, self.reply(text), now=self.now + 12.34))
+        line = self.trace()[-1]
+        self.assertEqual(list(line), list(self.OUTCOME))
+        self.assertEqual({k: v for k, v in line.items() if k != "t"},
+                         {"id": "toolu_r1", "session": "s1", "event": "outcome", "outcome": "ok", "verdict": "adjust",
+                          "confidence": "medium", "reply_chars": len(text), "seconds": 12.3})
+        for response, outcome, verdict, confidence in (
+                (self.reply("**Verdict:** stop\nConfidence: high"), "ok", "stop", "high"),
+                (self.reply("\nVerdict: Proceed\n"), "ok", "proceed", None),
+                ("Verdict: proceed\nConfidence: low", "ok", "proceed", "low"),
+                (self.reply("Here is my view.\nVerdict: proceed\nConfidence: high"), "malformed", None, "high"),
+                (self.reply("Verdict: maybe"), "malformed", None, None),
+                (self.reply(""), "malformed", None, None),
+                ({"status": "completed", "content": []}, "failed", None, None), ({}, "failed", None, None),
+                (None, "failed", None, None)):
+            self.result(data, response)
+            line = self.trace()[-1]
+            self.assertEqual((line["outcome"], line["verdict"], line["confidence"]), (outcome, verdict, confidence), response)
+        self.assertIsNone(self.trace()[-1]["reply_chars"], "no reply, no size")
+        self.result(self.call(tool_id="toolu_none"), self.reply("Verdict: proceed"))
+        self.assertIsNone(self.trace()[-1]["seconds"], "never admitted: no duration")
+        refused = self.call(self.brief(drop=["Task:"]), tool_id="toolu_d")
+        self.denied(refused, "brief-sections")
+        self.result(refused, self.reply("Verdict: proceed"))
+        self.assertIsNone(self.trace()[-1]["seconds"], "denied: no duration")
+        before = self.trace()
+        self.assertIsNone(self.result(self.call(agent="Explore"), self.reply("Verdict: stop")))
+        self.assertEqual(self.trace(), before, "another agent type: nothing written")
+        self.assertEqual(self.state()["sessions"]["s1"]["count"], 1, "a failed consultation still counts")
+
+    def test_the_result_hook_prints_nothing_and_never_keeps_the_reply(self):
+        data = self.call(tool_id="toolu_r2")
+        self.assertEqual(self.run_hook(self.HOOK, data).returncode, 0)
+        reply = {**data, "hook_event_name": "PostToolUse",
+                 "tool_response": self.reply(f"Verdict: proceed\nWhy: {self.S}\nConfidence: high")}
+        out = self.run_hook(self.RESULT, reply)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertEqual(self.trace()[-1]["outcome"], "ok")
+        written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertIn('"outcome"', written)
+        self.assertNotIn(self.S, written)
+        (self.home / "advisor" / "trace.jsonl").unlink()
+        (self.home / "advisor" / "trace.jsonl").mkdir()  # nothing can be traced: the call has run, so exit 0 all the same
+        for raw in (json.dumps(reply), "not json", ""):
+            out = self.run_hook(self.RESULT, raw)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertIn("advisor-result hook: no outcome traced (IsADirectoryError)", self.log())
+        written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertNotIn(self.S, written)
+
 
 class Settings(unittest.TestCase):
     """The LONGHAUL_* numbers read at import (Sprint 4, T5): a typo in any

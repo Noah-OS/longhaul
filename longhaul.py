@@ -4293,6 +4293,82 @@ def advisor_hook(_opts) -> int:
         return advisor_fail(data, e)
 
 
+def advisor_reply(response):
+    """The advisor's reply from the Agent tool's response (its content's
+    text blocks, or a plain string), or None when it holds none."""
+    if isinstance(response, dict):
+        response = response.get("content")
+    if isinstance(response, str):
+        return response
+    if isinstance(response, list):
+        parts = [part["text"] for part in response
+                 if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def advisor_verdict(text: str) -> tuple:
+    """(verdict, confidence) from D2.5's lines, markdown emphasis aside:
+    the verdict on the reply's first line, the confidence on any; None
+    for each that is missing."""
+    lines = [line.strip().strip("*_#> ").replace("**", "") for line in text.splitlines() if line.strip()]
+    verdict = re.match(r"verdict:\s*(proceed|adjust|stop)\b", lines[0], re.IGNORECASE) if lines else None
+    confidence = next((found for found in (re.match(r"confidence:\s*(high|medium|low)\b", line, re.IGNORECASE)
+                                           for line in lines) if found), None)
+    return (verdict.group(1).lower() if verdict else None, confidence.group(1).lower() if confidence else None)
+
+
+def advisor_decided_at(tool_id):
+    """When the consultation `tool_id` was admitted, from its decision
+    line, or None."""
+    if tool_id is None:
+        return None
+    for raw in reversed(advisor_lines()):
+        if tool_id not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("id") == tool_id and entry.get("event") == "decision" \
+                and entry.get("decision") == "allow":
+            return as_number(entry.get("t"))
+    return None
+
+
+def advisor_outcome(data, now: float | None = None) -> None:
+    """advisor-result's work: for a consultation, the outcome line (ok,
+    failed when the response holds no reply, malformed when its first
+    line is no verdict), with the verdict, the confidence, the reply's
+    size and the seconds since it was admitted; never the reply."""
+    if not advisor_consultation(data):
+        return None
+    now = time.time() if now is None else now
+    reply = advisor_reply(data.get("tool_response"))
+    verdict, confidence = advisor_verdict(reply or "")
+    line = {"t": round(now, 3), "id": advisor_id(data.get("tool_use_id")), "session": advisor_id(data.get("session_id")),
+            "event": "outcome", "outcome": "failed" if reply is None else "ok" if verdict else "malformed",
+            "verdict": verdict, "confidence": confidence, "reply_chars": None if reply is None else len(reply),
+            "seconds": None}
+    with locked("advisor"):
+        started = advisor_decided_at(line["id"])
+        line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
+        advisor_trace(line, now)
+    return None
+
+
+def advisor_result(_opts) -> int:
+    """The PostToolUse hook command: stdin in, nothing out, exit 0 always:
+    the call has run, so nothing is left to stop. An error is logged by
+    its kind alone, as advisor_fail() does, never with its text."""
+    try:
+        raw = sys.stdin.read()
+        advisor_outcome(json.loads(raw) if raw.strip() else {})
+    except Exception as e:
+        log(f"advisor-result hook: no outcome traced ({type(e).__name__})")
+    return 0
+
+
 # ------------------------------------------------------------- VS Code
 #
 # The Claude Code VS Code extension (2.1.300, 2.1.301) runs the program in
@@ -5459,7 +5535,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor-hook"):
+                            "add", "remove", "advisor-hook", "advisor-result"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -5491,7 +5567,7 @@ def main(argv: list[str]) -> int:
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
-                "advisor-hook": advisor_hook}[cmd](opts)
+                "advisor-hook": advisor_hook, "advisor-result": advisor_result}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
