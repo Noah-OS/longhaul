@@ -89,6 +89,17 @@
             "statusMessage": "Adding the Advisor's note (longhaul advisor)"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.main(['reminder'])\nexcept BaseException:\n    pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Checking the context's size (longhaul checkpoint)"
+          }
+        ]
       }
     ]
   }

@@ -5960,13 +5960,14 @@ class Advisor(unittest.TestCase):
 
     def test_the_plugin_registers_the_advisors_note_on_each_prompt(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
-        [entry] = hooks["UserPromptSubmit"]
+        entry, _ = hooks["UserPromptSubmit"]  # the reminder's is pinned in Reminder
         self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
         [handler] = entry["hooks"]
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 7, "the plugin's seventh hook")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 8,
+                         "the plugin's seventh hook, and the reminder's")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -6851,7 +6852,7 @@ class Shim(unittest.TestCase):
         # From the Bash tool a plain `longhaul` would start a second claude
         # under a session, with Remote Control and caffeinate.
         for args in ((), ("-c",), ("-r", "x"), ("setup",), ("add", "A", "a@b"), ("remove", "A"), ("clear",),
-                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("--switch", "auto")):
+                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto")):
             out = self.shim(*args)
             self.assertEqual(out.returncode, 2, args)
             self.assertIn("run it in a terminal", out.stderr, args)
@@ -7286,6 +7287,62 @@ class Reminder(unittest.TestCase):
         self.assertIsNone(self.record())
         self.grow(150_000, 205_000)
         self.assertEqual(self.remind(), self.reminded(205))
+
+    def hook(self, root=None):
+        """The reminder's hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook("UserPromptSubmit", "reminder")
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def run_hook(self, cmd, data, **env):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.run(cmd, input=raw, env={**self.env, **env}, cwd=self.tmp, capture_output=True, text=True,
+                              timeout=30)
+
+    def test_the_plugin_registers_the_reminder_on_each_prompt_as_its_eighth_hook(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        note, entry = hooks["UserPromptSubmit"]
+        self.assertIn("main(['advisor-note'])", note["hooks"][0]["args"][2], "the Advisor's note stays first")
+        self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
+        [handler] = entry["hooks"]
+        self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+        self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+        self.assertEqual((handler["timeout"], handler["statusMessage"]),
+                         (5, "Checking the context's size (longhaul checkpoint)"))
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 8, "the plugin's eighth hook")
+        # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
+        # does, BaseException included, the wrapper exits 0.
+        wrapper = handler["args"][2]
+        self.assertIn("longhaul.main(['reminder'])", wrapper)
+        self.assertIn("except BaseException:", wrapper)
+        self.assertTrue(wrapper.endswith("\nsys.exit(0)"), wrapper)
+        self.assertEqual(self.hook()[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+        self.grow(205_000)
+        out = self.run_hook(self.hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.reminded(205), ""))
+        out = self.run_hook(self.hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), "once")
+        self.grow(150_000)
+        out = self.run_hook(self.hook(), self.ask(), LONGHAUL_CHECKPOINT_AT="100000")
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), "100k is under 200k, the highest said")
+
+    def test_the_hook_never_blocks_a_prompt_whatever_its_longhaul_does(self):
+        self.grow(205_000)
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n", "returns": "def main(argv):\n    return 2\n",
+                 "interrupted": "def main(argv):\n    raise KeyboardInterrupt\n", "empty": None, "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / name
+            if name != "missing":
+                root.mkdir()
+            if source:
+                (root / "longhaul.py").write_text(source)
+            out = self.run_hook(self.hook(root), self.ask())
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
+        for raw in ("", "not json {", "[1]", json.dumps(self.ask(text=self.S * 60_000))):
+            out = self.run_hook(self.hook(), raw)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw[:20])
+        self.assertIsNone(self.record(), "nothing said yet")
 
     def test_the_guards_own_writes_keep_what_was_said(self):
         # The record is the guard's too: its PreToolUse hook rewrites it at
