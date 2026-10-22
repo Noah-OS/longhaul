@@ -3840,8 +3840,15 @@ class Advisor(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.home = self.tmp / "home"
         self.home.mkdir()
-        self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "USAGE_DIR")}
-        longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR = self.home, self.home / "usage"
+        self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "USAGE_DIR", "HOME")}
+        # The user's home folder, whose ~/.longhaul A2 reads as well (F13): a
+        # scratch one, never the real one, here and in every hook run.
+        self.os_home = self.tmp / "os-home"
+        self.os_home.mkdir()
+        longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR, longhaul.HOME = self.home, self.home / "usage", self.os_home
+        # The session's folder, beside the home: a cwd the home is inside makes it untrusted (F13).
+        self.work = self.tmp / "work"
+        self.work.mkdir()
         self.now = time.time()
         self.n = 0
         # Claude Code as the probe saw it on the owner's terminal: the version
@@ -3856,7 +3863,8 @@ class Advisor(unittest.TestCase):
         self.reading()
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("LONGHAUL_") and k not in self.VARS + Checkpoint.SESSION_VARS}
-        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude-config"),
+        self.env.update(HOME=str(self.os_home), LONGHAUL_HOME=str(self.home),
+                        LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude-config"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
                         LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
                         LONGHAUL_ADVISOR="experiment", CLAUDE_CODE_EXECPATH=str(self.exe))
@@ -3912,7 +3920,7 @@ class Advisor(unittest.TestCase):
         if brief is None:
             brief = self.brief() if longhaul.advisor_named(agent) else f"Find where the parser reads tabs ({self.S})."
         data = {"session_id": session, "prompt_id": prompt, "tool_use_id": tool_id or f"toolu_{uuid.uuid4().hex[:12]}",
-                "transcript_path": str(self.transcript), "cwd": str(self.tmp), "permission_mode": "default",
+                "transcript_path": str(self.transcript), "cwd": str(self.work), "permission_mode": "default",
                 "effort": "high", "hook_event_name": "PreToolUse", "tool_name": "Agent",
                 "tool_input": {"description": "Consult the advisor", "prompt": brief,
                                "run_in_background": False, "subagent_type": agent}}
@@ -4709,7 +4717,10 @@ class Advisor(unittest.TestCase):
         self.reading(five=97)
         (self.home / "accounts.json").write_text(json.dumps([{"name": "main", "repositories": [str(self.tmp / "elsewhere")]}]))
         bad = "Reconcile: yes\nfindings in sk-ant-x\n" + "x" * 9_000
-        step(call(bad, None), LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
+        around = call(bad, None)
+        around["cwd"] = str(self.tmp)  # the home is inside it (F13)
+        step(around, LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
+        step(around, CLAUDE_CODE_EXECPATH=None)
         step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
         self.enable()
         step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
@@ -4749,13 +4760,14 @@ class Advisor(unittest.TestCase):
         step(call(self.brief(), session="s2", extra=False))
         self.reading(five=40)
         step(call(self.brief(), session="s2", extra=False))
-        self.assertEqual(said, ["off", "not-enabled", "no-probe", "version-unknown", "version-mismatch", "model-mismatch",
+        self.assertEqual(said, ["off", "home-untrusted", "not-enabled", "no-probe", "version-unknown", "version-mismatch",
+                                "model-mismatch",
                                 "executor-unknown", "no-stronger-advisor", "model-unprobed", "repository", "call-fields",
                                 "brief-too-long", "brief-sections", "trigger-missing", "credential", "task-unknown",
                                 "reconcile-invalid", "repeat", "cap-task", "cap-session", "near-full", "allowance-unknown",
                                 "allow"])
         self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
-                         ["hard"] * 10 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
+                         ["hard"] * 11 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
 
     def test_the_brief_is_at_most_8000_characters(self):
         base = self.brief()
@@ -4871,7 +4883,8 @@ class Advisor(unittest.TestCase):
 
     def test_the_sessions_account_must_be_allowed_in_the_calls_repository(self):
         # F9 (A2): the launch chose an account allowed here; the hook checks
-        # that again, by the expression the allowance check names it with.
+        # that again, by the expression the allowance check names it with. A
+        # cwd that is not an absolute path is home-untrusted before it (F13).
         repo = self.tmp / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / "src").mkdir()
@@ -4879,8 +4892,7 @@ class Advisor(unittest.TestCase):
         for n, (repositories, cwd, verdict) in enumerate((
                 ([str(self.tmp / "elsewhere")], repo / "src", "repository"), ([str(repo)], repo / "src", "allow"),
                 ([str(repo / "src")], repo / "src", "repository"),  # the repository is the work tree's top
-                ("~/work", repo, "repository"), ([str(repo)], "relative/path", "repository"),
-                ([str(repo)], None, "repository"), (None, "relative/path", "allow"), ([], None, "allow"))):
+                ("~/work", repo, "repository"), (None, repo, "allow"), ([], repo / "src", "allow"))):
             accounts.write_text(json.dumps([{"name": "main", "config_dir": None, "repositories": repositories}]))
             data = self.call(prompt=f"p{n}")
             data["cwd"] = str(cwd) if isinstance(cwd, Path) else cwd
@@ -4897,6 +4909,88 @@ class Advisor(unittest.TestCase):
         accounts.write_text(json.dumps([{"name": "Max", "config_dir": None, "repositories": [str(repo)]}]))
         self.assertEqual(longhaul.session_account(None), ("Max", {"name": "Max", "config_dir": None, "repositories": [str(repo)]}))
         self.assertEqual(longhaul.session_account(str(self.tmp / "pro")), ("pro", {"name": "pro"}), "not in the file: no list")
+
+    def test_a_home_that_is_relative_or_inside_the_repository_is_untrusted(self):
+        # F13: a repository's own settings could point LONGHAUL_HOME at files
+        # it ships, a probe record and an enabled key among them. A home that
+        # is relative, or by real path the call's cwd, inside it or inside the
+        # repository above it, is denied before any file is read; a cwd that
+        # is not an absolute path rules nothing out. The tests' homes are
+        # absolute scratch folders beside the session's, so they are trusted.
+        (self.tmp / "alias").symlink_to(self.tmp, target_is_directory=True)
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+
+        def untrusted(data, home=None):
+            with mock.patch.object(longhaul, "LONGHAUL_HOME", home or self.home), \
+                    mock.patch.object(longhaul, "read_json", side_effect=AssertionError("a file was read")), \
+                    mock.patch.object(longhaul, "advisor_running_version", side_effect=AssertionError("version asked")):
+                out = self.decide(data)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny", data.get("cwd"))
+            self.assertIn("denied (home-untrusted)", out["permissionDecisionReason"], data.get("cwd"))
+            return out["permissionDecisionReason"]
+
+        for cwd in (self.tmp, self.home, self.tmp / "alias", f"{self.tmp}/alias/work/..", "relative/path", "", None):
+            data = self.call(prompt="p1")
+            data["cwd"] = str(cwd) if isinstance(cwd, Path) else cwd
+            if cwd is None:
+                del data["cwd"]
+            reason = untrusted(data)
+            self.assertEqual((self.trace()[-1]["reason"], self.trace()[-1]["kind"]), ("home-untrusted", "hard"), cwd)
+        self.assertNotIn("LONGHAUL_HOME", reason, "the executor is told why, not what to change")
+        inner = self.call(prompt="p1")
+        inner["cwd"] = str(repo / "src")
+        untrusted(inner, repo / "lh")  # the repository above the cwd holds it
+        untrusted(inner, repo / "src" / "lh")
+        (self.tmp / "lh").symlink_to(repo / "src", target_is_directory=True)
+        untrusted(inner, self.tmp / "lh" / "home")  # a link that resolves into it
+        untrusted(self.call(prompt="p1"), Path(os.path.relpath(self.home)))  # relative, wherever it leads
+        self.assertEqual(self.state(), {}, "nothing counted")
+        # The hook as the plugin runs it, given a relative home.
+        out = subprocess.run(self.HOOK, input=json.dumps(self.call(prompt="p1")), env={**self.env, "LONGHAUL_HOME": "home"},
+                             cwd=self.tmp, capture_output=True, text=True, timeout=30)
+        self.assertIn("denied (home-untrusted)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        # A home beside the session's folder is trusted, and so is one the
+        # session's folder is inside: no repository's files are in it.
+        self.admitted(self.call(prompt="p1"))
+        nested = self.call(prompt="p2")
+        nested["cwd"] = str(self.home / "advisor")
+        self.admitted(nested)
+
+    def test_a_scratch_home_cannot_lift_a_restriction_the_default_home_keeps(self):
+        # F13: with LONGHAUL_HOME not the default home, A2 reads the default
+        # home's accounts.json too, the account named there by its config
+        # folder as the status line names it; a restriction in either file
+        # that does not admit the repository denies the call.
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        pro, elsewhere = self.tmp / "pro", str(self.tmp / "elsewhere")
+        default = self.os_home / ".longhaul"
+        default.mkdir()
+        self.reading(name="Pro")
+        for n, (scratch, real, config, verdict) in enumerate((
+                (None, [{"name": "main", "repositories": [elsewhere]}], None, "repository"),
+                (None, [{"name": "main", "repositories": [str(repo)]}], None, "allow"),
+                ([{"name": "main", "repositories": [elsewhere]}], [{"name": "main", "repositories": [str(repo)]}], None,
+                 "repository"),
+                ([{"name": "Pro", "config_dir": str(pro)}],
+                 [{"name": "Work", "config_dir": str(pro), "repositories": [elsewhere]}], str(pro), "repository"),
+                ([{"name": "Pro", "config_dir": str(pro)}], [{"name": "Work", "config_dir": str(pro)}], str(pro), "allow"),
+                (None, [{"name": "main", "repositories": "~/work"}], None, "repository"),  # junk there fails closed
+                (None, None, None, "allow"))):  # no file there: no restriction
+            for home, accounts in ((self.home, scratch), (default, real)):
+                path = home / "accounts.json"
+                if accounts is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_text(json.dumps(accounts))
+            data = self.call(prompt=f"p{n}")
+            data["cwd"] = str(repo)
+            if verdict == "allow":
+                self.admitted(data, CLAUDE_CONFIG_DIR=config)
+            else:
+                self.assertIn("this repository", self.denied(data, "repository", CLAUDE_CONFIG_DIR=config), n)
 
     def test_the_caps_are_counted_apart_for_each_advisor_model(self):
         # F9, D2.4 as worded: an Opus advisor 2 per task plus 1 reconcile and
@@ -5297,10 +5391,11 @@ class Advisor(unittest.TestCase):
         written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
         self.assertNotIn(self.S, written)
 
-    def command(self, *args, **env):
-        """`longhaul advisor ...` from a terminal, the session's variables over it (None unsets a name)."""
+    def command(self, *args, cwd=None, **env):
+        """`longhaul advisor ...` from a terminal in the session's folder (or
+        `cwd`), the session's variables over it (None unsets a name)."""
         values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
-        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "advisor", *args], env=values,
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "advisor", *args], env=values, cwd=cwd or self.work,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
 
     def default_home(self):
@@ -5399,9 +5494,9 @@ class Advisor(unittest.TestCase):
         self.admitted(self.call(prompt="r1", session="s2"), LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
         self.assertEqual(self.trace()[-1]["allowance"], "checked", "a fresh reading was checked")
 
-    def status(self, **env):
+    def status(self, cwd=None, **env):
         """`longhaul advisor status`: its lines but the last, by what each names (the text before its colon), and the last."""
-        out = self.command("status", **env)
+        out = self.command("status", cwd=cwd, **env)
         self.assertEqual((out.returncode, out.stderr), (0, ""), env)
         lines = out.stdout.splitlines()
         return dict(line.split(": ", 1) for line in lines[:-1]), lines[-1]
@@ -5454,6 +5549,20 @@ class Advisor(unittest.TestCase):
         self.assertEqual((lines["Probe record"], last), ("none", "off: no passing probe record"))
         written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
         self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "status writes nothing")
+
+    def test_advisor_status_names_an_untrusted_home(self):
+        # F13: status runs in the session's folder, so it checks the home
+        # against that folder and the repository above it, as the hook does.
+        inside = "inside the working folder or its repository"
+        lines, last = self.status(cwd=self.tmp)
+        self.assertEqual((lines["Home"], last), (f"{self.home} (untrusted: {inside})", f"off: Longhaul's home is untrusted ({inside})"))
+        lines, last = self.status(cwd=self.tmp, LONGHAUL_HOME="home")
+        self.assertEqual((lines["Home"], last), ("home (untrusted: a relative path)", "off: Longhaul's home is untrusted (a relative path)"))
+        self.assertEqual(lines["Probe record"][:22], "Claude Code 2.1.307, p", "the relative home is read all the same")
+        _, last = self.status(cwd=self.tmp, LONGHAUL_ADVISOR=None)
+        self.assertEqual(last, "off: LONGHAUL_ADVISOR is not experiment", "the switch first, as in the hook")
+        lines, last = self.status()
+        self.assertEqual((lines["Home"], last), (str(self.home), "enabled"))
 
     def test_advisor_status_names_where_the_running_version_came_from(self):
         # F7: status reads what the hook reads: the session's transcript

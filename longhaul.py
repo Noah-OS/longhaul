@@ -1850,15 +1850,16 @@ def account_for_config(config_dir, accounts: list[dict]) -> str:
     return path.name
 
 
-def session_account(config_dir) -> tuple:
+def session_account(config_dir, home: Path | None = None) -> tuple:
     """(the account a claude process runs as, by its CLAUDE_CONFIG_DIR, and
     its entry in accounts.json, or {"name": ...} alone when the file has
     none: no repositories, so unrestricted). The file's accounts, not
     load_accounts()'s stand-in for a missing file, which would name every
     reading from ~/.claude after it: with no accounts.json a session there
     is "main". The status line and the Advisor's hook both name the
-    account so (Sprint 8, F9)."""
-    accounts = read_json(LONGHAUL_HOME / "accounts.json") or []
+    account so (Sprint 8, F9); the hook asks the default home's file too,
+    by `home` (F13)."""
+    accounts = read_json((home or LONGHAUL_HOME) / "accounts.json") or []
     name = account_for_config(config_dir, accounts)
     return name, next((a for a in accounts if isinstance(a, dict) and a.get("name") == name), {"name": name})
 
@@ -3938,6 +3939,8 @@ ADVISOR_FIXABLE = ("call-fields", "brief-too-long", "brief-sections", "trigger-m
 # None names the switch: turning the Advisor on is for the user.
 ADVISOR_DENIALS = {
     "off": "the Advisor is off. Continue without advice; do not retry.",
+    "home-untrusted": "Longhaul's home folder is a relative path or inside this repository, where the repository's "
+                      "own files could stand in for its records. Continue without advice; do not retry.",
     "not-enabled": "the Advisor experiment is not enabled for this Claude Code version. Continue without advice; "
                    "do not retry.",
     "no-probe": "no passing capability probe is recorded, so no consultation is admitted. "
@@ -4006,6 +4009,25 @@ def advisor_default_home() -> bool:
     """Whether LONGHAUL_HOME is ~/.longhaul, by real path: the home real
     sessions keep their records in, never a scratch one."""
     return os.path.realpath(LONGHAUL_HOME) == os.path.realpath(HOME / ".longhaul")
+
+
+def advisor_untrusted_home(cwd):
+    """F13: why LONGHAUL_HOME is not trusted for a session in `cwd`, else
+    None. A repository's own settings could point it at files the
+    repository ships, a probe record and an enabled key among them, so a
+    home that is relative (it resolves against whatever folder a hook runs
+    in) or, by real path, the cwd, inside it or inside the repository above
+    it is not, and neither is any home when the cwd is not an absolute
+    path: nothing rules that out. Paths alone: no file is read."""
+    if not LONGHAUL_HOME.is_absolute():
+        return "a relative path"
+    if not (isinstance(cwd, str) and os.path.isabs(cwd)):
+        return "no absolute working folder to check it against"
+    home = os.path.realpath(LONGHAUL_HOME)
+    folders = {os.path.realpath(cwd), os.path.realpath(repository_of(cwd))}
+    if any(home == folder or inside(home, folder) for folder in folders):
+        return "inside the working folder or its repository"
+    return None
 
 
 def advisor_unchecked() -> bool:
@@ -4351,11 +4373,14 @@ def advisor_denial(reason: str, **detail) -> tuple:
 def advisor_gate(data: dict, line: dict) -> tuple:
     """The checks that need no count, run before the lock is taken, as
     (the first to fail before model-mismatch, the first after it): the
-    enabled key, the probe record and the version; then advisor_fit(),
-    only when those pass. model-mismatch needs the session's record, so
-    it is read under the lock, and the order is kept by checking it
-    before the second. A key for another version than the record's is
-    not-enabled too: a new record needs a new enable."""
+    home (F13, before any file is read), the enabled key, the probe
+    record and the version; then advisor_fit(), only when those pass.
+    model-mismatch needs the session's record, so it is read under the
+    lock, and the order is kept by checking it before the second. A key
+    for another version than the record's is not-enabled too: a new
+    record needs a new enable."""
+    if advisor_untrusted_home(data.get("cwd")):
+        return advisor_denial("home-untrusted"), None
     enabled = advisor_enabled()
     if enabled is None:
         return advisor_denial("not-enabled"), None
@@ -4398,14 +4423,20 @@ def advisor_fit(data: dict, line: dict, record: dict, tail: list):
 def advisor_repository(data: dict) -> bool:
     """A2 again (F9): whether the session's account, named as the
     allowance check names it, may be used in the repository of the call's
-    cwd. A cwd that is not an absolute path allows an unrestricted
-    account alone. An account not in accounts.json has no list, and has
-    no reading either, so the allowance check denies it."""
-    _, acct = session_account(os.environ.get("CLAUDE_CONFIG_DIR"))
+    cwd, by LONGHAUL_HOME's accounts.json and, when that is not the
+    default home, by the default home's as well (F13): a scratch home
+    lifts no restriction the real one keeps. A cwd that is not an
+    absolute path allows only an account unrestricted in both (the home
+    check has denied it already). An account not in a file has no list
+    there; one not in LONGHAUL_HOME's has no reading either, so the
+    allowance check denies it."""
+    homes = [LONGHAUL_HOME] if advisor_default_home() else [LONGHAUL_HOME, HOME / ".longhaul"]
+    accts = [session_account(os.environ.get("CLAUDE_CONFIG_DIR"), home)[1] for home in homes]
     cwd = data.get("cwd")
     if not (isinstance(cwd, str) and os.path.isabs(cwd)):
-        return repositories_of(acct) == []
-    return account_allowed(acct, repository_of(cwd))
+        return all(repositories_of(acct) == [] for acct in accts)
+    top = repository_of(cwd)
+    return all(account_allowed(acct, top) for acct in accts)
 
 
 def advisor_fields_problem(tool: dict):
@@ -4918,9 +4949,15 @@ def advisor_status_lines() -> list:
     """`longhaul advisor status`: the switch, the probe record's version
     and the rewrites it saw (F5), the running version and where it came
     from (F7: the session's transcript, the path or --version, as the hook
-    finds it), the enabled key, the allowance rule and the home (F8), then
-    "enabled" or "off: <why>", the first gate that is shut. The skill's
-    first step runs it and stops unless its last line is enabled."""
+    finds it), the enabled key, the allowance rule and the home (F8), and
+    whether the home is untrusted in the folder status runs in, the
+    session's (F13), then "enabled" or "off: <why>", the first gate that
+    is shut. The skill's first step runs it and stops unless its last line
+    is enabled."""
+    try:
+        untrusted = advisor_untrusted_home(os.getcwd())
+    except OSError:  # the folder was removed under it
+        untrusted = advisor_untrusted_home(None)
     switch, record, enabled = advisor_switch(), advisor_probe(), advisor_enabled()
     recorded = record["claude_version"] if record else None
     running, source = advisor_running_version(advisor_tail(advisor_session_transcript()), recorded)
@@ -4933,9 +4970,11 @@ def advisor_status_lines() -> list:
              f"Running Claude Code: {running or 'unknown'}" + (f" (from {source})" if source else ""),
              f"Enabled key: {key}",
              f"Allowance: {advisor_allowance_said()}",
-             f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}",
+             f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}"
+             + (f" (untrusted: {untrusted})" if untrusted else ""),
              f"Unadmitted advisor runs traced: {advisor_unadmitted()}"]
     why = ("LONGHAUL_ADVISOR is not experiment" if not switch
+           else f"Longhaul's home is untrusted ({untrusted})" if untrusted
            else "not enabled (longhaul advisor enable, in a terminal)" if enabled is None
            else "no passing probe record" if record is None
            else f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
