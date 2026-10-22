@@ -114,7 +114,9 @@ Usage:
   longhaul advisor-hook         the plugin's PreToolUse hook on Agent and Task: admits
                           or denies a call of the longhaul:advisor agent type and
                           leaves any other alone; advisor-result, its PostToolUse
-                          hook, traces how the consultation went
+                          hook, traces how the consultation went; advisor-note,
+                          its UserPromptSubmit hook, adds a line naming the
+                          decision points while the experiment is fully on
   longhaul clear                forget the recorded limits
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
@@ -3866,7 +3868,11 @@ def checkpoint(opts) -> int:
 # no answer and nothing is written, as before the hook existed. The
 # hook never chooses an account: the subagent runs on the session's
 # own, which was decided at launch (A2). `longhaul advisor-result`
-# (PostToolUse) adds the outcome. LONGHAUL_HOME/advisor/ holds probe.json
+# (PostToolUse) adds the outcome. `longhaul advisor-note`
+# (UserPromptSubmit) adds ADVISOR_NOTE to each prompt while the
+# experiment is fully on (advisor_off_reason(), the gates `advisor status`
+# ends with), and fails open; its wrapper imports nothing with the switch
+# off. LONGHAUL_HOME/advisor/ holds probe.json
 # (written only by `longhaul advisor record-probe`, from a terminal),
 # state.json (counts and brief hashes), trace.jsonl (a line per attempt
 # and per outcome) and version-cache.json, each 0600 and written under
@@ -3996,6 +4002,17 @@ ADVISOR_DENIALS = {
                  "consultation through /longhaul:advise, within its caps; do not send this message again.",
     "error":"the hook could not finish its checks. Continue without advice; do not retry.",
 }
+# The line `longhaul advisor-note` (UserPromptSubmit) adds to the executor's
+# context with each prompt while the experiment is fully on: in 4 benchmark
+# runs the executor never consulted on its own, with the skill's
+# description alone (the owner's decision of 2026-10-22). It names the four
+# decision points and leaves the choice to the executor.
+ADVISOR_NOTE = ("Longhaul's Advisor experiment is on in this session. At these points you may consult a stronger "
+                "model with /longhaul:advise: early (after orientation, before the first write, on a multi-file, "
+                "architectural or unclear task), stuck (the same failure twice, or an approach not converging), "
+                "change (before changing approach), done (before declaring a long task done, once its files are "
+                "written and tests run). Not for trivial edits, docs edits or simple questions. You decide whether "
+                "a consultation would help.")
 
 
 def advisor_path(name: str) -> Path:
@@ -4992,6 +5009,29 @@ def advisor_result(_opts) -> int:
         advisor_outcome(json.loads(raw) if raw.strip() else {})
     except Exception as e:
         log(f"advisor-result hook: no outcome traced ({type(e).__name__})")
+    return 0
+
+
+def advisor_note(_opts) -> int:
+    """The UserPromptSubmit hook command: stdin in, ADVISOR_NOTE as the
+    prompt's added context when the experiment is fully on for the
+    session (advisor_off_reason() None, from the input's cwd and its
+    transcript's tail, as the gate reads them), else nothing out; exit 0
+    always. A missing note is safe, so it fails open: an error prints
+    nothing and is logged by its kind alone. Of the input only cwd and
+    transcript_path are looked at: the prompt's text is never used,
+    logged, kept or said."""
+    try:
+        raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
+        if len(raw) > ADVISOR_STDIN_MAX:
+            log(f"advisor-note hook: no note added (over {ADVISOR_STDIN_MAX:,} characters)")
+            return 0
+        data = json.loads(raw) if raw.strip() else {}
+        data = data if isinstance(data, dict) else {}
+        if advisor_off_reason(data.get("cwd"), advisor_tail(data.get("transcript_path"))) is None:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ADVISOR_NOTE}}))
+    except Exception as e:
+        log(f"advisor-note hook: no note added ({type(e).__name__})")
     return 0
 
 
@@ -6352,7 +6392,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor", "advisor-hook", "advisor-result"):
+                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -6391,7 +6431,8 @@ def main(argv: list[str]) -> int:
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
-                "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result}[cmd](opts)
+                "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
+                "advisor-note": advisor_note}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

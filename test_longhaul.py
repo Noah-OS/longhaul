@@ -3776,15 +3776,25 @@ class Advisor(unittest.TestCase):
     """The Advisor experiment's hooks (Sprint 8, region B; the decision
     package's D2.1-D2.8): `longhaul advisor-hook`, PreToolUse on Agent,
     admits or denies a consultation (a call of the longhaul:advisor agent
-    type), and `longhaul advisor-result`, PostToolUse, traces how it went.
+    type), and `longhaul advisor-result`, PostToolUse, traces how it went;
+    `longhaul advisor-note`, UserPromptSubmit, adds a line to each prompt
+    naming the decision points while the experiment is fully on.
     Off unless LONGHAUL_ADVISOR=experiment and a passing probe is recorded
     for the running Claude Code. Every test turns it on in a scratch home
     alone, and none runs a real claude: the version comes from a fake path
     or a fake executable."""
 
-    # A brief's or a reply's text: it belongs in the tool's input and in the
-    # engine's answer, and never in the trace, the state, the log or a reason.
+    # A brief's, a reply's or a prompt's text: it belongs in the tool's input
+    # and in the engine's answer, and never in the trace, the state, the log
+    # or a reason.
     S = "SENTINEL-OKAPI-4412"
+    # The Advisor's note, word for word (the owner's decision of 2026-10-22:
+    # in 4 benchmark runs the executor never consulted on its own).
+    NOTE = ("Longhaul's Advisor experiment is on in this session. At these points you may consult a stronger model "
+            "with /longhaul:advise: early (after orientation, before the first write, on a multi-file, architectural "
+            "or unclear task), stuck (the same failure twice, or an approach not converging), change (before "
+            "changing approach), done (before declaring a long task done, once its files are written and tests run). "
+            "Not for trivial edits, docs edits or simple questions. You decide whether a consultation would help.")
     # The hooks as the plugin registers them (F1: the PreToolUse one reads its
     # input before it imports longhaul, and denies a consultation without it).
     HOOK = registered_hook("PreToolUse", "advisor-hook")
@@ -5704,15 +5714,158 @@ class Advisor(unittest.TestCase):
             with mock.patch.dict(os.environ, values, clear=True):
                 why = longhaul.advisor_off_reason(str(cwd or self.work), [])
             self.assertEqual(last, "enabled" if why is None else f"off: {why}", name)
+            self.assertEqual(self.note(self.ask(cwd=cwd), **env), self.noted() if why is None else "", name)
             said.append(last)
         self.assertEqual(len(set(said)), len(states), "each state its own line")
         # Whatever the helper says is status's last line, from the folder
-        # status runs in and the session's transcript (none here).
+        # status runs in and the session's transcript (none here), and
+        # decides the note, from the input's cwd and transcript: the switch
+        # is the helper's to read too.
         with mock.patch.dict(os.environ, self.env, clear=True):
             for why, last in (("a test's reason", "off: a test's reason"), (None, "enabled")):
                 with mock.patch.object(longhaul, "advisor_off_reason", return_value=why) as off:
                     self.assertEqual(longhaul.advisor_status_lines()[-1], last)
                 off.assert_called_once_with(os.getcwd(), [])
+        self.stamped("2.1.307")
+        for why, env, out in (("a test's reason", {}, ""), (None, {"LONGHAUL_ADVISOR": None}, self.noted())):
+            with mock.patch.object(longhaul, "advisor_off_reason", return_value=why) as off:
+                self.assertEqual(self.note(self.ask(), **env), out)
+            off.assert_called_once_with(str(self.work), longhaul.advisor_tail(str(self.transcript)))
+
+    def ask(self, text=None, cwd=None):
+        """A UserPromptSubmit input as Claude Code sends one: the prompt's
+        text (holding S) beside the session's fields."""
+        return {"session_id": "s1", "transcript_path": str(self.transcript), "cwd": str(cwd or self.work),
+                "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+                "prompt": f"Make the parser take tabs ({self.S})" if text is None else text}
+
+    def noted(self):
+        """What advisor-note prints while the experiment is fully on, exactly."""
+        return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": self.NOTE}}) + "\n"
+
+    def note(self, data, **env):
+        """`longhaul advisor-note`'s output for `data` (an input, or its raw
+        text), in this process, in the session's environment with `env` over
+        it (None unsets a name)."""
+        raw = data if isinstance(data, str) else json.dumps(data)
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["advisor-note"])
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def note_hook(self, root=None):
+        """The note's hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook("UserPromptSubmit", "advisor-note")
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def test_the_plugin_registers_the_advisors_note_on_each_prompt(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        [entry] = hooks["UserPromptSubmit"]
+        self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
+        [handler] = entry["hooks"]
+        self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+        self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+        self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 7, "the plugin's seventh hook")
+        # Off, the hook costs Python's start alone: the switch is read before
+        # longhaul is imported.
+        wrapper = handler["args"][2]
+        self.assertLess(wrapper.index("os.environ.get('LONGHAUL_ADVISOR') != 'experiment'"), wrapper.index("import longhaul"))
+        self.assertIn("longhaul.main(['advisor-note'])", wrapper)
+        self.assertEqual(self.note_hook()[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+        out = self.run_hook(self.note_hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.noted(), ""))
+        self.assertEqual(longhaul.ADVISOR_NOTE, self.NOTE)
+        self.assertNotIn("\n", self.NOTE, "one line")
+
+    def test_the_note_is_added_only_while_the_experiment_is_fully_on(self):
+        # The gates `advisor status` ends with, each shut in turn from a
+        # session with all of them open: any one shut, nothing is printed.
+        self.assertEqual(self.note(self.ask()), self.noted())
+        other = self.tmp / "claude" / "versions" / "2.1.308"
+        other.write_text("")
+        key, record = self.home / "advisor" / "enabled.json", self.home / "advisor" / "probe.json"
+        cases = [("the switch unset", None, {"LONGHAUL_ADVISOR": None}, None),
+                 ("the switch another word", None, {"LONGHAUL_ADVISOR": "on"}, None),
+                 ("the switch capitalised", None, {"LONGHAUL_ADVISOR": "Experiment"}, None),
+                 ("no key", key.unlink, {}, None), ("a key for another version", lambda: self.enable("2.1.306"), {}, None),
+                 ("no probe", record.unlink, {}, None), ("a failing probe", lambda: self.probe(read_only=False), {}, None),
+                 ("empty rewrites", lambda: self.probe(rewrites=()), {}, None),
+                 ("no rewrites", lambda: self.probe(rewrites=None), {}, None),
+                 ("the home inside the session's folder", None, {}, self.ask(cwd=self.tmp)),
+                 ("no working folder", None, {}, {k: v for k, v in self.ask().items() if k != "cwd"}),
+                 ("a relative working folder", None, {}, self.ask(cwd="work")),
+                 *((f"{name} set", None, {name: ""}, None) for name in self.FORCED),
+                 ("another version on the path", None, {"CLAUDE_CODE_EXECPATH": str(other)}, None),
+                 ("another version in the transcript", lambda: self.stamped("2.1.308"), {}, None),
+                 ("no version", None, {"CLAUDE_CODE_EXECPATH": None}, None)]
+        for name, shut, env, data in cases:
+            self.probe()
+            self.enable()
+            self.executor("claude-sonnet-4-5")
+            if shut:
+                shut()
+            self.assertEqual(self.note(data or self.ask(), **env), "", name)
+        self.probe()
+        self.enable()
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", Path("home")):
+            self.assertEqual(self.note(self.ask()), "", "a relative home")
+        # The running version is the input's transcript's, as the gate reads it.
+        self.stamped("2.1.307")
+        self.assertEqual(self.note(self.ask(), CLAUDE_CODE_EXECPATH=str(self.tmp / "claude" / "versions" / "2.1.304")),
+                         self.noted())
+        written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
+        self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "the note writes nothing")
+
+    def test_the_note_hook_never_imports_longhaul_with_the_switch_off_and_fails_open(self):
+        # A plugin root whose longhaul would leave a mark, print and exit 3:
+        # with the switch anything but experiment, it is never imported.
+        mark = self.tmp / "imported"
+        planted = self.tmp / "planted"
+        planted.mkdir()
+        (planted / "longhaul.py").write_text(f"open({str(mark)!r}, 'w').close()\nprint('imported')\nraise SystemExit(3)\n")
+        env = {k: v for k, v in self.env.items() if k != "LONGHAUL_ADVISOR"}
+        for switch in (None, "", "off", "on", "Experiment", " experiment", "experiment "):
+            out = subprocess.run(self.note_hook(planted), input=json.dumps(self.ask()), cwd=self.tmp, capture_output=True,
+                                 env=env if switch is None else {**env, "LONGHAUL_ADVISOR": switch}, text=True, timeout=30)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), repr(switch))
+        self.assertFalse(mark.exists(), "longhaul was never imported")
+        # With the switch on, a longhaul that cannot be imported, or whose
+        # call raises or exits (2 would block the prompt), adds nothing and
+        # exits 0: a missing note is safe.
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n", "returns": "def main(argv):\n    return 2\n",
+                 "empty": None, "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / name
+            if name != "missing":
+                root.mkdir()
+            if source:
+                (root / "longhaul.py").write_text(source)
+            out = subprocess.run(self.note_hook(root), input=json.dumps(self.ask()), env=self.env, cwd=self.tmp,
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
+
+    def test_the_note_never_keeps_or_says_the_prompts_text(self):
+        hook = self.run_hook(self.note_hook(), self.ask())
+        outs = [hook.stdout, hook.stderr, self.note(self.ask()), self.note(self.ask(), LONGHAUL_ADVISOR=None)]
+        self.assertEqual(outs, [self.noted(), "", self.noted(), ""])
+        # An error prints nothing and is logged by its kind alone, never its
+        # text; so is an input past the cap.
+        with mock.patch.object(longhaul, "advisor_off_reason", side_effect=RuntimeError(self.S)):
+            self.assertEqual(self.note(self.ask()), "")
+        self.assertEqual(self.note(json.dumps(self.ask())[:-1]), "", "not JSON")
+        self.assertEqual(self.note(self.ask(text=self.S * 60_000)), "", "past the cap")
+        self.assertEqual(self.note(json.dumps([self.S])), "", "not an object")
+        for kind in ("RuntimeError", "JSONDecodeError", "over 1,000,000 characters"):
+            self.assertIn(f"advisor-note hook: no note added ({kind})", self.log())
+        for root in (self.home, self.os_home):
+            for path in root.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(self.S.encode(), path.read_bytes(), path)
 
     def test_record_probe_writes_a_passing_record_and_refuses_anything_else(self):
         path = self.home / "advisor" / "probe.json"
@@ -6135,8 +6288,10 @@ class Checkpoint(unittest.TestCase):
 
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse"}, "these three events and nothing else")
-        # The Advisor's two entries on Agent, Task, SendMessage and Workflow are pinned in Advisor (Sprint 8).
+        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse", "UserPromptSubmit"},
+                         "these four events and nothing else")
+        # The Advisor's two entries on Agent, Task, SendMessage and Workflow
+        # (Sprint 8) and its note on UserPromptSubmit are pinned in Advisor.
         self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]],
                          ["Read|Bash", "Agent|Task|SendMessage|Workflow"])
         calls = hooks["hooks"]["PreToolUse"][0]
@@ -6513,7 +6668,7 @@ class Shim(unittest.TestCase):
         self.assertEqual(lines[-1], "off: LONGHAUL_ADVISOR is not experiment")
         # F8: enabling is the owner's, in a terminal; disable too goes there.
         for args in (("advisor",), ("advisor", "record-probe", "x.json"), ("advisor", "-h"), ("advisor-hook",),
-                     ("advisor-result",), ("advisor", "enable"), ("advisor", "disable")):
+                     ("advisor-result",), ("advisor-note",), ("advisor", "enable"), ("advisor", "disable")):
             out = self.shim(*args, CLAUDE_CODE_EXECPATH=exe)
             self.assertEqual((out.returncode, out.stdout), (2, ""), args)
             self.assertIn("run it in a terminal", out.stderr, args)
