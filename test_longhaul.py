@@ -5120,6 +5120,39 @@ class Advisor(unittest.TestCase):
         self.assertEqual(ran("toolu_f1", "p1", session="s4", model="fable"), "fable")
         self.admitted(self.call(session="s4", prompt="p2"))
 
+    def test_one_round_trip_across_the_regions(self):
+        # F11, item 2: what Region B writes is what Region A reads. A
+        # consultation admitted by advisor_decide and its outcome traced by
+        # advisor_outcome are in inspect_transcript's report, with the
+        # advisor's own tokens from its subagent's transcript.
+        data = self.call(tool_id="toolu_trip")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            answer = longhaul.advisor_decide(data, self.now)
+        self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "allow")
+        self.assertIsNone(longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse",
+                                                    "tool_response": self.reply(f"Verdict: adjust\nWhy: {self.S}")},
+                                                   self.now + 7))
+        self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
+        subagents = self.transcript.with_suffix("") / "subagents"
+        subagents.mkdir(parents=True)
+        usage = {"input_tokens": 3, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 50, "output_tokens": 40}
+        (subagents / "agent-a1.jsonl").write_text(json.dumps(
+            {"type": "assistant", "isSidechain": True,
+             "message": {"id": "msg_a1", "model": "claude-opus-4-5", "role": "assistant", "usage": usage,
+                         "content": [{"type": "text", "text": f"Verdict: adjust {self.S}"}]}}) + "\n")
+        (subagents / "agent-a1.meta.json").write_text(json.dumps(
+            {"agentType": longhaul.ADVISOR_TYPE, "toolUseId": "toolu_trip", "model": "opus"}))
+        r = longhaul.inspect_transcript(self.transcript)
+        c = r["consultations"]
+        self.assertEqual({k: c[k] for k in ("attempts", "admitted", "denied", "outcomes", "verdicts", "transcripts")},
+                         {"attempts": 2, "admitted": 1, "denied": {"brief-sections": 1}, "outcomes": {"ok": 1},
+                          "verdicts": {"adjust": 1}, "transcripts": 1})
+        self.assertEqual(c["tokens"], [{"model": "claude-opus-4-5", "input": 3, "cache_write": 100, "cache_read": 50,
+                                        "output": 40}])
+        lines = longhaul.inspect_lines(r)
+        self.assertIn("  2 consultations asked for: 1 admitted, 1 denied", lines)
+        self.assertNotIn(self.S, "\n".join(lines))
+
     def test_the_result_hook_prints_nothing_and_never_keeps_the_reply(self):
         data = self.call(tool_id="toolu_r2")
         self.assertEqual(self.run_hook(self.HOOK, data).returncode, 0)
