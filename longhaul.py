@@ -3850,7 +3850,8 @@ def checkpoint(opts) -> int:
 # through the /longhaul:advise skill, which calls the Agent tool with
 # subagent_type longhaul:advisor (agents/advisor.md: Read, Grep and Glob
 # alone). `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent,
-# Task and SendMessage (a message to an advisor is denied: F2), is what
+# Task, SendMessage and Workflow (a message to an advisor is denied: F2;
+# a workflow that names one too: F17), is what
 # enforces it: it admits a consultation only when
 # LONGHAUL_ADVISOR=experiment and a passing probe is recorded for the
 # Claude Code version running, then only on the advisor D3 names for the
@@ -3977,9 +3978,10 @@ ADVISOR_DENIALS = {
                  "do not retry.",
     "allowance-unknown": "no fresh allowance reading exists for this session's account, so the near-full rule cannot "
                          "be checked. Continue without advice; do not retry.",
-    # Outside the order: a call of any other agent type, and a message.
+    # Outside the order: a call of any other agent type, a workflow, and a message.
     "stand-in": "a brief (a first line Trigger:) goes to the longhaul:advisor agent type alone, through "
-                "/longhaul:advise, never to another agent. Continue without advice; do not retry.",
+                "/longhaul:advise, never to another agent, and no workflow may name the advisor. Continue without "
+                "advice; do not retry.",
     "follow-up": "an advisor answers one brief, so no message goes to it after that. More advice is a new "
                  "consultation through /longhaul:advise, within its caps; do not send this message again.",
     "error":"the hook could not finish its checks. Continue without advice; do not retry.",
@@ -4186,14 +4188,28 @@ def advisor_named(agent) -> bool:
     return isinstance(agent, str) and re.sub(r"\s", "", agent).lower() in ADVISOR_NAMES
 
 
+def advisor_workflow(data) -> bool:
+    """A Workflow call (F17): its script may start any agent, the advisor
+    among them, past every check. Its hook input is not yet probed, so
+    its fields are never read as an Agent call's."""
+    return isinstance(data, dict) and data.get("tool_name") == "Workflow"
+
+
 def advisor_consultation(data) -> bool:
-    """An Agent call of the advisor's agent type, by advisor_named()."""
-    return advisor_named(dict_at(data, "tool_input").get("subagent_type"))
+    """An Agent call of the advisor's agent type, by advisor_named(). A
+    Workflow call is never one, whatever its input holds (F17)."""
+    return not advisor_workflow(data) and advisor_named(dict_at(data, "tool_input").get("subagent_type"))
 
 
 def advisor_stand_in(data) -> bool:
     """A call of another agent type given a brief: its prompt's first
-    non-empty line begins Trigger:, however it is cased or spaced (F6)."""
+    non-empty line begins Trigger:, however it is cased or spaced (F6).
+    And a Workflow call whose input names the advisor in any case,
+    anywhere in its JSON (F17): read as text, since its shape is not
+    probed. A script that builds the name as it runs is stopped only by
+    the advisor's own refusal, for want of an admission line."""
+    if advisor_workflow(data) and "advisor" in json.dumps(data.get("tool_input")).lower():
+        return True
     prompt = dict_at(data, "tool_input").get("prompt")
     lines = prompt.splitlines() if isinstance(prompt, str) else []
     first = next((line.strip() for line in lines if line.strip()), "")
@@ -4384,9 +4400,9 @@ def advisor_brief_problem(brief: str):
 
 def advisor_check(data, now: float):
     """The hook's answer to one call, or None for a call it leaves alone:
-    a consultation is decided; a message to an advisor (follow-up) and a
-    brief sent to any other agent type (stand-in) are denied, whether or
-    not the experiment is on."""
+    a consultation is decided; a message to an advisor (follow-up), and a
+    brief sent to any other agent type or a workflow that names the
+    advisor (stand-in), are denied, whether or not the experiment is on."""
     if not isinstance(data, dict):
         return None
     if advisor_consultation(data):

@@ -3984,7 +3984,7 @@ class Advisor(unittest.TestCase):
                 "tool_name": "SendMessage", "tool_input": {"to": to, "message": f"One more question ({self.S})",
                                                            "summary": "a follow-up", **fields}}
 
-    def test_the_plugin_registers_both_hooks_on_agent_task_and_sendmessage(self):
+    def test_the_plugin_registers_both_hooks_on_agent_task_sendmessage_and_workflow(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
         guard, pre = hooks["PreToolUse"]
         [post] = hooks["PostToolUse"]
@@ -3992,9 +3992,10 @@ class Advisor(unittest.TestCase):
         for entry, command, cmd, says, timeout in (
                 (pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation", 30),
                 (post, "advisor-result", self.RESULT, "Tracing an advisor consultation", 5)):
-            # The subagent tool's name, its name before 2.1.63, and the tool
-            # that sends a running or finished agent a message (F2).
-            self.assertEqual(entry["matcher"], "Agent|Task|SendMessage")
+            # The subagent tool's name, its name before 2.1.63, the tool that
+            # sends a running or finished agent a message (F2), and the one
+            # that runs a script of agents (F17).
+            self.assertEqual(entry["matcher"], "Agent|Task|SendMessage|Workflow")
             [handler] = entry["hooks"]
             self.assertEqual(cmd[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
             self.assertEqual((handler["args"][:2], handler["args"][3]), (["-I", "-c"], "${CLAUDE_PLUGIN_ROOT}"))
@@ -4027,7 +4028,10 @@ class Advisor(unittest.TestCase):
         huge = json.dumps(self.call(self.brief(extra="x" * 1_100_000)))
         cases = [(self.call(), deny), (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
                  (self.call(agent="Explore"), None), ("{not json, an advisor", deny), ("{not json", None), ("", None),
-                 ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), None)]
+                 ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), None),
+                 # F17: a Workflow call is read as text, as the hook reads it.
+                 (self.workflow({"script": "agent({subagent_type: 'ADVISOR'})"}), deny),
+                 (self.workflow({"script": "agent({subagent_type: 'Explore'})"}), None)]
         for name, source in roots.items():
             root = self.tmp / name
             root.mkdir()
@@ -4334,6 +4338,49 @@ class Advisor(unittest.TestCase):
         out = self.run_hook(self.HOOK, self.call(self.brief(), agent="Explore"), LONGHAUL_ADVISOR="off")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def workflow(self, tool_input, session="s1"):
+        """A PreToolUse input for a Workflow call. Its hook input is not yet
+        probed (F17): the fields an Agent call's input comes with, and the
+        tool's name."""
+        return {"session_id": session, "prompt_id": "p1", "tool_use_id": f"toolu_{uuid.uuid4().hex[:12]}",
+                "transcript_path": str(self.transcript), "cwd": str(self.tmp), "hook_event_name": "PreToolUse",
+                "tool_name": "Workflow", "tool_input": tool_input}
+
+    def test_a_workflow_that_mentions_an_advisor_is_denied_and_any_other_passes(self):
+        # F17: a Workflow's script may start any agent, the advisor among
+        # them, past the gate. Its input is not probed, so it is read as
+        # text: advisor in any case, anywhere in its JSON, is a stand-in,
+        # whether or not the experiment is on. It is never a consultation,
+        # even in an Agent call's shape, so nothing is counted or admitted.
+        script = "const a = await agent({subagent_type: 'longhaul:advisor', prompt: brief})"
+        for tool_input in ({"script": script}, {"name": "review", "args": {"agents": ["Explore", "ADVISOR"]}},
+                           {"Advisor": True}, "ask the advisor", ["x", {"y": "an advisory note"}],
+                           {"description": "Consult the advisor", "prompt": self.brief(), "subagent_type": "longhaul:advisor"}):
+            data = self.workflow(tool_input)
+            self.assertFalse(longhaul.advisor_consultation(data), tool_input)
+            for env in ({}, {"LONGHAUL_ADVISOR": None}):
+                reason = self.denied(data, "stand-in", **env)
+                self.assertIn("/longhaul:advise", reason)
+                self.assertIn("workflow", reason)
+                self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.assertEqual(self.state(), {}, "nothing counted")
+        before = self.trace()
+        for tool_input in ({"script": "await agent({subagent_type: 'Explore', prompt: 'find the parser'})"}, {}, None,
+                           "x", [], 7):
+            self.assertIsNone(self.decide(self.workflow(tool_input)), tool_input)
+        # Its result is not a consultation's either: nothing is traced.
+        self.assertIsNone(self.result(self.workflow({"script": script}), self.reply("Verdict: proceed")))
+        self.assertEqual(self.trace(), before, "nothing written for a workflow that passes, nor for a result")
+        # Through the hook as the plugin runs it: the name is read once the
+        # JSON's escapes are, so an escaped letter does not hide it.
+        raw = json.dumps(self.workflow({"script": "agent({subagent_type: 'ADVISOR'})"})).replace("ADVISOR", "ADV\\u0049SOR")
+        self.assertNotIn("ADVISOR", raw)
+        out = self.run_hook(self.HOOK, raw)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.run_hook(self.HOOK, self.workflow({"script": "agent({subagent_type: 'Explore'})"}))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
 
     def test_a_message_to_an_advisor_is_denied_and_any_other_passes(self):
         # F2: a SendMessage resumes the advisor past every check. advisor-result
@@ -5777,8 +5824,9 @@ class Checkpoint(unittest.TestCase):
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
         self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse"}, "these three events and nothing else")
-        # The Advisor's two entries on Agent, Task and SendMessage are pinned in Advisor (Sprint 8).
-        self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]], ["Read|Bash", "Agent|Task|SendMessage"])
+        # The Advisor's two entries on Agent, Task, SendMessage and Workflow are pinned in Advisor (Sprint 8).
+        self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]],
+                         ["Read|Bash", "Agent|Task|SendMessage|Workflow"])
         calls = hooks["hooks"]["PreToolUse"][0]
         self.assertEqual(len(hooks["hooks"]["SessionStart"]), 3)
         starts = {entry["matcher"]: entry for entry in hooks["hooks"]["SessionStart"]}
