@@ -3938,15 +3938,15 @@ class Advisor(unittest.TestCase):
     def test_with_no_version_in_the_path_claude_is_asked_once_and_the_answer_cached(self):
         exe, mark = self.fake_claude()
         self.assertIsNone(longhaul.advisor_version_in(str(exe)), "the fixture's path names no version")
-        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
-        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
+        self.admitted(self.call(prompt="p1"), CLAUDE_CODE_EXECPATH=str(exe))
+        self.admitted(self.call(prompt="p2"), CLAUDE_CODE_EXECPATH=str(exe))
         self.assertEqual(mark.read_text(), "--version\n", "asked once")
         cache = self.home / "advisor" / "version-cache.json"
         self.assertEqual(json.loads(cache.read_text()),
                          {"realpath": str(exe), "mtime": exe.stat().st_mtime, "version": "2.1.307"})
         self.assertEqual(oct(cache.stat().st_mode & 0o777), oct(0o600))
         os.utime(exe, (self.now - 60, self.now - 60))  # an update in place: asked again
-        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
+        self.admitted(self.call(prompt="p3"), CLAUDE_CODE_EXECPATH=str(exe))
         self.assertEqual(mark.read_text(), "--version\n--version\n")
         for name, says, code in (("junk", "Claude Code", 0), ("fails", "2.1.307 (Claude Code)", 1)):
             other, ran = self.fake_claude(name, says, code)
@@ -4034,6 +4034,327 @@ class Advisor(unittest.TestCase):
         self.assertNotIn(self.S, self.log())
         out = self.run_hook(self.HOOK, self.call(agent="Explore"))
         self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type still runs: fail open")
+
+    def test_the_checks_run_in_the_documented_order(self):
+        # Every check failing at once, then put right one at a time: each
+        # answer names the next check down the list, never a later one.
+        said = []
+
+        def step(data, **env):
+            answer = self.decide(data, **env)["hookSpecificOutput"]
+            said.append(self.trace()[-1]["reason"] if answer["permissionDecision"] == "deny" else "allow")
+
+        first = self.brief()
+        self.admitted(self.call(first, prompt="p0"))  # in the session's hashes from now on
+        state = self.state()
+        state["sessions"]["s1"].update(count=6, prompts={"p1": {"count": 2, "reconcile": 0}})
+        (self.home / "advisor" / "state.json").write_text(json.dumps(state))
+        (self.home / "advisor" / "probe.json").unlink()
+        self.transcript.unlink()
+        self.reading(five=97)
+        bad = "Reconcile: yes\nfindings in sk-ant-x\n" + "x" * 9_000
+        step(self.call(bad, prompt="p9"), LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
+        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=None)
+        self.probe()
+        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=None)
+        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"))
+        step(self.call(bad, prompt="p9"))
+        self.executor("claude-fable-5")
+        step(self.call(bad, prompt="p9"))
+        self.executor("claude-sonnet-4-5")
+        step(self.call(bad, prompt="p9"))
+        bad = "Reconcile: yes\nfindings in sk-ant-x"
+        step(self.call(bad, prompt="p9"))
+        bad = "Reconcile: yes\nTask: t\nConstraints: c\nFindings: sk-ant-x\nApproach: a\nQuestion: q"
+        step(self.call(bad, prompt="p9"))
+        bad = "Trigger: stuck\n" + bad
+        step(self.call(bad, prompt="p9"))
+        step(self.call(bad.replace("sk-ant-x", "f.py:1-9"), prompt="p9"))
+        step(self.call(first, prompt="p9"))
+        step(self.call(self.brief(), prompt="p1"))
+        step(self.call(self.brief(), prompt="p9"))
+        step(self.call(self.brief(), session="s2", prompt="p9"))
+        self.reading(five=40, at=self.now - 3_600)
+        step(self.call(self.brief(), session="s2", prompt="p9"))
+        self.reading(five=40)
+        step(self.call(self.brief(), session="s2", prompt="p9"))
+        self.assertEqual(said, ["off", "no-probe", "version-unknown", "version-mismatch", "executor-unknown",
+                                "no-stronger-advisor", "brief-too-long", "brief-sections", "trigger-missing",
+                                "credential", "reconcile-invalid", "repeat", "cap-task", "cap-session", "near-full",
+                                "allowance-unknown", "allow"])
+        self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
+                         ["hard"] * 6 + ["fixable"] * 5 + ["hard"] * 5, "D2.6's two kinds of denial")
+
+    def test_the_brief_is_at_most_8000_characters(self):
+        base = self.brief()
+        exact = base + "x" * (8_000 - len(base))
+        self.admitted(self.call(exact))
+        self.assertEqual(self.trace()[-1]["brief_chars"], 8_000)
+        reason = self.denied(self.call(exact + "y"), "brief-too-long")
+        self.assertIn("8,001", reason)
+        self.assertIn("8,000", reason)
+        self.assertEqual(self.trace()[-1]["kind"], "fixable")
+
+    def test_each_section_must_have_its_line(self):
+        for section in longhaul.ADVISOR_SECTIONS:
+            self.assertIn(f"starting {section}", self.denied(self.call(self.brief(drop=[section])), "brief-sections"))
+        self.assertIn("starting Task: or Question:",
+                      self.denied(self.call(self.brief(drop=["Task:", "Question:"])), "brief-sections"))
+        self.assertEqual(longhaul.ADVISOR_SECTIONS, ("Task:", "Constraints:", "Findings:", "Approach:", "Question:"))
+        self.admitted(self.call("  " + self.brief().replace("\n", "\n  ")))  # an indented line counts
+
+    def test_the_first_line_names_the_trigger(self):
+        for trigger in ("early", "stuck", "change", "done"):
+            self.admitted(self.call(self.brief(trigger), prompt=trigger))
+            self.assertEqual(self.trace()[-1]["trigger"], trigger)
+        body = self.brief().split("\n", 1)[1]
+        for brief in (body, f"{body}\nTrigger: stuck", f"Trigger: later\n{body}", f"trigger: stuck\n{body}",
+                      f"Trigger: stuck now\n{body}", f"Note: first\nTrigger: stuck\n{body}"):
+            self.assertIn("first line", self.denied(self.call(brief), "trigger-missing"))
+            self.assertIsNone(self.trace()[-1]["trigger"])
+        self.admitted(self.call("\n\n" + self.brief("done"), prompt="blank"))  # a blank line before it is no line
+
+    def test_a_credential_in_the_brief_is_denied(self):
+        for shape in longhaul.CHECKPOINT_SECRET_SHAPES:
+            reason = self.denied(self.call(self.brief(extra=f" the key is {shape}0123456789abcdef")), "credential")
+            self.assertIn("Remove the credential from the brief", reason)
+            self.assertNotIn(shape, reason)
+            self.assertNotIn(shape, json.dumps(self.trace()[-1]))
+            self.assertEqual(self.trace()[-1]["kind"], "fixable")
+        self.assertEqual(self.state(), {}, "the advisor never ran: nothing counted")
+
+    def test_a_reconcile_call_only_after_a_consultation_in_the_same_task(self):
+        self.assertIn("same task", self.denied(self.call(self.brief(reconcile=True)), "reconcile-invalid"))
+        self.assertEqual(self.trace()[-1]["kind"], "fixable")
+        self.admitted(self.call())
+        self.denied(self.call(self.brief(reconcile=True), prompt="p2"), "reconcile-invalid")
+        self.admitted(self.call(self.brief(reconcile=True)))
+        self.assertTrue(self.trace()[-1]["reconcile"])
+        self.assertEqual(self.state()["sessions"]["s1"]["prompts"], {"p1": {"count": 1, "reconcile": 1}})
+        # With no prompt_id there is no task for it to follow: the session's
+        # caps alone hold, and no call is a reconcile call.
+        self.admitted(self.call(prompt=None))
+        self.denied(self.call(self.brief(reconcile=True), prompt=None), "reconcile-invalid")
+        self.assertEqual(self.state()["sessions"]["s1"]["count"], 3)
+        self.assertTrue(longhaul.advisor_reconcile("Trigger: done\n  reconcile:  YES \n"))
+        self.assertFalse(longhaul.advisor_reconcile("Trigger: done\nReconcile: no\nTask: reconcile: yes"))
+
+    def test_the_same_brief_twice_in_a_session_is_a_repeat(self):
+        first = self.brief()
+        self.admitted(self.call(first))
+        self.assertIn("earlier advice", self.denied(self.call(first, prompt="p2"), "repeat"))
+        self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.admitted(self.call(first, session="s2"))  # another session's hashes are its own
+        entry = self.state()["sessions"]["s1"]
+        self.assertEqual(entry["hashes"], [self.trace()[0]["brief_hash"]])
+        self.assertRegex(entry["hashes"][0], r"^[0-9a-f]{12}$")
+        self.assertEqual(entry["count"], 1, "the repeat did not count")
+
+    def test_the_caps_per_task_for_both_advisors(self):
+        # D2.4: per task (one user prompt), an Opus advisor 2 and a Fable
+        # advisor 1, each with one reconcile call.
+        for session, model, advisor, cap in (("s1", "claude-sonnet-4-5", "opus", 2), ("s2", "claude-opus-4-5", "fable", 1)):
+            self.executor(model)
+            for _ in range(cap):
+                self.assertEqual(self.admitted(self.call(session=session))["updatedInput"]["model"], advisor)
+            reason = self.denied(self.call(session=session), "cap-task")
+            self.assertIn(f"its {cap} consultation", reason)
+            self.assertIn(f"the {advisor} advisor", reason)
+            self.admitted(self.call(self.brief(reconcile=True), session=session))
+            self.assertIn("its 1 reconcile call", self.denied(self.call(self.brief(reconcile=True), session=session), "cap-task"))
+            self.admitted(self.call(session=session, prompt="p2"))  # the next task starts afresh
+            self.assertEqual(self.state()["sessions"][session]["prompts"]["p1"], {"count": cap, "reconcile": 1})
+
+    def test_the_caps_per_session_for_both_advisors_and_with_no_prompt_id_those_alone(self):
+        for session, model, cap, per_task in (("s1", "claude-sonnet-4-5", 6, 2), ("s2", "claude-opus-4-5", 3, 1)):
+            self.executor(model)
+            for n in range(cap):
+                self.admitted(self.call(session=session, prompt=f"p{n // per_task}"))
+            self.assertIn(f"its {cap} consultations", self.denied(self.call(session=session, prompt="new"), "cap-session"))
+            # A reconcile call is a consultation too.
+            self.denied(self.call(self.brief(reconcile=True), session=session, prompt="p0"), "cap-session")
+        self.assertEqual((self.state()["sessions"]["s2"]["count"], self.state()["sessions"]["s2"]["fable"]), (3, 3))
+        self.executor("claude-sonnet-4-5")
+        for _ in range(6):
+            self.admitted(self.call(session="s3", prompt=None))
+        self.denied(self.call(session="s3", prompt=None), "cap-session")
+        self.assertEqual(self.state()["sessions"]["s3"]["prompts"], {})
+        # Six in a session whichever the advisor: a session that moved from
+        # Sonnet to Opus has four Opus consultations and room for two on Fable.
+        for n in range(4):
+            self.admitted(self.call(session="s4", prompt=f"p{n // 2}"))
+        self.executor("claude-opus-4-5")
+        for n in range(2):
+            self.admitted(self.call(session="s4", prompt=f"q{n}"))
+        self.denied(self.call(session="s4", prompt="q9"), "cap-session")
+
+    def test_a_denied_attempt_counts_for_nothing_and_an_admitted_one_counts_at_once(self):
+        self.denied(self.call("x" * 9_000), "brief-too-long")
+        self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
+        self.reading(five=99)
+        self.denied(self.call(), "near-full")
+        self.assertEqual(self.state(), {})
+        self.reading()
+        self.admitted(self.call())
+        # Counted when admitted, before the advisor runs: a consultation that
+        # then fails counts all the same (D2.4).
+        entry = self.state()["sessions"]["s1"]
+        self.assertEqual({k: entry[k] for k in ("count", "fable", "prompts")},
+                         {"count": 1, "fable": 0, "prompts": {"p1": {"count": 1, "reconcile": 0}}})
+        self.assertEqual(oct((self.home / "advisor" / "state.json").stat().st_mode & 0o777), oct(0o600))
+
+    def test_the_allowance_guard_and_its_benchmark_opt_out(self):
+        self.reading(five=95)
+        self.assertIn("95%", self.denied(self.call(), "near-full"))
+        self.reading(five=40, week=96)
+        self.denied(self.call(), "near-full")
+        self.reading(five=94.9)
+        self.admitted(self.call())
+        for at in (self.now - longhaul.ADVISOR_FRESH - 1, self.now + 3_600, "x"):
+            self.reading(at=at)
+            self.denied(self.call(), "allowance-unknown")
+        self.reading()
+        reset = json.loads((self.home / "usage" / "main.json").read_text())
+        reset["five_hour"]["resets_at"] = self.now - 1  # the window this reading was in has reset since
+        (self.home / "usage" / "main.json").write_text(json.dumps(reset))
+        self.denied(self.call(), "allowance-unknown")
+        (self.home / "usage" / "main.json").unlink()
+        self.denied(self.call(), "allowance-unknown")
+        self.assertEqual(self.trace()[-1]["allowance"], "checked")
+        for value in ("yes", "UNCHECKED", ""):
+            self.denied(self.call(), "allowance-unknown", LONGHAUL_ADVISOR_ALLOWANCE=value)
+        # The benchmark's scratch runs (claude -p) have no status line, so no
+        # reading: the opt-out admits them, and the trace says so.
+        self.admitted(self.call(prompt="p2"), LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
+        self.assertEqual(self.trace()[-1]["allowance"], "unchecked")
+        self.reading(five=99)  # a fresh reading still counts
+        self.denied(self.call(prompt="p3"), "near-full", LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
+
+    def test_the_reading_is_the_sessions_own_account_and_the_hook_never_chooses_one(self):
+        # A2 decided the account at launch and the subagent runs on it: the
+        # hook names the session's account only to find its reading.
+        pro = self.tmp / "pro"
+        accounts = [{"name": "Max", "config_dir": None},
+                    {"name": "Pro", "config_dir": str(pro), "repositories": [str(self.tmp / "elsewhere")]}]
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
+        before = (self.home / "accounts.json").read_bytes()
+        self.reading(five=40, name="Max")
+        self.reading(five=99, name="Pro")
+        self.denied(self.call(), "near-full", CLAUDE_CONFIG_DIR=str(pro))
+        data = self.call()
+        out = self.admitted(data)  # no CLAUDE_CONFIG_DIR: ~/.claude, Max's folder
+        self.assertEqual(out["updatedInput"], {**data["tool_input"], "model": "opus"}, "the model and nothing else")
+        self.assertEqual(set(out), {"hookEventName", "permissionDecision", "permissionDecisionReason", "updatedInput"})
+        # Pro may be used elsewhere only, and this session runs on it all the
+        # same: the hook does not decide that again.
+        self.reading(five=40, name="Pro")
+        self.admitted(self.call(), CLAUDE_CONFIG_DIR=str(pro))
+        self.assertEqual((self.home / "accounts.json").read_bytes(), before)
+        self.assertFalse((self.home / "state.json").exists(), "the supervisor's state is untouched")
+        self.assertEqual(sorted(p.name for p in (self.home / "advisor").iterdir()), ["probe.json", "state.json", "trace.jsonl"])
+
+    DECISION = ("t", "id", "session", "prompt_id", "event", "decision", "reason", "kind", "trigger", "reconcile",
+                "executor", "advisor", "brief_chars", "brief_hash", "allowance")
+
+    def test_the_trace_has_the_documented_shape(self):
+        import hashlib
+        data = self.call(tool_id="toolu_1")
+        self.admitted(data)
+        self.denied(self.call(self.brief(drop=["Task:"]), prompt=None), "brief-sections")
+        allow, deny = self.trace()
+        self.assertEqual(list(allow), list(self.DECISION))
+        brief = data["tool_input"]["prompt"]
+        self.assertEqual({k: v for k, v in allow.items() if k != "t"},
+                         {"id": "toolu_1", "session": "s1", "prompt_id": "p1", "event": "decision", "decision": "allow",
+                          "reason": None, "kind": None, "trigger": "stuck", "reconcile": False, "executor": "sonnet",
+                          "advisor": "opus", "brief_chars": len(brief),
+                          "brief_hash": hashlib.sha256(brief.encode()).hexdigest()[:12], "allowance": "checked"})
+        self.assertAlmostEqual(allow["t"], self.now, places=2)
+        self.assertEqual((deny["decision"], deny["reason"], deny["kind"], deny["prompt_id"]),
+                         ("deny", "brief-sections", "fixable", None))
+        # What is not a plain id is not kept; with no session there is no
+        # cap to keep, so the call is denied.
+        self.denied(self.call(session="../s1", tool_id="toolu 2", prompt="p\n1"), "error")
+        self.assertEqual([self.trace()[-1][k] for k in ("id", "session", "prompt_id")], [None, None, None])
+
+    def test_no_brief_text_reaches_the_trace_the_state_the_log_or_a_reason(self):
+        admitted = self.call(tool_id="toolu_a")
+        runs = [admitted, self.call(self.brief(extra=" sk-ant-" + self.S)), self.call(self.brief(extra="x" * 9_000)),
+                self.call(admitted["tool_input"]["prompt"], prompt="p2"), self.call(self.brief(reconcile=True), prompt="p3"),
+                self.call(self.brief(trigger="soon"))]
+        for data in runs:
+            out = self.run_hook(self.HOOK, data)
+            self.assertEqual((out.returncode, out.stderr), (0, ""))
+            answer = json.loads(out.stdout)["hookSpecificOutput"]
+            given = answer.pop("updatedInput", None)
+            if given is not None:  # the subagent's prompt: the brief belongs there
+                self.assertEqual(given, {**data["tool_input"], "model": "opus"})
+            self.assertNotIn(self.S, json.dumps(answer))
+        self.assertEqual([line["decision"] for line in self.trace()], ["allow"] + ["deny"] * 5)
+        written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertIn('"brief_hash"', written)
+        self.assertNotIn(self.S, written)
+
+    def test_the_trace_keeps_30_days_and_2000_lines_and_the_state_30_days(self):
+        path = self.home / "advisor" / "trace.jsonl"
+        old = self.now - 31 * 86400
+        lines = [{"t": old, "n": n} for n in range(10)] + [{"t": self.now - 60, "n": n} for n in range(10, 2_005)]
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        path.chmod(0o644)  # made before Longhaul kept it private
+        self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
+        kept = self.trace()
+        self.assertEqual((len(kept), kept[0]["n"]), (1_996, 10), "the month-old lines went")
+        self.assertEqual(oct(path.stat().st_mode & 0o777), oct(0o600))
+        path.write_text("".join(json.dumps({"t": self.now - 60, "n": n}) + "\n" for n in range(2_000)))
+        self.admitted(self.call())
+        kept = self.trace()
+        self.assertEqual((len(kept), kept[0]["n"], kept[-1]["decision"]), (2_000, 1, "allow"), "the oldest went")
+        state = self.state()
+        for sid, at in (("old", old), ("recent", self.now - 86400)):
+            state["sessions"][sid] = {"count": 1, "fable": 0, "prompts": {}, "hashes": [], "at": at}
+        (self.home / "advisor" / "state.json").write_text(json.dumps(state))
+        self.admitted(self.call(session="s2"))
+        self.assertEqual(set(self.state()["sessions"]), {"s1", "recent", "s2"})
+
+    def test_a_state_that_cannot_be_read_denies_every_consultation(self):
+        # Counts that were lost would lift the caps: fail closed, said in the
+        # log, until the file is deleted.
+        path = self.home / "advisor" / "state.json"
+        entry = {"count": 1, "fable": 0, "prompts": {}, "hashes": []}
+        for text in ("not json", "[]", '{"sessions": []}', json.dumps({"sessions": {"s1": {**entry, "count": "1"}}}),
+                     json.dumps({"sessions": {"s1": {**entry, "hashes": None}}}),
+                     json.dumps({"sessions": {"s1": {**entry, "prompts": {"p1": {"count": -1, "reconcile": 0}}}}})):
+            path.write_text(text)
+            with self.assertRaises(ValueError):
+                self.decide(self.call())
+        out = self.run_hook(self.HOOK, self.call())
+        self.assertIn("denied (error)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn("could not be read; consultations are denied until it is deleted", self.log())
+        self.assertNotIn(self.S, self.log())
+        path.write_text(json.dumps({"sessions": {"other": "junk"}}))  # another session's entry is not this one's
+        self.admitted(self.call())
+        path.unlink()
+        self.admitted(self.call())
+
+    def test_the_hook_is_fast(self):
+        # Claude Code lets a call run when its hook overruns the timeout (5 s
+        # here), so the hook must stay fast; its speed is in the work log.
+        # This catches one that hangs or crawls, on a 6 MB transcript.
+        self.executor("claude-sonnet-4-5", before=(json.dumps({"type": "user", "message": {"content": "y" * 2_000}}) + "\n").encode() * 3_000)
+        exe, mark = self.fake_claude()
+        took = []
+        for data, env in ((self.call(), {}), (self.call(self.brief(drop=["Task:"])), {}), (self.call(agent="Explore"), {}),
+                          (self.call(prompt="p2"), {"CLAUDE_CODE_EXECPATH": str(exe)}),
+                          (self.call(prompt="p3"), {"CLAUDE_CODE_EXECPATH": str(exe)}), (self.call(), {"LONGHAUL_ADVISOR": "off"}),
+                          ("not json", {})):
+            started = time.time()
+            out = self.run_hook(self.HOOK, data, **env)
+            took.append(time.time() - started)
+            self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([line["decision"] for line in self.trace()], ["allow", "deny", "allow", "allow", "deny"],
+                         [line["reason"] for line in self.trace()])
+        self.assertEqual(mark.read_text(), "--version\n")
+        self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
 
 
 class Settings(unittest.TestCase):
