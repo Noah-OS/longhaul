@@ -32,7 +32,8 @@ Then call the Agent tool once with `subagent_type` `longhaul:advisor`, a
 `description` naming the trigger (for example "Longhaul advisor consultation
 (stuck)"), and the brief as the `prompt`, and no other field: no
 `run_in_background`, `isolation` or `name`. Never send a brief to any other
-agent type: it is denied. Longhaul's hook
+agent type: it is denied. Never send a message to an advisor after its
+reply: that is denied too, and more advice is a new consultation. Longhaul's hook
 checks the call, the brief, the caps and the model, and may deny the call
 with a reason: if the reason is one you can fix (a field the call may not
 have, the brief too long, a line missing, a credential in it), fix it and
