@@ -3725,6 +3725,32 @@ def remove_state_file(state_file: str, sid) -> bool | None:
         return False
 
 
+def checkpoint_carry_path(sid: str, carried: bool = False) -> Path:
+    """The record a /clear's lookup goes by, beside the checkpoint:
+    <session>.carry.json, renamed <session>.carried.json once carried. A
+    session id holds no dot, so neither is ever a checkpoint's name."""
+    return LONGHAUL_HOME / "checkpoints" / f"{sid}.{'carried' if carried else 'carry'}.json"
+
+
+def checkpoint_record_folder(sid: str, at: float, cwd: str) -> bool:
+    """Where and when a checkpoint was saved, for the clear's lookup: the
+    real path of the folder the save ran in and the checkpoint's own
+    written_at, 0600 (write_json) beside it, with none of the model's
+    text. Kept out of the checkpoint, whose keys stay schema v1's: a
+    Longhaul that predates this (another account's plugin, say) refuses
+    a key it does not know. The record of an earlier carry goes first:
+    this is a new checkpoint. False, with a log line, when it could not
+    be written; the checkpoint is saved all the same and stays its own
+    session's."""
+    try:
+        checkpoint_carry_path(sid, carried=True).unlink(missing_ok=True)
+        write_json(checkpoint_carry_path(sid), {"session_id": sid, "written_at": at, "folder": os.path.realpath(cwd)})
+        return True
+    except OSError as e:
+        log(f"checkpoint for {sid}: its folder was not recorded, so no /clear carries it: {e.strerror or e}")
+        return False
+
+
 def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state_file: str | None = None) -> int:
     """`longhaul checkpoint save [session] [--file PATH]`: the state, JSON
     on stdin or in `state_file`, checked, capped and written whole and
@@ -3769,6 +3795,8 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
                 write_json(path, record)
             except OSError as e:  # a full disk, a home that is not a writable folder
                 problem = f"could not write the file: {e.strerror or e}"
+            else:
+                checkpoint_record_folder(sid, record["written_at"], cwd)
     removed = remove_state_file(state_file, sid) if state_file is not None else None
     if problem:
         if removed:

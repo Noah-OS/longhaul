@@ -6291,6 +6291,11 @@ class Checkpoint(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+        # The carry window is read when the hook runs: the default unless a test sets it.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("LONGHAUL_CHECKPOINT_CARRY_HOURS", None)
 
     def tearDown(self):
         longhaul.LONGHAUL_HOME = self.saved
@@ -6313,11 +6318,12 @@ class Checkpoint(unittest.TestCase):
                               input=None if "--file" in args else raw, cwd=cwd or self.work, env={**self.env, **(env or {})},
                               capture_output=True, text=True, timeout=30)
 
-    def start(self, source="compact", session="s1", agent=None):
-        # The hook's cwd is not the save's: the files a checkpoint names are
-        # relative to the folder the save ran in, which the file records.
+    def start(self, source="compact", session="s1", agent=None, cwd=None):
+        # The hook's cwd is not the save's unless a test says so: the files a
+        # checkpoint names are relative to the folder the save ran in, which
+        # the file records.
         data = {"session_id": session, "hook_event_name": "SessionStart", "source": source,
-                "cwd": str(self.tmp / "elsewhere"), "transcript_path": "/t/s1.jsonl"}
+                "cwd": str(cwd or self.tmp / "elsewhere"), "transcript_path": "/t/s1.jsonl"}
         if agent:
             data["agent_id"], data["agent_type"] = agent, "Explore"
         return data
@@ -6551,7 +6557,8 @@ class Checkpoint(unittest.TestCase):
                                      "it comes back after a compaction or a resume\n")
         self.assertEqual(out.stderr, "")
         self.assertEqual(oct(self.file().stat().st_mode & 0o777), oct(0o600))
-        self.assertEqual([p.name for p in self.file().parent.iterdir()], ["s1.json"], "whole or not at all: no .tmp")
+        self.assertEqual(sorted(p.name for p in self.file().parent.iterdir()), ["s1.carry.json", "s1.json"],
+                         "whole or not at all: no .tmp")
         kept = json.loads(self.file().read_text())
         self.assertEqual((kept["schema_version"], kept["session_id"]), (1, "s1"))
         self.assertLessEqual(before, kept["written_at"])
@@ -6571,7 +6578,42 @@ class Checkpoint(unittest.TestCase):
         out = self.save(self.state(goal=f"the second goal {self.S}"), "s1")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(self.file().read_text())["goal"], f"the second goal {self.S}")
-        self.assertEqual([p.name for p in self.file().parent.iterdir()], ["s1.json"])
+        self.assertEqual(sorted(p.name for p in self.file().parent.iterdir()), ["s1.carry.json", "s1.json"])
+
+    def test_checkpoint_save_records_the_folder_it_ran_in_beside_the_checkpoint_and_not_in_it(self):
+        # Sprint 8 (the owner, 2026-10-23): a /clear gives the conversation
+        # a new id, so the clear's lookup goes by folder and age. The save
+        # records the real path of the folder it ran in and the checkpoint's
+        # time beside it, as <session>.carry.json, 0600 as the checkpoint
+        # is, with none of the model's text. The checkpoint keeps schema
+        # v1's keys: a Longhaul that predates this (another account's
+        # plugin, say) refuses a key it does not know, and still reads it.
+        link = self.tmp / "link"
+        link.symlink_to(self.work)
+        out = self.save(self.state(), "s1", cwd=link)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        kept = json.loads(self.file().read_text())
+        self.assertEqual(set(kept), {"schema_version", "session_id", "written_at", "cwd",
+                                     *longhaul.CHECKPOINT_TEXTS, *longhaul.CHECKPOINT_LISTS})
+        carry = self.home / "checkpoints" / "s1.carry.json"
+        self.assertEqual(json.loads(carry.read_text()),
+                         {"session_id": "s1", "written_at": kept["written_at"], "folder": str(self.work)},
+                         "the folder by its real path, the time the checkpoint's own")
+        self.assertEqual(oct(carry.stat().st_mode & 0o777), oct(0o600))
+        self.assertNotIn(self.S, carry.read_text())
+        # Saved again: the record follows the newer checkpoint, and the
+        # record of an earlier carry goes: a new checkpoint is carried anew.
+        carried = carry.with_name("s1.carried.json")
+        carried.write_text("{}")
+        out = self.save(self.state(), "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(carry.read_text())["written_at"], json.loads(self.file().read_text())["written_at"])
+        self.assertFalse(carried.exists())
+        self.assertEqual(sorted(p.name for p in carry.parent.iterdir()), ["s1.carry.json", "s1.json"])
+        # A refusal writes neither.
+        self.assertEqual(self.save(self.state(goal=""), "s2").returncode, 2)
+        self.assertFalse(carry.with_name("s2.carry.json").exists())
+        self.assertNotIn(self.S, self.log())
 
     def test_checkpoint_save_refuses_bad_json_an_unknown_key_a_wrong_type_an_oversize_field_or_a_key_shape_and_names_only_the_field(self):
         long = "x" * 1_001
@@ -6681,7 +6723,8 @@ class Checkpoint(unittest.TestCase):
         out = self.save(self.state(), env={"CLAUDE_CODE_SESSION_ID": "../x"})
         self.assertEqual(out.returncode, 2, "an environment id is held to the same shape")
         self.assertIn("the session id must be", out.stderr)
-        self.assertEqual(sorted(p.name for p in self.file().parent.iterdir()), ["s1.json", "s3.json"])
+        self.assertEqual(sorted(p.name for p in self.file().parent.iterdir()),
+                         ["s1.carry.json", "s1.json", "s3.carry.json", "s3.json"])
         self.assertNotIn(self.S, self.log())
 
     def test_checkpoint_save_reads_the_state_from_a_file_when_asked(self):
@@ -6725,14 +6768,15 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(out.stdout, f"longhaul checkpoint: saved for s1 ({size:,} bytes); "
                                      "it comes back after a compaction or a resume\n")
         self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
-        self.assertEqual([p.name for p in folder.iterdir()], ["s1.json"], "the state file went, the checkpoint stays")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"],
+                         "the state file went, the checkpoint stays")
         for refused in ("{not json", json.dumps(self.state(goal=f"sk-ant-{self.S}")), b"\xff\xfe not text"):
             state.write_bytes(refused if isinstance(refused, bytes) else refused.encode())
             out = self.save("", "s1", "--file", str(state))
             self.assertEqual((out.returncode, out.stdout), (2, ""), out.stderr)
             self.assertEqual(out.stderr.count("\n"), 1, out.stderr)
             self.assertTrue(out.stderr.endswith("; the state file was removed, write it again\n"), out.stderr)
-            self.assertEqual([p.name for p in folder.iterdir()], ["s1.json"], "refused: the text goes too")
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"], "refused: the text goes too")
             self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
         for other in (self.work / "s1.state.json", folder / "draft.json"):
             other.write_text("{not json")
@@ -6746,7 +6790,7 @@ class Checkpoint(unittest.TestCase):
             self.assertNotIn("state file", out.stdout)
             self.assertTrue(other.is_file(), f"{other.name} is not the skill's file: left, saved")
             self.assertEqual(json.loads(self.file().read_text())["goal"], f"from {other.name} {self.S}")
-        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["draft.json", "s1.json"])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["draft.json", "s1.carry.json", "s1.json"])
         self.assertNotIn(self.S, self.log())
 
     def test_the_checkpoints_folder_is_private_when_the_save_makes_it(self):
