@@ -6,6 +6,7 @@ Run: python3 -m unittest -v  (from the checkout, with the scratch LONGHAUL_* pat
 
 import contextlib
 import datetime as dt
+import fcntl
 import io
 import json
 import os
@@ -4054,6 +4055,64 @@ class Advisor(unittest.TestCase):
         self.assertNotIn(self.S, self.log())
         out = self.run_hook(self.HOOK, self.call(agent="Explore"))
         self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type still runs: fail open")
+
+    def hold(self, name="advisor"):
+        """The lock `name` held by this process, as another hook would hold it, until the file is closed."""
+        f = open(self.home / f".{name}.lock", "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        self.addCleanup(f.close)
+        return f
+
+    def test_the_lock_waits_at_most_its_deadline_and_others_wait_as_before(self):
+        # Sprint 8, F3: a hook past its timeout lets the call run, so the
+        # Advisor's waits are bounded; every other caller blocks as before.
+        held = self.hold("x")
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            with longhaul.locked("x", wait=0.2):
+                self.fail("the lock was had while another held it")
+        self.assertLess(time.monotonic() - started, 1)
+        threading.Timer(0.3, held.close).start()
+        started = time.monotonic()
+        with longhaul.locked("x"):  # no deadline: it waits for the other to let go
+            self.assertGreaterEqual(time.monotonic() - started, 0.25)
+        with longhaul.locked("x", wait=0.2):
+            pass  # free again: had at once
+        self.assertEqual(longhaul.ADVISOR_LOCK_WAIT, 2)
+
+    def test_a_held_lock_denies_the_consultation_within_the_deadline_and_the_trace_failure_is_logged(self):
+        self.hold()
+        started = time.monotonic()
+        out = self.run_hook(self.HOOK, self.call())
+        took = time.monotonic() - started
+        self.assertEqual(out.returncode, 0, out.stderr)
+        [answer] = [json.loads(line) for line in out.stdout.splitlines()]  # one answer, never two
+        self.assertIn("denied (error)", answer["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertLess(took, 2 * longhaul.ADVISOR_LOCK_WAIT + 3, "the lock for the count, then the one for the trace")
+        self.assertIn("advisor hook: a consultation denied on an error (TimeoutError)", self.log())
+        self.assertIn("advisor hook: the error's denial was not traced (TimeoutError)", self.log())
+        self.assertEqual(self.trace(), [])
+
+    def test_off_is_decided_from_the_environment_before_any_file_is_read(self):
+        with mock.patch.object(longhaul, "read_json", side_effect=AssertionError("a file was read")), \
+                mock.patch.object(longhaul, "advisor_running_version", side_effect=AssertionError("the version was asked")):
+            self.denied(self.call(), "off", LONGHAUL_ADVISOR=None)
+
+    def test_stdin_is_read_up_to_1_mb_and_past_it_a_consultation_is_denied(self):
+        self.assertEqual(longhaul.ADVISOR_STDIN_MAX, 1_000_000, "run_hook's cap")
+        big = self.call(self.brief(extra="x" * 1_000_000))
+        out = self.run_hook(self.HOOK, big)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        reason = json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("denied (brief-too-long)", reason)
+        self.assertEqual(self.trace()[-1]["reason"], "brief-too-long")
+        other = self.call("y" * 1_000_000, agent="Explore")
+        other["tool_input"]["description"] = "Explore the parser"
+        out = self.run_hook(self.HOOK, other)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type, past the cap: nothing")
+        out = self.run_hook(self.RESULT, {**big, "hook_event_name": "PostToolUse", "tool_response": self.reply("x")})
+        self.assertEqual((out.returncode, out.stdout), (0, ""))
+        self.assertIn("advisor-result hook: no outcome traced (over 1,000,000 characters)", self.log())
 
     def test_the_checks_run_in_the_documented_order(self):
         # Every check failing at once, then put right one at a time: each

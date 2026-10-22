@@ -385,12 +385,27 @@ def log(msg: str) -> None:
 
 
 @contextlib.contextmanager
-def locked(name: str):
+def locked(name: str, wait: float | None = None):
     """One writer at a time across processes: terminal longhaul windows, panel
-    relays and panel launches all update the same few files."""
+    relays and panel launches all update the same few files. With `wait`,
+    a lock not had within that many seconds raises TimeoutError instead:
+    the Advisor's hook must answer before Claude Code gives up on it and
+    lets the call run (Sprint 8, F3). Without it, it waits as long as it
+    takes."""
     LONGHAUL_HOME.mkdir(parents=True, exist_ok=True)
     with open(LONGHAUL_HOME / f".{name}.lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        if wait is None:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"the {name} lock was not had within {wait:g} s") from None
+                    time.sleep(0.01)
         try:
             yield
         finally:
@@ -3831,6 +3846,11 @@ ADVISOR_VERSION = r"\d+\.\d+\.\d+"
 # Seconds `claude --version` may take when the path names no version:
 # well inside the hook's 5, past which Claude Code lets the call run.
 ADVISOR_VERSION_TIMEOUT = 2
+# Seconds the hooks wait for locked("advisor") before they give up: a
+# consultation is then denied (error). With the --version above and the
+# trace of the denial's own wait, the hook stays under 10 s (F3).
+ADVISOR_LOCK_WAIT = 2
+ADVISOR_STDIN_MAX = 1_000_000  # characters of the hook's input read, run_hook's cap
 ADVISOR_TAIL = 256 * 1024  # bytes of the transcript read for the executor's model
 ADVISOR_FAMILIES = ("opus", "sonnet", "haiku", "fable", "mythos")  # any other model is "other"
 # D3: the executor's family and its advisor. A family with no entry has no
@@ -3893,6 +3913,11 @@ def advisor_path(name: str) -> Path:
     return LONGHAUL_HOME / "advisor" / name
 
 
+def advisor_locked():
+    """locked("advisor"), given up after ADVISOR_LOCK_WAIT seconds."""
+    return locked("advisor", ADVISOR_LOCK_WAIT)
+
+
 def advisor_switch() -> bool:
     """LONGHAUL_ADVISOR=experiment, exactly; anything else is off (D2.8)."""
     return os.environ.get("LONGHAUL_ADVISOR") == "experiment"
@@ -3950,7 +3975,7 @@ def advisor_asked_version(real: str):
     found = re.search(ADVISOR_VERSION, out.stdout or "")
     if out.returncode != 0 or not found:
         return None
-    with locked("advisor"):
+    with advisor_locked():
         write_json(path, {"realpath": real, "mtime": mtime, "version": found.group()})
     return found.group()
 
@@ -4048,8 +4073,6 @@ def advisor_gate(data: dict, line: dict):
     probe record, the version, the executor's model and its advisor (D3,
     into `line`), the brief. The first that fails is the denial; None
     when all pass."""
-    if not advisor_switch():
-        return advisor_denial("off")
     record = advisor_probe()
     if record is None:
         return advisor_denial("no-probe")
@@ -4084,10 +4107,12 @@ def advisor_brief_problem(brief: str):
 
 
 def advisor_decide(data: dict, now: float) -> dict:
-    """The hook's answer to a consultation, its trace line written."""
+    """The hook's answer to a consultation, its trace line written. The
+    switch is decided first, from the environment alone, before any file
+    is read or the lock taken (F3)."""
     line = advisor_line(data, now)
-    denial = advisor_gate(data, line)
-    with locked("advisor"):  # parallel calls run their hooks at once
+    denial = advisor_denial("off") if not advisor_switch() else advisor_gate(data, line)
+    with advisor_locked():  # parallel calls run their hooks at once
         if denial is None:
             denial = advisor_admit(line, now)
         advisor_trace(advisor_decided(line, denial), now)
@@ -4273,18 +4298,22 @@ def advisor_time(line: str) -> float:
     return (as_number(entry.get("t")) or 0) if isinstance(entry, dict) else 0
 
 
-def advisor_fail(data, error: Exception) -> int:
+def advisor_fail(data, error, reason: str = "error", **detail) -> int:
     """A consultation the hook could not finish checking, or an input it
-    could not read: denied, never let run. The log and the trace name the
-    error's kind alone, never its text, which could quote the brief."""
-    log(f"advisor hook: a consultation denied on an error ({type(error).__name__})")
+    could not read: denied, never let run. The denial is printed first and
+    then traced, within the lock's deadline (F3): a trace that cannot be
+    written is logged, never in place of the denial. The log and the trace
+    name the error's kind alone, never its text, which could quote the
+    brief."""
+    if error is not None:
+        log(f"advisor hook: a consultation denied on an error ({type(error).__name__})")
+    print(json.dumps(advisor_answer(data, {}, advisor_denial(reason, **detail))), flush=True)
     try:
-        line = advisor_line(data, time.time())
-        with locked("advisor"):
-            advisor_trace(advisor_decided(line, ("error", "")), time.time())
-    except Exception:  # the trace may be what failed: the denial matters more
-        pass
-    print(json.dumps(advisor_answer(data, {}, advisor_denial("error"))))
+        line = advisor_line(data if isinstance(data, dict) else {}, time.time())
+        with advisor_locked():
+            advisor_trace(advisor_decided(line, (reason, "")), time.time())
+    except Exception as e:
+        log(f"advisor hook: the {reason}'s denial was not traced ({type(e).__name__})")
     return 0
 
 
@@ -4292,10 +4321,15 @@ def advisor_hook(_opts) -> int:
     """The PreToolUse hook command: stdin in, JSON or nothing out, exit 0.
     Not run_hook(): its silent exit on an error lets a call run, which is
     right for any other agent type and wrong for a consultation. Input
-    that is not JSON could be a consultation, so it is denied."""
+    that is not JSON could be a consultation, so it is denied; so is
+    input past run_hook's cap that names an advisor (F3)."""
     data = None
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
+        if len(raw) > ADVISOR_STDIN_MAX:
+            if "advisor" not in raw.lower():
+                return 0
+            return advisor_fail({}, None, "brief-too-long", chars=len(raw), limit=ADVISOR_BRIEF_MAX)
         data = json.loads(raw) if raw.strip() else {}
         if not advisor_consultation(data):
             return 0
@@ -4362,7 +4396,7 @@ def advisor_outcome(data, now: float | None = None) -> None:
             "event": "outcome", "outcome": "failed" if reply is None else "ok" if verdict else "malformed",
             "verdict": verdict, "confidence": confidence, "reply_chars": None if reply is None else len(reply),
             "seconds": None}
-    with locked("advisor"):
+    with advisor_locked():
         started = advisor_decided_at(line["id"])
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
         advisor_trace(line, now)
@@ -4374,7 +4408,10 @@ def advisor_result(_opts) -> int:
     the call has run, so nothing is left to stop. An error is logged by
     its kind alone, as advisor_fail() does, never with its text."""
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
+        if len(raw) > ADVISOR_STDIN_MAX:
+            log(f"advisor-result hook: no outcome traced (over {ADVISOR_STDIN_MAX:,} characters)")
+            return 0
         advisor_outcome(json.loads(raw) if raw.strip() else {})
     except Exception as e:
         log(f"advisor-result hook: no outcome traced ({type(e).__name__})")
