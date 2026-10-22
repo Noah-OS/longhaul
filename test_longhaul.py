@@ -5679,6 +5679,41 @@ class Advisor(unittest.TestCase):
         self.assertEqual((lines["Running Claude Code"], said), ("unknown (from the transcript)",
                                                                "off: the running Claude Code version is unknown"))
 
+    def test_advisor_status_and_the_note_decide_by_one_function(self):
+        # advisor_off_reason() is the chain of gates status ends with, the
+        # first one shut, or None when all are open: status's last line is
+        # its answer, so nothing else can say the experiment is on.
+        other = self.tmp / "claude" / "versions" / "2.1.308"
+        other.write_text("")
+        key, record = self.home / "advisor" / "enabled.json", self.home / "advisor" / "probe.json"
+        states = [("on", None, {}, None), ("the switch off", None, {"LONGHAUL_ADVISOR": None}, None),
+                  ("an untrusted home", None, {}, self.tmp), ("no key", key.unlink, {}, None),
+                  ("no probe", record.unlink, {}, None), ("a key for another version", lambda: self.enable("2.1.306"), {}, None),
+                  ("no version", None, {"CLAUDE_CODE_EXECPATH": None}, None),
+                  ("another version", None, {"CLAUDE_CODE_EXECPATH": str(other)}, None),
+                  ("a forced model", None, {"CLAUDE_CODE_SUBAGENT_MODEL": "opus"}, None),
+                  ("empty rewrites", lambda: self.probe(rewrites=()), {}, None)]
+        said = []
+        for name, shut, env, cwd in states:
+            self.probe()
+            self.enable()
+            if shut:
+                shut()
+            _, last = self.status(cwd=cwd, **env)
+            values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+            with mock.patch.dict(os.environ, values, clear=True):
+                why = longhaul.advisor_off_reason(str(cwd or self.work), [])
+            self.assertEqual(last, "enabled" if why is None else f"off: {why}", name)
+            said.append(last)
+        self.assertEqual(len(set(said)), len(states), "each state its own line")
+        # Whatever the helper says is status's last line, from the folder
+        # status runs in and the session's transcript (none here).
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            for why, last in (("a test's reason", "off: a test's reason"), (None, "enabled")):
+                with mock.patch.object(longhaul, "advisor_off_reason", return_value=why) as off:
+                    self.assertEqual(longhaul.advisor_status_lines()[-1], last)
+                off.assert_called_once_with(os.getcwd(), [])
+
     def test_record_probe_writes_a_passing_record_and_refuses_anything_else(self):
         path = self.home / "advisor" / "probe.json"
         path.unlink()

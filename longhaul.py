@@ -5002,15 +5002,16 @@ def advisor_status_lines() -> list:
     finds it), the enabled key, the allowance rule and the home (F8), and
     whether the home is untrusted in the folder status runs in, the
     session's (F13), then "enabled" or "off: <why>", the first gate that
-    is shut. The skill's first step runs it and stops unless its last line
-    is enabled."""
+    is shut (advisor_off_reason()). The skill's first step runs it and
+    stops unless its last line is enabled."""
     try:
-        untrusted = advisor_untrusted_home(os.getcwd())
+        cwd = os.getcwd()
     except OSError:  # the folder was removed under it
-        untrusted = advisor_untrusted_home(None)
+        cwd = None
+    untrusted, tail = advisor_untrusted_home(cwd), advisor_tail(advisor_session_transcript())
     switch, record, enabled = advisor_switch(), advisor_probe(), advisor_enabled()
     recorded = record["claude_version"] if record else None
-    running, source = advisor_running_version(advisor_tail(advisor_session_transcript()), recorded)
+    running, source = advisor_running_version(tail, recorded)
     key = ("missing" if enabled is None else f"present, for Claude Code {enabled}"
            + ("" if recorded in (None, enabled) else f", not the probe record's {recorded}"))
     rewrites = ", ".join(advisor_rewrites(record.get("rewrite_models")) or []) if record else ""
@@ -5023,18 +5024,42 @@ def advisor_status_lines() -> list:
              f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}"
              + (f" (untrusted: {untrusted})" if untrusted else ""),
              f"Unadmitted advisor runs traced: {advisor_unadmitted()}"]
-    why = ("LONGHAUL_ADVISOR is not experiment" if not switch
-           else f"Longhaul's home is untrusted ({untrusted})" if untrusted
-           else "not enabled (longhaul advisor enable, in a terminal)" if enabled is None
-           else "no passing probe record" if record is None
-           else f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
-           if enabled != recorded
-           else "the running Claude Code version is unknown" if running is None
-           else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded
-           else f"Claude Code is set to choose subagents' model itself ({', '.join(advisor_forced())})" if advisor_forced()
-           else "the probe record names no advisor model whose rewrite it saw (rewrite_models); record a probe that does"
-           if not rewrites else None)
+    why = advisor_off_reason(cwd, tail)
     return lines + [f"off: {why}" if why else "enabled"]
+
+
+def advisor_off_reason(cwd, tail):
+    """Why the experiment is off for a session in `cwd` whose transcript
+    ends in `tail` (advisor_tail()), the first gate that is shut, or None
+    when it is fully on: the switch, the home (F13), the enabled key, a
+    passing probe record and the key for its version (F8), the running
+    version (F7), a forced subagent model (F14) and an advisor model whose
+    rewrite the probe saw (F5). `advisor status` ends with it and
+    advisor-note adds the note only when it is None, so the two cannot
+    drift apart."""
+    if not advisor_switch():
+        return "LONGHAUL_ADVISOR is not experiment"
+    untrusted = advisor_untrusted_home(cwd)
+    if untrusted:
+        return f"Longhaul's home is untrusted ({untrusted})"
+    enabled, record = advisor_enabled(), advisor_probe()
+    if enabled is None:
+        return "not enabled (longhaul advisor enable, in a terminal)"
+    if record is None:
+        return "no passing probe record"
+    recorded = record["claude_version"]
+    if enabled != recorded:
+        return f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
+    running, _ = advisor_running_version(tail, recorded)
+    if running is None:
+        return "the running Claude Code version is unknown"
+    if running != recorded:
+        return f"the probe passed on {recorded}, not on {running}, the version running"
+    if advisor_forced():
+        return f"Claude Code is set to choose subagents' model itself ({', '.join(advisor_forced())})"
+    if not advisor_rewrites(record.get("rewrite_models")):
+        return "the probe record names no advisor model whose rewrite it saw (rewrite_models); record a probe that does"
+    return None
 
 
 def advisor_unadmitted() -> int:
