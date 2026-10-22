@@ -4,6 +4,7 @@ files Claude Code writes, so nothing here needs an account or the network.
 Run: python3 -m unittest -v  (from the checkout, with the scratch LONGHAUL_* paths)
 """
 
+import collections
 import contextlib
 import datetime as dt
 import fcntl
@@ -4128,9 +4129,16 @@ class Advisor(unittest.TestCase):
             self.assertIn("denied (error)", answer["permissionDecisionReason"])
         self.assertIn("advisor hook: a consultation denied on an error (IsADirectoryError)", self.log())
         self.assertNotIn(self.S, self.log())
-        # F10: the state is written before the trace (conservative), so the
-        # first call, admitted and then denied when its trace failed, counts.
-        self.assertEqual(self.state()["sessions"]["s1"]["count"], 1, "a consultation whose trace failed still counts")
+        # A trace that cannot be read leaves the counts unknown (F9): denied
+        # before anything is counted. F10: the state is written before the
+        # trace (conservative), so a consultation admitted and then denied
+        # when its trace could not be written counts.
+        self.assertEqual(self.state(), {}, "the trace could not be read, so nothing was counted")
+        (self.home / "advisor" / "trace.jsonl").rmdir()
+        with mock.patch.object(longhaul, "advisor_trace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.decide(self.call())
+        self.assertEqual(len(self.counted()), 1, "a consultation whose trace failed still counts")
         out = self.run_hook(self.HOOK, self.call(agent="Explore"))
         self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type still runs: fail open")
 
@@ -4234,46 +4242,58 @@ class Advisor(unittest.TestCase):
             answer = self.decide(data, **env)["hookSpecificOutput"]
             said.append(self.trace()[-1]["reason"] if answer["permissionDecision"] == "deny" else "allow")
 
+        def call(brief, prompt="p9", extra=True, **kw):
+            data = self.call(brief, prompt=prompt, **kw)
+            data["tool_input"].update({"isolation": "worktree"} if extra else {})
+            return data
+
         first = self.brief()
         self.admitted(self.call(first, prompt="p0"))  # in the session's hashes from now on
         state = self.state()
-        state["sessions"]["s1"].update(count=6, prompts={"p1": {"count": 2, "reconcile": 0}})
+        state["sessions"]["s1"]["admitted"] = [{"id": None, "advisor": "opus", "prompt_id": p, "reconcile": False}
+                                               for p in ("p1", "p1", "p2", "p3", "p4", "p0")]
         (self.home / "advisor" / "state.json").write_text(json.dumps(state))
         (self.home / "advisor" / "probe.json").unlink()
         self.transcript.unlink()
         self.reading(five=97)
+        (self.home / "accounts.json").write_text(json.dumps([{"name": "main", "repositories": [str(self.tmp / "elsewhere")]}]))
         bad = "Reconcile: yes\nfindings in sk-ant-x\n" + "x" * 9_000
-        step(self.call(bad, prompt="p9"), LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
-        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=None)
+        step(call(bad, None), LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
         self.probe()
-        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=None)
-        step(self.call(bad, prompt="p9"), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"))
-        step(self.call(bad, prompt="p9"))
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"))
+        step(call(bad, None))
         self.executor("claude-fable-5")
-        step(self.call(bad, prompt="p9"))
+        step(call(bad, None))
         self.executor("claude-sonnet-4-5")
-        step(self.call(bad, prompt="p9"))
+        step(call(bad, None))
+        (self.home / "accounts.json").unlink()
+        step(call(bad, None))
+        step(call(bad, None, extra=False))
         bad = "Reconcile: yes\nfindings in sk-ant-x"
-        step(self.call(bad, prompt="p9"))
+        step(call(bad, None, extra=False))
         bad = "Reconcile: yes\nTask: t\nConstraints: c\nFindings: sk-ant-x\nApproach: a\nQuestion: q"
-        step(self.call(bad, prompt="p9"))
+        step(call(bad, None, extra=False))
         bad = "Trigger: stuck\n" + bad
-        step(self.call(bad, prompt="p9"))
-        step(self.call(bad.replace("sk-ant-x", "f.py:1-9"), prompt="p9"))
-        step(self.call(first, prompt="p9"))
-        step(self.call(self.brief(), prompt="p1"))
-        step(self.call(self.brief(), prompt="p9"))
-        step(self.call(self.brief(), session="s2", prompt="p9"))
+        step(call(bad, None, extra=False))
+        bad = bad.replace("sk-ant-x", "f.py:1-9")
+        step(call(bad, None, extra=False))
+        step(call(bad, extra=False))
+        step(call(first, extra=False))
+        step(call(self.brief(), "p1", extra=False))
+        step(call(self.brief(), extra=False))
+        step(call(self.brief(), session="s2", extra=False))
         self.reading(five=40, at=self.now - 3_600)
-        step(self.call(self.brief(), session="s2", prompt="p9"))
+        step(call(self.brief(), session="s2", extra=False))
         self.reading(five=40)
-        step(self.call(self.brief(), session="s2", prompt="p9"))
+        step(call(self.brief(), session="s2", extra=False))
         self.assertEqual(said, ["off", "no-probe", "version-unknown", "version-mismatch", "executor-unknown",
-                                "no-stronger-advisor", "brief-too-long", "brief-sections", "trigger-missing",
-                                "credential", "reconcile-invalid", "repeat", "cap-task", "cap-session", "near-full",
-                                "allowance-unknown", "allow"])
+                                "no-stronger-advisor", "repository", "call-fields", "brief-too-long", "brief-sections",
+                                "trigger-missing", "credential", "task-unknown", "reconcile-invalid", "repeat", "cap-task",
+                                "cap-session", "near-full", "allowance-unknown", "allow"])
         self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
-                         ["hard"] * 6 + ["fixable"] * 5 + ["hard"] * 5, "D2.6's two kinds of denial")
+                         ["hard"] * 7 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
 
     def test_the_brief_is_at_most_8000_characters(self):
         base = self.brief()
@@ -4320,12 +4340,11 @@ class Advisor(unittest.TestCase):
         self.denied(self.call(self.brief(reconcile=True), prompt="p2"), "reconcile-invalid")
         self.admitted(self.call(self.brief(reconcile=True)))
         self.assertTrue(self.trace()[-1]["reconcile"])
-        self.assertEqual(self.state()["sessions"]["s1"]["prompts"], {"p1": {"count": 1, "reconcile": 1}})
-        # With no prompt_id there is no task for it to follow: the session's
-        # caps alone hold, and no call is a reconcile call.
-        self.admitted(self.call(prompt=None))
-        self.denied(self.call(self.brief(reconcile=True), prompt=None), "reconcile-invalid")
-        self.assertEqual(self.state()["sessions"]["s1"]["count"], 3)
+        self.assertEqual(self.counted(), [("opus", "p1", False), ("opus", "p1", True)])
+        # With no prompt_id there is no task for it to follow: since F9 the
+        # call is denied before the reconcile rule is reached.
+        self.denied(self.call(self.brief(reconcile=True), prompt=None), "task-unknown")
+        self.assertEqual(len(self.counted()), 2)
         self.assertTrue(longhaul.advisor_reconcile("Trigger: done\n  reconcile:  YES \n"))
         self.assertFalse(longhaul.advisor_reconcile("Trigger: done\nReconcile: no\nTask: reconcile: yes"))
 
@@ -4338,7 +4357,7 @@ class Advisor(unittest.TestCase):
         entry = self.state()["sessions"]["s1"]
         self.assertEqual(entry["hashes"], [self.trace()[0]["brief_hash"]])
         self.assertRegex(entry["hashes"][0], r"^[0-9a-f]{12}$")
-        self.assertEqual(entry["count"], 1, "the repeat did not count")
+        self.assertEqual(len(entry["admitted"]), 1, "the repeat did not count")
 
     def test_the_caps_per_task_for_both_advisors(self):
         # D2.4: per task (one user prompt), an Opus advisor 2 and a Fable
@@ -4353,9 +4372,10 @@ class Advisor(unittest.TestCase):
             self.admitted(self.call(self.brief(reconcile=True), session=session))
             self.assertIn("its 1 reconcile call", self.denied(self.call(self.brief(reconcile=True), session=session), "cap-task"))
             self.admitted(self.call(session=session, prompt="p2"))  # the next task starts afresh
-            self.assertEqual(self.state()["sessions"][session]["prompts"]["p1"], {"count": cap, "reconcile": 1})
+            self.assertEqual([c for c in self.counted(session) if c[1] == "p1"],
+                             [(advisor, "p1", False)] * cap + [(advisor, "p1", True)])
 
-    def test_the_caps_per_session_for_both_advisors_and_with_no_prompt_id_those_alone(self):
+    def test_the_caps_per_session_for_both_advisors(self):
         for session, model, cap, per_task in (("s1", "claude-sonnet-4-5", 6, 2), ("s2", "claude-opus-4-5", 3, 1)):
             self.executor(model)
             for n in range(cap):
@@ -4363,20 +4383,107 @@ class Advisor(unittest.TestCase):
             self.assertIn(f"its {cap} consultations", self.denied(self.call(session=session, prompt="new"), "cap-session"))
             # A reconcile call is a consultation too.
             self.denied(self.call(self.brief(reconcile=True), session=session, prompt="p0"), "cap-session")
-        self.assertEqual((self.state()["sessions"]["s2"]["count"], self.state()["sessions"]["s2"]["fable"]), (3, 3))
+        self.assertEqual([a for a, _, _ in self.counted("s2")], ["fable"] * 3)
+        # Each advisor model's apart (F9): a session that moved from Sonnet to
+        # Opus after four Opus consultations still has its three on Fable.
         self.executor("claude-sonnet-4-5")
-        for _ in range(6):
-            self.admitted(self.call(session="s3", prompt=None))
-        self.denied(self.call(session="s3", prompt=None), "cap-session")
-        self.assertEqual(self.state()["sessions"]["s3"]["prompts"], {})
-        # Six in a session whichever the advisor: a session that moved from
-        # Sonnet to Opus has four Opus consultations and room for two on Fable.
         for n in range(4):
             self.admitted(self.call(session="s4", prompt=f"p{n // 2}"))
         self.executor("claude-opus-4-5")
-        for n in range(2):
+        for n in range(3):
             self.admitted(self.call(session="s4", prompt=f"q{n}"))
         self.denied(self.call(session="s4", prompt="q9"), "cap-session")
+
+    def counted(self, session="s1"):
+        """The state's admitted consultations of `session`, as (advisor, prompt_id, reconcile), in order."""
+        return [(a["advisor"], a["prompt_id"], a["reconcile"]) for a in self.state()["sessions"][session]["admitted"]]
+
+    def test_a_call_that_names_no_task_is_denied(self):
+        # F9: D2.4's caps are per task because the probe showed prompt_id
+        # names it; on a probed version an absent or junk one is a fault.
+        for prompt in (None, "", "p\n1", "p 1", 7, "x" * 101):
+            reason = self.denied(self.call(prompt=prompt), "task-unknown")
+            self.assertIn("prompt_id", reason)
+            self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.assertEqual(self.state(), {}, "nothing counted")
+
+    def test_the_sessions_account_must_be_allowed_in_the_calls_repository(self):
+        # F9 (A2): the launch chose an account allowed here; the hook checks
+        # that again, by the expression the allowance check names it with.
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        accounts = self.home / "accounts.json"
+        for n, (repositories, cwd, verdict) in enumerate((
+                ([str(self.tmp / "elsewhere")], repo / "src", "repository"), ([str(repo)], repo / "src", "allow"),
+                ([str(repo / "src")], repo / "src", "repository"),  # the repository is the work tree's top
+                ("~/work", repo, "repository"), ([str(repo)], "relative/path", "repository"),
+                ([str(repo)], None, "repository"), (None, "relative/path", "allow"), ([], None, "allow"))):
+            accounts.write_text(json.dumps([{"name": "main", "config_dir": None, "repositories": repositories}]))
+            data = self.call(prompt=f"p{n}")
+            data["cwd"] = str(cwd) if isinstance(cwd, Path) else cwd
+            if verdict == "allow":
+                self.admitted(data)
+            else:
+                self.assertIn("this repository", self.denied(data, "repository"), (repositories, cwd))
+                self.assertEqual(self.trace()[-1]["kind"], "hard")
+        # One helper names the account for the status line and for the hook.
+        with mock.patch.object(longhaul, "session_account", return_value=("Zed", {"name": "Zed"})), \
+                mock.patch.object(longhaul, "LEDGER", self.home / "ledger.jsonl"):
+            longhaul.record_usage({"session_id": "s1", "rate_limits": {"five_hour": {"used_percentage": 1}}}, None)
+        self.assertTrue((self.home / "usage" / "Zed.json").exists(), "record_usage names it through session_account")
+        accounts.write_text(json.dumps([{"name": "Max", "config_dir": None, "repositories": [str(repo)]}]))
+        self.assertEqual(longhaul.session_account(None), ("Max", {"name": "Max", "config_dir": None, "repositories": [str(repo)]}))
+        self.assertEqual(longhaul.session_account(str(self.tmp / "pro")), ("pro", {"name": "pro"}), "not in the file: no list")
+
+    def test_the_caps_are_counted_apart_for_each_advisor_model(self):
+        # F9, D2.4 as worded: an Opus advisor 2 per task plus 1 reconcile and
+        # 6 per session; a Fable advisor 1 plus 1 and 3; each model apart, so
+        # a session that moved from Sonnet to Opus may hold 6 Opus and 3 Fable.
+        self.assertEqual((longhaul.ADVISOR_TASK_CAP_PER_MODEL, longhaul.ADVISOR_TASK_RECONCILES_PER_MODEL,
+                          longhaul.ADVISOR_SESSION_CAP_PER_MODEL), ({"opus": 2, "fable": 1}, 1, {"opus": 6, "fable": 3}))
+        for old in ("ADVISOR_TASK", "ADVISOR_RECONCILES", "ADVISOR_SESSION"):
+            self.assertFalse(hasattr(longhaul, old), old)
+        self.executor("claude-opus-4-5")
+        self.admitted(self.call(prompt="p1"))
+        self.assertIn("the fable advisor", self.denied(self.call(prompt="p1"), "cap-task"))
+        self.admitted(self.call(self.brief(reconcile=True), prompt="p1"))
+        self.executor("claude-sonnet-4-5")  # the same task, the other advisor: its own caps
+        self.denied(self.call(self.brief(reconcile=True), prompt="p1"), "reconcile-invalid")
+        for _ in range(2):
+            self.admitted(self.call(prompt="p1"))
+        self.admitted(self.call(self.brief(reconcile=True), prompt="p1"))
+        self.assertIn("the opus advisor", self.denied(self.call(prompt="p1"), "cap-task"))
+        self.executor("claude-opus-4-5")
+        self.admitted(self.call(prompt="p2"))
+        self.assertIn("its 3 consultations with the fable advisor", self.denied(self.call(prompt="p3"), "cap-session"))
+        self.executor("claude-sonnet-4-5")  # the Fable cap is reached, and the Opus advisor still has room
+        for n in range(3):
+            self.admitted(self.call(prompt=f"q{n}"))
+        self.assertIn("its 6 consultations with the opus advisor", self.denied(self.call(prompt="q9"), "cap-session"))
+        self.assertEqual(collections.Counter(a for a, _, _ in self.counted()), {"opus": 6, "fable": 3})
+
+    def test_the_counts_are_the_larger_of_the_states_and_the_traces(self):
+        # F9: a deleted state.json lifts no cap; the trace's admitted
+        # decisions count, a consultation that then failed among them.
+        state, trace = self.home / "advisor" / "state.json", self.home / "advisor" / "trace.jsonl"
+        first = self.call(prompt="p1")
+        self.admitted(first)
+        self.result(first, None)  # it failed: counted all the same
+        self.admitted(self.call(prompt="p1"))
+        state.unlink()
+        self.denied(self.call(prompt="p1"), "cap-task")
+        self.admitted(self.call(self.brief(reconcile=True), prompt="p1"))  # valid: the trace has p1's consultations
+        for n in range(3):
+            self.admitted(self.call(prompt=f"p{n + 2}"))
+        state.unlink()
+        self.denied(self.call(prompt="p9"), "cap-session")
+        # And the other way: the trace gone, the state's counts hold.
+        for _ in range(2):
+            self.admitted(self.call(session="s2", prompt="p1"))
+        trace.unlink()
+        self.denied(self.call(session="s2", prompt="p1"), "cap-task")
+        self.admitted(self.call(session="s3", prompt="p1"))  # another session's are its own
 
     def test_a_denied_attempt_counts_for_nothing_and_an_admitted_one_counts_at_once(self):
         self.denied(self.call("x" * 9_000), "brief-too-long")
@@ -4388,9 +4495,7 @@ class Advisor(unittest.TestCase):
         self.admitted(self.call())
         # Counted when admitted, before the advisor runs: a consultation that
         # then fails counts all the same (D2.4).
-        entry = self.state()["sessions"]["s1"]
-        self.assertEqual({k: entry[k] for k in ("count", "fable", "prompts")},
-                         {"count": 1, "fable": 0, "prompts": {"p1": {"count": 1, "reconcile": 0}}})
+        self.assertEqual(self.counted(), [("opus", "p1", False)])
         self.assertEqual(oct((self.home / "advisor" / "state.json").stat().st_mode & 0o777), oct(0o600))
 
     def test_the_allowance_guard_and_its_benchmark_opt_out(self):
@@ -4425,9 +4530,8 @@ class Advisor(unittest.TestCase):
         # hook names the session's account only to find its reading.
         pro = self.tmp / "pro"
         accounts = [{"name": "Max", "config_dir": None},
-                    {"name": "Pro", "config_dir": str(pro), "repositories": [str(self.tmp / "elsewhere")]}]
+                    {"name": "Pro", "config_dir": str(pro), "repositories": [str(self.tmp)]}]
         (self.home / "accounts.json").write_text(json.dumps(accounts))
-        before = (self.home / "accounts.json").read_bytes()
         self.reading(five=40, name="Max")
         self.reading(five=99, name="Pro")
         self.denied(self.call(), "near-full", CLAUDE_CONFIG_DIR=str(pro))
@@ -4435,10 +4539,13 @@ class Advisor(unittest.TestCase):
         out = self.admitted(data)  # no CLAUDE_CONFIG_DIR: ~/.claude, Max's folder
         self.assertEqual(out["updatedInput"], {**data["tool_input"], "model": "opus"}, "the model and nothing else")
         self.assertEqual(set(out), {"hookEventName", "permissionDecision", "permissionDecisionReason", "updatedInput"})
-        # Pro may be used elsewhere only, and this session runs on it all the
-        # same: the hook does not decide that again.
+        # Pro may be used elsewhere only. Before F9 the hook let this session
+        # consult on it all the same; now it checks A2 again, and fails closed.
+        accounts[1]["repositories"] = [str(self.tmp / "elsewhere")]
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
+        before = (self.home / "accounts.json").read_bytes()
         self.reading(five=40, name="Pro")
-        self.admitted(self.call(), CLAUDE_CONFIG_DIR=str(pro))
+        self.denied(self.call(), "repository", CLAUDE_CONFIG_DIR=str(pro))
         self.assertEqual((self.home / "accounts.json").read_bytes(), before)
         self.assertFalse((self.home / "state.json").exists(), "the supervisor's state is untouched")
         self.assertEqual(sorted(p.name for p in (self.home / "advisor").iterdir()), ["probe.json", "state.json", "trace.jsonl"])
@@ -4501,7 +4608,8 @@ class Advisor(unittest.TestCase):
         self.assertEqual((len(kept), kept[0]["n"], kept[-1]["decision"]), (2_000, 1, "allow"), "the oldest went")
         state = self.state()
         for sid, at in (("old", old), ("recent", self.now - 86400)):
-            state["sessions"][sid] = {"count": 1, "fable": 0, "prompts": {}, "hashes": [], "at": at}
+            state["sessions"][sid] = {"admitted": [{"id": None, "advisor": "opus", "prompt_id": "p0", "reconcile": False}],
+                                      "hashes": [], "at": at}
         (self.home / "advisor" / "state.json").write_text(json.dumps(state))
         self.admitted(self.call(session="s2"))
         self.assertEqual(set(self.state()["sessions"]), {"s1", "recent", "s2"})
@@ -4510,10 +4618,13 @@ class Advisor(unittest.TestCase):
         # Counts that were lost would lift the caps: fail closed, said in the
         # log, until the file is deleted.
         path = self.home / "advisor" / "state.json"
-        entry = {"count": 1, "fable": 0, "prompts": {}, "hashes": []}
-        for text in ("not json", "[]", '{"sessions": []}', json.dumps({"sessions": {"s1": {**entry, "count": "1"}}}),
-                     json.dumps({"sessions": {"s1": {**entry, "hashes": None}}}),
-                     json.dumps({"sessions": {"s1": {**entry, "prompts": {"p1": {"count": -1, "reconcile": 0}}}}})):
+        good = {"id": "toolu_1", "advisor": "opus", "prompt_id": "p0", "reconcile": False}
+        entry = {"admitted": [good], "hashes": []}
+        junk = [{**entry, "admitted": None}, {**entry, "admitted": {}}, {**entry, "hashes": None}, {"hashes": []},
+                {**entry, "admitted": ["x"]}, {"count": 1, "fable": 0, "prompts": {}, "hashes": []}]  # the shape before F9
+        junk += [{**entry, "admitted": [{**good, key: value}]} for key, value in (
+            ("advisor", "haiku"), ("advisor", ["opus"]), ("prompt_id", None), ("prompt_id", "p 1"), ("reconcile", 0))]
+        for text in ["not json", "[]", '{"sessions": []}'] + [json.dumps({"sessions": {"s1": e}}) for e in junk]:
             path.write_text(text)
             with self.assertRaises(ValueError):
                 self.decide(self.call())
@@ -4590,7 +4701,7 @@ class Advisor(unittest.TestCase):
         before = self.trace()
         self.assertIsNone(self.result(self.call(agent="Explore"), self.reply("Verdict: stop")))
         self.assertEqual(self.trace(), before, "another agent type: nothing written")
-        self.assertEqual(self.state()["sessions"]["s1"]["count"], 1, "a failed consultation still counts")
+        self.assertEqual(len(self.counted()), 1, "a failed consultation still counts")
 
     def test_the_result_hook_prints_nothing_and_never_keeps_the_reply(self):
         data = self.call(tool_id="toolu_r2")

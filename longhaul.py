@@ -1846,6 +1846,19 @@ def account_for_config(config_dir, accounts: list[dict]) -> str:
     return path.name
 
 
+def session_account(config_dir) -> tuple:
+    """(the account a claude process runs as, by its CLAUDE_CONFIG_DIR, and
+    its entry in accounts.json, or {"name": ...} alone when the file has
+    none: no repositories, so unrestricted). The file's accounts, not
+    load_accounts()'s stand-in for a missing file, which would name every
+    reading from ~/.claude after it: with no accounts.json a session there
+    is "main". The status line and the Advisor's hook both name the
+    account so (Sprint 8, F9)."""
+    accounts = read_json(LONGHAUL_HOME / "accounts.json") or []
+    name = account_for_config(config_dir, accounts)
+    return name, next((a for a in accounts if isinstance(a, dict) and a.get("name") == name), {"name": name})
+
+
 def save_label(sid: str, label: str) -> None:
     labels = read_json(LABELS) or {}
     if labels.get(sid) != label:
@@ -1865,10 +1878,7 @@ def gauge(name: str, part: dict) -> str:
 def record_usage(data: dict, config_dir, now: float | None = None) -> str:
     """Keep this reading and return the status line text."""
     now = time.time() if now is None else now
-    # The file's accounts, not load_accounts()'s stand-in for a missing file,
-    # which would name every reading from ~/.claude after it: with no
-    # accounts.json a session there is "main".
-    acct = account_for_config(config_dir, read_json(LONGHAUL_HOME / "accounts.json") or [])
+    acct, _ = session_account(config_dir)
     limits = data.get("rate_limits") or {}
     sid = data.get("session_id")
     if limits:
@@ -3870,14 +3880,15 @@ ADVISOR_FOR = {"haiku": "opus", "sonnet": "opus", "opus": "fable"}
 ADVISOR_CALL_FIELDS = ("description", "prompt", "subagent_type", "run_in_background", "model")
 ADVISOR_BRIEF_MAX = 8_000  # characters (D2.3)
 ADVISOR_SECTIONS = ("Task:", "Constraints:", "Findings:", "Approach:", "Question:")  # each starts a line of the brief
-# D2.4's caps. Per task, one user prompt (prompt_id names it: the probe
-# showed it on 2.1.307): an Opus advisor 2 consultations and a Fable one
-# 1, each with one reconcile call more. Per session: 6 in all whichever
-# the advisor, at most 3 of them on Fable. Without a prompt_id the
-# session's caps alone hold.
-ADVISOR_TASK = {"opus": 2, "fable": 1}
-ADVISOR_RECONCILES = 1
-ADVISOR_SESSION = {"opus": 6, "fable": 3}
+# D2.4's caps, as it words them (F9), each advisor model's counted apart.
+# Per task, one user prompt (prompt_id names it: the probe showed it on
+# 2.1.307, so a call without one is denied): an Opus advisor 2
+# consultations and a Fable one 1, each with one reconcile call more. Per
+# session: 6 on Opus and 3 on Fable, reconcile calls among them, so a
+# session that moved from Sonnet to Opus may hold 6 and 3.
+ADVISOR_TASK_CAP_PER_MODEL = {"opus": 2, "fable": 1}
+ADVISOR_TASK_RECONCILES_PER_MODEL = 1
+ADVISOR_SESSION_CAP_PER_MODEL = {"opus": 6, "fable": 3}
 # Seconds a status line reading of the session's account stays good for
 # the near-full rule. The status line runs after every reply; an older
 # reading says too little of the use now.
@@ -3901,6 +3912,8 @@ ADVISOR_DENIALS = {
                         "Continue without advice; do not retry.",
     "no-stronger-advisor": "no advisor stronger than your model ({executor}) is set, and no other model stands in. "
                            "Continue without advice; do not retry.",
+    "repository": "this session's account may not be used in this repository (its repositories in Longhaul's "
+                  "accounts.json), so no consultation runs here. Continue without advice; do not retry.",
     "call-fields": "the call may hold only description, prompt and subagent_type, and run_in_background only as "
                    "false. Drop every other field and call again once.",
     "brief-too-long": "the brief is {chars:,} characters, over the {limit:,} allowed. Shorten it (paths and line "
@@ -3910,11 +3923,14 @@ ADVISOR_DENIALS = {
     "trigger-missing": "the brief's first line must be Trigger: early, stuck, change or done. Put it first and "
                        "resubmit once.",
     "credential": "the brief holds what looks like a credential. Remove the credential from the brief and resubmit once.",
+    "task-unknown": "the call names no task (Claude Code gave no prompt_id), so the caps per task cannot be kept. "
+                    "Continue without advice; do not retry.",
     "reconcile-invalid": "Reconcile: yes is only for the call after a consultation in the same task. Drop the line "
                          "and resubmit once.",
     "repeat": "this brief was already sent in this session. Use the earlier advice; do not retry.",
     "cap-task": "this task has had its {used} with the {advisor} advisor. Continue without advice; do not retry.",
-    "cap-session": "this session has had its {cap} consultations{which}. Continue without advice; do not retry.",
+    "cap-session": "this session has had its {cap} consultations with the {advisor} advisor. Continue without advice; "
+                   "do not retry.",
     "near-full": "the account is nearly full (an allowance window at {limit:g}% or more). Continue without advice; "
                  "do not retry.",
     "allowance-unknown": "no fresh allowance reading exists for this session's account, so the near-full rule cannot "
@@ -4099,26 +4115,53 @@ def advisor_denial(reason: str, **detail) -> tuple:
     return reason, ADVISOR_DENIALS[reason].format(**detail)
 
 
-def advisor_gate(data: dict, line: dict):
-    """The checks that need no count, in their order: the switch, the
-    probe record, the version, the executor's model and its advisor (D3,
-    into `line`), the brief. The first that fails is the denial; None
-    when all pass."""
+def advisor_gate(data: dict, line: dict) -> tuple:
+    """The checks that need no count, run before the lock is taken, as
+    (the first to fail before model-mismatch, the first after it): the
+    probe record and the version; then advisor_fit(), only when those
+    pass. model-mismatch needs the session's record, so it is read under
+    the lock, and the order is kept by checking it before the second."""
     record = advisor_probe()
     if record is None:
-        return advisor_denial("no-probe")
+        return advisor_denial("no-probe"), None
     running = advisor_running_version()
     if running is None:
-        return advisor_denial("version-unknown")
+        return advisor_denial("version-unknown"), None
     if running != record["claude_version"]:
-        return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running)
+        return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running), None
+    return None, advisor_fit(data, line)
+
+
+def advisor_fit(data: dict, line: dict):
+    """The rest of the checks that need no count, in their order: the
+    executor's model and its advisor (D3, into `line`), the repository
+    (A2), the call's fields, the brief, the task. The first that fails is
+    the denial; None when all pass."""
     line["executor"] = advisor_executor(data.get("transcript_path"))
     if line["executor"] is None:
         return advisor_denial("executor-unknown")
     line["advisor"] = ADVISOR_FOR.get(line["executor"])
     if line["advisor"] is None:
         return advisor_denial("no-stronger-advisor", executor=line["executor"])
-    return advisor_fields_problem(data["tool_input"]) or advisor_brief_problem(advisor_brief(data))
+    if not advisor_repository(data):
+        return advisor_denial("repository")
+    denial = advisor_fields_problem(data["tool_input"]) or advisor_brief_problem(advisor_brief(data))
+    if denial is None and line["prompt_id"] is None:
+        return advisor_denial("task-unknown")
+    return denial
+
+
+def advisor_repository(data: dict) -> bool:
+    """A2 again (F9): whether the session's account, named as the
+    allowance check names it, may be used in the repository of the call's
+    cwd. A cwd that is not an absolute path allows an unrestricted
+    account alone. An account not in accounts.json has no list, and has
+    no reading either, so the allowance check denies it."""
+    _, acct = session_account(os.environ.get("CLAUDE_CONFIG_DIR"))
+    cwd = data.get("cwd")
+    if not (isinstance(cwd, str) and os.path.isabs(cwd)):
+        return repositories_of(acct) == []
+    return account_allowed(acct, repository_of(cwd))
 
 
 def advisor_fields_problem(tool: dict):
@@ -4173,23 +4216,23 @@ def advisor_decide(data: dict, now: float) -> dict:
     switch is decided first, from the environment alone, before any file
     is read or the lock taken (F3)."""
     line = advisor_line(data, now)
-    denial = advisor_denial("off") if not advisor_switch() else advisor_gate(data, line)
+    early, rest = (advisor_denial("off"), None) if not advisor_switch() else advisor_gate(data, line)
     with advisor_locked():  # parallel calls run their hooks at once
-        if denial is None:
-            denial = advisor_admit(line, now)
+        denial = early or advisor_admit(line, rest, now)
         advisor_trace(advisor_decided(line, denial), now)
     return advisor_answer(data, line, denial)
 
 
-def advisor_admit(line: dict, now: float):
-    """The checks on the counts, then the allowance; when all pass, the
-    consultation counted and None. With no session there is no cap to
-    keep, so the call is denied."""
+def advisor_admit(line: dict, rest, now: float):
+    """Under the lock: the session's record, then `rest` (advisor_fit()'s
+    denial), the checks on the counts, then the allowance; when all pass,
+    the consultation counted and None. With no session there is no record
+    to check or cap to keep, so the call is denied."""
     if line["session"] is None:
         return advisor_denial("error")
     state = advisor_state()
     entry = advisor_entry(state, line["session"])
-    denial = advisor_counted(line, entry) or advisor_allowance(line, now)
+    denial = rest or advisor_counted(line, entry, advisor_traced(line["session"])) or advisor_allowance(line, now)
     if denial is None:
         advisor_count(state, entry, line, now)
     return denial
@@ -4210,56 +4253,88 @@ def advisor_state() -> dict:
 
 
 def advisor_entry(state: dict, sid: str) -> dict:
-    """This session's counts, fresh for a new session; counts not in their
-    shape raise, as a state that cannot be read does."""
+    """This session's record, fresh for a new session: "admitted", a line
+    per consultation admitted ({"id", "advisor", "prompt_id",
+    "reconcile"}), and the briefs' "hashes". One not in this shape raises,
+    as a state that cannot be read does."""
     entry = state["sessions"].get(sid)
     if entry is None:
-        return {"count": 0, "fable": 0, "prompts": {}, "hashes": []}
-    prompts = entry.get("prompts") if isinstance(entry, dict) else None
-    if not (isinstance(prompts, dict) and isinstance(entry.get("hashes"), list) and advisor_counts(entry, ("count", "fable"))
-            and all(isinstance(p, dict) and advisor_counts(p, ("count", "reconcile")) for p in prompts.values())):
+        return {"admitted": [], "hashes": []}
+    admitted = entry.get("admitted") if isinstance(entry, dict) else None
+    if not (isinstance(admitted, list) and isinstance(entry.get("hashes"), list) and all(map(advisor_counted_ok, admitted))):
         log(f"advisor: {home_path(str(advisor_path('state.json')))} could not be read; consultations are denied "
             "until it is deleted")
         raise ValueError("the advisor's state could not be read")
     return entry
 
 
-def advisor_counts(entry: dict, keys) -> bool:
-    return all(type(entry.get(key)) is int and entry[key] >= 0 for key in keys)
+def advisor_counted_ok(admitted) -> bool:
+    """A consultation the state counted, in its shape: an advisor D3 gives,
+    the task's id, and whether it was a reconcile call."""
+    return (isinstance(admitted, dict) and isinstance(admitted.get("advisor"), str)
+            and admitted["advisor"] in ADVISOR_SESSION_CAP_PER_MODEL and advisor_id(admitted.get("prompt_id")) is not None
+            and type(admitted.get("reconcile")) is bool)
 
 
-def advisor_counted(line: dict, entry: dict):
+def advisor_traced(sid: str) -> list:
+    """The session's admitted decisions in the trace, as the state counts
+    them (F9): those whose outcome failed count too. A line that is not
+    JSON, or names no advisor D3 gives, is passed over."""
+    found = []
+    for raw in advisor_lines():
+        if sid not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if (isinstance(entry, dict) and entry.get("session") == sid and entry.get("event") == "decision"
+                and entry.get("decision") == "allow" and isinstance(entry.get("advisor"), str)
+                and entry["advisor"] in ADVISOR_SESSION_CAP_PER_MODEL):
+            found.append({"advisor": entry["advisor"], "prompt_id": advisor_id(entry.get("prompt_id")),
+                          "reconcile": entry.get("reconcile") is True})
+    return found
+
+
+def advisor_tally(admitted: list) -> collections.Counter:
+    """Counts of consultations: by advisor model for the session, and by
+    (model, task, whether a reconcile call) for the task."""
+    tally = collections.Counter()
+    for a in admitted:
+        tally[a["advisor"]] += 1
+        tally[(a["advisor"], a["prompt_id"], a["reconcile"])] += 1
+    return tally
+
+
+def advisor_counted(line: dict, entry: dict, traced: list):
     """The checks on this session's record, in order: a reconcile call only
-    after a consultation in the same task, the repeat, the task's cap."""
-    prompt = entry["prompts"].get(line["prompt_id"], {"count": 0, "reconcile": 0}) if line["prompt_id"] else None
-    if line["reconcile"] and not (prompt and prompt["count"]):
+    after a consultation in the same task, the repeat, the task's cap, the
+    session's; each advisor model's counted apart. A count is the larger
+    of the state's and the trace's (F9): a deleted state.json lifts no
+    cap."""
+    tally = advisor_tally(entry["admitted"]) | advisor_tally(traced)  # | keeps the larger count of each
+    advisor, cap = line["advisor"], ADVISOR_TASK_CAP_PER_MODEL[line["advisor"]]
+    asked, reconciled = (tally[(advisor, line["prompt_id"], kind)] for kind in (False, True))
+    if line["reconcile"] and not asked:
         return advisor_denial("reconcile-invalid")
     if line["brief_hash"] in entry["hashes"]:
         return advisor_denial("repeat")
-    advisor, cap = line["advisor"], ADVISOR_TASK[line["advisor"]]
-    if prompt and line["reconcile"] and prompt["reconcile"] >= ADVISOR_RECONCILES:
-        return advisor_denial("cap-task", used=f"{ADVISOR_RECONCILES} reconcile call", advisor=advisor)
-    if prompt and not line["reconcile"] and prompt["count"] >= cap:
+    if line["reconcile"] and reconciled >= ADVISOR_TASK_RECONCILES_PER_MODEL:
+        return advisor_denial("cap-task", used=f"{ADVISOR_TASK_RECONCILES_PER_MODEL} reconcile call", advisor=advisor)
+    if not line["reconcile"] and asked >= cap:
         return advisor_denial("cap-task", used=f"{cap} consultation{'s' if cap > 1 else ''}", advisor=advisor)
-    return advisor_session_full(entry, advisor)
-
-
-def advisor_session_full(entry: dict, advisor: str):
-    """The session's cap: 6 in all whichever the advisor, 3 on Fable."""
-    if entry["count"] >= ADVISOR_SESSION["opus"]:
-        return advisor_denial("cap-session", cap=ADVISOR_SESSION["opus"], which="")
-    if advisor == "fable" and entry["fable"] >= ADVISOR_SESSION["fable"]:
-        return advisor_denial("cap-session", cap=ADVISOR_SESSION["fable"], which=" with the fable advisor")
+    if tally[advisor] >= ADVISOR_SESSION_CAP_PER_MODEL[advisor]:
+        return advisor_denial("cap-session", cap=ADVISOR_SESSION_CAP_PER_MODEL[advisor], advisor=advisor)
     return None
 
 
 def advisor_allowance(line: dict, now: float):
     """D2.4's near-full rule on the session's own account, named as the
-    status line names its readings (record_usage). No fresh reading is a
-    denial too, unless LONGHAUL_ADVISOR_ALLOWANCE=unchecked, which the
+    status line names its readings (session_account()). No fresh reading
+    is a denial too, unless LONGHAUL_ADVISOR_ALLOWANCE=unchecked, which the
     benchmark's scratch runs set (they have no status line); a fresh
     reading that is nearly full is a denial even then."""
-    acct = account_for_config(os.environ.get("CLAUDE_CONFIG_DIR"), read_json(LONGHAUL_HOME / "accounts.json") or [])
+    acct, _ = session_account(os.environ.get("CLAUDE_CONFIG_DIR"))
     reading = readings([{"name": acct}])[acct]
     if not advisor_fresh(reading, now):
         return None if line["allowance"] == "unchecked" else advisor_denial("allowance-unknown")
@@ -4283,11 +4358,8 @@ def advisor_count(state: dict, entry: dict, line: dict, now: float) -> None:
     """The consultation counted and its hash kept, when admitted: one that
     then fails counts too (D2.4). Sessions last written over
     ADVISOR_KEEP_DAYS ago go."""
-    entry["count"] += 1
-    entry["fable"] += 1 if line["advisor"] == "fable" else 0
-    if line["prompt_id"]:
-        prompt = entry["prompts"].setdefault(line["prompt_id"], {"count": 0, "reconcile": 0})
-        prompt["reconcile" if line["reconcile"] else "count"] += 1
+    entry["admitted"].append({"id": line["id"], "advisor": line["advisor"], "prompt_id": line["prompt_id"],
+                              "reconcile": line["reconcile"]})
     entry["hashes"].append(line["brief_hash"])
     entry["at"] = round(now, 3)
     cutoff = now - ADVISOR_KEEP_DAYS * 86400
