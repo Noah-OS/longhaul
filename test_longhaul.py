@@ -4823,6 +4823,27 @@ class Advisor(unittest.TestCase):
         self.denied(self.call(session="s2", prompt="p1"), "cap-task")
         self.admitted(self.call(session="s3", prompt="p1"))  # another session's are its own
 
+    def test_two_hooks_at_once_with_one_consultation_left_admit_exactly_one(self):
+        # F11, item 1: parallel Agent calls run their hooks at once. The
+        # counts are read and written under the lock, so the session's last
+        # consultation goes to one of them alone.
+        for n in range(5):
+            self.admitted(self.call(prompt=f"p{n // 2}"))
+        hooks = []
+        for n in range(2):  # two tasks: the session's cap alone stands between them
+            given = self.tmp / f"input{n}.json"
+            given.write_text(json.dumps(self.call(prompt=f"q{n}")))
+            with given.open() as f:
+                hooks.append(subprocess.Popen(self.HOOK, stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              env=self.env, text=True))
+        outs = [hook.communicate(timeout=30) for hook in hooks]
+        self.assertEqual([hook.returncode for hook in hooks], [0, 0], [err for _, err in outs])
+        answers = sorted((json.loads(out)["hookSpecificOutput"] for out, _ in outs), key=lambda a: a["permissionDecision"])
+        self.assertEqual([a["permissionDecision"] for a in answers], ["allow", "deny"])
+        self.assertIn("denied (cap-session)", answers[1]["permissionDecisionReason"])
+        self.assertEqual(len(self.counted()), 6)
+        self.assertEqual([line["decision"] for line in self.trace()].count("allow"), 6)
+
     def test_a_denied_attempt_counts_for_nothing_and_an_admitted_one_counts_at_once(self):
         self.denied(self.call("x" * 9_000), "brief-too-long")
         self.denied(self.call(self.brief(drop=["Task:"])), "brief-sections")
