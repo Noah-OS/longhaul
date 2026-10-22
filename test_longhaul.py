@@ -4508,8 +4508,10 @@ class Name(unittest.TestCase):
     SIGNED = ("LICENSE", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json")
     # The README is checked line by line (it passed whole before, so a
     # private path pasted into an example would have passed with it): its
-    # one allowed match is the handle inside the repository's name.
-    HANDLE = "amr" + "adel55/longhaul"
+    # one allowed match is the repository's own address, which since
+    # 2026-10-22 is in the organisation the owner moved it to (the owner's
+    # choice); any other mention of that name still fails. In pieces, as above.
+    HANDLE = "No" + "ah-OS/longhaul"
 
     def test_nothing_private_ships(self):
         requires_git(self)

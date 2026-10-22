@@ -85,7 +85,7 @@ claude --plugin-dir /path/to/longhaul
 **Install the plugin**, in Claude Code:
 
 ```
-/plugin marketplace add amradel55/longhaul
+/plugin marketplace add Noah-OS/longhaul
 /plugin install longhaul@longhaul
 ```
 
