@@ -3892,6 +3892,11 @@ ADVISOR_CHECKS = ("recognise", "deny", "prompt_id", "model_rewrite", "read_only"
 # those a probe saw take effect (the subagent's meta.json model), and only
 # an advisor model among them is set (F5): a record without it has none.
 ADVISOR_REWRITES = ("haiku", "sonnet", "opus", "fable")
+# Claude Code's variables with which it chooses a subagent's model itself,
+# over the one the hook sets (F14). With any of them set, even empty, the
+# advisor would not run on D3's model, so nothing is admitted.
+ADVISOR_FORCED_MODEL_VARS = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_COORDINATOR_FORCE_WORKER_INHERIT_MODEL",
+                             "CLAUDE_CODE_SUBAGENT_MODEL")
 ADVISOR_VERSION = r"\d+\.\d+\.\d+"
 # Seconds `claude --version` may take when the transcript names no version
 # and the path names none, or not the record's (F7): well inside the
@@ -3949,6 +3954,8 @@ ADVISOR_DENIALS = {
                        "Continue without advice; do not retry.",
     "version-mismatch": "the probe passed on Claude Code {recorded}, not on {running}, the version running; it must "
                         "pass on this one first. Continue without advice; do not retry.",
+    "model-forced": "Claude Code is set to choose subagents' model itself ({names}), so the advisor's model cannot be "
+                    "set. Continue without advice; do not retry.",
     "model-mismatch": "an earlier consultation in this session ran on {seen}, not on the {decided} advisor it was "
                       "admitted with, so the advisor's model is not trusted for the rest of the session. Continue "
                       "without advice; do not retry.",
@@ -4028,6 +4035,12 @@ def advisor_untrusted_home(cwd):
     if any(home == folder or inside(home, folder) for folder in folders):
         return "inside the working folder or its repository"
     return None
+
+
+def advisor_forced() -> list:
+    """The ADVISOR_FORCED_MODEL_VARS set in the environment, even empty
+    ones (F14): the environment alone, no file."""
+    return [name for name in ADVISOR_FORCED_MODEL_VARS if name in os.environ]
 
 
 def advisor_unchecked() -> bool:
@@ -4374,7 +4387,8 @@ def advisor_gate(data: dict, line: dict) -> tuple:
     """The checks that need no count, run before the lock is taken, as
     (the first to fail before model-mismatch, the first after it): the
     home (F13, before any file is read), the enabled key, the probe
-    record and the version; then advisor_fit(), only when those pass.
+    record, the version and a forced subagent model (F14); then
+    advisor_fit(), only when those pass.
     model-mismatch needs the session's record, so it is read under the
     lock, and the order is kept by checking it before the second. A key
     for another version than the record's is not-enabled too: a new
@@ -4395,6 +4409,8 @@ def advisor_gate(data: dict, line: dict) -> tuple:
         return advisor_denial("version-unknown"), None
     if running != record["claude_version"]:
         return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running), None
+    if advisor_forced():
+        return advisor_denial("model-forced", names=", ".join(advisor_forced())), None
     return None, advisor_fit(data, line, record, tail)
 
 
@@ -4980,6 +4996,7 @@ def advisor_status_lines() -> list:
            if enabled != recorded
            else "the running Claude Code version is unknown" if running is None
            else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded
+           else f"Claude Code is set to choose subagents' model itself ({', '.join(advisor_forced())})" if advisor_forced()
            else "the probe record names no advisor model whose rewrite it saw (rewrite_models); record a probe that does"
            if not rewrites else None)
     return lines + [f"off: {why}" if why else "enabled"]

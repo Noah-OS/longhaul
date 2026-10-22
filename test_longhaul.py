@@ -3833,8 +3833,11 @@ class Advisor(unittest.TestCase):
     # input before it imports longhaul, and denies a consultation without it).
     HOOK = registered_hook("PreToolUse", "advisor-hook")
     RESULT = registered_hook("PostToolUse", "advisor-result")
+    # Claude Code's variables that set a subagent's model over the hook's (F14).
+    FORCED = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_COORDINATOR_FORCE_WORKER_INHERIT_MODEL",
+              "CLAUDE_CODE_SUBAGENT_MODEL")
     # What the hooks read of the session's environment: each test gives its own.
-    VARS = ("CLAUDE_CODE_EXECPATH", "CLAUDE_CONFIG_DIR")
+    VARS = ("CLAUDE_CODE_EXECPATH", "CLAUDE_CONFIG_DIR", *FORCED)
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
@@ -4265,6 +4268,26 @@ class Advisor(unittest.TestCase):
             self.denied(data, "executor-unknown")
         self.transcript.write_text(json.dumps({"type": "user", "message": {"content": "go"}}) + "\n")
         self.denied(self.call(), "executor-unknown")
+
+    def test_a_subagent_model_forced_by_claude_codes_variables_is_denied(self):
+        # F14: each of these makes Claude Code choose a subagent's model over
+        # the one the hook sets, so with any of them set, even empty, the
+        # advisor's model is not D3's and nothing is admitted.
+        self.assertEqual(longhaul.ADVISOR_FORCED_MODEL_VARS, self.FORCED)
+        for name in self.FORCED:
+            for value in ("opus", "fable", ""):
+                reason = self.denied(self.call(prompt="p1"), "model-forced", **{name: value})
+                self.assertIn(name, reason)
+                self.assertEqual(self.trace()[-1]["kind"], "hard")
+        reason = self.denied(self.call(prompt="p1"), "model-forced", **dict.fromkeys(self.FORCED, "1"))
+        self.assertIn(", ".join(self.FORCED), reason, "each one set is named")
+        self.assertEqual(self.state(), {}, "nothing counted")
+        self.admitted(self.call(prompt="p1"))
+        # status says so, after the version and before the rewrites
+        _, last = self.status(CLAUDE_CODE_SUBAGENT_MODEL="opus")
+        self.assertEqual(last, "off: Claude Code is set to choose subagents' model itself (CLAUDE_CODE_SUBAGENT_MODEL)")
+        _, last = self.status(CLAUDE_CODE_SUBAGENT_MODEL="opus", CLAUDE_CODE_EXECPATH=None)
+        self.assertEqual(last, "off: the running Claude Code version is unknown")
 
     def test_d3_names_the_advisor_and_never_a_substitute(self):
         self.assertEqual(longhaul.ADVISOR_FOR, {"haiku": "opus", "sonnet": "opus", "opus": "fable"})
@@ -4729,17 +4752,19 @@ class Advisor(unittest.TestCase):
         bad = "Reconcile: yes\nfindings in sk-ant-x\n" + "x" * 9_000
         around = call(bad, None)
         around["cwd"] = str(self.tmp)  # the home is inside it (F13)
-        step(around, LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
-        step(around, CLAUDE_CODE_EXECPATH=None)
-        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
-        self.enable()
-        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
-        self.probe()
-        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
-        step(call(bad, None), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"))
-        marked = self.state()
+        forced = {"CLAUDE_CODE_SUBAGENT_MODEL": "haiku"}  # F14
+        marked = json.loads(json.dumps(state))
         marked["sessions"]["s1"]["mismatch"] = {"decided": "opus", "seen": "sonnet"}
         (self.home / "advisor" / "state.json").write_text(json.dumps(marked))
+        step(around, LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None, **forced)
+        step(around, CLAUDE_CODE_EXECPATH=None, **forced)
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None, **forced)
+        self.enable()
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None, **forced)
+        self.probe()
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None, **forced)
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"), **forced)
+        step(call(bad, None), **forced)
         step(call(bad, None))
         (self.home / "advisor" / "state.json").write_text(json.dumps(state))
         step(call(bad, None))
@@ -4771,13 +4796,13 @@ class Advisor(unittest.TestCase):
         self.reading(five=40)
         step(call(self.brief(), session="s2", extra=False))
         self.assertEqual(said, ["off", "home-untrusted", "not-enabled", "no-probe", "version-unknown", "version-mismatch",
-                                "model-mismatch",
+                                "model-forced", "model-mismatch",
                                 "executor-unknown", "no-stronger-advisor", "model-unprobed", "repository", "call-fields",
                                 "brief-too-long", "brief-sections", "trigger-missing", "credential", "task-unknown",
                                 "reconcile-invalid", "repeat", "cap-task", "cap-session", "near-full", "allowance-unknown",
                                 "allow"])
         self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
-                         ["hard"] * 11 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
+                         ["hard"] * 12 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
 
     def test_the_brief_is_at_most_8000_characters(self):
         base = self.brief()
