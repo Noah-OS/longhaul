@@ -3891,8 +3891,9 @@ ADVISOR_CHECKS = ("recognise", "deny", "prompt_id", "model_rewrite", "read_only"
 # an advisor model among them is set (F5): a record without it has none.
 ADVISOR_REWRITES = ("haiku", "sonnet", "opus", "fable")
 ADVISOR_VERSION = r"\d+\.\d+\.\d+"
-# Seconds `claude --version` may take when the path names no version:
-# well inside the hook's 5, past which Claude Code lets the call run.
+# Seconds `claude --version` may take when the transcript names no version
+# and the path names none, or not the record's (F7): well inside the
+# hook's timeout, past which Claude Code lets the call run.
 ADVISOR_VERSION_TIMEOUT = 2
 # Seconds the hooks wait for locked("advisor") before they give up: a
 # consultation is then denied (error). With the --version above and the
@@ -4052,28 +4053,71 @@ def advisor_version_in(text: str):
     return found[-1] if found else None
 
 
-def advisor_running_version():
-    """The Claude Code version this hook runs under: the last x.y.z in the
-    real path of CLAUDE_CODE_EXECPATH (the terminal's .../versions/2.1.307,
-    the panel's .../anthropic.claude-code-2.1.304-darwin-arm64/...), else
-    what that executable says to --version; None when neither says."""
+def advisor_running_version(tail=(), recorded=None) -> tuple:
+    """(The Claude Code version this hook runs under, where it came from:
+    "the transcript", "the path", "--version" or None.) First the
+    transcript's tail (advisor_tail()): the process writing it names its
+    version on each line, whatever binary is on disk now (F7), and the last
+    line that names one decides; one that is not x.y.z is unknown. With no
+    such line, the last x.y.z in the real path of CLAUDE_CODE_EXECPATH (the
+    terminal's .../versions/2.1.307, the panel's
+    .../anthropic.claude-code-2.1.304-darwin-arm64/...). When the path names
+    none, or not `recorded` (an npm or nvm path names node's, .../node/
+    v20.11.1/...), what the executable says to --version, before the path's
+    is taken; (None, None) when nothing says."""
+    for raw in reversed(tail):
+        version = advisor_version_of(raw)
+        if version is not None:
+            return (version if isinstance(version, str) and re.fullmatch(ADVISOR_VERSION, version) else None,
+                    "the transcript")
     exe = os.environ.get("CLAUDE_CODE_EXECPATH")
     if not exe:
-        return None
+        return None, None
     real = os.path.realpath(exe)
-    return advisor_version_in(real) or advisor_asked_version(real)
+    named = advisor_version_in(real)
+    if named is not None and recorded in (None, named):
+        return named, "the path"
+    asked = advisor_asked_version(real)
+    if asked is not None:
+        return asked, "--version"
+    return (named, "the path") if named else (None, None)
+
+
+def advisor_version_of(raw: bytes):
+    """A transcript line's own version (its top-level "version"), or None
+    for a line that names none."""
+    if b'"version"' not in raw:
+        return None
+    try:
+        entry = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return entry.get("version") if isinstance(entry, dict) else None
+
+
+def advisor_session_transcript():
+    """For `advisor status`, run from a session: its transcript, found by
+    CLAUDE_CODE_SESSION_ID as inspect finds one, or None."""
+    hits = transcript_hits(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    return str(hits[0]) if hits else None
 
 
 def advisor_asked_version(real: str):
-    """`real --version`, once per (path, mtime): a found version is kept in
-    version-cache.json, a failure is not, so the next call asks again."""
+    """`real --version`, once per build of the file: a found version is kept
+    in version-cache.json under the file's real path, st_mtime_ns and
+    st_size (F7), a failure is not, so the next call asks again. A cache
+    that is junk, or of another build, is asked past and written over."""
     try:
-        mtime = os.stat(real).st_mtime
+        st = os.stat(real)
     except OSError:
         return None
+    key = {"realpath": real, "mtime_ns": st.st_mtime_ns, "size": st.st_size}
     path = advisor_path("version-cache.json")
-    cache = read_json(path)
-    if isinstance(cache, dict) and cache.get("realpath") == real and cache.get("mtime") == mtime \
+    try:
+        cache = read_json(path)
+    except RecursionError:  # nested past the limit: junk, as Region A has it
+        cache = None
+    if isinstance(cache, dict) and all(type(cache.get(k)) is type(v) and cache[k] == v for k, v in key.items()) \
             and isinstance(cache.get("version"), str) and re.fullmatch(ADVISOR_VERSION, cache["version"]):
         return cache["version"]
     try:
@@ -4085,24 +4129,30 @@ def advisor_asked_version(real: str):
     if out.returncode != 0 or not found:
         return None
     with advisor_locked():
-        write_json(path, {"realpath": real, "mtime": mtime, "version": found.group()})
+        write_json(path, {**key, "version": found.group()})
     return found.group()
 
 
-def advisor_executor(path):
-    """The executor's model family: the last assistant line's model in the
-    last ADVISOR_TAIL bytes of the session's transcript, or None."""
+def advisor_tail(path) -> list:
+    """The last ADVISOR_TAIL bytes of the session's transcript, as lines (a
+    cut first line is no line), or [] when it cannot be read. Read once a
+    call, for the version and the executor both (F7)."""
     if not isinstance(path, str) or not path:
-        return None
+        return []
     try:
         with open(path, "rb") as f:
             size = f.seek(0, os.SEEK_END)
             f.seek(max(0, size - ADVISOR_TAIL))
             tail = f.read(ADVISOR_TAIL)
     except OSError:
-        return None
-    lines = tail.split(b"\n")[1 if size > ADVISOR_TAIL else 0:]  # a cut first line is no line
-    for raw in reversed(lines):
+        return []
+    return tail.split(b"\n")[1 if size > ADVISOR_TAIL else 0:]
+
+
+def advisor_executor(tail: list):
+    """The executor's model family: the last assistant line's model in the
+    transcript's tail (advisor_tail()), or None."""
+    for raw in reversed(tail):
         model = advisor_model_of(raw)
         if model:
             return advisor_family(model)
@@ -4261,21 +4311,22 @@ def advisor_gate(data: dict, line: dict) -> tuple:
         return advisor_denial("no-probe"), None
     if enabled != record["claude_version"]:
         return advisor_denial("not-enabled"), None
-    running = advisor_running_version()
+    tail = advisor_tail(data.get("transcript_path"))  # for the version and the executor, read once (F7)
+    running, _ = advisor_running_version(tail, record["claude_version"])
     if running is None:
         return advisor_denial("version-unknown"), None
     if running != record["claude_version"]:
         return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running), None
-    return None, advisor_fit(data, line, record)
+    return None, advisor_fit(data, line, record, tail)
 
 
-def advisor_fit(data: dict, line: dict, record: dict):
+def advisor_fit(data: dict, line: dict, record: dict, tail: list):
     """The rest of the checks that need no count, in their order: the
-    executor's model and its advisor (D3, into `line`), whether the probe
-    saw that advisor's model set (F5), the repository (A2), the call's
-    fields, the brief, the task. The first that fails is the denial; None
-    when all pass."""
-    line["executor"] = advisor_executor(data.get("transcript_path"))
+    executor's model and its advisor (D3, into `line`, from the
+    transcript's `tail`), whether the probe saw that advisor's model set
+    (F5), the repository (A2), the call's fields, the brief, the task. The
+    first that fails is the denial; None when all pass."""
+    line["executor"] = advisor_executor(tail)
     if line["executor"] is None:
         return advisor_denial("executor-unknown")
     line["advisor"] = ADVISOR_FOR.get(line["executor"])
@@ -4812,19 +4863,22 @@ def advisor_result(_opts) -> int:
 
 def advisor_status_lines() -> list:
     """`longhaul advisor status`: the switch, the probe record's version
-    and the rewrites it saw (F5), the running version, the enabled key,
-    the allowance rule and the home (F8), then "enabled" or "off: <why>",
-    the first gate that is shut. The skill's first step runs it and stops
-    unless its last line is enabled."""
-    switch, record, running, enabled = advisor_switch(), advisor_probe(), advisor_running_version(), advisor_enabled()
+    and the rewrites it saw (F5), the running version and where it came
+    from (F7: the session's transcript, the path or --version, as the hook
+    finds it), the enabled key, the allowance rule and the home (F8), then
+    "enabled" or "off: <why>", the first gate that is shut. The skill's
+    first step runs it and stops unless its last line is enabled."""
+    switch, record, enabled = advisor_switch(), advisor_probe(), advisor_enabled()
     recorded = record["claude_version"] if record else None
+    running, source = advisor_running_version(advisor_tail(advisor_session_transcript()), recorded)
     key = ("missing" if enabled is None else f"present, for Claude Code {enabled}"
            + ("" if recorded in (None, enabled) else f", not the probe record's {recorded}"))
     rewrites = ", ".join(advisor_rewrites(record.get("rewrite_models")) or []) if record else ""
     lines = [f"LONGHAUL_ADVISOR: {'experiment' if switch else 'off'}",
              f"Probe record: Claude Code {recorded}, passed {advisor_day(record.get('passed_at'))}; "
              f"rewrites seen: {rewrites or 'none'}" if record else "Probe record: none",
-             f"Running Claude Code: {running or 'unknown'}", f"Enabled key: {key}",
+             f"Running Claude Code: {running or 'unknown'}" + (f" (from {source})" if source else ""),
+             f"Enabled key: {key}",
              f"Allowance: {advisor_allowance_said()}",
              f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}",
              f"Unadmitted advisor runs traced: {advisor_unadmitted()}"]

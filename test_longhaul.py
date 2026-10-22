@@ -4146,12 +4146,18 @@ class Advisor(unittest.TestCase):
         self.admitted(self.call(prompt="p2"), CLAUDE_CODE_EXECPATH=str(exe))
         self.assertEqual(mark.read_text(), "--version\n", "asked once")
         cache = self.home / "advisor" / "version-cache.json"
-        self.assertEqual(json.loads(cache.read_text()),
-                         {"realpath": str(exe), "mtime": exe.stat().st_mtime, "version": "2.1.307"})
+        self.assertEqual(json.loads(cache.read_text()), {"realpath": str(exe), "mtime_ns": exe.stat().st_mtime_ns,
+                                                         "size": exe.stat().st_size, "version": "2.1.307"})
         self.assertEqual(oct(cache.stat().st_mode & 0o777), oct(0o600))
         os.utime(exe, (self.now - 60, self.now - 60))  # an update in place: asked again
         self.admitted(self.call(prompt="p3"), CLAUDE_CODE_EXECPATH=str(exe))
         self.assertEqual(mark.read_text(), "--version\n--version\n")
+        same = exe.stat().st_mtime_ns  # F7: another build with the same time, a size apart: asked again
+        with exe.open("a") as f:
+            f.write("# another build\n")
+        os.utime(exe, ns=(same, same))
+        self.admitted(self.call(prompt="p4"), CLAUDE_CODE_EXECPATH=str(exe))
+        self.assertEqual(mark.read_text(), "--version\n" * 3)
         for name, says, code in (("junk", "Claude Code", 0), ("fails", "2.1.307 (Claude Code)", 1)):
             other, ran = self.fake_claude(name, says, code)
             self.denied(self.call(), "version-unknown", CLAUDE_CODE_EXECPATH=str(other))
@@ -4172,6 +4178,51 @@ class Advisor(unittest.TestCase):
         reason = self.denied(self.call(), "version-mismatch", CLAUDE_CODE_EXECPATH=str(other))
         self.assertIn("2.1.307", reason)
         self.assertIn("2.1.308", reason)
+
+    def stamped(self, *versions, model="claude-sonnet-4-5"):
+        """The session's transcript as Claude Code writes it, each line naming
+        the version that wrote it: an assistant line on `model` per version
+        given, None a line with no version."""
+        lines = [{"type": "assistant", "message": {"model": model, "role": "assistant", "content": []},
+                  **({} if version is None else {"version": version})} for version in versions]
+        self.transcript.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    def test_the_version_is_the_transcripts_then_the_paths_then_what_claude_says(self):
+        # F7: the process writing the transcript names its version on each
+        # line, whatever binary is on disk now. The last line that names one
+        # decides, read from the tail the executor check reads, and once.
+        older = self.tmp / "claude" / "versions" / "2.1.304"
+        older.write_text("")
+        self.stamped("2.1.306", "2.1.307", None)
+        with mock.patch("builtins.open", wraps=open) as opened:
+            self.admitted(self.call(prompt="p1"), CLAUDE_CODE_EXECPATH=str(older))
+        self.assertEqual(sum(1 for c in opened.call_args_list if c.args[:1] == (str(self.transcript),)), 1, "read once")
+        exe, mark = self.fake_claude()
+        self.stamped("2.1.307", "2.1.308")
+        self.assertIn("2.1.308", self.denied(self.call(prompt="p2"), "version-mismatch", CLAUDE_CODE_EXECPATH=str(exe)))
+        self.denied(self.call(prompt="p2"), "version-mismatch")  # the path's 2.1.307 does not outrank it
+        self.assertFalse(mark.exists(), "the transcript named it: claude was not asked")
+        for junk in ("2.1.307-dev", "2.1", 2107, ""):  # the last one named is no x.y.z: unknown, never an older line's
+            self.stamped("2.1.307", junk)
+            self.denied(self.call(prompt="p3"), "version-unknown")
+        # No line names one: the path's, and when that is not the record's
+        # (an npm or nvm path names node's), claude is asked before a denial.
+        self.stamped(None, None)
+        self.admitted(self.call(prompt="p4"))
+        nvm = self.tmp / "nvm" / "versions" / "node" / "v20.11.1" / "bin" / "claude"
+        nvm.parent.mkdir(parents=True)
+        shutil.copy2(exe, nvm)
+        with mock.patch.object(longhaul, "ADVISOR_VERSION_TIMEOUT", 10):
+            self.admitted(self.call(prompt="p5"), CLAUDE_CODE_EXECPATH=str(nvm))
+            self.admitted(self.call(prompt="p6"), CLAUDE_CODE_EXECPATH=str(nvm))
+            self.assertEqual(mark.read_text(), "--version\n", "asked once, then cached")
+            nvm.write_text("#!/bin/sh\nexit 1\n")  # one that cannot say: the path's version, and denied
+            self.assertIn("20.11.1", self.denied(self.call(prompt="p7"), "version-mismatch", CLAUDE_CODE_EXECPATH=str(nvm)))
+            match = self.tmp / "v" / "2.1.307" / "claude"  # a path naming the record's version is taken as it is
+            match.parent.mkdir(parents=True)
+            shutil.copy2(self.fake_claude("other", "2.1.308 (Claude Code)")[0], match)
+            self.admitted(self.call(prompt="p7"), CLAUDE_CODE_EXECPATH=str(match))
+        self.assertFalse((self.tmp / "other.ran").exists(), "not asked")
 
     def test_the_executor_is_the_last_assistant_line_in_the_transcripts_tail(self):
         self.executor("claude-opus-4-5")
@@ -5148,7 +5199,8 @@ class Advisor(unittest.TestCase):
         lines, last = self.status()
         self.assertEqual(lines, {"LONGHAUL_ADVISOR": "experiment",
                                  "Probe record": f"Claude Code 2.1.307, passed {day}; rewrites seen: opus, fable",
-                                 "Running Claude Code": "2.1.307", "Enabled key": "present, for Claude Code 2.1.307",
+                                 "Running Claude Code": "2.1.307 (from the path)",
+                                 "Enabled key": "present, for Claude Code 2.1.307",
                                  "Allowance": "checked: a fresh status-line reading of the session's account is needed",
                                  "Home": str(self.home), "Unadmitted advisor runs traced": "0"})
         self.assertEqual(last, "enabled", "the skill's contract: the last line")
@@ -5161,7 +5213,7 @@ class Advisor(unittest.TestCase):
                 ({"LONGHAUL_ADVISOR": None}, {"LONGHAUL_ADVISOR": "off"}, "LONGHAUL_ADVISOR is not experiment"),
                 ({"LONGHAUL_ADVISOR": "on"}, {"LONGHAUL_ADVISOR": "off"}, "LONGHAUL_ADVISOR is not experiment"),
                 ({"CLAUDE_CODE_EXECPATH": None}, {"Running Claude Code": "unknown"}, "the running Claude Code version is unknown"),
-                ({"CLAUDE_CODE_EXECPATH": str(other)}, {"Running Claude Code": "2.1.308"},
+                ({"CLAUDE_CODE_EXECPATH": str(other)}, {"Running Claude Code": "2.1.308 (from the path)"},
                  "the probe passed on 2.1.307, not on 2.1.308, the version running"),
                 ({"LONGHAUL_ADVISOR_ALLOWANCE": "unchecked"},
                  {"Allowance": "unchecked when no fresh reading exists (LONGHAUL_ADVISOR_ALLOWANCE=unchecked, a scratch home)"},
@@ -5187,6 +5239,30 @@ class Advisor(unittest.TestCase):
         self.assertEqual((lines["Probe record"], last), ("none", "off: no passing probe record"))
         written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
         self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "status writes nothing")
+
+    def test_advisor_status_names_where_the_running_version_came_from(self):
+        # F7: status reads what the hook reads: the session's transcript
+        # (by CLAUDE_CODE_SESSION_ID, as inspect finds one), then the path,
+        # then what claude says to --version.
+        self.transcript = self.tmp / "claude-config" / "projects" / "-code-app" / "s1.jsonl"
+        self.transcript.parent.mkdir(parents=True)
+        self.stamped("2.1.307")
+        older = self.tmp / "claude" / "versions" / "2.1.304"
+        older.write_text("")
+        exe, _ = self.fake_claude()
+        for env, running, last in (
+                ({"CLAUDE_CODE_SESSION_ID": "s1", "CLAUDE_CODE_EXECPATH": str(older)}, "2.1.307 (from the transcript)",
+                 "enabled"),
+                ({"CLAUDE_CODE_SESSION_ID": "s2"}, "2.1.307 (from the path)", "enabled"),
+                ({"CLAUDE_CODE_SESSION_ID": "../s1"}, "2.1.307 (from the path)", "enabled"),
+                ({"CLAUDE_CODE_EXECPATH": str(exe)}, "2.1.307 (from --version)", "enabled"),
+                ({"CLAUDE_CODE_EXECPATH": None}, "unknown", "off: the running Claude Code version is unknown")):
+            lines, said = self.status(**env)
+            self.assertEqual((lines["Running Claude Code"], said), (running, last), env)
+        self.stamped("2.1.307", "2.1.307-dev")
+        lines, said = self.status(CLAUDE_CODE_SESSION_ID="s1")
+        self.assertEqual((lines["Running Claude Code"], said), ("unknown (from the transcript)",
+                                                               "off: the running Claude Code version is unknown"))
 
     def test_record_probe_writes_a_passing_record_and_refuses_anything_else(self):
         path = self.home / "advisor" / "probe.json"
@@ -5980,7 +6056,8 @@ class Shim(unittest.TestCase):
         out = self.shim("advisor", "status", CLAUDE_CODE_EXECPATH=exe)
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
-        self.assertEqual(lines[:3], ["LONGHAUL_ADVISOR: off", "Probe record: none", "Running Claude Code: 2.1.307"])
+        self.assertEqual(lines[:3], ["LONGHAUL_ADVISOR: off", "Probe record: none",
+                                     "Running Claude Code: 2.1.307 (from the path)"])
         self.assertIn("Enabled key: missing", lines)
         self.assertEqual(lines[-1], "off: LONGHAUL_ADVISOR is not experiment")
         # F8: enabling is the owner's, in a terminal; disable too goes there.
