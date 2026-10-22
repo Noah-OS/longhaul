@@ -22,6 +22,8 @@
 !bin/longhaul
 !skills/
 !skills/**
+!agents/
+!agents/advisor.md
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
