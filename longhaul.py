@@ -99,6 +99,18 @@ Usage:
                           refused
   longhaul checkpoint           the plugin's SessionStart hook: puts that state back
                           after a compaction or a resume
+  longhaul advisor status       the Advisor experiment's gate: its switch
+                          (LONGHAUL_ADVISOR, off unless experiment), the probe
+                          record's Claude Code version, the running one, and
+                          "enabled" or "off: why"
+  longhaul advisor record-probe EVIDENCE
+                          writes the probe record from EVIDENCE, a JSON file naming
+                          claude_version and five checks, when all five are true;
+                          turns nothing on
+  longhaul advisor-hook         the plugin's PreToolUse hook on Agent and Task: admits
+                          or denies a call of the longhaul:advisor agent type and
+                          leaves any other alone; advisor-result, its PostToolUse
+                          hook, traces how the consultation went
   longhaul clear                forget the recorded limits
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
@@ -4369,6 +4381,76 @@ def advisor_result(_opts) -> int:
     return 0
 
 
+def advisor_status_lines() -> list:
+    """`longhaul advisor status`: the switch, the probe record's version,
+    the running version, and "enabled" or "off: <why>", the first of the
+    three gates that is shut. The skill's first step runs it and stops
+    when it is off."""
+    switch, record, running = advisor_switch(), advisor_probe(), advisor_running_version()
+    lines = [f"LONGHAUL_ADVISOR: {'experiment' if switch else 'off'}",
+             f"Probe record: Claude Code {record['claude_version']}, passed {advisor_day(record.get('passed_at'))}"
+             if record else "Probe record: none",
+             f"Running Claude Code: {running or 'unknown'}"]
+    why = ("LONGHAUL_ADVISOR is not experiment" if not switch else "no passing probe record" if record is None
+           else "the running Claude Code version is unknown" if running is None
+           else f"the probe passed on {record['claude_version']}, not on {running}, the version running"
+           if running != record["claude_version"] else None)
+    return lines + [f"off: {why}" if why else "enabled"]
+
+
+def advisor_day(epoch) -> str:
+    try:
+        return dt.datetime.fromtimestamp(as_number(epoch)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "at an unknown time"
+
+
+def advisor_record(path: str) -> tuple:
+    """(the probe record, None) from an evidence file, a JSON object with
+    claude_version and the five checks (and, if it has them, evidence: a
+    path or a sentence, and passed_at), or (None, why it is refused).
+    Only a record with all five checks true is ever written."""
+    try:
+        found = json.loads(Path(path).read_text())
+    except OSError as e:
+        return None, f"could not read {home_path(os.path.abspath(path))}: {e.strerror or e}"
+    except ValueError:  # not UTF-8 either
+        return None, "it is not JSON"
+    if not isinstance(found, dict):
+        return None, "it is not a JSON object"
+    version, checks = found.get("claude_version"), found.get("checks")
+    if not (isinstance(version, str) and re.fullmatch(ADVISOR_VERSION, version)):
+        return None, "it names no claude_version such as 2.1.307"
+    failing = [check for check in ADVISOR_CHECKS if not (isinstance(checks, dict) and checks.get(check) is True)]
+    if failing:
+        return None, f"these checks are not true: {', '.join(failing)}"
+    evidence, passed = found.get("evidence"), as_number(found.get("passed_at"))
+    return {"schema": 1, "claude_version": version, "passed_at": passed if passed and passed > 0 else round(time.time()),
+            "checks": dict.fromkeys(ADVISOR_CHECKS, True),
+            "evidence": evidence if isinstance(evidence, str) and evidence.strip() else os.path.abspath(path)}, None
+
+
+def advisor(opts) -> int:
+    """`longhaul advisor status` and `longhaul advisor record-probe
+    EVIDENCE`. Neither turns the Advisor on: that is LONGHAUL_ADVISOR=
+    experiment, which the user sets where Claude Code gets its
+    environment. bin/longhaul lets `status` alone through from a session."""
+    if opts.action == "status":
+        print("\n".join(advisor_status_lines()))
+        return 0
+    record, why = (advisor_record(opts.evidence) if opts.evidence else
+                   (None, "name the evidence file, a JSON object with claude_version and the five checks"))
+    if record is None:
+        print(f"longhaul advisor record-probe: not recorded: {why}", file=sys.stderr)
+        return 2
+    with locked("advisor"):
+        write_json(advisor_path("probe.json"), record)
+    print(json.dumps(record, indent=2))
+    print(f"Recorded in {home_path(str(advisor_path('probe.json')))}. This turns nothing on: a consultation is admitted "
+          f"only with LONGHAUL_ADVISOR=experiment as well, and only on Claude Code {record['claude_version']}.")
+    return 0
+
+
 # ------------------------------------------------------------- VS Code
 #
 # The Claude Code VS Code extension (2.1.300, 2.1.301) runs the program in
@@ -5535,7 +5617,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor-hook", "advisor-result"):
+                            "add", "remove", "advisor", "advisor-hook", "advisor-result"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -5547,6 +5629,12 @@ def main(argv: list[str]) -> int:
             p.add_argument("--file", metavar="PATH",
                            help="save: read the state from this file instead of stdin "
                                 "(a .state.json under LONGHAUL_HOME/checkpoints is removed once saved)")
+        if cmd == "advisor":
+            p.add_argument("action", choices=["status", "record-probe"],
+                           help="status: the switch, the probe record and the running version; "
+                                "record-probe: write the probe record from EVIDENCE")
+            p.add_argument("evidence", nargs="?", metavar="EVIDENCE",
+                           help="record-probe: a JSON file naming claude_version and the five checks, all true")
         if cmd == "inspect":
             p.add_argument("target", nargs="?", metavar="ID|PATH",
                            help="a conversation (default: the latest one in the ledger)")
@@ -5567,7 +5655,7 @@ def main(argv: list[str]) -> int:
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
-                "advisor-hook": advisor_hook, "advisor-result": advisor_result}[cmd](opts)
+                "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
