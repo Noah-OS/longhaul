@@ -4079,6 +4079,32 @@ class Advisor(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_only_the_calls_known_fields_reach_claude_code(self):
+        # F4: any other field (a background run, an isolation, a name) would
+        # reach the engine unchecked. Fixable: drop them and call once more.
+        self.assertEqual(longhaul.ADVISOR_CALL_FIELDS, ("description", "prompt", "subagent_type", "run_in_background", "model"))
+        for change in ({"run_in_background": True}, {"run_in_background": "false"}, {"run_in_background": None},
+                       {"isolation": "worktree"}, {"name": "helper"}, {"description": 7}):
+            data = self.call()
+            data["tool_input"].update(change)
+            reason = self.denied(data, "call-fields")
+            self.assertIn("Drop every other field", reason)
+            self.assertEqual(self.trace()[-1]["kind"], "fixable", change)
+            self.assertNotIn("worktree", reason + json.dumps(self.trace()[-1]), "a field's value is never echoed")
+        self.assertIn("call-fields", longhaul.ADVISOR_FIXABLE)
+        self.assertEqual(self.state(), {}, "nothing counted")
+        # Built from scratch: the allowed keys alone, run_in_background false, the model overwritten.
+        data = self.call()
+        data["tool_input"]["model"] = "haiku"
+        out = self.admitted(data)
+        self.assertEqual(list(out["updatedInput"]), ["description", "prompt", "subagent_type", "run_in_background", "model"])
+        self.assertEqual((out["updatedInput"]["run_in_background"], out["updatedInput"]["model"]), (False, "opus"))
+        data = self.call()
+        del data["tool_input"]["run_in_background"], data["tool_input"]["description"]
+        out = self.admitted(data)
+        self.assertEqual(list(out["updatedInput"]), ["prompt", "subagent_type", "run_in_background", "model"])
+        self.assertIs(out["updatedInput"]["run_in_background"], False, "set false where the call left it out")
+
     def test_one_agent_type_constant_and_region_bs_patterns_are_built_from_region_as_codes(self):
         # F6: the two regions cannot drift apart.
         self.assertFalse(hasattr(longhaul, "CONSULTATION_AGENT"), "ADVISOR_TYPE alone names the agent type")

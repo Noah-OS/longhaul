@@ -3863,6 +3863,11 @@ ADVISOR_FAMILIES = ("opus", "sonnet", "haiku", "fable", "mythos")  # any other m
 # D3: the executor's family and its advisor. A family with no entry has no
 # stronger advisor, and no other model stands in (D2.6).
 ADVISOR_FOR = {"haiku": "opus", "sonnet": "opus", "opus": "fable"}
+# The fields a consultation's input may hold (F4), the Agent tool's own:
+# run_in_background only when false, model only to be overwritten. Any
+# other would reach Claude Code unchecked, so the call is denied; the
+# answer's updatedInput is built from these alone.
+ADVISOR_CALL_FIELDS = ("description", "prompt", "subagent_type", "run_in_background", "model")
 ADVISOR_BRIEF_MAX = 8_000  # characters (D2.3)
 ADVISOR_SECTIONS = ("Task:", "Constraints:", "Findings:", "Approach:", "Question:")  # each starts a line of the brief
 # D2.4's caps. Per task, one user prompt (prompt_id names it: the probe
@@ -3881,7 +3886,7 @@ ADVISOR_KEEP_DAYS = 30  # the trace's lines and the state's sessions, by age (D2
 ADVISOR_KEEP_LINES = 2_000  # the trace's lines, whatever their age
 # The denials the executor may put right and resubmit once (D2.6); the
 # others are hard: it continues without advice.
-ADVISOR_FIXABLE = ("brief-too-long", "brief-sections", "trigger-missing", "credential", "reconcile-invalid")
+ADVISOR_FIXABLE = ("call-fields", "brief-too-long", "brief-sections", "trigger-missing", "credential", "reconcile-invalid")
 # What the executor reads after "longhaul advisor: denied (<reason>): ".
 # None names the switch: turning the Advisor on is for the user.
 ADVISOR_DENIALS = {
@@ -3896,6 +3901,8 @@ ADVISOR_DENIALS = {
                         "Continue without advice; do not retry.",
     "no-stronger-advisor": "no advisor stronger than your model ({executor}) is set, and no other model stands in. "
                            "Continue without advice; do not retry.",
+    "call-fields": "the call may hold only description, prompt and subagent_type, and run_in_background only as "
+                   "false. Drop every other field and call again once.",
     "brief-too-long": "the brief is {chars:,} characters, over the {limit:,} allowed. Shorten it (paths and line "
                       "ranges, not pasted files) and resubmit once.",
     "brief-sections": "the brief has no line starting {missing}. Give each of Task:, Constraints:, Findings:, "
@@ -4111,7 +4118,16 @@ def advisor_gate(data: dict, line: dict):
     line["advisor"] = ADVISOR_FOR.get(line["executor"])
     if line["advisor"] is None:
         return advisor_denial("no-stronger-advisor", executor=line["executor"])
-    return advisor_brief_problem(advisor_brief(data))
+    return advisor_fields_problem(data["tool_input"]) or advisor_brief_problem(advisor_brief(data))
+
+
+def advisor_fields_problem(tool: dict):
+    """F4: the input's keys are ADVISOR_CALL_FIELDS' alone, with
+    run_in_background false or left out and a description that is text."""
+    if (set(tool) - set(ADVISOR_CALL_FIELDS) or tool.get("run_in_background", False) is not False
+            or not isinstance(tool.get("description", ""), str)):
+        return advisor_denial("call-fields")
+    return None
 
 
 def advisor_brief_problem(brief: str):
@@ -4293,15 +4309,20 @@ def advisor_decided(line: dict, denial) -> dict:
 
 def advisor_answer(data: dict, line: dict, denial) -> dict:
     """The engine's JSON: a deny with its reason, or an allow whose
-    updatedInput is the call's own input with the advisor's model."""
+    updatedInput is built from scratch (F4), never copied from the input:
+    its description, its brief, the plugin's agent type, no background
+    run, and the advisor's model."""
     if denial:
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": f"longhaul advisor: denied ({denial[0]}): {denial[1]}"}}
+    tool = data["tool_input"]
+    given = {"description": tool["description"]} if "description" in tool else {}
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "allow",
         "permissionDecisionReason": f"longhaul advisor: admitted; the {line['advisor']} advisor for your "
                                     f"model ({line['executor']}).",
-        "updatedInput": {**data["tool_input"], "subagent_type": ADVISOR_TYPE, "model": line["advisor"]}}}
+        "updatedInput": {**given, "prompt": advisor_brief(data), "subagent_type": ADVISOR_TYPE,
+                         "run_in_background": False, "model": line["advisor"]}}}
 
 
 def advisor_lines() -> list:
