@@ -311,14 +311,19 @@ def files_of(paths) -> list[Path]:
 
 
 def write_json(path: Path, data) -> None:
-    """Write whole or not at all. The temporary file is unique per write:
-    on 2026-10-16 two sessions' status lines saved Max.json at the same
-    moment through one shared name, and one found it already moved."""
+    write_whole(path, json.dumps(data, indent=2) + "\n")
+
+
+def write_whole(path: Path, text: str) -> None:
+    """Write whole or not at all, a file only you can read (mkstemp makes
+    it 0600). The temporary file is unique per write: on 2026-10-16 two
+    sessions' status lines saved Max.json at the same moment through one
+    shared name, and one found it already moved."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(data, indent=2) + "\n")
+            f.write(text)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -3776,6 +3781,349 @@ def checkpoint(opts) -> int:
     return run_hook(check, "checkpoint")
 
 
+# -------------------------------------------------------------- advisor
+#
+# The Advisor experiment (Sprint 8; the decision package's D2.1-D2.8 and
+# D3): a stronger model the executor consults at a few decision points
+# through the /longhaul:advise skill, which calls the Agent tool with
+# subagent_type longhaul:advisor (agents/advisor.md: Read, Grep and Glob
+# alone). `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent
+# and Task, is what enforces it: it admits a consultation only when
+# LONGHAUL_ADVISOR=experiment and a passing probe is recorded for the
+# Claude Code version running, then only on the advisor D3 names for the
+# executor's model (set through updatedInput, whose one change is the
+# model), for a brief in the documented shape, within the caps and away
+# from a nearly full account; every other consultation is denied with a
+# reason the executor can act on. Off by default: unset, `off` or any
+# other value is off. A failure to finish the checks denies the call
+# too (reason `error`), where the other hooks fail open: a hook that
+# printed nothing would let it run. A call of any other agent type gets
+# no answer and nothing is written, as before the hook existed. The
+# hook never chooses an account: the subagent runs on the session's
+# own, which was decided at launch (A2). `longhaul advisor-result`
+# (PostToolUse) adds the outcome. LONGHAUL_HOME/advisor/ holds probe.json
+# (written only by `longhaul advisor record-probe`, from a terminal),
+# state.json (counts and brief hashes), trace.jsonl (a line per attempt
+# and per outcome) and version-cache.json, each 0600 and written under
+# locked("advisor"). None of them, the log or a reason ever holds a
+# brief's or a reply's text: the trace keeps sizes, a 12-hex hash, the
+# trigger and the verdict.
+
+ADVISOR_TYPE = "longhaul:advisor"  # the agent type the plugin ships
+# What the probe must have shown on a version before it is trusted: the
+# hook recognises a consultation, its deny stops one, prompt_id names the
+# user prompt, updatedInput sets the subagent's model, and the agent
+# type's tools hold. A record with any of them missing or false is none.
+ADVISOR_CHECKS = ("recognise", "deny", "prompt_id", "model_rewrite", "read_only")
+ADVISOR_VERSION = r"\d+\.\d+\.\d+"
+# Seconds `claude --version` may take when the path names no version:
+# well inside the hook's 5, past which Claude Code lets the call run.
+ADVISOR_VERSION_TIMEOUT = 2
+ADVISOR_TAIL = 256 * 1024  # bytes of the transcript read for the executor's model
+ADVISOR_FAMILIES = ("opus", "sonnet", "haiku", "fable", "mythos")  # any other model is "other"
+# D3: the executor's family and its advisor. A family with no entry has no
+# stronger advisor, and no other model stands in (D2.6).
+ADVISOR_FOR = {"haiku": "opus", "sonnet": "opus", "opus": "fable"}
+ADVISOR_KEEP_DAYS = 30  # the trace's lines and the state's sessions, by age (D2.7)
+ADVISOR_KEEP_LINES = 2_000  # the trace's lines, whatever their age
+# The denials the executor may put right and resubmit once (D2.6); the
+# others are hard: it continues without advice.
+ADVISOR_FIXABLE = ("brief-too-long", "brief-sections", "trigger-missing", "credential", "reconcile-invalid")
+# What the executor reads after "longhaul advisor: denied (<reason>): ".
+# None names the switch: turning the Advisor on is for the user.
+ADVISOR_DENIALS = {
+    "off": "the Advisor is off. Continue without advice; do not retry.",
+    "no-probe": "no passing capability probe is recorded, so no consultation is admitted. "
+                "Continue without advice; do not retry.",
+    "version-unknown": "the running Claude Code version could not be found, so it cannot be matched to the probe's. "
+                       "Continue without advice; do not retry.",
+    "version-mismatch": "the probe passed on Claude Code {recorded}, not on {running}, the version running; it must "
+                        "pass on this one first. Continue without advice; do not retry.",
+    "executor-unknown": "your model could not be read from the session's transcript, so no advisor can be chosen. "
+                        "Continue without advice; do not retry.",
+    "no-stronger-advisor": "no advisor stronger than your model ({executor}) is set, and no other model stands in. "
+                           "Continue without advice; do not retry.",
+    "error": "the hook could not finish its checks. Continue without advice; do not retry.",
+}
+
+
+def advisor_path(name: str) -> Path:
+    return LONGHAUL_HOME / "advisor" / name
+
+
+def advisor_switch() -> bool:
+    """LONGHAUL_ADVISOR=experiment, exactly; anything else is off (D2.8)."""
+    return os.environ.get("LONGHAUL_ADVISOR") == "experiment"
+
+
+def advisor_probe():
+    """probe.json when it is a passing record (schema 1, a version, all
+    five checks true), else None."""
+    record = read_json(advisor_path("probe.json"))
+    if not (isinstance(record, dict) and type(record.get("schema")) is int and record["schema"] == 1):
+        return None
+    version, checks = record.get("claude_version"), record.get("checks")
+    if not (isinstance(version, str) and re.fullmatch(ADVISOR_VERSION, version)):
+        return None
+    if not (isinstance(checks, dict) and all(checks.get(check) is True for check in ADVISOR_CHECKS)):
+        return None
+    return record
+
+
+def advisor_version_in(text: str):
+    """The last x.y.z in `text`, or None."""
+    found = re.findall(ADVISOR_VERSION, text)
+    return found[-1] if found else None
+
+
+def advisor_running_version():
+    """The Claude Code version this hook runs under: the last x.y.z in the
+    real path of CLAUDE_CODE_EXECPATH (the terminal's .../versions/2.1.307,
+    the panel's .../anthropic.claude-code-2.1.304-darwin-arm64/...), else
+    what that executable says to --version; None when neither says."""
+    exe = os.environ.get("CLAUDE_CODE_EXECPATH")
+    if not exe:
+        return None
+    real = os.path.realpath(exe)
+    return advisor_version_in(real) or advisor_asked_version(real)
+
+
+def advisor_asked_version(real: str):
+    """`real --version`, once per (path, mtime): a found version is kept in
+    version-cache.json, a failure is not, so the next call asks again."""
+    try:
+        mtime = os.stat(real).st_mtime
+    except OSError:
+        return None
+    path = advisor_path("version-cache.json")
+    cache = read_json(path)
+    if isinstance(cache, dict) and cache.get("realpath") == real and cache.get("mtime") == mtime \
+            and isinstance(cache.get("version"), str) and re.fullmatch(ADVISOR_VERSION, cache["version"]):
+        return cache["version"]
+    try:
+        out = subprocess.run([real, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=ADVISOR_VERSION_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    found = re.search(ADVISOR_VERSION, out.stdout or "")
+    if out.returncode != 0 or not found:
+        return None
+    with locked("advisor"):
+        write_json(path, {"realpath": real, "mtime": mtime, "version": found.group()})
+    return found.group()
+
+
+def advisor_executor(path):
+    """The executor's model family: the last assistant line's model in the
+    last ADVISOR_TAIL bytes of the session's transcript, or None."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - ADVISOR_TAIL))
+            tail = f.read(ADVISOR_TAIL)
+    except OSError:
+        return None
+    lines = tail.split(b"\n")[1 if size > ADVISOR_TAIL else 0:]  # a cut first line is no line
+    for raw in reversed(lines):
+        model = advisor_model_of(raw)
+        if model:
+            return advisor_family(model)
+    return None
+
+
+def advisor_model_of(raw: bytes):
+    """An assistant line's model, or None: also for a subagent's line in
+    the main transcript (isSidechain) and the engine's own (<synthetic>)."""
+    if b'"assistant"' not in raw:
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") is True:
+        return None
+    model = dict_at(entry, "message").get("model")
+    return model if isinstance(model, str) and model and not model.startswith("<") else None
+
+
+def advisor_family(model: str) -> str:
+    low = model.lower()
+    return next((family for family in ADVISOR_FAMILIES if family in low), "other")
+
+
+def advisor_consultation(data) -> bool:
+    """An Agent call of the advisor's agent type, however it is cased or
+    spaced: a near miss is checked as a consultation, never let through."""
+    agent = dict_at(data, "tool_input").get("subagent_type")
+    return isinstance(agent, str) and agent.strip().casefold() == ADVISOR_TYPE
+
+
+def advisor_id(value):
+    """An id from the engine (a session's, a prompt's, a tool call's), or
+    None for anything that is not a plain id: the trace holds no text."""
+    return value if isinstance(value, str) and re.fullmatch(GUARD_ID, value) else None
+
+
+def advisor_brief(data) -> str:
+    brief = dict_at(data, "tool_input").get("prompt")
+    return brief if isinstance(brief, str) else ""
+
+
+def advisor_trigger(brief: str):
+    """The trigger the brief's first line names, or None."""
+    first = brief.lstrip().split("\n", 1)[0].strip()
+    found = re.fullmatch(r"Trigger:\s*(early|stuck|change|done)", first)
+    return found.group(1) if found else None
+
+
+def advisor_reconcile(brief: str) -> bool:
+    return any(re.fullmatch(r"Reconcile:\s*yes", line.strip(), re.IGNORECASE) for line in brief.splitlines())
+
+
+def advisor_hash(brief: str) -> str:
+    import hashlib  # here, not at the top: see index_key()
+    return hashlib.sha256(brief.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+def advisor_line(data: dict, now: float) -> dict:
+    """The decision's trace line as far as the input alone tells it."""
+    brief = advisor_brief(data)
+    return {"t": round(now, 3), "id": advisor_id(data.get("tool_use_id")), "session": advisor_id(data.get("session_id")),
+            "prompt_id": advisor_id(data.get("prompt_id")), "event": "decision", "decision": None, "reason": None,
+            "kind": None, "trigger": advisor_trigger(brief), "reconcile": advisor_reconcile(brief), "executor": None,
+            "advisor": None, "brief_chars": len(brief), "brief_hash": advisor_hash(brief),
+            "allowance": "unchecked" if os.environ.get("LONGHAUL_ADVISOR_ALLOWANCE") == "unchecked" else "checked"}
+
+
+def advisor_denial(reason: str, **detail) -> tuple:
+    return reason, ADVISOR_DENIALS[reason].format(**detail)
+
+
+def advisor_gate(data: dict, line: dict):
+    """The checks that need no count, in their order: the switch, the
+    probe record, the version, the executor's model and its advisor (D3,
+    into `line`). The first that fails is the denial; None when all pass."""
+    if not advisor_switch():
+        return advisor_denial("off")
+    record = advisor_probe()
+    if record is None:
+        return advisor_denial("no-probe")
+    running = advisor_running_version()
+    if running is None:
+        return advisor_denial("version-unknown")
+    if running != record["claude_version"]:
+        return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running)
+    line["executor"] = advisor_executor(data.get("transcript_path"))
+    if line["executor"] is None:
+        return advisor_denial("executor-unknown")
+    line["advisor"] = ADVISOR_FOR.get(line["executor"])
+    if line["advisor"] is None:
+        return advisor_denial("no-stronger-advisor", executor=line["executor"])
+    return None
+
+
+def advisor_decide(data: dict, now: float) -> dict:
+    """The hook's answer to a consultation, its trace line written."""
+    line = advisor_line(data, now)
+    denial = advisor_gate(data, line)
+    with locked("advisor"):
+        advisor_trace(advisor_decided(line, denial), now)
+    return advisor_answer(data, line, denial)
+
+
+def advisor_decided(line: dict, denial) -> dict:
+    reason = denial[0] if denial else None
+    kind = None if reason is None else "fixable" if reason in ADVISOR_FIXABLE else "hard"
+    return {**line, "decision": "deny" if denial else "allow", "reason": reason, "kind": kind}
+
+
+def advisor_answer(data: dict, line: dict, denial) -> dict:
+    """The engine's JSON: a deny with its reason, or an allow whose
+    updatedInput is the call's own input with the advisor's model."""
+    if denial:
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": f"longhaul advisor: denied ({denial[0]}): {denial[1]}"}}
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "allow",
+        "permissionDecisionReason": f"longhaul advisor: admitted; the {line['advisor']} advisor for your "
+                                    f"model ({line['executor']}).",
+        "updatedInput": {**data["tool_input"], "model": line["advisor"]}}}
+
+
+def advisor_lines() -> list:
+    path = advisor_path("trace.jsonl")
+    try:
+        return path.read_bytes().decode("utf-8", "replace").splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def advisor_trace(entry: dict, now: float) -> None:
+    """One line at the end of trace.jsonl, under locked("advisor"). Lines
+    older than ADVISOR_KEEP_DAYS and those past the last ADVISOR_KEEP_LINES
+    go at each write, the file then written whole."""
+    lines = advisor_lines()
+    kept = advisor_recent(lines, now)
+    text = json.dumps(entry) + "\n"
+    if len(kept) == len(lines):
+        append(advisor_path("trace.jsonl"), text, 0)
+    else:
+        write_whole(advisor_path("trace.jsonl"), "".join(line + "\n" for line in kept) + text)
+
+
+def advisor_recent(lines: list, now: float) -> list:
+    """The lines to keep before one more is added: the file is in time
+    order, so the old ones are at the front (one that is not JSON with a
+    time counts as old)."""
+    start = max(0, len(lines) - (ADVISOR_KEEP_LINES - 1))
+    cutoff = now - ADVISOR_KEEP_DAYS * 86400
+    while start < len(lines) and advisor_time(lines[start]) < cutoff:
+        start += 1
+    return lines[start:]
+
+
+def advisor_time(line: str) -> float:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return 0
+    return (as_number(entry.get("t")) or 0) if isinstance(entry, dict) else 0
+
+
+def advisor_fail(data, error: Exception) -> int:
+    """A consultation the hook could not finish checking, or an input it
+    could not read: denied, never let run. The log and the trace name the
+    error's kind alone, never its text, which could quote the brief."""
+    log(f"advisor hook: a consultation denied on an error ({type(error).__name__})")
+    try:
+        line = advisor_line(data, time.time())
+        with locked("advisor"):
+            advisor_trace(advisor_decided(line, ("error", "")), time.time())
+    except Exception:  # the trace may be what failed: the denial matters more
+        pass
+    print(json.dumps(advisor_answer(data, {}, advisor_denial("error"))))
+    return 0
+
+
+def advisor_hook(_opts) -> int:
+    """The PreToolUse hook command: stdin in, JSON or nothing out, exit 0.
+    Not run_hook(): its silent exit on an error lets a call run, which is
+    right for any other agent type and wrong for a consultation. Input
+    that is not JSON could be a consultation, so it is denied."""
+    data = None
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+        if not advisor_consultation(data):
+            return 0
+        print(json.dumps(advisor_decide(data, time.time())))
+        return 0
+    except Exception as e:
+        return advisor_fail(data, e)
+
+
 # ------------------------------------------------------------- VS Code
 #
 # The Claude Code VS Code extension (2.1.300, 2.1.301) runs the program in
@@ -4942,7 +5290,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove"):
+                            "add", "remove", "advisor-hook"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -4973,7 +5321,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
-                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove}[cmd](opts)
+                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
+                "advisor-hook": advisor_hook}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

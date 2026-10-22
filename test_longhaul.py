@@ -3756,6 +3756,286 @@ class Index(unittest.TestCase):
         self.assertFalse((self.home / "index").exists(), "nothing written")
 
 
+class Advisor(unittest.TestCase):
+    """The Advisor experiment's hooks (Sprint 8, region B; the decision
+    package's D2.1-D2.8): `longhaul advisor-hook`, PreToolUse on Agent,
+    admits or denies a consultation (a call of the longhaul:advisor agent
+    type), and `longhaul advisor-result`, PostToolUse, traces how it went.
+    Off unless LONGHAUL_ADVISOR=experiment and a passing probe is recorded
+    for the running Claude Code. Every test turns it on in a scratch home
+    alone, and none runs a real claude: the version comes from a fake path
+    or a fake executable."""
+
+    # A brief's or a reply's text: it belongs in the tool's input and in the
+    # engine's answer, and never in the trace, the state, the log or a reason.
+    S = "SENTINEL-OKAPI-4412"
+    HOOK = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                                        "sys.exit(longhaul.main(['advisor-hook']))", str(HERE)]
+    RESULT = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                                          "sys.exit(longhaul.main(['advisor-result']))", str(HERE)]
+    # What the hooks read of the session's environment: each test gives its own.
+    VARS = ("CLAUDE_CODE_EXECPATH", "CLAUDE_CONFIG_DIR")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "USAGE_DIR")}
+        longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR = self.home, self.home / "usage"
+        self.now = time.time()
+        self.n = 0
+        # Claude Code as the probe saw it on the owner's terminal: the version
+        # is the last folder of the executable's path.
+        self.exe = self.tmp / "claude" / "versions" / "2.1.307"
+        self.exe.parent.mkdir(parents=True)
+        self.exe.write_text("")
+        self.transcript = self.tmp / "s1.jsonl"
+        self.executor("claude-sonnet-4-5")
+        self.probe()
+        self.reading()
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("LONGHAUL_") and k not in self.VARS + Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude-config"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                        LONGHAUL_ADVISOR="experiment", CLAUDE_CODE_EXECPATH=str(self.exe))
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(longhaul, k, v)
+
+    def executor(self, model, path=None, before=b""):
+        """The session's transcript, its last assistant line on `model`."""
+        lines = [{"type": "user", "message": {"role": "user", "content": "go"}},
+                 {"type": "assistant", "message": {"model": model, "role": "assistant", "content": []}}]
+        (path or self.transcript).write_bytes(before + "".join(json.dumps(line) + "\n" for line in lines).encode())
+
+    def probe(self, version="2.1.307", **checks):
+        record = {"schema": 1, "claude_version": version, "passed_at": self.now,
+                  "checks": {**dict.fromkeys(longhaul.ADVISOR_CHECKS, True), **checks}, "evidence": "a test"}
+        (self.home / "advisor").mkdir(exist_ok=True)
+        (self.home / "advisor" / "probe.json").write_text(json.dumps(record))
+
+    def reading(self, five=40, at=None, name="main", week=10):
+        """The status line's latest reading for account `name`."""
+        (self.home / "usage").mkdir(exist_ok=True)
+        (self.home / "usage" / f"{name}.json").write_text(json.dumps(
+            {"at": self.now if at is None else at, "session": "s1",
+             "five_hour": {"used_percentage": five, "resets_at": self.now + 3600},
+             "seven_day": {"used_percentage": week, "resets_at": self.now + 86400}}))
+
+    def brief(self, trigger="stuck", reconcile=False, drop=(), extra=""):
+        """A brief in the documented shape, each one new unless a test means a repeat."""
+        self.n += 1
+        lines = [f"Trigger: {trigger}", f"Task: make the parser take tabs ({self.S}, brief {self.n})",
+                 "Constraints: the standard library only", "Findings: longhaul.py:120-140",
+                 f"Approach: a second pass over the tokens {self.S}", f"Question: is one pass enough?{extra}"]
+        if reconcile:
+            lines.insert(1, "Reconcile: yes")
+        return "\n".join(line for line in lines if not line.startswith(tuple(drop)))
+
+    def call(self, brief=None, session="s1", prompt="p1", tool_id=None, agent="longhaul:advisor"):
+        """A PreToolUse input for an Agent call, as the probe saw one on 2.1.307."""
+        data = {"session_id": session, "prompt_id": prompt, "tool_use_id": tool_id or f"toolu_{uuid.uuid4().hex[:12]}",
+                "transcript_path": str(self.transcript), "cwd": str(self.tmp), "permission_mode": "default",
+                "effort": "high", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                "tool_input": {"description": "Consult the advisor", "prompt": self.brief() if brief is None else brief,
+                               "run_in_background": False, "subagent_type": agent}}
+        if prompt is None:
+            del data["prompt_id"]
+        return data
+
+    def decide(self, data, now=None, **env):
+        """The hook's answer, in this process, in the session's environment
+        with `env` over it (None unsets a name)."""
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True):
+            return longhaul.advisor_decide(data, self.now if now is None else now)
+
+    def denied(self, data, code, **kw):
+        out = self.decide(data, **kw)["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "deny"), out)
+        self.assertIn(f"denied ({code})", out["permissionDecisionReason"])
+        self.assertEqual(self.trace()[-1]["reason"], code)
+        return out["permissionDecisionReason"]
+
+    def admitted(self, data, **kw):
+        out = self.decide(data, **kw)["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "allow"), out)
+        self.assertEqual(self.trace()[-1]["decision"], "allow")
+        return out
+
+    def trace(self):
+        path = self.home / "advisor" / "trace.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def state(self):
+        path = self.home / "advisor" / "state.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def run_hook(self, cmd, data, **env):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.run(cmd, input=raw, env={**self.env, **env}, capture_output=True, text=True, timeout=30)
+
+    def fake_claude(self, name="claude", says="2.1.307 (Claude Code)", code=0):
+        """An executable that answers --version and leaves a mark each time it runs."""
+        exe, mark = self.tmp / "bin" / name, self.tmp / f"{name}.ran"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{mark}'\nprintf '%s\\n' '{says}'\nexit {code}\n")
+        exe.chmod(0o755)
+        return exe, mark
+
+    def test_off_by_default_and_admitted_only_with_experiment_and_a_probe_for_this_version(self):
+        for value in (None, "", "off", "on", "true", "1", "Experiment", " experiment"):
+            self.denied(self.call(), "off", LONGHAUL_ADVISOR=value)
+        (self.home / "advisor" / "probe.json").unlink()
+        self.denied(self.call(), "no-probe")
+        self.probe("2.1.304")
+        self.denied(self.call(), "version-mismatch")
+        self.assertEqual(self.state(), {}, "nothing denied was counted")
+        self.probe()
+        self.assertEqual(self.admitted(self.call())["updatedInput"]["model"], "opus")
+        self.assertEqual(self.trace()[0]["kind"], "hard", "off is no fault of the brief")
+
+    def test_a_probe_record_counts_only_with_schema_1_a_version_and_all_five_checks_true(self):
+        path = self.home / "advisor" / "probe.json"
+        good = json.loads(path.read_text())
+        broken = ["not json", "[]", json.dumps({**good, "schema": 2}), json.dumps({**good, "schema": True}),
+                  json.dumps({k: v for k, v in good.items() if k != "claude_version"}),
+                  json.dumps({**good, "claude_version": "2.1"}), json.dumps({**good, "checks": None}),
+                  json.dumps({**good, "checks": {**good["checks"], "deny": "true"}})]
+        broken += [json.dumps({**good, "checks": {**good["checks"], check: False}}) for check in longhaul.ADVISOR_CHECKS]
+        broken += [json.dumps({**good, "checks": {k: v for k, v in good["checks"].items() if k != check}})
+                   for check in longhaul.ADVISOR_CHECKS]
+        for text in broken:
+            path.write_text(text)
+            self.denied(self.call(), "no-probe")
+        path.unlink()
+        self.denied(self.call(), "no-probe")
+        self.assertEqual(longhaul.ADVISOR_CHECKS, ("recognise", "deny", "prompt_id", "model_rewrite", "read_only"))
+
+    def test_the_running_version_is_the_last_one_in_the_real_path_of_the_execpath(self):
+        link = self.tmp / "bin" / "claude"
+        link.parent.mkdir()
+        link.symlink_to(self.exe)  # the terminal's ~/.local/bin/claude, a link to the version's file
+        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(link))
+        panel = self.tmp / "ext" / "anthropic.claude-code-{}-darwin-arm64" / "resources" / "native-binary" / "claude"
+        for version in ("2.1.307", "2.1.304"):
+            path = Path(str(panel).format(version))
+            path.parent.mkdir(parents=True)
+            path.write_text("")
+        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(panel).format("2.1.307"))
+        reason = self.denied(self.call(), "version-mismatch", CLAUDE_CODE_EXECPATH=str(panel).format("2.1.304"))
+        self.assertIn("2.1.307", reason)
+        self.assertIn("2.1.304", reason)
+        self.assertEqual(longhaul.advisor_version_in("/a/claude-code-2.1.304-darwin/x/2.1.9/claude"), "2.1.9")
+        self.assertIsNone(longhaul.advisor_version_in("/a/claude-2.1/claude"))
+
+    def test_with_no_version_in_the_path_claude_is_asked_once_and_the_answer_cached(self):
+        exe, mark = self.fake_claude()
+        self.assertIsNone(longhaul.advisor_version_in(str(exe)), "the fixture's path names no version")
+        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
+        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
+        self.assertEqual(mark.read_text(), "--version\n", "asked once")
+        cache = self.home / "advisor" / "version-cache.json"
+        self.assertEqual(json.loads(cache.read_text()),
+                         {"realpath": str(exe), "mtime": exe.stat().st_mtime, "version": "2.1.307"})
+        self.assertEqual(oct(cache.stat().st_mode & 0o777), oct(0o600))
+        os.utime(exe, (self.now - 60, self.now - 60))  # an update in place: asked again
+        self.admitted(self.call(), CLAUDE_CODE_EXECPATH=str(exe))
+        self.assertEqual(mark.read_text(), "--version\n--version\n")
+        for name, says, code in (("junk", "Claude Code", 0), ("fails", "2.1.307 (Claude Code)", 1)):
+            other, ran = self.fake_claude(name, says, code)
+            self.denied(self.call(), "version-unknown", CLAUDE_CODE_EXECPATH=str(other))
+            self.denied(self.call(), "version-unknown", CLAUDE_CODE_EXECPATH=str(other))
+            self.assertEqual(ran.read_text(), "--version\n--version\n", "a failure is not cached")
+        slow, _ = self.fake_claude("slow", "2.1.307")
+        slow.write_text("#!/bin/sh\nsleep 5\necho 2.1.307\n")
+        started = time.time()
+        with mock.patch.object(longhaul, "ADVISOR_VERSION_TIMEOUT", 0.3):
+            self.denied(self.call(), "version-unknown", CLAUDE_CODE_EXECPATH=str(slow))
+        self.assertLess(time.time() - started, 3, "the hook's own timeout is far off")
+
+    def test_an_unknown_or_another_version_is_denied(self):
+        for exe in (None, "", str(self.tmp / "nowhere" / "claude"), str(self.tmp / "s1.jsonl")):
+            self.denied(self.call(), "version-unknown", CLAUDE_CODE_EXECPATH=exe)
+        other = self.tmp / "claude" / "versions" / "2.1.308"
+        other.write_text("")
+        reason = self.denied(self.call(), "version-mismatch", CLAUDE_CODE_EXECPATH=str(other))
+        self.assertIn("2.1.307", reason)
+        self.assertIn("2.1.308", reason)
+
+    def test_the_executor_is_the_last_assistant_line_in_the_transcripts_tail(self):
+        self.executor("claude-opus-4-5")
+        with self.transcript.open("a") as f:  # neither a subagent's line nor the engine's own is the executor
+            f.write(json.dumps({"type": "assistant", "isSidechain": True, "message": {"model": "claude-haiku-4-5"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
+            f.write("not json\n")
+        self.assertEqual(self.admitted(self.call())["updatedInput"]["model"], "fable")
+        self.assertEqual(self.trace()[-1]["executor"], "opus")
+        # Past the last 256 KB the transcript is not read: the line there is
+        # not the executor's latest.
+        self.executor("claude-haiku-4-5")
+        with self.transcript.open("a") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "y" * 300_000}}) + "\n")
+        self.denied(self.call(), "executor-unknown")
+        self.executor("claude-haiku-4-5", before=json.dumps({"type": "user", "message": {"content": "y" * 300_000}}).encode() + b"\n")
+        self.assertEqual(self.admitted(self.call())["updatedInput"]["model"], "opus")
+        for path in (self.tmp / "missing.jsonl", None, 7):
+            data = self.call()
+            data["transcript_path"] = str(path) if isinstance(path, Path) else path
+            self.denied(data, "executor-unknown")
+        self.transcript.write_text(json.dumps({"type": "user", "message": {"content": "go"}}) + "\n")
+        self.denied(self.call(), "executor-unknown")
+
+    def test_d3_names_the_advisor_and_never_a_substitute(self):
+        self.assertEqual(longhaul.ADVISOR_FOR, {"haiku": "opus", "sonnet": "opus", "opus": "fable"})
+        for n, (model, family, advisor) in enumerate((
+                ("claude-haiku-4-5", "haiku", "opus"), ("claude-sonnet-4-5", "sonnet", "opus"),
+                ("claude-opus-4-5", "opus", "fable"), ("claude-opus-5-5", "opus", "fable"),
+                ("claude-fable-5", "fable", None), ("claude-mythos-1", "mythos", None), ("gpt-5", "other", None))):
+            self.executor(model)
+            data = self.call(session=f"s{n}")
+            if advisor:
+                self.assertEqual(self.admitted(data)["updatedInput"]["model"], advisor, model)
+            else:
+                self.assertIn(f"({family})", self.denied(data, "no-stronger-advisor"), model)
+            self.assertEqual((self.trace()[-1]["executor"], self.trace()[-1]["advisor"]), (family, advisor), model)
+
+    def test_a_call_of_another_agent_type_gets_no_answer_and_nothing_is_written(self):
+        others = [self.call(agent="Explore"), self.call(agent="general-purpose"), self.call(agent=None),
+                  {**self.call(), "tool_input": "x"}, {"tool_name": "Agent"}, [], "x", {}]
+        for data in others:
+            self.assertFalse(longhaul.advisor_consultation(data), data)
+            out = self.run_hook(self.HOOK, json.dumps(data))
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), data)
+        out = self.run_hook(self.HOOK, "")
+        self.assertEqual((out.returncode, out.stdout), (0, ""))
+        written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
+        self.assertEqual(written, ["advisor/probe.json", "usage/main.json"], "the fixture's own files alone")
+        # The agent type's name, however it is cased or spaced, is a consultation.
+        self.assertTrue(longhaul.advisor_consultation(self.call(agent=" Longhaul:Advisor ")))
+
+    def test_an_error_while_checking_a_consultation_denies_it(self):
+        # Fail closed (D2.1, the owner's boundary): a consultation the hook
+        # cannot finish checking never runs; run_hook's silent exit would let it.
+        (self.home / "advisor" / "trace.jsonl").mkdir()
+        for raw in (json.dumps(self.call()), "{not json", json.dumps(self.call())[:-5]):
+            out = self.run_hook(self.HOOK, raw)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            answer = json.loads(out.stdout)["hookSpecificOutput"]
+            self.assertEqual(answer["permissionDecision"], "deny", raw[:40])
+            self.assertIn("denied (error)", answer["permissionDecisionReason"])
+        self.assertIn("advisor hook: a consultation denied on an error (IsADirectoryError)", self.log())
+        self.assertNotIn(self.S, self.log())
+        out = self.run_hook(self.HOOK, self.call(agent="Explore"))
+        self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type still runs: fail open")
+
+
 class Settings(unittest.TestCase):
     """The LONGHAUL_* numbers read at import (Sprint 4, T5): a typo in any
     one is ignored and said, never a stop."""
