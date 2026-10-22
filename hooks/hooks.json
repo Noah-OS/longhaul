@@ -12,6 +12,32 @@
             "statusMessage": "Checking this call (longhaul guard)"
           }
         ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['advisor-hook']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Checking for an advisor consultation (longhaul advisor)"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['advisor-result']))", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Tracing an advisor consultation (longhaul advisor)"
+          }
+        ]
       }
     ],
     "SessionStart": [

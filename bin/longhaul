@@ -5,8 +5,9 @@
 # bare command; the skills run it by its full path all the same, since
 # their allowed-tools rules name that path and a bare `longhaul ...`
 # would prompt. It runs the longhaul.py beside it, so an installed
-# plugin runs its own version. Only the read-only commands are allowed,
-# and `checkpoint save`, which writes one file under LONGHAUL_HOME/
+# plugin runs its own version. Only the read-only commands are allowed
+# (`advisor status` among them since Sprint 8: the advise skill's first
+# step), and `checkpoint save`, which writes one file under LONGHAUL_HOME/
 # checkpoints/ and nothing else: the supervisor starts and watches a
 # claude of its own, and the others change the accounts or the state, so
 # they belong in a terminal (the rule since the plugin layout was decided,
@@ -20,11 +21,17 @@ command -v python3 >/dev/null 2>&1 || {
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 if [ $# -eq 0 ]; then
-  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, checkpoint save and -h run; for the rest, ask the user to run it in a terminal." >&2
+  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, advisor status, checkpoint save and -h run; for the rest, ask the user to run it in a terminal." >&2
   exit 2
 fi
 case "$1" in
   inspect|usage|status|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
+  advisor)
+    # A probe record is half of the Advisor's gate (D2.8), so recording one
+    # is the user's, in a terminal; from here only the status runs.
+    [ "$2" = status ] && exec python3 "$here/longhaul.py" "$@"
+    printf '%s\n' "longhaul: from here only \`advisor status\` runs; \`advisor record-probe\` records the probe the Advisor's gate trusts, which is the user's to do. Ask the user to run it in a terminal." >&2
+    exit 2 ;;
   checkpoint)
     # With no action, checkpoint is the SessionStart hook, which prints the
     # checkpoint named on stdin: from here only `checkpoint save` runs.
@@ -32,6 +39,6 @@ case "$1" in
     printf '%s\n' "longhaul: from here only \`checkpoint save\` runs; \`longhaul checkpoint\` with no action is the SessionStart hook, which the engine runs by itself." >&2
     exit 2 ;;
   *)
-    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, checkpoint save and -h run. Ask the user to run it in a terminal." >&2
+    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, advisor status, checkpoint save and -h run. Ask the user to run it in a terminal." >&2
     exit 2 ;;
 esac

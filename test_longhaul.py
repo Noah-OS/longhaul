@@ -2190,7 +2190,7 @@ class Plugin(unittest.TestCase):
         rows = [line for line in section.splitlines() if line.startswith("| `")]
         with self.subTest("the hooks table"):
             entries = [(event, entry) for event, entries in hooks["hooks"].items() for entry in entries]
-            self.assertEqual(len(entries), 4, "the four hooks the README describes, and nothing else")
+            self.assertEqual(len(entries), 6, "the six hooks the README describes, and nothing else")
             self.assertEqual(len(rows), len(entries), "one row per hook")
             timeouts = set()
             for event, entry in entries:
@@ -3889,6 +3889,26 @@ class Advisor(unittest.TestCase):
         exe.chmod(0o755)
         return exe, mark
 
+    def test_the_plugin_registers_both_hooks_on_agent_and_task(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        guard, pre = hooks["PreToolUse"]
+        [post] = hooks["PostToolUse"]
+        [guard] = guard["hooks"]
+        for entry, command, cmd, says in ((pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation"),
+                                          (post, "advisor-result", self.RESULT, "Tracing an advisor consultation")):
+            self.assertEqual(entry["matcher"], "Agent|Task", "the subagent tool's name, and its name before 2.1.63")
+            [handler] = entry["hooks"]
+            # The guard's command line with the command alone changed, run the
+            # way the tests run it.
+            self.assertEqual(handler["args"], [*guard["args"][:2], guard["args"][2].replace("'guard'", f"'{command}'"),
+                                               "${CLAUDE_PLUGIN_ROOT}"])
+            self.assertEqual(cmd[1:-1], handler["args"][:-1])
+            self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+            # A hook past its timeout lets the call run: the deny must come first.
+            self.assertEqual(handler["timeout"], 5)
+            self.assertLess(longhaul.ADVISOR_VERSION_TIMEOUT, handler["timeout"] / 2)
+            self.assertEqual(handler["statusMessage"], f"{says} (longhaul advisor)")
+
     def test_off_by_default_and_admitted_only_with_experiment_and_a_probe_for_this_version(self):
         for value in (None, "", "off", "on", "true", "1", "Experiment", " experiment"):
             self.denied(self.call(), "off", LONGHAUL_ADVISOR=value)
@@ -4587,7 +4607,11 @@ class Settings(unittest.TestCase):
             (bin_dir / name).write_text("#!/bin/sh\n" f"printf '%s\\n' \"{name} $*\" >> '{mark}'\n")
             (bin_dir / name).chmod(0o755)
         env = {k: v for k, v in self.env.items() if k != "LONGHAUL_CLAUDE_BIN"}
-        env.update(PATH=f"{bin_dir}{os.pathsep}{env.get('PATH', os.defpath)}", LONGHAUL_TEST_CHILD="1")
+        # Sprint 8: the Advisor's hook asks CLAUDE_CODE_EXECPATH for its version
+        # when the path names none; the suite runs inside a session, whose
+        # variable would name the real claude, so the marker stands there.
+        env.update(PATH=f"{bin_dir}{os.pathsep}{env.get('PATH', os.defpath)}", LONGHAUL_TEST_CHILD="1",
+                   CLAUDE_CODE_EXECPATH=str(bin_dir / "claude"))
         # The positive control (review, Sprint 5, G5): the marker programs
         # are the ones this PATH gives, and running each leaves the mark;
         # without this, a mark that stayed empty proved nothing. Run by
@@ -4602,7 +4626,7 @@ class Settings(unittest.TestCase):
                          "each marker records its name and arguments")
         mark.write_text("")
         out = subprocess.run([sys.executable, "-m", "unittest", "test_longhaul.Settings", "test_longhaul.Guard",
-                              "test_longhaul.Index", "-q"],
+                              "test_longhaul.Index", "test_longhaul.Advisor", "-q"],
                              cwd=HERE, env=env, capture_output=True, text=True, timeout=300)  # slow CI runners
         self.assertEqual(mark.read_text(), "", "a test ran a program on PATH, with these arguments")
         self.assertEqual(out.returncode, 0, out.stderr[-1500:])
@@ -4859,8 +4883,10 @@ class Checkpoint(unittest.TestCase):
 
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart"}, "these two events and nothing else")
-        [calls] = hooks["hooks"]["PreToolUse"]
+        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse"}, "these three events and nothing else")
+        # The Advisor's two entries on Agent and Task are pinned in Advisor (Sprint 8).
+        self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]], ["Read|Bash", "Agent|Task"])
+        calls = hooks["hooks"]["PreToolUse"][0]
         self.assertEqual(len(hooks["hooks"]["SessionStart"]), 3)
         starts = {entry["matcher"]: entry for entry in hooks["hooks"]["SessionStart"]}
         self.assertEqual(calls["matcher"], "Read|Bash")
@@ -5219,6 +5245,24 @@ class Shim(unittest.TestCase):
             self.assertEqual(out.stdout, "", args)
         self.assertIn("nothing to run", self.shim().stderr)
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
+    def test_the_shim_runs_advisor_status_and_nothing_else_of_the_advisor(self):
+        # Sprint 8: `advisor status` is the advise skill's first step. A probe
+        # record is half of the Advisor's gate, so recording one is the
+        # user's, in a terminal; the hooks are the engine's.
+        exe = str(self.tmp / "versions" / "2.1.307" / "claude")  # never the session's own claude
+        out = self.shim("advisor", "status", CLAUDE_CODE_EXECPATH=exe)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.splitlines(), ["LONGHAUL_ADVISOR: off", "Probe record: none",
+                                                   "Running Claude Code: 2.1.307", "off: LONGHAUL_ADVISOR is not experiment"])
+        for args in (("advisor",), ("advisor", "record-probe", "x.json"), ("advisor", "-h"), ("advisor-hook",),
+                     ("advisor-result",)):
+            out = self.shim(*args, CLAUDE_CODE_EXECPATH=exe)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("run it in a terminal", out.stderr, args)
+        self.assertFalse((self.tmp / "home" / "advisor").exists(), "nothing was written")
+        self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
+        self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
 
     def test_the_shim_runs_checkpoint_save_which_writes_one_file_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
