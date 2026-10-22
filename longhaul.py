@@ -2034,6 +2034,12 @@ CODEGRAPH_INSTALL = {"link": "github.com/colbymchenry/codegraph",  # as its READ
                      "npm": "npm i -g @colbymchenry/codegraph"}  # all three; the advice line names the link and npm
 TOKEN_KINDS = (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"),
                ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens"))
+# The Advisor experiment's (Sprint 8): the agent type a consultation runs
+# as, and the codes its trace may hold, in the order the report lists them.
+CONSULTATION_AGENT = "longhaul:advisor"
+CONSULTATION_TRIGGERS = ("early", "stuck", "change", "done")
+CONSULTATION_OUTCOMES = ("ok", "failed", "malformed")
+CONSULTATION_VERDICTS = ("proceed", "adjust", "stop")
 
 
 def as_int(value) -> int:
@@ -2206,11 +2212,79 @@ def search_advice(s: dict) -> str:
             "unless told not to; `codegraph init` writes `.codegraph/` in the project. Longhaul installs nothing.")
 
 
+def agent_type(transcript: Path):
+    """The agent type a subagent ran as, from the meta.json Claude Code
+    writes beside its transcript (agent-<id>.meta.json, `agentType`: the
+    Agent tool's subagent_type), else None: no such file, or junk."""
+    try:
+        meta = json.loads(transcript.with_name(transcript.stem + ".meta.json").read_text(errors="replace"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    kind = meta.get("agentType") if isinstance(meta, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
+def consultations(sid: str):
+    """The Advisor experiment's consultations in a conversation (Sprint 8),
+    from its trace: a decision line for each one the executor asked for,
+    admitted or denied with a reason code, and an outcome line for each
+    one that ran, with its verdict and the size of its reply. None when
+    there is no trace, or no line of this conversation's in it. The trace
+    is only read here (its hooks write it), and only its codes and
+    numbers: each code is one of those it may be, else "other", so a line
+    is never passed on as written."""
+    try:
+        text = (LONGHAUL_HOME / "advisor" / "trace.jsonl").read_text(errors="replace")
+    except OSError:
+        return None
+    found, admitted, replies = False, 0, []
+    denied, outcomes, verdicts = collections.Counter(), collections.Counter(), collections.Counter()
+    asked, allowed = collections.Counter(), collections.Counter()  # by trigger
+    for raw in text.splitlines():
+        try:
+            line = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(line, dict) or line.get("session") != sid:
+            continue
+        if line.get("event") == "decision" and line.get("decision") in ("allow", "deny"):
+            found = True
+            trigger = line.get("trigger")
+            trigger = "none" if trigger is None else trigger if trigger in CONSULTATION_TRIGGERS else "other"
+            asked[trigger] += 1
+            if line["decision"] == "allow":
+                admitted += 1
+                allowed[trigger] += 1
+            else:
+                reason = line.get("reason")
+                denied[reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z-]{0,39}", reason)
+                       else "other"] += 1
+        elif line.get("event") == "outcome":
+            found = True
+            outcomes[line.get("outcome") if line.get("outcome") in CONSULTATION_OUTCOMES else "other"] += 1
+            if line.get("verdict") is not None:
+                verdicts[line["verdict"] if line["verdict"] in CONSULTATION_VERDICTS else "other"] += 1
+            replies.append(as_int(line.get("reply_chars")))
+    if not found:
+        return None
+
+    def ordered(counts, order=()):
+        """The codes in the order given, then the rest by count; "other" last."""
+        rank = {k: i for i, k in enumerate(order)}
+        return {k: counts[k] for k in sorted(counts, key=lambda k: (k == "other", rank.get(k, len(rank)),
+                                                                    -counts[k], k))}
+    return {"attempts": sum(asked.values()), "admitted": admitted, "denied": ordered(denied),
+            "triggers": {t: {"attempts": n, "admitted": allowed[t]}
+                         for t, n in ordered(asked, CONSULTATION_TRIGGERS + ("none",)).items()},
+            "outcomes": ordered(outcomes, CONSULTATION_OUTCOMES), "verdicts": ordered(verdicts, CONSULTATION_VERDICTS),
+            "reply_chars": sum(replies), "reply_chars_max": max(replies, default=0)}
+
+
 def inspect_transcript(path: Path) -> dict:
     """The numbers `longhaul inspect` shows for the conversation in `path`."""
     # files_of(): a link to nowhere among the subagents' is no transcript to open.
     files = [path] + sorted(files_of(path.with_suffix("").glob("subagents/agent-*.jsonl")))
-    responses: dict = {}  # message id -> (scope, model, usage), from the id's last line with usage
+    responses: dict = {}  # message id -> (scope, model, usage, file), from the id's last line with usage
     calls: dict = {}      # tool_use id -> (tool, what it worked on)
     results: dict = {}    # tool_use id -> (characters, images, is_error, scope)
     events = []           # per file, in its order: (time, file, "call" or "compact", (scope, tool, input, id))
@@ -2254,7 +2328,7 @@ def inspect_transcript(path: Path) -> dict:
                     key, model, usage = msg.get("id") or line.get("uuid"), msg.get("model"), dict_at(msg, "usage")
                     # <synthetic> lines are Claude Code's own (18 on this Mac), not API requests.
                     if isinstance(key, str) and model != "<synthetic>" and (usage or key not in responses):
-                        responses[key] = (scope, shown(model, 80) if isinstance(model, str) else None, usage)
+                        responses[key] = (scope, shown(model, 80) if isinstance(model, str) else None, usage, n)
                     for b in blocks:
                         tid = b.get("id")
                         if b.get("type") != "tool_use" or not isinstance(tid, str) or tid in calls:
@@ -2299,7 +2373,7 @@ def inspect_transcript(path: Path) -> dict:
     tokens = {s: {k: 0 for k, _ in TOKEN_KINDS} for s in requests}
     by_model: dict = {}  # (scope, model) -> {kind: tokens}
     models, context = collections.Counter(), []
-    for scope, model, usage in responses.values():
+    for scope, model, usage, _ in responses.values():
         requests[scope] += 1
         if isinstance(model, str) and model != "<synthetic>":
             models[model] += 1
@@ -2310,6 +2384,22 @@ def inspect_transcript(path: Path) -> dict:
         size = sum(as_int(usage.get(field)) for k, field in TOKEN_KINDS if k != "output")
         if scope == "main" and size:
             context.append(size)
+
+    # The consultations' own tokens (Sprint 8): those of the subagents that
+    # ran as the advisor, looked for only when the trace has a line of
+    # this conversation's.
+    consulted = consultations(path.stem)
+    if consulted is not None:
+        advisors = {n for n, file in enumerate(files) if n and agent_type(file) == CONSULTATION_AGENT}
+        own: dict = {}  # model -> {kind: tokens}
+        for _, model, usage, where in responses.values():
+            if where in advisors:
+                row = own.setdefault(model if isinstance(model, str) else "?", {k: 0 for k, _ in TOKEN_KINDS})
+                for k, field in TOKEN_KINDS:
+                    row[k] += as_int(usage.get(field))
+        consulted["transcripts"] = len(advisors)
+        consulted["tokens"] = [{"model": m, **t} for m, t in sorted(own.items(),
+                                                                     key=lambda kv: (-sum(kv[1].values()), kv[0]))]
 
     rereads, searches = {}, collections.Counter()
     for scope, name, what, tid in repeats:
@@ -2356,6 +2446,7 @@ def inspect_transcript(path: Path) -> dict:
         "api_errors": dict(api_errors.most_common()),
         "unreadable": unreadable,
         "guard": guard_counts(path.stem),
+        "consultations": consulted,
     }
 
 
@@ -2400,7 +2491,14 @@ def inspect_lines(r: dict) -> list[str]:
     def where(item):
         return "  (a subagent)" if item["scope"] != "main" else ""
 
-    files = f", and {r['subagents']} subagent transcript{'s' * (r['subagents'] != 1)}" if r["subagents"] else ""
+    def token_table(rows, indent, label):
+        """Tokens by kind under one header, a row each, named by label(row)."""
+        width = max((len(label(t)) for t in rows), default=0)
+        return ([f"{indent}{'':<{width}}{'input':>12}{'cache write':>14}{'cache read':>14}{'output':>12}"]
+                + [f"{indent}{label(t):<{width}}{t['input']:>12,}{t['cache_write']:>14,}{t['cache_read']:>14,}"
+                   f"{t['output']:>12,}" for t in rows]) if rows else [indent + "none"]
+
+    files =f", and {r['subagents']} subagent transcript{'s' * (r['subagents'] != 1)}" if r["subagents"] else ""
     out = [f"Conversation {r['session']} ({home_path(r['path'])}{files})",
            "Requests [transcript, counted]",
            f"  main {r['requests']['main']}, subagents {r['requests']['subagents']}"]
@@ -2416,11 +2514,7 @@ def inspect_lines(r: dict) -> list[str]:
         out.append(f"  {name:<10}{t['input']:>12,}{t['cache_write']:>14,}{t['cache_read']:>14,}{t['output']:>12,}")
 
     out.append("Tokens by model [transcript, measured: the API's own counts]")
-    width = max((len(m["model"]) for m in r["model_tokens"]), default=0)
-    out.extend([f"  {'':<10}{'':<{width}}{'input':>12}{'cache write':>14}{'cache read':>14}{'output':>12}"]
-               + [f"  {m['scope']:<10}{m['model']:<{width}}{m['input']:>12,}{m['cache_write']:>14,}"
-                  f"{m['cache_read']:>14,}{m['output']:>12,}" for m in r["model_tokens"]]
-               if r["model_tokens"] else ["  none"])
+    out.extend(token_table(r["model_tokens"], "  ", lambda t: f"{t['scope']:<10}{t['model']}"))
 
     out.append("Context, main conversation [transcript, measured: input, cache write and cache read per request]")
     c = r["context"]
@@ -2489,6 +2583,28 @@ def inspect_lines(r: dict) -> list[str]:
                 [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in
                  (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
                  if g[k]])
+
+    c = r["consultations"]
+    if c is not None:  # else the trace has no line of this conversation's, or there is none: no section
+        def listed(counts):
+            return ", ".join(f"{k} {n}" for k, n in counts.items()) or "none"
+
+        denied = sum(c["denied"].values())
+        out.append("Consultations [longhaul advisor trace, counted; own tokens: the advisor's transcripts, measured]")
+        out.append(f"  {c['attempts']} consultation{'s' * (c['attempts'] != 1)} asked for: "
+                   f"{c['admitted']} admitted, {denied} denied")
+        out.append("  denied by reason: " + listed(c["denied"]))
+        out.append("  by trigger: " + (", ".join(f"{t} {x['attempts']} ({x['admitted']} admitted)"
+                                                 for t, x in c["triggers"].items()) or "none"))
+        out.append("  outcomes: " + listed(c["outcomes"]))
+        out.append("  verdicts: " + listed(c["verdicts"]))
+        out.append(f"  replies: {c['reply_chars']:,} chars in all, the longest {c['reply_chars_max']:,}"
+                   if c["outcomes"] else "  replies: none")
+        if c["transcripts"]:
+            out.append(f"  own tokens, from {c['transcripts']} advisor transcript{'s' * (c['transcripts'] != 1)}:")
+            out.extend(token_table(c["tokens"], "    ", lambda t: t["model"]))
+        else:
+            out.append("  own tokens: no advisor transcript")
 
     out.append("Failures [transcript, counted]")
     out.append("  tool errors: " + (", ".join(f"{t} {c}" for t, c in r["tool_errors"].items()) or "none"))
@@ -2560,6 +2676,26 @@ def inspect_records(r: dict) -> list[dict]:
     for k in GUARD_RULES if r["guard"] else ():
         add("guard_fired", r["guard"][k], "calls", "all", "guard", "counted", k)
         add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "guard", "counted", k)
+    c = r["consultations"]
+    if c is not None:  # none when the trace has no line of this conversation's
+        counted = ("consultations", "all", "advisor", "counted")
+        add("consultation_attempts", c["attempts"], *counted)
+        add("consultation_admitted", c["admitted"], *counted)
+        for reason, n in c["denied"].items():
+            add("consultation_denied", n, *counted, reason)
+        for trigger, x in c["triggers"].items():
+            add("consultation_trigger", x["attempts"], *counted, trigger)
+            add("consultation_trigger_admitted", x["admitted"], *counted, trigger)
+        for outcome, n in c["outcomes"].items():
+            add("consultation_outcomes", n, *counted, outcome)
+        for verdict, n in c["verdicts"].items():
+            add("consultation_verdicts", n, *counted, verdict)
+        add("consultation_reply_chars", c["reply_chars"], "chars", "all", "advisor", "counted")
+        add("consultation_reply_chars_max", c["reply_chars_max"], "chars", "all", "advisor", "counted")
+        add("consultation_transcripts", c["transcripts"], "files", "subagents", "transcript", "counted")
+        for t in c["tokens"]:
+            for kind, _ in TOKEN_KINDS:
+                add("consultation_tokens", t[kind], "tokens", "subagents", "transcript", "measured", t["model"], kind)
     add("transcript_lines", r["lines"], "lines", "all", "transcript", "counted")
     add("unreadable_lines", r["unreadable"], "lines", "all", "transcript", "counted")
     return out

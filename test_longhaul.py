@@ -1212,6 +1212,30 @@ class Inspect(unittest.TestCase):
         """The lines, written at that second: subagents write alongside the main conversation."""
         return [{**l, "timestamp": f"2026-10-20T10:00:{second:02d}.000Z"} for l in lines]
 
+    def meta(self, name, **fields):
+        """A subagent's meta.json, beside its transcript, as Claude Code 2.1.307 writes it."""
+        path = self.path.with_suffix("") / "subagents" / f"{name}.meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(fields))
+
+    def trace(self, *lines):
+        """The Advisor experiment's trace (Sprint 8), as its hooks write it; a string is written as it is."""
+        path = self.relay / "advisor" / "trace.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("".join((l if isinstance(l, str) else json.dumps(l)) + "\n" for l in lines))
+
+    def decision(self, tid, reason=None, trigger="early", session="s1"):
+        """A decision line: admitted with no reason, denied with one."""
+        return {"t": 1000.0, "id": tid, "session": session, "prompt_id": "p1", "event": "decision",
+                "decision": "deny" if reason else "allow", "reason": reason,
+                "kind": None if not reason else "fixable" if reason.startswith("brief") else "hard",
+                "trigger": trigger, "reconcile": False, "executor": "sonnet", "advisor": "opus",
+                "brief_chars": 900, "brief_hash": "0123456789ab", "allowance": "checked"}
+
+    def outcome(self, tid, verdict="proceed", chars=400, outcome="ok", session="s1"):
+        return {"t": 1010.0, "id": tid, "session": session, "event": "outcome", "outcome": outcome,
+                "verdict": verdict, "confidence": "high", "reply_chars": chars, "seconds": 9.5}
+
     def test_a_response_written_over_several_lines_is_counted_once(self):
         # One line per content block, one message id. In a subagent's
         # transcript the early lines carry a partial output count (16 where
@@ -1285,6 +1309,114 @@ class Inspect(unittest.TestCase):
         out = longhaul.inspect_lines(r)
         head = out.index("Tokens by model [transcript, measured: the API's own counts]")
         self.assertEqual(out[head + 1], "  none")
+
+    CONSULTATIONS = "Consultations [longhaul advisor trace, counted; own tokens: the advisor's transcripts, measured]"
+
+    def test_consultations_are_counted_from_the_advisor_trace_for_this_conversation_only(self):
+        # Sprint 8, Region A: the trace holds a line per decision and per
+        # outcome, of every conversation; the report counts this one's.
+        self.write(self.reply())
+        self.trace(self.decision("c1"), self.outcome("c1", "proceed", 400),
+                   self.decision("c2", trigger="stuck"), self.outcome("c2", "adjust", 700),
+                   self.decision("c3", "cap-task", trigger="change"),
+                   self.decision("c4", "brief-sections", trigger=None), self.decision("c5", "cap-task"),
+                   self.decision("x1", trigger="done", session="s2"), self.outcome("x1", "stop", 999, session="s2"),
+                   "not json", "[1, 2]", '{"session": "s1", "event": "other"}')
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["consultations"], {
+            "attempts": 5, "admitted": 2, "denied": {"cap-task": 2, "brief-sections": 1},
+            "triggers": {"early": {"attempts": 2, "admitted": 1}, "stuck": {"attempts": 1, "admitted": 1},
+                         "change": {"attempts": 1, "admitted": 0}, "none": {"attempts": 1, "admitted": 0}},
+            "outcomes": {"ok": 2}, "verdicts": {"proceed": 1, "adjust": 1},
+            "reply_chars": 1100, "reply_chars_max": 700, "transcripts": 0, "tokens": []})
+        out = longhaul.inspect_lines(r)
+        head = out.index(self.CONSULTATIONS)
+        self.assertGreater(head, out.index("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, "
+                                           "cat or search]"))
+        self.assertEqual(out[head + 1:head + 9], [
+            "  5 consultations asked for: 2 admitted, 3 denied",
+            "  denied by reason: cap-task 2, brief-sections 1",
+            "  by trigger: early 2 (1 admitted), stuck 1 (1 admitted), change 1 (0 admitted), none 1 (0 admitted)",
+            "  outcomes: ok 2",
+            "  verdicts: proceed 1, adjust 1",
+            "  replies: 1,100 chars in all, the longest 700",
+            "  own tokens: no advisor transcript",
+            "Failures [transcript, counted]"])
+        got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
+               for x in self.records("s1") if x["metric"].startswith("consultation_")}
+        n = ("consultations", "advisor", "counted")
+        self.assertEqual(got, {
+            ("consultation_attempts", "all", None): (5, *n), ("consultation_admitted", "all", None): (2, *n),
+            ("consultation_denied", "all", "cap-task"): (2, *n), ("consultation_denied", "all", "brief-sections"): (1, *n),
+            ("consultation_trigger", "all", "early"): (2, *n), ("consultation_trigger", "all", "stuck"): (1, *n),
+            ("consultation_trigger", "all", "change"): (1, *n), ("consultation_trigger", "all", "none"): (1, *n),
+            ("consultation_trigger_admitted", "all", "early"): (1, *n),
+            ("consultation_trigger_admitted", "all", "stuck"): (1, *n),
+            ("consultation_trigger_admitted", "all", "change"): (0, *n),
+            ("consultation_trigger_admitted", "all", "none"): (0, *n),
+            ("consultation_outcomes", "all", "ok"): (2, *n),
+            ("consultation_verdicts", "all", "proceed"): (1, *n), ("consultation_verdicts", "all", "adjust"): (1, *n),
+            ("consultation_reply_chars", "all", None): (1100, "chars", "advisor", "counted"),
+            ("consultation_reply_chars_max", "all", None): (700, "chars", "advisor", "counted"),
+            ("consultation_transcripts", "subagents", None): (0, "files", "transcript", "counted")})
+
+    def test_a_consultations_own_tokens_come_from_the_subagents_whose_agent_type_is_the_advisor(self):
+        self.write(self.reply())
+        self.trace(self.decision("c1"), self.outcome("c1"))
+        self.agent(self.reply(inp=3, write=100, read=5000, out=40), "agent-a1")
+        self.meta("agent-a1", agentType="longhaul:advisor", toolUseId="c1", model="opus")
+        self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a2")
+        self.meta("agent-a2", agentType="general-purpose")
+        self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a3")  # no meta.json
+        self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a4")
+        self.meta("agent-a4", agentType=["longhaul:advisor"])  # not a name
+        self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a5")
+        (self.path.with_suffix("") / "subagents" / "agent-a5.meta.json").write_text("[" * 100_000 + "]" * 100_000)  # RecursionError on 3.9
+        r = longhaul.inspect_transcript(self.path)
+        c = r["consultations"]
+        self.assertEqual((r["subagents"], c["transcripts"]), (5, 1))
+        self.assertEqual(c["tokens"], [{"model": "claude-opus-5-5", "input": 3, "cache_write": 100, "cache_read": 5000,
+                                        "output": 40}])
+        out = longhaul.inspect_lines(r)
+        head = out.index("  own tokens, from 1 advisor transcript:")
+        self.assertEqual(out[head + 1:head + 4], [
+            "                          input   cache write    cache read      output",
+            "    claude-opus-5-5           3           100         5,000          40",
+            "Failures [transcript, counted]"])
+        got = {(x["metric"], x["scope"], x["item"], x["kind"]): (x["value"], x["unit"], x["source"], x["confidence"])
+               for x in self.records("s1") if x["metric"] in ("consultation_tokens", "consultation_transcripts")}
+        t = ("tokens", "transcript", "measured")
+        self.assertEqual(got, {
+            ("consultation_transcripts", "subagents", None, None): (1, "files", "transcript", "counted"),
+            ("consultation_tokens", "subagents", "claude-opus-5-5", "input"): (3, *t),
+            ("consultation_tokens", "subagents", "claude-opus-5-5", "cache_write"): (100, *t),
+            ("consultation_tokens", "subagents", "claude-opus-5-5", "cache_read"): (5000, *t),
+            ("consultation_tokens", "subagents", "claude-opus-5-5", "output"): (40, *t)})
+
+    def test_no_trace_line_of_this_conversation_no_consultations(self):
+        self.write(self.reply())
+        self.agent(self.reply(), "agent-a1")
+        self.meta("agent-a1", agentType="longhaul:advisor")
+        for lines in ((), (self.decision("x1", session="s2"), "junk", '{"session": "s1", "event": "noise"}')):
+            if lines:
+                self.trace(*lines)
+            r = longhaul.inspect_transcript(self.path)
+            self.assertIsNone(r["consultations"], lines)
+            self.assertFalse([l for l in longhaul.inspect_lines(r) if l.startswith("Consultations")], lines)
+            self.assertFalse([x for x in longhaul.inspect_records(r) if x["metric"].startswith("consultation_")])
+
+    def test_a_trace_value_that_is_not_one_of_its_codes_is_counted_as_other(self):
+        # The trace is another program's file: what is not a code is never
+        # passed on as written, and a decision neither allow nor deny is none.
+        self.write(self.reply())
+        self.trace(self.decision("c1", "Not A Code!", trigger="sideways"),
+                   {**self.outcome("c1", verdict="maybe", outcome="partly"), "reply_chars": "many"},
+                   {**self.decision("c2"), "decision": "perhaps"})
+        c = longhaul.inspect_transcript(self.path)["consultations"]
+        self.assertEqual((c["attempts"], c["admitted"], c["denied"], c["triggers"]),
+                         (1, 0, {"other": 1}, {"other": {"attempts": 1, "admitted": 0}}))
+        self.assertEqual((c["outcomes"], c["verdicts"], c["reply_chars"], c["reply_chars_max"]),
+                         ({"other": 1}, {"other": 1}, 0, 0))
 
     def test_context_shows_its_first_peak_and_last_size_and_each_compaction(self):
         self.write(self.reply(inp=2, write=20000) + self.reply(inp=1, write=5000, read=900000)
@@ -1645,12 +1777,14 @@ class Inspect(unittest.TestCase):
                    + self.turn("t3", "Bash", "no", error=True, command="make") + [self.compaction()])
         longhaul.record_usage({"session_id": "s1", "cost": {"total_cost_usd": 0.1},
                          "prompt_cache": {"hit_ratio": 0.5, "misses": 1, "miss_recache_tokens": 9}}, None)
+        self.trace(self.decision("c1"))  # Sprint 8: the Consultations section too
         out = self.cli("s1")
         self.assertEqual(out.returncode, 0, out.stderr)
         heads = [l for l in out.stdout.splitlines()[1:] if l.strip() and not l.startswith(" ")]
         self.assertGreaterEqual(len(heads), 7, out.stdout)
+        self.assertIn(self.CONSULTATIONS, heads)
         for head in heads:
-            self.assertRegex(head, r"\[(transcript|status line|longhaul guard)[^\]]*\]", head)
+            self.assertRegex(head, r"\[(transcript|status line|longhaul guard|longhaul advisor trace)[^\]]*\]", head)
         for head in heads:
             if head.startswith(("Read again", "The same search")):
                 self.assertIn("through Bash are not seen", head)
@@ -1841,8 +1975,17 @@ class Inspect(unittest.TestCase):
         longhaul.record_usage({"session_id": "s1", "cost": {"total_cost_usd": 0.1}, "session_name": secret,
                          "workspace": {"current_dir": secret}, "model": {"id": "claude-opus-5-5",
                                                                          "display_name": secret}}, None)
+        # Sprint 8: a consultation whose trace lines hold the secret in every field, those the hooks write a code
+        # in and a brief and a reply they never write; the advisor's transcript and meta.json hold it as text.
+        self.trace({**self.decision(secret, secret, trigger=secret), "kind": secret, "executor": secret,
+                    "advisor": secret, "brief_hash": secret, "prompt_id": secret, "brief": secret},
+                   {**self.outcome(secret, verdict=secret, outcome=secret), "confidence": secret, "reply": secret})
+        self.agent(self.reply({"type": "text", "text": f"Verdict: proceed\n{secret}"}), "agent-adv")
+        self.meta("agent-adv", agentType="longhaul:advisor", description=secret, toolUseId=secret)
         out, records = self.cli("s1"), self.cli("s1", "--json")
         self.assertEqual((out.returncode, records.returncode), (0, 0), out.stderr + records.stderr)
+        self.assertIn("denied by reason: other 1", out.stdout, "the Consultations section ran over the trace")
+        self.assertIn("own tokens, from 1 advisor transcript:", out.stdout)
         self.assertIn("curl", out.stdout)  # t1's program, which the report may name
         self.assertIn("curl", records.stdout)
         self.assertIn("Search-heavy", out.stdout, "the Search section and its advice line ran over those searches")
