@@ -8852,19 +8852,31 @@ class Pipe(StreamHarness):
     def test_pipe_never_starts_claude_when_the_accounts_file_is_missing_or_broken(self):
         # load_accounts() falls back to one account on ~/.claude with no
         # email, which the sign-in check lets through: a driven session
-        # would run on the panel's own sign-in.
+        # would run on the panel's own sign-in. A file that cannot be read
+        # is said so, exit 2, as the terminal says it (UX review, Sprint 8).
         path = self.relay / "accounts.json"
-        for case, text in (("missing", None), ("empty", ""), ("invalid JSON", "[{not json"),
-                           ("no accounts", "[]"), ("not a list", '{"name": "Max"}')):
+        work, personal = self.repositories()
+        broken = unreadable_accounts(
+            {"name": "Max", "config_dir": str(self.max), "email": "first@example.com", "repositories": [str(work)]},
+            {"name": "Pro", "config_dir": str(self.pro), "email": "second@example.com"})
+        for case, text, code in (("missing", None, 1), ("no accounts", "[]", 1), ("empty", "", 2),
+                                 ("invalid JSON", "[{not json", 2), ("not a list", '{"name": "Max"}', 2),
+                                 *((case, text, 2) for case, text in broken.items())):
             with self.subTest(case):
                 if text is None:
                     path.unlink(missing_ok=True)
                 else:
                     path.write_text(text)
-                p = self.pipe()
-                self.assertEqual(p.wait(10), 1)
+                before = self.log_text()
+                p = self.pipe(cwd=personal)
+                self.assertEqual(p.wait(10), code)
                 self.assertEqual(self.output(), b"")
                 self.assertEqual(self.calls_or_none(), [])
+                said = self.log_text()[len(before):]
+                if code == 2:
+                    self.assertRegex(said, r"pipe: accounts\.json is not readable: [^\n]+; fix or remove it\n")
+                else:
+                    self.assertIn("pipe: accounts.json is missing or names no accounts", said)
 
     def test_pipe_never_runs_on_an_account_without_an_email_or_a_folder_of_its_own(self):
         self.emails["default"] = "first@example.com"  # ~/.claude is signed in as Max would be

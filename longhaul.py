@@ -5652,13 +5652,16 @@ def pipe(argv: list[str]) -> int:
         log(settings_note())
     relay = None
     try:
-        # Read here, not with load_accounts(): its fallback is one account
-        # on ~/.claude with no email, which the sign-in check lets through,
-        # so a missing or broken file would have run the session on the
-        # panel's own sign-in.
-        accounts = read_json(LONGHAUL_HOME / "accounts.json")
-        if not (isinstance(accounts, list) and accounts
-                and all(isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"] for a in accounts)):
+        # Read here, not with load_accounts(): its stand-in for a missing
+        # file is one account on ~/.claude with no email, which the sign-in
+        # check lets through, so a missing file would have run the session
+        # on the panel's own sign-in. One that cannot be read is said as the
+        # terminal says it, exit 2 (UX review, Sprint 8).
+        accounts, problem = read_accounts_file()
+        if problem:
+            log(f"pipe: {unreadable_text(problem)}")
+            return 2
+        if not accounts:
             log("pipe: accounts.json is missing or names no accounts, so longhaul did not start Claude")
             return 1
         names = [a["name"] for a in accounts]
