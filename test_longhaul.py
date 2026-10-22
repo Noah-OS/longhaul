@@ -5293,7 +5293,10 @@ class Advisor(unittest.TestCase):
                                  "Home": str(self.home), "Unadmitted advisor runs traced": "0"})
         self.assertEqual(last, "enabled", "the skill's contract: the last line")
         self.probe(rewrites=None)  # F5: the list, none when the record has none
-        self.assertEqual(self.status()[0]["Probe record"], f"Claude Code 2.1.307, passed {day}; rewrites seen: none")
+        lines, last = self.status()
+        self.assertEqual(lines["Probe record"], f"Claude Code 2.1.307, passed {day}; rewrites seen: none")
+        self.assertEqual(last, "off: the probe record names no advisor model whose rewrite it saw (rewrite_models); "
+                               "record a probe that does", "no model the gate could admit: not enabled")
         self.probe()
         other = self.tmp / "claude" / "versions" / "2.1.308"
         other.write_text("")

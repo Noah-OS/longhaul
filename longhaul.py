@@ -4888,7 +4888,9 @@ def advisor_status_lines() -> list:
            else f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
            if enabled != recorded
            else "the running Claude Code version is unknown" if running is None
-           else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded else None)
+           else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded
+           else "the probe record names no advisor model whose rewrite it saw (rewrite_models); record a probe that does"
+           if not rewrites else None)
     return lines + [f"off: {why}" if why else "enabled"]
 
 
