@@ -2530,7 +2530,7 @@ def inspect_lines(r: dict) -> list[str]:
                 + [f"{indent}{label(t):<{width}}{t['input']:>12,}{t['cache_write']:>14,}{t['cache_read']:>14,}"
                    f"{t['output']:>12,}" for t in rows]) if rows else [indent + "none"]
 
-    files =f", and {r['subagents']} subagent transcript{'s' * (r['subagents'] != 1)}" if r["subagents"] else ""
+    files = f", and {r['subagents']} subagent transcript{'s' * (r['subagents'] != 1)}" if r["subagents"] else ""
     out = [f"Conversation {r['session']} ({home_path(r['path'])}{files})",
            "Requests [transcript, counted]",
            f"  main {r['requests']['main']}, subagents {r['requests']['subagents']}"]
@@ -4007,7 +4007,7 @@ def advisor_model_of(raw: bytes):
         return None
     try:
         entry = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # nested past the limit: 3.9's json raises this
         return None
     if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") is True:
         return None
@@ -4293,7 +4293,7 @@ def advisor_recent(lines: list, now: float) -> list:
 def advisor_time(line: str) -> float:
     try:
         entry = json.loads(line)
-    except ValueError:
+    except (ValueError, RecursionError):
         return 0
     return (as_number(entry.get("t")) or 0) if isinstance(entry, dict) else 0
 
@@ -4374,7 +4374,7 @@ def advisor_decided_at(tool_id):
             continue
         try:
             entry = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(entry, dict) and entry.get("id") == tool_id and entry.get("event") == "decision" \
                 and entry.get("decision") == "allow":
@@ -4451,7 +4451,7 @@ def advisor_record(path: str) -> tuple:
         found = json.loads(Path(path).read_text())
     except OSError as e:
         return None, f"could not read {home_path(os.path.abspath(path))}: {e.strerror or e}"
-    except ValueError:  # not UTF-8 either
+    except (ValueError, RecursionError):  # not UTF-8 either, or nested past the limit
         return None, "it is not JSON"
     if not isinstance(found, dict):
         return None, "it is not a JSON object"

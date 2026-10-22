@@ -4053,8 +4053,44 @@ class Advisor(unittest.TestCase):
             self.assertIn("denied (error)", answer["permissionDecisionReason"])
         self.assertIn("advisor hook: a consultation denied on an error (IsADirectoryError)", self.log())
         self.assertNotIn(self.S, self.log())
+        # F10: the state is written before the trace (conservative), so the
+        # first call, admitted and then denied when its trace failed, counts.
+        self.assertEqual(self.state()["sessions"]["s1"]["count"], 1, "a consultation whose trace failed still counts")
         out = self.run_hook(self.HOOK, self.call(agent="Explore"))
         self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type still runs: fail open")
+
+    DEEP = "[" * 100_000 + "]" * 100_000  # RecursionError in json.loads on 3.9; 3.14 parses it
+
+    def test_json_nested_past_the_recursion_limit_is_junk_wherever_the_advisor_reads_it(self):
+        # F10: as Region A does, a RecursionError is a line that cannot be
+        # read, never the hook's error: the transcript's tail, the trace
+        # (its trim and the decision's lookup) and the probe's evidence.
+        with self.transcript.open("a") as f:
+            f.write('{"type": "assistant", "x": ' + self.DEEP + "}\n")
+        data = self.call(tool_id="toolu_deep")
+        path = self.home / "advisor" / "trace.jsonl"
+        path.write_text(self.DEEP + "\nnot json\n" + '{"id": "toolu_deep", "x": ' + self.DEEP + "}\n")
+        self.admitted(data)  # a trim at this write: the unreadable lines count as old
+        self.assertEqual(len(path.read_text().splitlines()), 1, "the junk at the front went")
+        path.write_text(self.DEEP + "\n" + path.read_text() + '{"id": "toolu_deep", "x": ' + self.DEEP + "}\n")
+        self.result(data, self.reply("Verdict: proceed"), now=self.now + 5)
+        self.assertEqual((self.trace_lines()[-1]["outcome"], self.trace_lines()[-1]["seconds"]), ("ok", 5.0))
+        evidence = self.tmp / "deep.json"
+        evidence.write_text(self.DEEP)
+        out = self.command("record-probe", str(evidence))
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertRegex(out.stderr, r"not recorded: it is not (JSON|a JSON object)\n$", "3.9 cannot parse it; 3.14 can")
+
+    def trace_lines(self):
+        """The trace's lines that are JSON objects: a test may leave junk in it."""
+        found = []
+        for line in (self.home / "advisor" / "trace.jsonl").read_text().splitlines():
+            with contextlib.suppress(ValueError, RecursionError):
+                found.append(json.loads(line))
+        return [line for line in found if isinstance(line, dict)]
+
+    def test_the_tail_read_for_the_executor_is_at_least_200_kb(self):
+        self.assertGreaterEqual(longhaul.ADVISOR_TAIL, 200 * 1024, "an assistant line can be long; a short tail misses it")
 
     def hold(self, name="advisor"):
         """The lock `name` held by this process, as another hook would hold it, until the file is closed."""
