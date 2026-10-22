@@ -56,6 +56,15 @@ def requires_git(test: unittest.TestCase):
         test.skipTest("not a git checkout")
 
 
+def unreadable_accounts(*accounts) -> dict:
+    """accounts.json as a hand edit leaves it, by case: the list of
+    `accounts` with a trailing comma, and the first alone as an object, not
+    a list. Neither is "no accounts" (UX review, Sprint 8): the stand-in
+    for a missing file would drop every account's repositories (A2)."""
+    listed = json.dumps(list(accounts))
+    return {"a trailing comma": listed[:-1] + ",]", "a lone object": json.dumps(accounts[0])}
+
+
 class Loop(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -854,6 +863,34 @@ class Loop(unittest.TestCase):
         self.assertEqual((out.returncode, calls), (1, []), out.stdout)
         self.assertIn(f"No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work / 'sub'}. "
                       f'Edit "repositories" in {self.home / "accounts.json"}, or run from one of those.', out.stdout)
+
+    def test_an_accounts_file_that_cannot_be_read_stops_longhaul_before_claude(self):
+        # UX review, Sprint 8: load_accounts() took a file it could not read
+        # for no file, and its stand-in, one account on ~/.claude with no
+        # repositories, ran Claude in a repository no account may use.
+        work, personal = self.repositories()
+        path = self.home / "accounts.json"
+        cases = unreadable_accounts({"name": "Max", "config_dir": None, "repositories": [str(work)]},
+                                    {"name": "Pro", "config_dir": str(self.pro), "repositories": [str(work)]})
+        whys = {"a trailing comma": "not JSON (", "a lone object": "not a list of accounts, each with a name"}
+        for case, text in cases.items():
+            path.write_text(text)
+            for argv in ((), ("-c",), ("-r", "sid-old"), ("--account", "Max")):
+                with self.subTest(case=case, argv=argv):
+                    (self.home / "calls.jsonl").unlink(missing_ok=True)
+                    out, calls = self.run_longhaul(["exit"], *argv, runs=1, cwd=personal)
+                    self.assertEqual((out.returncode, calls), (2, []), out.stdout + out.stderr)
+                    said = [line for line in out.stdout.splitlines() if "accounts.json" in line]
+                    self.assertEqual(len(said), 1, out.stdout)
+                    self.assertIn(f"accounts.json is not readable: {whys[case]}", said[0])
+                    self.assertTrue(said[0].endswith("; fix or remove it"), said[0])
+                    self.assertEqual(path.read_text(), text, "never written over")
+        # No file is one account on ~/.claude, unrestricted, as before.
+        path.unlink()
+        (self.home / "calls.jsonl").unlink(missing_ok=True)
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=personal)
+        self.assertEqual((out.returncode, [c["config"] for c in calls]), (0, [None]), out.stdout + out.stderr)
+        self.assertNotIn("not readable", out.stdout)
 
     def test_with_the_allowed_account_signed_in_wrong_the_denied_one_is_never_launched(self):
         # Final review, Sprint 7 (G5): Pro, signed in as expected, may not be
@@ -8132,7 +8169,10 @@ class Panel(StreamHarness):
         self.assertIn("should be first@example.com", (self.relay / "longhaul.log").read_text())
 
     def test_if_longhaul_fails_while_choosing_the_panel_still_gets_claude(self):
-        self.accounts([{"nam": "broken"}])
+        # A folder that is no path fails the launch. Not a file that cannot
+        # be read: a job then runs as the extension asked by design, and a
+        # chat is refused (UX review, Sprint 8).
+        self.accounts([{"name": "Max", "config_dir": 5}])
         p = self.start(["--version"])
         self.assertEqual(self.output(), b"fake job done")
         self.assertIsNone(self.calls()[0]["config"], "run as the extension asked")
@@ -8446,6 +8486,49 @@ class Panel(StreamHarness):
         job = self.start(["--version"], cwd=personal)
         self.assertEqual(self.output(), b"fake job done")
         self.assertEqual(job.wait(10), 0)
+
+    def test_an_accounts_file_that_cannot_be_read_refuses_the_panel_chat_with_a_notification(self):
+        # UX review, Sprint 8: load_accounts() took a file it could not read
+        # for no file, and the chat ran on its stand-in, ~/.claude with no
+        # repositories, in a folder no account may use.
+        work, personal = self.repositories()
+        path = self.relay / "accounts.json"
+        cases = unreadable_accounts(
+            {"name": "Max", "config_dir": str(self.max), "email": "first@example.com", "repositories": [str(work)]},
+            {"name": "Pro", "config_dir": str(self.pro), "email": "second@example.com", "repositories": [str(work)]})
+        env = self.fake_notifications()
+        for case, text in cases.items():
+            with self.subTest(case):
+                path.write_text(text)
+                self.notes.unlink(missing_ok=True)
+                (self.relay / "calls.jsonl").unlink(missing_ok=True)
+                p = self.start(cwd=personal, **env)
+                self.assertEqual(p.wait(10), 1)
+                self.assertFalse((self.relay / "calls.jsonl").exists(), "no claude, not even the panel's own")
+                self.assertIn("panel: accounts.json is not readable: ", self.log_text())
+                notes = self.notified()
+                self.assertEqual(len(notes), 1, notes)
+                self.assertTrue(notes[0].startswith("accounts.json is not readable: "), notes)
+                self.assertTrue(notes[0].endswith("; fix or remove it"), notes)
+                # A short job chooses no account by repository: it runs as the
+                # extension asked, as the wrapper's other failures do.
+                job = self.start(["--version"], cwd=personal)
+                self.assertEqual(self.output(), b"fake job done")
+                self.assertEqual(job.wait(10), 0)
+                self.assertEqual([c["config"] for c in self.calls()], [None])
+                self.assertEqual(path.read_text(), text, "never written over")
+        # No file: one account on ~/.claude, unrestricted, as before.
+        path.unlink()
+        (self.relay / "calls.jsonl").unlink(missing_ok=True)
+        said = self.log_text().count("not readable")
+        self.switch_mid_session(False)
+        self.plan(["reply"])
+        p = self.start(cwd=personal)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.wait_for(self.result_for(self.user(p, "hello")))
+        self.assertEqual([c["config"] for c in self.calls()], [None])
+        self.assertEqual(self.log_text().count("not readable"), said)
 
     def test_with_the_allowed_accounts_signed_in_wrong_a_chat_is_refused_not_run_on_claude(self):
         # Final review, Sprint 7: with Max denied here and Pro, the one account
@@ -9193,6 +9276,32 @@ class Accounts(unittest.TestCase):
         self.assertIn(f"       {longhaul.REPOSITORIES_JUNK}; longhaul will not use this account anywhere",
                       under["Team"], out.stdout)
         self.assertFalse([l for l in under["Pro"] if "only in" in l or "repositories" in l], "Pro is unrestricted")
+
+    def test_longhaul_status_says_an_accounts_file_that_cannot_be_read_and_shows_the_rest(self):
+        # UX review, Sprint 8: status showed load_accounts()'s stand-in for a
+        # missing file, one account on ~/.claude with no repositories, and a
+        # lone object stopped it with a traceback.
+        path = self.relay / "accounts.json"
+        cases = unreadable_accounts({"name": "Max", "config_dir": str(self.max), "email": "first@example.com",
+                                     "repositories": [str(self.tmp / "work")]})
+        for case, text in cases.items():
+            with self.subTest(case):
+                path.write_text(text)
+                out = self.longhaul("status")
+                self.assertEqual((out.returncode, out.stderr), (2, ""), out.stdout)
+                lines = out.stdout.splitlines()
+                self.assertEqual(lines[0][:31], "accounts.json is not readable: ", out.stdout)
+                self.assertTrue(lines[0].endswith("; fix or remove it"), out.stdout)
+                self.assertFalse([l for l in lines if l.startswith("Max ")], "no stand-in account shown")
+                self.assertTrue([l for l in lines if l.startswith("Claude Code ")], out.stdout)
+                self.assertTrue([l for l in lines if l.startswith("Switching: ")], out.stdout)
+                self.assertEqual(path.read_text(), text, "never written over")
+        # No file: the stand-in, one account on ~/.claude, as before.
+        path.unlink()
+        out = self.longhaul("status")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(out.stdout.startswith("Max "), out.stdout)
+        self.assertNotIn("not readable", out.stdout)
 
     def test_remove_and_setup_keep_another_accounts_repositories(self):
         team, new = self.tmp / "team", self.tmp / "new"

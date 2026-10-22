@@ -470,13 +470,33 @@ def ago_text(seconds: float) -> str:
 
 # ------------------------------------------------------------- accounts
 
-def load_accounts() -> list[dict]:
-    accounts = read_json(LONGHAUL_HOME / "accounts.json")
-    return accounts or [{"name": "Max", "config_dir": None}]
+# load_accounts()'s one account when there is no accounts.json (one
+# subscription): ~/.claude, with no repositories.
+STAND_IN = {"name": "Max", "config_dir": None}
 
 
-def read_accounts_file():
-    """accounts.json for the commands that change it: (the accounts, None);
+def load_accounts() -> tuple:
+    """The accounts to choose from or show: (the file's, None); with no
+    file, or an empty list, one stand-in on ~/.claude with no repositories,
+    so unrestricted; (None, why) when there is a file that cannot be read
+    (read_accounts_file()). That is never no accounts: the stand-in would
+    drop every account's repositories (A2) over one trailing comma, and the
+    terminal and the panel ran Claude on ~/.claude in a repository no
+    account may use (UX review, Sprint 8). Each caller says unreadable_text()."""
+    accounts, problem = read_accounts_file()
+    if problem:
+        return None, problem
+    return accounts or [dict(STAND_IN)], None
+
+
+def unreadable_text(problem: str) -> str:
+    """What every place says of an accounts.json it cannot read: the kind of
+    problem, never the file's text."""
+    return f"accounts.json is not readable: {problem}; fix or remove it"
+
+
+def read_accounts_file(home: Path | None = None):
+    """accounts.json (LONGHAUL_HOME's, or `home`'s): (the accounts, None);
     ([], None) when there is no file, which is no accounts, as an empty
     list is; or (None, why) when there is a file that is not a list of
     accounts with names (not JSON, not UTF-8, a half-written file, a lone
@@ -484,7 +504,7 @@ def read_accounts_file():
     for "no accounts", said Ready and exited 0, and add would have written
     a one-account list over it (review, Sprint 5)."""
     try:
-        found = json.loads((LONGHAUL_HOME / "accounts.json").read_text())
+        found = json.loads(((home or LONGHAUL_HOME) / "accounts.json").read_text())
     except FileNotFoundError:
         return [], None
     except OSError as e:
@@ -1492,7 +1512,10 @@ def run(opts) -> int:
     except ValueError as e:
         say(str(e))
         return 2
-    accounts = load_accounts()
+    accounts, problem = load_accounts()
+    if problem:
+        say(unreadable_text(problem))
+        return 2
     names = [a["name"] for a in accounts]
     if opts.account and opts.account not in names:
         say(f"no account called {opts.account}; the accounts are {', '.join(names)}")
@@ -2020,8 +2043,11 @@ def task_name(sid: str, labels: dict) -> str:
 
 def usage(opts) -> int:
     now = time.time()
+    accounts, problem = load_accounts()
+    if problem:  # said, and the readings listed as with no file: this only shows them
+        print(unreadable_text(problem))
     print("Allowance (latest reading per account)")
-    for name in [a["name"] for a in load_accounts()] + ["main"]:
+    for name in [a["name"] for a in accounts or [STAND_IN]] + ["main"]:
         u = read_json(USAGE_DIR / f"{name}.json")
         if not u:
             continue
@@ -5480,8 +5506,20 @@ def wrap(argv: list[str]) -> int:
             log(f"panel: '{' '.join(args[:2])}' runs as the extension asked, not on an account longhaul manages")
             notify("Signing in or out in the panel does not change longhaul's accounts; use longhaul setup for those.")
             os.execv(binary, [binary] + args)
-        accounts = load_accounts()
+        accounts, problem = load_accounts()
         chat = is_chat(args)
+        if problem:
+            msg = unreadable_text(problem)
+            if chat:
+                # Refused as a chat with no account allowed here is: on the
+                # stand-in for a missing file it ran on ~/.claude with every
+                # account's repositories dropped (UX review, Sprint 8).
+                log(f"panel: {msg}")
+                notify(msg)
+                return 1
+            # A short job is chosen for by no repository: as the extension asked.
+            log(f"panel: {msg}; the job runs as the extension asked")
+            os.execv(binary, [binary] + args)
         mode = panel_switch_mode() if chat else "never"
         resumed = resume_id(args) if chat else None
         # A chat runs in the wrapper's folder, which its claude inherits. A
@@ -6214,7 +6252,7 @@ def setup(opts) -> int:
     A file that cannot be read is an error, exit 2, not "no accounts"."""
     accounts, problem = read_accounts_file()
     if problem:
-        say(f"accounts.json is not readable: {problem}; fix or remove it")
+        say(unreadable_text(problem))
         return 2
     if not accounts:
         if opts.account:
@@ -6318,7 +6356,7 @@ def add(opts) -> int:
     with locked("accounts"):
         accounts, problem = read_accounts_file()
         if problem:  # never written over: it may be the list, half-written or hand-edited
-            say(f"accounts.json is not readable: {problem}; fix or remove it")
+            say(unreadable_text(problem))
             return 2
         for a in accounts:
             if a["name"].lower() == name.lower():
@@ -6348,7 +6386,7 @@ def remove(opts) -> int:
     with locked("accounts"):
         accounts, problem = read_accounts_file()
         if problem:
-            say(f"accounts.json is not readable: {problem}; fix or remove it")
+            say(unreadable_text(problem))
             return 2
         gone = [a for a in accounts if a["name"].lower() == opts.name.lower()]
         if not gone:
@@ -6367,7 +6405,10 @@ def remove(opts) -> int:
 def status(_opts) -> int:
     state = load_state()
     now = time.time()
-    for acct in load_accounts():
+    accounts, problem = load_accounts()
+    if problem:  # said, no stand-in shown in the accounts' place, and the rest shown; exit 2
+        print(unreadable_text(problem))
+    for acct in accounts or []:
         a = auth_status(acct)
         until = state["limited_until"].get(acct["name"], 0)
         limit = f"at its limit until {clock(until)}" if until > now else "available"
@@ -6410,7 +6451,7 @@ def status(_opts) -> int:
           "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never.")
     if settings_note():
         print(settings_note())
-    return 0
+    return 2 if problem else 0
 
 
 def clear(_opts) -> int:
