@@ -4916,6 +4916,31 @@ class Advisor(unittest.TestCase):
             self.assertEqual(self.trace()[-1]["kind"], "hard")
         self.assertEqual(self.state(), {}, "nothing counted")
 
+    def test_a_call_with_no_call_id_is_denied_before_anything_is_counted(self):
+        # F16: the call's id joins the decision to its outcome and the
+        # admitted consultation to its advisor (F2, F5); with none, or one
+        # not in the id's shape, the hook could not follow it, so it is
+        # denied as an error, as a call with no session is.
+        absent = self.call()
+        del absent["tool_use_id"]
+        runs = [absent] + [{**self.call(), "tool_use_id": junk}
+                           for junk in (None, "", "toolu 2", "toolu\n1", "../toolu_1", 7, ["toolu_1"], "x" * 101)]
+        for data in runs:
+            self.denied(data, "error")
+            self.assertIsNone(self.trace()[-1]["id"])
+            self.assertIsNone(self.trace()[-1]["admission"])
+        self.assertEqual(self.state(), {}, "nothing counted")
+        # The hook as the plugin runs it denies it too.
+        out = self.run_hook(self.HOOK, absent)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        answer = json.loads(out.stdout)["hookSpecificOutput"]
+        self.assertEqual(answer["permissionDecision"], "deny")
+        self.assertIn("denied (error)", answer["permissionDecisionReason"])
+        self.assertEqual(self.state(), {}, "nothing counted")
+        # A call with an id is admitted and counted, the denials before it costing nothing.
+        self.admitted(self.call(tool_id="toolu_ok"))
+        self.assertEqual(self.counted(), [("opus", "p1", False)])
+
     def test_the_sessions_account_must_be_allowed_in_the_calls_repository(self):
         # F9 (A2): the launch chose an account allowed here; the hook checks
         # that again, by the expression the allowance check names it with. A

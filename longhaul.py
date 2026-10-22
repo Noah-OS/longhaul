@@ -4525,8 +4525,10 @@ def advisor_admit(line: dict, rest, now: float, nonce: str):
     (advisor_fit()'s denial), the checks on the counts, then the
     allowance; when all pass, the consultation counted with its nonce,
     and None. With no session there is no record to check or cap to
-    keep, so the call is denied."""
-    if line["session"] is None:
+    keep, and with no call id (F16) no outcome or advisor to join to the
+    decision, so either call is denied before anything is counted. The
+    line's ids are advisor_id()'s: one not in an id's shape is None."""
+    if line["session"] is None or line["id"] is None:
         return advisor_denial("error")
     state = advisor_state()
     entry = advisor_entry(state, line["session"])
