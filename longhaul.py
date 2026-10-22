@@ -2066,9 +2066,9 @@ CODEGRAPH_INSTALL = {"link": "github.com/colbymchenry/codegraph",  # as its READ
                      "npm": "npm i -g @colbymchenry/codegraph"}  # all three; the advice line names the link and npm
 TOKEN_KINDS = (("input", "input_tokens"), ("cache_write", "cache_creation_input_tokens"),
                ("cache_read", "cache_read_input_tokens"), ("output", "output_tokens"))
-# The Advisor experiment's (Sprint 8): the agent type a consultation runs
-# as, and the codes its trace may hold, in the order the report lists them.
-CONSULTATION_AGENT = "longhaul:advisor"
+# The Advisor experiment's (Sprint 8): the codes its trace may hold, in the
+# order the report lists them. Region B builds its patterns from them; the
+# agent type is its ADVISOR_TYPE and the reasons its ADVISOR_DENIALS (F6).
 CONSULTATION_TRIGGERS = ("early", "stuck", "change", "done")
 CONSULTATION_OUTCOMES = ("ok", "failed", "malformed")
 CONSULTATION_VERDICTS = ("proceed", "adjust", "stop")
@@ -2266,7 +2266,7 @@ def consultations(sid: str):
     numbers: each code is one of those it may be, else "other", so a line
     is never passed on as written."""
     try:
-        text = (LONGHAUL_HOME / "advisor" / "trace.jsonl").read_text(errors="replace")
+        text = advisor_path("trace.jsonl").read_text(errors="replace")
     except OSError:
         return None
     found, admitted, replies = False, 0, []
@@ -2289,8 +2289,7 @@ def consultations(sid: str):
                 allowed[trigger] += 1
             else:
                 reason = line.get("reason")
-                denied[reason if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z-]{0,39}", reason)
-                       else "other"] += 1
+                denied[reason if isinstance(reason, str) and reason in ADVISOR_DENIALS else "other"] += 1
         elif line.get("event") == "outcome":
             found = True
             outcomes[line.get("outcome") if line.get("outcome") in CONSULTATION_OUTCOMES else "other"] += 1
@@ -2422,7 +2421,7 @@ def inspect_transcript(path: Path) -> dict:
     # this conversation's.
     consulted = consultations(path.stem)
     if consulted is not None:
-        advisors = {n for n, file in enumerate(files) if n and agent_type(file) == CONSULTATION_AGENT}
+        advisors = {n for n, file in enumerate(files) if n and advisor_named(agent_type(file))}
         own: dict = {}  # model -> {kind: tokens}
         for _, model, usage, where in responses.values():
             if where in advisors:
@@ -3836,7 +3835,15 @@ def checkpoint(opts) -> int:
 # brief's or a reply's text: the trace keeps sizes, a 12-hex hash, the
 # trigger and the verdict.
 
-ADVISOR_TYPE = "longhaul:advisor"  # the agent type the plugin ships
+ADVISOR_TYPE = "longhaul:advisor"  # the agent type the plugin ships; Region A counts its subagents by it
+# What a subagent_type is checked as, lowercased with every space taken
+# out (F6): the plugin's name, and the bare name, which may reach the
+# same agent. Another plugin's `other:advisor` is not ours.
+ADVISOR_NAMES = (ADVISOR_TYPE, "advisor")
+# The brief's first line and the reply's, from Region A's codes, so the
+# two regions cannot drift apart (F6).
+ADVISOR_TRIGGER = re.compile(r"Trigger:\s*(" + "|".join(CONSULTATION_TRIGGERS) + ")")
+ADVISOR_VERDICT = re.compile(r"verdict:\s*(" + "|".join(CONSULTATION_VERDICTS) + r")\b", re.IGNORECASE)
 # What the probe must have shown on a version before it is trusted: the
 # hook recognises a consultation, its deny stops one, prompt_id names the
 # user prompt, updatedInput sets the subagent's model, and the agent
@@ -3905,7 +3912,10 @@ ADVISOR_DENIALS = {
                  "do not retry.",
     "allowance-unknown": "no fresh allowance reading exists for this session's account, so the near-full rule cannot "
                          "be checked. Continue without advice; do not retry.",
-    "error": "the hook could not finish its checks. Continue without advice; do not retry.",
+    # Outside the order: a call of any other agent type.
+    "stand-in": "a brief (a first line Trigger:) goes to the longhaul:advisor agent type alone, through "
+                "/longhaul:advise, never to another agent. Continue without advice; do not retry.",
+    "error":"the hook could not finish its checks. Continue without advice; do not retry.",
 }
 
 
@@ -4020,11 +4030,25 @@ def advisor_family(model: str) -> str:
     return next((family for family in ADVISOR_FAMILIES if family in low), "other")
 
 
+def advisor_named(agent) -> bool:
+    """Whether an agent type (a call's subagent_type, a meta.json's
+    agentType) is the advisor's, however it is cased or spaced: a near
+    miss is checked as one, never let through."""
+    return isinstance(agent, str) and re.sub(r"\s", "", agent).lower() in ADVISOR_NAMES
+
+
 def advisor_consultation(data) -> bool:
-    """An Agent call of the advisor's agent type, however it is cased or
-    spaced: a near miss is checked as a consultation, never let through."""
-    agent = dict_at(data, "tool_input").get("subagent_type")
-    return isinstance(agent, str) and agent.strip().casefold() == ADVISOR_TYPE
+    """An Agent call of the advisor's agent type, by advisor_named()."""
+    return advisor_named(dict_at(data, "tool_input").get("subagent_type"))
+
+
+def advisor_stand_in(data) -> bool:
+    """A call of another agent type given a brief: its prompt's first
+    non-empty line begins Trigger:, however it is cased or spaced (F6)."""
+    prompt = dict_at(data, "tool_input").get("prompt")
+    lines = prompt.splitlines() if isinstance(prompt, str) else []
+    first = next((line.strip() for line in lines if line.strip()), "")
+    return re.match(r"trigger\s*:", first, re.IGNORECASE) is not None
 
 
 def advisor_id(value):
@@ -4041,7 +4065,7 @@ def advisor_brief(data) -> str:
 def advisor_trigger(brief: str):
     """The trigger the brief's first line names, or None."""
     first = brief.lstrip().split("\n", 1)[0].strip()
-    found = re.fullmatch(r"Trigger:\s*(early|stuck|change|done)", first)
+    found = ADVISOR_TRIGGER.fullmatch(first)
     return found.group(1) if found else None
 
 
@@ -4104,6 +4128,28 @@ def advisor_brief_problem(brief: str):
     if any(shape in brief for shape in CHECKPOINT_SECRET_SHAPES):
         return advisor_denial("credential")
     return None
+
+
+def advisor_check(data, now: float):
+    """The hook's answer to one call, or None for a call it leaves alone:
+    a consultation is decided; a brief sent to any other agent type is
+    denied (stand-in), whether or not the experiment is on."""
+    if not isinstance(data, dict):
+        return None
+    if advisor_consultation(data):
+        return advisor_decide(data, now)
+    if advisor_stand_in(data):
+        return advisor_refuse(data, "stand-in", now)
+    return None
+
+
+def advisor_refuse(data: dict, reason: str, now: float) -> dict:
+    """A call outside the consultations' order denied with `reason`, its
+    trace line written: it ran no check, so it names no models."""
+    line = advisor_line(data, now)
+    with advisor_locked():
+        advisor_trace(advisor_decided(line, (reason, "")), now)
+    return advisor_answer(data, line, advisor_denial(reason))
 
 
 def advisor_decide(data: dict, now: float) -> dict:
@@ -4255,7 +4301,7 @@ def advisor_answer(data: dict, line: dict, denial) -> dict:
         "hookEventName": "PreToolUse", "permissionDecision": "allow",
         "permissionDecisionReason": f"longhaul advisor: admitted; the {line['advisor']} advisor for your "
                                     f"model ({line['executor']}).",
-        "updatedInput": {**data["tool_input"], "model": line["advisor"]}}}
+        "updatedInput": {**data["tool_input"], "subagent_type": ADVISOR_TYPE, "model": line["advisor"]}}}
 
 
 def advisor_lines() -> list:
@@ -4331,9 +4377,9 @@ def advisor_hook(_opts) -> int:
                 return 0
             return advisor_fail({}, None, "brief-too-long", chars=len(raw), limit=ADVISOR_BRIEF_MAX)
         data = json.loads(raw) if raw.strip() else {}
-        if not advisor_consultation(data):
-            return 0
-        print(json.dumps(advisor_decide(data, time.time())))
+        answer = advisor_check(data, time.time())
+        if answer:
+            print(json.dumps(answer))
         return 0
     except Exception as e:
         return advisor_fail(data, e)
@@ -4358,7 +4404,7 @@ def advisor_verdict(text: str) -> tuple:
     the verdict on the reply's first line, the confidence on any; None
     for each that is missing."""
     lines = [line.strip().strip("*_#> ").replace("**", "") for line in text.splitlines() if line.strip()]
-    verdict = re.match(r"verdict:\s*(proceed|adjust|stop)\b", lines[0], re.IGNORECASE) if lines else None
+    verdict = ADVISOR_VERDICT.match(lines[0]) if lines else None
     confidence = next((found for found in (re.match(r"confidence:\s*(high|medium|low)\b", line, re.IGNORECASE)
                                            for line in lines) if found), None)
     return (verdict.group(1).lower() if verdict else None, confidence.group(1).lower() if confidence else None)

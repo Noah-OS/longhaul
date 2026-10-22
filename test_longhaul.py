@@ -1412,10 +1412,12 @@ class Inspect(unittest.TestCase):
         self.write(self.reply())
         self.trace(self.decision("c1", "Not A Code!", trigger="sideways"),
                    {**self.outcome("c1", verdict="maybe", outcome="partly"), "reply_chars": "many"},
-                   {**self.decision("c2"), "decision": "perhaps"})
+                   {**self.decision("c2"), "decision": "perhaps"},
+                   # A code's shape is not enough: the reasons are ADVISOR_DENIALS' keys (F6).
+                   self.decision("c3", "made-up-code", trigger="early"), {**self.decision("c4", "off"), "reason": ["off"]})
         c = longhaul.inspect_transcript(self.path)["consultations"]
         self.assertEqual((c["attempts"], c["admitted"], c["denied"], c["triggers"]),
-                         (1, 0, {"other": 1}, {"other": {"attempts": 1, "admitted": 0}}))
+                         (3, 0, {"other": 3}, {"early": {"attempts": 2, "admitted": 0}, "other": {"attempts": 1, "admitted": 0}}))
         self.assertEqual((c["outcomes"], c["verdicts"], c["reply_chars"], c["reply_chars_max"]),
                          ({"other": 1}, {"other": 1}, 0, 0))
 
@@ -3836,11 +3838,14 @@ class Advisor(unittest.TestCase):
         return "\n".join(line for line in lines if not line.startswith(tuple(drop)))
 
     def call(self, brief=None, session="s1", prompt="p1", tool_id=None, agent="longhaul:advisor"):
-        """A PreToolUse input for an Agent call, as the probe saw one on 2.1.307."""
+        """A PreToolUse input for an Agent call, as the probe saw one on 2.1.307: a
+        brief for the advisor, an ordinary prompt for any other agent type."""
+        if brief is None:
+            brief = self.brief() if longhaul.advisor_named(agent) else f"Find where the parser reads tabs ({self.S})."
         data = {"session_id": session, "prompt_id": prompt, "tool_use_id": tool_id or f"toolu_{uuid.uuid4().hex[:12]}",
                 "transcript_path": str(self.transcript), "cwd": str(self.tmp), "permission_mode": "default",
                 "effort": "high", "hook_event_name": "PreToolUse", "tool_name": "Agent",
-                "tool_input": {"description": "Consult the advisor", "prompt": self.brief() if brief is None else brief,
+                "tool_input": {"description": "Consult the advisor", "prompt": brief,
                                "run_in_background": False, "subagent_type": agent}}
         if prompt is None:
             del data["prompt_id"]
@@ -3851,7 +3856,7 @@ class Advisor(unittest.TestCase):
         with `env` over it (None unsets a name)."""
         values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
         with mock.patch.dict(os.environ, values, clear=True):
-            return longhaul.advisor_decide(data, self.now if now is None else now)
+            return longhaul.advisor_check(data, self.now if now is None else now)
 
     def denied(self, data, code, **kw):
         out = self.decide(data, **kw)["hookSpecificOutput"]
@@ -4040,6 +4045,50 @@ class Advisor(unittest.TestCase):
         self.assertEqual(written, ["advisor/probe.json", "usage/main.json"], "the fixture's own files alone")
         # The agent type's name, however it is cased or spaced, is a consultation.
         self.assertTrue(longhaul.advisor_consultation(self.call(agent=" Longhaul:Advisor ")))
+
+    def test_a_consultation_is_the_advisors_name_or_the_bare_advisor_however_it_is_spaced(self):
+        # F6: lowercased with every space taken out. Another plugin's
+        # other:advisor is not ours and passes through as any agent type.
+        for agent in ("longhaul:advisor", " Longhaul : Advisor ", "LONGHAUL:ADVISOR", "advisor", "Advisor", "\tad visor\n"):
+            self.assertTrue(longhaul.advisor_consultation(self.call(agent=agent)), agent)
+        for agent in ("other:advisor", "advisors", "longhaul:advisor2", "longhaul-advisor", "Explore", "", None, 7):
+            self.assertFalse(longhaul.advisor_consultation(self.call(agent=agent)), agent)
+        self.assertEqual(longhaul.ADVISOR_NAMES, ("longhaul:advisor", "advisor"))
+        # A bare advisor goes through the whole gate, and the call admitted names the plugin's agent type.
+        self.denied(self.call(agent="Advisor", prompt=None) | {"transcript_path": None}, "executor-unknown")
+        out = self.admitted(self.call(agent=" advisor"))
+        self.assertEqual(out["updatedInput"]["subagent_type"], "longhaul:advisor")
+        other = self.call("Look at the parser's tests.", agent="other:advisor")
+        self.assertIsNone(self.decide(other), "another plugin's advisor: no answer")
+
+    def test_a_brief_sent_to_any_other_agent_type_is_denied_whether_or_not_the_experiment_is_on(self):
+        # F6: a stand-in. The prompt's first non-empty line begins Trigger:,
+        # the brief's shape; a call that only mentions one is left alone.
+        for agent, brief in (("Explore", self.brief()), ("general-purpose", "\n\n  Trigger: stuck\nTask: x"),
+                             (None, "trigger : done\nTask: y"), ("other:advisor", self.brief("early"))):
+            for env in ({}, {"LONGHAUL_ADVISOR": None}):
+                reason = self.denied(self.call(brief, agent=agent), "stand-in", **env)
+                self.assertIn("longhaul:advisor", reason)
+                self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.assertEqual(self.state(), {}, "nothing counted")
+        for prompt in ("Find the parser. Trigger: stuck", "Note: first\nTrigger: stuck", "", None, 7):
+            data = self.call(agent="Explore")
+            data["tool_input"]["prompt"] = prompt
+            self.assertIsNone(self.decide(data), prompt)
+        out = self.run_hook(self.HOOK, self.call(self.brief(), agent="Explore"), LONGHAUL_ADVISOR="off")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_one_agent_type_constant_and_region_bs_patterns_are_built_from_region_as_codes(self):
+        # F6: the two regions cannot drift apart.
+        self.assertFalse(hasattr(longhaul, "CONSULTATION_AGENT"), "ADVISOR_TYPE alone names the agent type")
+        self.assertEqual(longhaul.ADVISOR_TRIGGER.pattern, r"Trigger:\s*(" + "|".join(longhaul.CONSULTATION_TRIGGERS) + ")")
+        self.assertEqual(longhaul.ADVISOR_VERDICT.pattern, r"verdict:\s*(" + "|".join(longhaul.CONSULTATION_VERDICTS) + r")\b")
+        self.assertTrue(longhaul.ADVISOR_VERDICT.flags & re.IGNORECASE)
+        with mock.patch.object(longhaul, "advisor_path", return_value=self.tmp / "elsewhere.jsonl"):
+            (self.tmp / "elsewhere.jsonl").write_text(json.dumps({"session": "s9", "event": "decision", "decision": "deny",
+                                                                  "reason": "off", "trigger": None}) + "\n")
+            self.assertEqual(longhaul.consultations("s9")["denied"], {"off": 1}, "inspect reads the trace advisor_path names")
 
     def test_an_error_while_checking_a_consultation_denies_it(self):
         # Fail closed (D2.1, the owner's boundary): a consultation the hook
