@@ -1682,6 +1682,7 @@ class Inspect(unittest.TestCase):
         # relative cwd is unknown, like none.
         project = self.tmp / "project"
         (project / ".codegraph").mkdir(parents=True)
+        (project / ".git").mkdir()  # a repository: its subfolders are looked for up to its top
         lines = self.searching(20)
         lines[0]["cwd"] = str(project)
         self.write(lines)
@@ -1716,6 +1717,7 @@ class Inspect(unittest.TestCase):
         # line; without a cwd the map is unknown and its record left out.
         project = self.tmp / "project"
         (project / ".trail").mkdir(parents=True)
+        (project / ".git").mkdir()
         lines = self.searching(20)
         lines[0]["cwd"] = str(project / "src")  # a session opened in a subfolder of the mapped repository
         self.write(lines)
@@ -1762,6 +1764,25 @@ class Inspect(unittest.TestCase):
         got = {x["metric"] for x in self.records("s1")}
         self.assertIn("trail_calls", got)
         self.assertNotIn("trail_index", got, "no cwd: the record is left out, not 0")
+
+    def test_a_map_in_the_home_folder_is_no_index_of_a_project_under_it(self):
+        # The UX review (2026-10-23): ~/.codegraph/ is CodeGraph's own
+        # folder and ~/.trail/ Trail's, the map of no project, so a
+        # search-heavy conversation in a git project under them is told
+        # of no index and gets the advice.
+        user = self.tmp / "user"
+        for folder in (".codegraph", ".trail", "code/app/.git", "code/app/src"):
+            (user / folder).mkdir(parents=True)
+        lines = self.searching(20)
+        lines[0]["cwd"] = str(user / "code" / "app" / "src")
+        self.write(lines)
+        with mock.patch.object(longhaul, "HOME", user), mock.patch.dict(os.environ, {"HOME": str(user)}):
+            s = longhaul.inspect_transcript(self.path)["search"]
+            out = self.cli("s1").stdout
+        self.assertEqual((s["codegraph_index"], s["trail_index"]), (0, 0))
+        self.assertIn("  CodeGraph: 0 calls, no .codegraph/ index at or above the cwd\n", out)
+        self.assertIn("  Trail: 0 calls, no .trail/ map at or above the cwd\n", out)
+        self.assertIn("Search-heavy", out, "no index seen: the advice runs")
 
     def test_tool_errors_are_counted_per_tool(self):
         self.write(self.turn("t1", "Bash", "Exit code 1", error=True, command="make")
@@ -2436,16 +2457,71 @@ class Guard(unittest.TestCase):
         self.assertIsNone(self.check(self.start(source="resume")), "a resume is not a start")
         self.assertIsNone(self.check(self.start(), mode="off"))
         self.assertFalse((self.home / "guard").exists(), "nothing to record")
-        # The index is looked for at the cwd and above it, where CodeGraph
-        # itself looks: a session opened in a subfolder is told too. A
-        # relative or missing cwd is no index.
+        # The index is looked for at the cwd and above it up to the work
+        # tree's top, where CodeGraph itself looks: a session opened in a
+        # subfolder of the repository is told too. A relative or missing
+        # cwd is no index.
         (self.tmp / "src").mkdir()
+        (self.tmp / ".git").mkdir()
         self.assertIsNotNone(self.check(self.start(cwd=str(self.tmp / "src"))), "a subfolder of the indexed project")
         self.assertIsNone(self.check(self.start(cwd="src")), "a relative cwd")
         self.assertIsNone(self.check({k: v for k, v in self.start().items() if k != "cwd"}), "no cwd")
         (self.tmp / ".codegraph").rmdir()
         (self.tmp / ".codegraph").write_text("not a folder")
         self.assertIsNone(self.check(self.start()), "a file of that name is no index")
+
+    def seen(self, cwd) -> tuple:
+        """What each caller of the map walk makes of a cwd, in a session of
+        its own: the startup note, the note at the GUARD_SEARCHES-th
+        search, inspect's two numbers (search_stats) and the auto-init's
+        two maps (index_map)."""
+        session = f"w{uuid.uuid4().hex[:8]}"
+        note = bool(self.context(self.check(self.start(session=session, cwd=str(cwd)))))
+        grep = {**self.hook("Bash", session=session, command="grep -rn x ."), "cwd": str(cwd)}
+        nudged = any([self.context(self.check(grep)) for _ in range(longhaul.GUARD_SEARCHES)])
+        s = longhaul.search_stats([], {}, {}, str(cwd))
+        return (note, nudged, s["codegraph_index"] == 1, s["trail_index"] == 1,
+                longhaul.index_map(str(cwd), "codegraph") is not None, longhaul.index_map(str(cwd), "trail") is not None)
+
+    def test_a_code_map_counts_from_the_cwd_to_its_work_trees_top_and_never_in_the_home_folder(self):
+        # The UX review (2026-10-23): CodeGraph keeps its own files in
+        # ~/.codegraph/ and Trail's init writes ~/.trail/, and a walk up to
+        # `/` took either for the map of every project under the home
+        # folder: the startup note in every session, the search note in
+        # every context, inspect's advice hidden, the auto-init never run.
+        # One walk now, for every caller: from the cwd up to its git work
+        # tree's top, the cwd alone outside a work tree, and never in the
+        # home folder or a parent of it, by index_top()'s rule.
+        user = self.tmp / "user"
+        app, shipped, notes = user / "code" / "app", user / "code" / "shipped", user / "notes"
+        for folder in (user / ".codegraph", user / ".trail", app / ".git", app / "src",
+                       shipped / ".git", shipped / ".codegraph", shipped / ".trail", shipped / "src" / "deep",
+                       notes / ".codegraph", notes / ".trail", notes / "drafts"):
+            folder.mkdir(parents=True)
+        cases = {app: False, app / "src": False,  # a git project under a home folder holding both
+                 shipped: True, shipped / "src" / "deep": True,  # a repository that ships both at its top
+                 notes: True,  # a folder outside any work tree, mapped itself
+                 notes / "drafts": False}  # one under a mapped folder: the cwd alone is looked at
+        with mock.patch.object(longhaul, "HOME", user):
+            for cwd, mapped in cases.items():
+                self.assertEqual(self.seen(cwd), (mapped,) * 6, cwd)
+            # A work tree whose top is the home folder itself (a dotfiles
+            # repository): ~/.codegraph/ and ~/.trail/ are no map there
+            # either, and a map between the cwd and that top still is.
+            (user / ".git").mkdir()
+            (user / "scratch").mkdir()
+            (user / "work" / "src").mkdir(parents=True)
+            (user / "work" / ".codegraph").mkdir()
+            (user / "work" / ".trail").mkdir()
+            for cwd, mapped in ((user, False), (user / "scratch", False), (user / "work" / "src", True)):
+                self.assertEqual(self.seen(cwd), (mapped,) * 6, cwd)
+        # The hook as the plugin runs it reads the home folder from HOME.
+        out = subprocess.run(self.HOOK, input=json.dumps(self.start(session="w-hook", cwd=str(app / "src"))),
+                             env={**self.env, "HOME": str(user)}, capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        out = subprocess.run(self.HOOK, input=json.dumps(self.start(session="w-hook", cwd=str(shipped))),
+                             env={**self.env, "HOME": str(user)}, capture_output=True, text=True, timeout=10)
+        self.assertTrue(self.context(json.loads(out.stdout)).startswith("This project has a CodeGraph index"), out)
 
     def test_the_twentieth_search_of_a_context_in_an_indexed_project_is_nudged_once_and_never_denied(self):
         # Sprint 6, G3 (3): the count found nearly all search is Bash grep,
@@ -2971,6 +3047,22 @@ class Index(unittest.TestCase):
             (third / folder).mkdir(parents=True)
         self.assertEqual(self.begin(self.start(cwd=str(third))), [], "a repository that ships both maps")
         self.assertFalse(self.state_path(str(third)).exists(), "no state file for a project with nothing to do")
+
+    def test_a_map_in_the_home_folder_does_not_stop_the_init(self):
+        # The UX review (2026-10-23): CodeGraph keeps its own files in
+        # ~/.codegraph/ and Trail's init writes ~/.trail/; found above the
+        # work tree, either was taken for a map someone else made, and no
+        # project under the home folder was ever built. The walk stops at
+        # the top and never counts the home folder (map_folders).
+        for folder in (".codegraph", ".trail"):
+            (self.tmp / folder).mkdir()
+        top = str(self.repo)
+        with mock.patch.object(longhaul, "HOME", self.tmp):
+            self.assertEqual([longhaul.index_map(self.start()["cwd"], program) for program in self.MAPS], [None, None])
+            self.assertEqual(self.begin(self.start()), [("codegraph", top), ("trail", top)])
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+            self.assertTrue((self.repo / self.MAPS[program]).is_dir(), program)
 
     def test_a_missing_program_is_skipped_and_the_other_still_runs(self):
         (self.bin / "trail").unlink()
@@ -3545,6 +3637,9 @@ class Index(unittest.TestCase):
             self.assertEqual(longhaul.inside(path, folder), expected, (path, folder))
         # And the callers ask these two, never a spelling of their own
         # (final review, Sprint 7, G4, G8): each helper counted per call.
+        # A map is looked for in one walk, map_folders(), and the home
+        # folder is ruled out by one test, home_or_above(), the work tree's
+        # (the UX review, 2026-10-23).
         top, work = str(self.repo), {"name": "Work", "repositories": [str(self.repo)]}
         src = str(self.repo / "src")
         for caller, helper, call in (
@@ -3552,6 +3647,13 @@ class Index(unittest.TestCase):
                 ("index_map", "above", lambda: longhaul.index_map(src, "codegraph")),
                 ("index_top", "above", lambda: longhaul.index_top(src)),
                 ("index_top", "inside", lambda: longhaul.index_top(src)),
+                ("map_at", "map_folders", lambda: longhaul.map_at(src, ".trail")),
+                ("index_map", "map_folders", lambda: longhaul.index_map(src, "trail")),
+                ("codegraph_index_at", "map_folders", lambda: longhaul.codegraph_index_at(src)),
+                ("map_folders", "work_tree", lambda: longhaul.map_folders(src)),
+                ("map_folders", "home_or_above", lambda: longhaul.map_folders(src)),
+                ("index_top", "work_tree", lambda: longhaul.index_top(src)),
+                ("index_top", "home_or_above", lambda: longhaul.index_top(src)),
                 ("index_program", "inside", lambda: longhaul.index_program("codegraph", top)),
                 ("account_allowed", "inside", lambda: longhaul.account_allowed(work, src))):
             seen = []

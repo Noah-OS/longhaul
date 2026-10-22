@@ -2173,18 +2173,53 @@ def inside(path: str, folder: str) -> bool:
     return path.startswith(folder.rstrip(os.sep) + os.sep)
 
 
-def map_at(cwd, folder: str) -> bool:
-    """Whether a code map's folder (`.codegraph/`, `.trail/`) is at the
-    absolute path cwd or in one of its parents, which is where the
-    indexers themselves look (the nearest map at or above the path; a
-    session opened in a subfolder of a mapped repository has one).
-    Anything but an absolute path is no map."""
-    return any(os.path.isdir(os.path.join(parent, folder)) for parent in above(cwd))
+def home_or_above(folder: str) -> bool:
+    """Whether a folder's real path is the home folder's or a parent of
+    it, `/` included: the one rule for the folders no project owns. A
+    work tree there is none (index_top(): a dotfiles repository at `~`
+    makes every folder a work tree), and a code map there is none
+    (map_folders(): CodeGraph keeps its own files in ~/.codegraph/ and
+    Trail's init writes ~/.trail/)."""
+    real, home = os.path.realpath(folder), os.path.realpath(str(HOME))
+    return real == home or inside(home, real)
+
+
+def work_tree(cwd):
+    """The nearest folder at or above the absolute cwd with a `.git`
+    entry (a folder, or a worktree's file), as git finds its work tree's
+    top level, or None (a bare repository has no `.git` entry). Walked
+    here, so no `git` runs at a session's start."""
+    return next((p for p in above(cwd) if os.path.exists(os.path.join(p, ".git"))), None)
+
+
+def map_folders(cwd) -> list:
+    """The folders a code map (`.codegraph/`, `.trail/`) is looked for in
+    for a session in the absolute cwd, nearest first, the one walk every
+    caller makes: the cwd and each parent up to its work tree's top
+    (work_tree()), the top included, so a session opened in a subfolder
+    of a mapped repository has the map; outside a work tree the cwd
+    alone. A folder that is the home folder or a parent of it
+    (home_or_above()) is never one, even in a work tree whose top is the
+    home folder: a map there is the indexer's own, not a project's (the
+    UX review, 2026-10-23: a walk up to `/` made every project under the
+    home folder look mapped). Nothing for anything but an absolute path."""
+    folders = list(above(cwd))
+    top = work_tree(cwd)
+    folders = folders[:folders.index(top) + 1] if top is not None else folders[:1]
+    return [folder for folder in folders if not home_or_above(folder)]
+
+
+def map_at(cwd, folder: str):
+    """The code map's folder (`.codegraph/`, `.trail/`) nearest the
+    absolute cwd in map_folders(), as a path, or None: a folder of that
+    name, not a file."""
+    return next((path for path in (os.path.join(parent, folder) for parent in map_folders(cwd))
+                 if os.path.isdir(path)), None)
 
 
 def codegraph_index_at(cwd) -> bool:
     """Whether a CodeGraph index covers this folder (Sprint 6, G3)."""
-    return map_at(cwd, ".codegraph")
+    return map_at(cwd, ".codegraph") is not None
 
 
 def search_stats(events, calls, results, cwd) -> dict:
@@ -2200,10 +2235,10 @@ def search_stats(events, calls, results, cwd) -> dict:
     `codegraph` CLI, whose result was not an error (a call that failed
     says nothing of an index in use and must not withhold the advice), or
     as a `.codegraph/` folder at or above the transcript's first line's
-    cwd; with no absolute cwd that is None (unknown), not 0, and its
-    record is left out. A Trail map is an index seen the same way (Sprint
-    7, G4): Trail-Code builds its code graph in `.trail/` in the
-    repository and answers through six tools, `trail_find_code`,
+    cwd (map_folders()); with no absolute cwd that is None (unknown), not
+    0, and its record is left out. A Trail map is an index seen the same
+    way (Sprint 7, G4): Trail-Code builds its code graph in `.trail/` in
+    the repository and answers through six tools, `trail_find_code`,
     `trail_file_api`, `trail_trace_calls`, `trail_find_all`,
     `trail_repo_map` and `trail_check_freshness` (under Claude Code,
     `mcp__trail__trail_*`), and a `trail` CLI; a call of one of those that
@@ -2241,7 +2276,7 @@ def search_stats(events, calls, results, cwd) -> dict:
             "codegraph_index": int(codegraph_index_at(cwd)) if located else None,
             "trail_calls": calls_of(lambda name, what: "mcp__trail__" in name or name.startswith("trail_")
                                     or (name == "Bash" and what == "trail")),
-            "trail_index": int(map_at(cwd, ".trail")) if located else None}
+            "trail_index": int(map_at(cwd, ".trail") is not None) if located else None}
 
 
 def search_advice(s: dict) -> str:
@@ -2857,21 +2892,14 @@ def index_mode() -> str:
 
 
 def index_top(cwd):
-    """The git work tree's top level: the nearest folder at or above the
-    absolute cwd with a `.git` entry (a folder, or a worktree's file),
-    walked as map_at() walks, so no `git` runs at a session's start.
-    None when there is none (a bare repository has no `.git` entry) and
-    when its real path is the home folder's or a parent of it, `/`
-    included: a dotfiles repository at `~` makes every folder a work
-    tree, and there Trail's "repo" settings file would be the user's
-    own."""
-    top = next((p for p in above(cwd) if os.path.exists(os.path.join(p, ".git"))), None)
-    if top is None:
-        return None
-    real, home = os.path.realpath(top), os.path.realpath(str(HOME))
-    if real == home or inside(home, real):
-        return None
-    return top
+    """The git work tree's top level the auto-init may build in: the
+    nearest folder at or above the absolute cwd with a `.git` entry
+    (work_tree()), or None. None when there is none and when it is the
+    home folder or a parent of it, `/` included (home_or_above()): a
+    dotfiles repository at `~` makes every folder a work tree, and there
+    Trail's "repo" settings file would be the user's own."""
+    top = work_tree(cwd)
+    return None if top is None or home_or_above(top) else top
 
 
 def index_program(name: str, top: str):
@@ -2950,10 +2978,9 @@ def index_log(program: str, top: str) -> Path:
 
 
 def index_map(cwd, program: str):
-    """The program's map folder nearest at or above the absolute cwd, as
-    map_at() looks for it, or None."""
-    folders = (os.path.join(parent, INDEX_MAPS[program]) for parent in above(cwd))
-    return next((folder for folder in folders if os.path.isdir(folder)), None)
+    """The program's map folder nearest the absolute cwd, as map_at()
+    finds it in map_folders(), or None."""
+    return map_at(cwd, INDEX_MAPS[program])
 
 
 def index_running(entry: dict, now: float) -> bool:
