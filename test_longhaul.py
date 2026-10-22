@@ -5714,7 +5714,10 @@ class Advisor(unittest.TestCase):
             with mock.patch.dict(os.environ, values, clear=True):
                 why = longhaul.advisor_off_reason(str(cwd or self.work), [])
             self.assertEqual(last, "enabled" if why is None else f"off: {why}", name)
-            self.assertEqual(self.note(self.ask(cwd=cwd), **env), self.noted() if why is None else "", name)
+            # One exception, the note's own: a version that cannot be read
+            # yet does not keep it off (a session's first prompt).
+            on = why is None or name == "no version"
+            self.assertEqual(self.note(self.ask(cwd=cwd), **env), self.noted() if on else "", name)
             said.append(last)
         self.assertEqual(len(set(said)), len(states), "each state its own line")
         # Whatever the helper says is status's last line, from the folder
@@ -5730,7 +5733,7 @@ class Advisor(unittest.TestCase):
         for why, env, out in (("a test's reason", {}, ""), (None, {"LONGHAUL_ADVISOR": None}, self.noted())):
             with mock.patch.object(longhaul, "advisor_off_reason", return_value=why) as off:
                 self.assertEqual(self.note(self.ask(), **env), out)
-            off.assert_called_once_with(str(self.work), longhaul.advisor_tail(str(self.transcript)))
+            off.assert_called_once_with(str(self.work), longhaul.advisor_tail(str(self.transcript)), unread_version_ok=True)
 
     def ask(self, text=None, cwd=None):
         """A UserPromptSubmit input as Claude Code sends one: the prompt's
@@ -5799,8 +5802,7 @@ class Advisor(unittest.TestCase):
                  ("a relative working folder", None, {}, self.ask(cwd="work")),
                  *((f"{name} set", None, {name: ""}, None) for name in self.FORCED),
                  ("another version on the path", None, {"CLAUDE_CODE_EXECPATH": str(other)}, None),
-                 ("another version in the transcript", lambda: self.stamped("2.1.308"), {}, None),
-                 ("no version", None, {"CLAUDE_CODE_EXECPATH": None}, None)]
+                 ("another version in the transcript", lambda: self.stamped("2.1.308"), {}, None)]
         for name, shut, env, data in cases:
             self.probe()
             self.enable()
@@ -5812,6 +5814,14 @@ class Advisor(unittest.TestCase):
         self.enable()
         with mock.patch.object(longhaul, "LONGHAUL_HOME", Path("home")):
             self.assertEqual(self.note(self.ask()), "", "a relative home")
+        # A session's first prompt: no version in the transcript yet and no
+        # CLAUDE_CODE_EXECPATH in the hook's environment (seen on 2.1.307,
+        # probe 9b). An unread version does not keep the note off; the gate
+        # reads it again before any consultation (its own tests).
+        self.executor("claude-sonnet-4-5")  # a transcript with no version line
+        self.assertEqual(self.note(self.ask(), CLAUDE_CODE_EXECPATH=None), self.noted(), "no version to read yet")
+        missing = {**self.ask(), "transcript_path": str(self.tmp / "not-written-yet.jsonl")}
+        self.assertEqual(self.note(missing, CLAUDE_CODE_EXECPATH=None), self.noted(), "no transcript yet")
         # The running version is the input's transcript's, as the gate reads it.
         self.stamped("2.1.307")
         self.assertEqual(self.note(self.ask(), CLAUDE_CODE_EXECPATH=str(self.tmp / "claude" / "versions" / "2.1.304")),

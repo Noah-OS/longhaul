@@ -5020,7 +5020,11 @@ def advisor_note(_opts) -> int:
     always. A missing note is safe, so it fails open: an error prints
     nothing and is logged by its kind alone. Of the input only cwd and
     transcript_path are looked at: the prompt's text is never used,
-    logged, kept or said."""
+    logged, kept or said. On a session's first prompt the transcript holds
+    no version yet and the hook's environment carries no
+    CLAUDE_CODE_EXECPATH (seen on 2.1.307, 2026-10-22), so a version that
+    cannot be read does not keep the note off: the note is advice, and
+    the gate reads the version again before any consultation."""
     try:
         raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
         if len(raw) > ADVISOR_STDIN_MAX:
@@ -5028,7 +5032,7 @@ def advisor_note(_opts) -> int:
             return 0
         data = json.loads(raw) if raw.strip() else {}
         data = data if isinstance(data, dict) else {}
-        if advisor_off_reason(data.get("cwd"), advisor_tail(data.get("transcript_path"))) is None:
+        if advisor_off_reason(data.get("cwd"), advisor_tail(data.get("transcript_path")), unread_version_ok=True) is None:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ADVISOR_NOTE}}))
     except Exception as e:
         log(f"advisor-note hook: no note added ({type(e).__name__})")
@@ -5068,7 +5072,7 @@ def advisor_status_lines() -> list:
     return lines + [f"off: {why}" if why else "enabled"]
 
 
-def advisor_off_reason(cwd, tail):
+def advisor_off_reason(cwd, tail, unread_version_ok=False):
     """Why the experiment is off for a session in `cwd` whose transcript
     ends in `tail` (advisor_tail()), the first gate that is shut, or None
     when it is fully on: the switch, the home (F13), the enabled key, a
@@ -5076,7 +5080,9 @@ def advisor_off_reason(cwd, tail):
     version (F7), a forced subagent model (F14) and an advisor model whose
     rewrite the probe saw (F5). `advisor status` ends with it and
     advisor-note adds the note only when it is None, so the two cannot
-    drift apart."""
+    drift apart. With `unread_version_ok` (the note's), a version that
+    cannot be read yet is not a shut gate, while one read as another
+    version still is."""
     if not advisor_switch():
         return "LONGHAUL_ADVISOR is not experiment"
     untrusted = advisor_untrusted_home(cwd)
@@ -5091,9 +5097,9 @@ def advisor_off_reason(cwd, tail):
     if enabled != recorded:
         return f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
     running, _ = advisor_running_version(tail, recorded)
-    if running is None:
+    if running is None and not unread_version_ok:
         return "the running Claude Code version is unknown"
-    if running != recorded:
+    if running is not None and running != recorded:
         return f"the probe passed on {recorded}, not on {running}, the version running"
     if advisor_forced():
         return f"Claude Code is set to choose subagents' model itself ({', '.join(advisor_forced())})"
