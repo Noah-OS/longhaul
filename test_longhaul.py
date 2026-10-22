@@ -7344,6 +7344,146 @@ class Reminder(unittest.TestCase):
             self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw[:20])
         self.assertIsNone(self.record(), "nothing said yet")
 
+    # The guard's PreToolUse hook on Read and Bash says it too (the owner's
+    # second decision of 2026-10-23): a run with no prompts hears it.
+
+    def tool(self, tool="Read", agent=None, **tool_input):
+        data = {"session_id": "s1", "transcript_path": str(self.transcript), "cwd": str(self.tmp),
+                "permission_mode": "default", "hook_event_name": "PreToolUse", "tool_name": tool,
+                "tool_input": tool_input, "tool_use_id": "t1"}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "Explore"
+        return data
+
+    def read(self, path, **env):
+        return self.guard(self.tool(file_path=str(path)), **env)
+
+    def ls(self, **env):
+        return self.guard(self.tool("Bash", command="ls"), **env)
+
+    def guard(self, data, **env):
+        """The guard's hook answer for `data`, in this process, parsed (None for nothing)."""
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["guard"])
+        self.assertEqual(code, 0)
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def told(self, k, context=None):
+        """The guard's hook answer at about k thousand tokens, the model's line after the guard's own `context`."""
+        return {"systemMessage": self.USER.format(k), "hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "additionalContext": "\n".join(filter(None, [context, self.MODEL.format(k)]))}}
+
+    def files(self):
+        self.small, self.big = self.tmp / "small.py", self.tmp / "big.py"
+        self.small.write_text("y" * 300)
+        self.big.write_text("x" * 30_000)
+
+    def test_the_guards_hook_says_it_during_unattended_work(self):
+        self.files()
+        self.grow(150_000)
+        self.assertIsNone(self.read(self.small), "under the threshold, a first read")
+        self.grow(205_000)
+        self.assertEqual(self.ls(), self.told(205), "a call the guard has nothing to say of")
+        self.assertIsNone(self.ls(), "once")
+        self.assertEqual(self.record()["reminder"], {"at": 200_000})
+        # The hook as the plugin registers it, in its own process.
+        self.grow(401_000)
+        out = self.run_hook(registered_hook("PreToolUse", "guard"), self.tool("Bash", command="ls"))
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertEqual(json.loads(out.stdout), self.told(401))
+        # Neither a session start through the same command nor a subagent's call.
+        self.grow(605_000)
+        start = {"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup",
+                 "transcript_path": str(self.transcript), "cwd": str(self.tmp)}
+        self.assertIsNone(self.guard(start))
+        self.assertIsNone(self.guard(self.tool("Bash", agent="a1", command="ls")), "a subagent's context is not the conversation's")
+        self.assertEqual(self.ls(), self.told(605))
+
+    def test_prompts_and_tool_calls_share_one_record_of_what_was_said(self):
+        self.grow(205_000)
+        self.assertEqual(self.ls(), self.told(205))
+        self.assertEqual(self.remind(), "", "a tool call said 200k")
+        self.grow(401_000)
+        self.assertEqual(self.remind(), self.reminded(401))
+        self.assertIsNone(self.ls(), "a prompt said 400k")
+        self.assertEqual(self.record()["reminder"], {"at": 400_000})
+        # Parallel tool calls run their hooks at once: the lock lets one say it.
+        self.grow(605_000)
+        cmd = registered_hook("PreToolUse", "guard")
+        procs = [subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=self.env, cwd=self.tmp, text=True) for _ in range(6)]
+        outs = [p.communicate(json.dumps(self.tool("Bash", command="ls")), timeout=30) for p in procs]
+        said = [json.loads(out) for out, _ in outs if out]
+        self.assertEqual(said, [self.told(605)], "one of the six")
+        self.assertEqual([err for _, err in outs], [""] * 6)
+
+    def test_the_guards_own_warnings_still_come_through_with_it(self):
+        self.files()
+        self.grow(150_000)
+        self.read(self.small)
+        self.grow(205_000)
+        answer = self.read(self.small)  # read again unchanged: the guard's repeat
+        warning = answer["hookSpecificOutput"]["additionalContext"].split("\n")[0]
+        self.assertTrue(warning.startswith("longhaul guard (advice; the call went ahead): "), warning)
+        self.assertIn("already in the context", warning)
+        self.assertEqual(answer, self.told(205, warning), "the guard's warning, a newline, the model's line")
+        alone = self.read(self.small)
+        self.assertEqual(alone, {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": warning}},
+                         "with nothing crossed, the guard's answer as it was")
+        # In block mode the warning is the denial's reason: the line joins it there.
+        self.grow(401_000)
+        answer = self.read(self.big, LONGHAUL_GUARD="block")
+        out = answer["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "deny"))
+        reason, line = out["permissionDecisionReason"].split("\n")
+        self.assertTrue(reason.startswith("longhaul guard blocked this call. "), reason)
+        self.assertEqual(line, self.MODEL.format(401))
+        self.assertNotIn("additionalContext", out)
+        self.assertEqual(answer["systemMessage"], self.USER.format(401))
+        self.assertEqual(self.record()["fired"]["big"], 1, "the guard counted its own")
+
+    def test_off_silences_both_paths(self):
+        self.files()
+        off = {"LONGHAUL_CHECKPOINT_AT": "off"}
+        self.grow(150_000)
+        self.read(self.small, **off)
+        self.grow(450_000)
+        answer = self.read(self.small, **off)
+        self.assertEqual(set(answer), {"hookSpecificOutput"}, "the guard's warning alone")
+        self.assertNotIn("\n", answer["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.ls(**off))
+        self.assertEqual(self.remind(**off), "")
+        self.assertNotIn("reminder", self.record())
+        self.assertEqual(self.ls(), self.told(450), "on again, the next call says it")
+
+    def test_the_guard_switched_off_still_reminds(self):
+        self.files()
+        off = {"LONGHAUL_GUARD": "off"}
+        self.grow(150_000)
+        for _ in range(2):
+            self.assertIsNone(self.read(self.small, **off), "no rule runs")
+        self.assertIsNone(self.record(), "the guard keeps nothing")
+        self.grow(205_000)
+        self.assertEqual(self.read(self.big, **off), self.told(205), "no word of the big read: the reminder alone")
+        self.assertEqual(self.record(), {"reminder": {"at": 200_000}})
+        self.assertIsNone(longhaul.guard_counts("s1"), "inspect still says the guard kept no record")
+        self.assertIsNone(self.read(self.big, **off))
+
+    def test_a_reminder_that_fails_leaves_the_guards_answer_as_it_was(self):
+        self.files()
+        self.grow(150_000)
+        self.read(self.small)
+        self.grow(205_000)
+        with mock.patch.object(longhaul, "reminder_size", side_effect=RuntimeError(self.S)):
+            answer = self.read(self.small)
+        self.assertEqual(set(answer), {"hookSpecificOutput"})
+        self.assertIn("already in the context", answer["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("reminder: none with the guard (RuntimeError)", self.log())
+        self.assertNotIn(self.S, self.log())
+        self.assertEqual(self.ls(), self.told(205), "said at the next call")
+
     def test_the_guards_own_writes_keep_what_was_said(self):
         # The record is the guard's too: its PreToolUse hook rewrites it at
         # each whole read, and a compaction empties its reads. Neither may

@@ -120,7 +120,9 @@ Usage:
   longhaul reminder             the plugin's UserPromptSubmit hook: once the context
                           passes LONGHAUL_CHECKPOINT_AT tokens (200000 unless set;
                           off turns it off), and again at each multiple, says to
-                          save a checkpoint and start fresh
+                          save a checkpoint and start fresh; the guard's PreToolUse
+                          hook says it too, whatever LONGHAUL_GUARD is, and each
+                          multiple is said once
   longhaul clear                forget the recorded limits
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
@@ -3598,8 +3600,10 @@ def run_hook(check, name: str) -> int:
 
 
 def guard(_opts) -> int:
-    """The hook command: stdin in, JSON or nothing out, exit 0 always."""
-    return run_hook(lambda data: guard_check(data, guard_mode(), index=index_mode()), "guard")
+    """The hook command: stdin in, JSON or nothing out, exit 0 always. On
+    PreToolUse the reminder joins the answer when it is due, in any mode:
+    LONGHAUL_GUARD=off stops the rules, not the reminder."""
+    return run_hook(lambda data: reminder_join(data, guard_check(data, guard_mode(), index=index_mode())), "guard")
 
 
 # ----------------------------------------------------------- checkpoint
@@ -5327,7 +5331,11 @@ def advisor(opts) -> int:
 # it, from the transcript's tail. The session's guard record keeps the
 # highest multiple said, under the guard's lock, so each is said once;
 # after a compaction the context drops, and only a multiple above that
-# one is said. Of the input only session_id, transcript_path and agent_id (a subagent's call is
+# one is said. The guard's PreToolUse hook on Read and Bash says it too
+# (reminder_join(), the owner's second decision of 2026-10-23), so an
+# unattended run with no prompts hears it as well; the one record serves
+# both, so a multiple is said once wherever it is crossed first. Of the
+# input only session_id, transcript_path and agent_id (a subagent's call is
 # never reminded) are used: the prompt's text is never used, logged,
 # kept or said. Like the other hooks it fails open:
 # an error prints nothing, and the hook never blocks a prompt.
@@ -5418,6 +5426,32 @@ def reminder_due(data: dict):
     if due:
         log(f"reminder: {record.stem} reminded at {crossed:,} tokens (the context is {size:,})")
     return size if due else None
+
+
+def reminder_join(data, answer):
+    """The guard's hook answer (`answer`, or None) for a PreToolUse input,
+    with the reminder added when one is due (reminder_due()): the model's
+    line after the guard's own words with a newline, in its
+    additionalContext or, for a call it denies, in the denial's reason,
+    which the model reads either way; and the user's line as the
+    systemMessage. Anything else goes as it came. What the reminder
+    raises is logged by its kind, and the guard's answer goes unchanged."""
+    if not isinstance(data, dict) or data.get("hook_event_name") != "PreToolUse":
+        return answer
+    try:
+        size = reminder_due(data)
+    except Exception as e:
+        log(f"reminder: none with the guard ({type(e).__name__})")
+        return answer
+    if size is None:
+        return answer
+    answer = dict(answer or {})
+    out = {"hookEventName": "PreToolUse", **dict_at(answer, "hookSpecificOutput")}
+    key = "permissionDecisionReason" if out.get("permissionDecision") == "deny" else "additionalContext"
+    out[key] = "\n".join(filter(None, [out.get(key), REMINDER_MODEL.format(k=size // 1000)]))
+    answer["hookSpecificOutput"] = out
+    answer["systemMessage"] = "\n".join(filter(None, [answer.get("systemMessage"), REMINDER_USER.format(k=size // 1000)]))
+    return answer
 
 
 def reminder(_opts) -> int:
