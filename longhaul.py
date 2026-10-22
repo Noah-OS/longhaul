@@ -2292,15 +2292,21 @@ def inspect_transcript(path: Path) -> dict:
                 repeats.append((scope, name, calls[tid][1], tid))
             seen[ctx][same] = args.get("file_path") if name == "Read" else None
 
+    # The tokens are summed by model too (Sprint 8), main and subagents
+    # apart; a response that names no model is "?", so that each kind's
+    # rows add up to its total.
     requests = {"main": 0, "subagents": 0}
     tokens = {s: {k: 0 for k, _ in TOKEN_KINDS} for s in requests}
+    by_model: dict = {}  # (scope, model) -> {kind: tokens}
     models, context = collections.Counter(), []
     for scope, model, usage in responses.values():
         requests[scope] += 1
         if isinstance(model, str) and model != "<synthetic>":
             models[model] += 1
+        row = by_model.setdefault((scope, model if isinstance(model, str) else "?"), {k: 0 for k, _ in TOKEN_KINDS})
         for k, field in TOKEN_KINDS:
             tokens[scope][k] += as_int(usage.get(field))
+            row[k] += as_int(usage.get(field))
         size = sum(as_int(usage.get(field)) for k, field in TOKEN_KINDS if k != "output")
         if scope == "main" and size:
             context.append(size)
@@ -2332,6 +2338,9 @@ def inspect_transcript(path: Path) -> dict:
     return {
         "session": path.stem, "path": str(path), "subagents": len(files) - 1, "lines": lines,
         "requests": requests, "models": dict(models.most_common()), "tokens": tokens,
+        # main first; in each scope, the model with the most tokens first
+        "model_tokens": [{"model": m, "scope": s, **t} for (s, m), t in
+                         sorted(by_model.items(), key=lambda kv: (kv[0][0] != "main", -sum(kv[1].values()), kv[0][1]))],
         "context": {"first": context[0], "peak": max(context), "last": context[-1]} if context else None,
         "compactions": compactions, "cache": cache,
         "outputs": [{"tool": calls.get(tid, ("?", ""))[0], "what": calls.get(tid, ("?", ""))[1],
@@ -2405,6 +2414,13 @@ def inspect_lines(r: dict) -> list[str]:
     total = {k: r["tokens"]["main"][k] + r["tokens"]["subagents"][k] for k in r["tokens"]["main"]}
     for name, t in (("main", r["tokens"]["main"]), ("subagents", r["tokens"]["subagents"]), ("total", total)):
         out.append(f"  {name:<10}{t['input']:>12,}{t['cache_write']:>14,}{t['cache_read']:>14,}{t['output']:>12,}")
+
+    out.append("Tokens by model [transcript, measured: the API's own counts]")
+    width = max((len(m["model"]) for m in r["model_tokens"]), default=0)
+    out.extend([f"  {'':<10}{'':<{width}}{'input':>12}{'cache write':>14}{'cache read':>14}{'output':>12}"]
+               + [f"  {m['scope']:<10}{m['model']:<{width}}{m['input']:>12,}{m['cache_write']:>14,}"
+                  f"{m['cache_read']:>14,}{m['output']:>12,}" for m in r["model_tokens"]]
+               if r["model_tokens"] else ["  none"])
 
     out.append("Context, main conversation [transcript, measured: input, cache write and cache read per request]")
     c = r["context"]
@@ -2486,13 +2502,14 @@ def inspect_lines(r: dict) -> list[str]:
 def inspect_records(r: dict) -> list[dict]:
     """The same numbers as flat records, for comparing runs (handover §8):
     one number each, with its session, what it is of (`item`: a model,
-    tool, file or error kind, else None), where it came from and how sure
-    it is. No totals: a total next to main and subagents would be counted
-    again by anyone adding a metric up."""
+    tool, file or error kind, else None; `kind`: the token kind of a
+    count by model, else None, since Sprint 8), where it came from and
+    how sure it is. No totals: a total next to main and subagents would
+    be counted again by anyone adding a metric up."""
     out = []
 
-    def add(metric, value, unit, scope, source, confidence, item=None):
-        out.append({"session": r["session"], "metric": metric, "scope": scope, "item": item,
+    def add(metric, value, unit, scope, source, confidence, item=None, kind=None):
+        out.append({"session": r["session"], "metric": metric, "scope": scope, "item": item, "kind": kind,
                     "value": value, "unit": unit, "source": source, "confidence": confidence})
 
     add("subagent_transcripts", r["subagents"], "files", "subagents", "transcript", "counted")
@@ -2500,6 +2517,9 @@ def inspect_records(r: dict) -> list[dict]:
         add("requests", n, "requests", scope, "transcript", "counted")
     for model, n in r["models"].items():
         add("model_requests", n, "requests", "all", "transcript", "counted", model)
+    for m in r["model_tokens"]:
+        for kind, _ in TOKEN_KINDS:
+            add("model_tokens", m[kind], "tokens", m["scope"], "transcript", "measured", m["model"], kind)
     for scope, kinds in r["tokens"].items():
         for kind, n in kinds.items():
             add(f"{kind}_tokens", n, "tokens", scope, "transcript", "measured")

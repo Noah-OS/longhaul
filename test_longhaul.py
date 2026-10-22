@@ -1238,6 +1238,54 @@ class Inspect(unittest.TestCase):
         self.assertEqual(r["models"], {"claude-opus-5-5": 1, "claude-haiku-5-5": 1})
         self.assertEqual(r["api_errors"], {"rate_limit": 1})
 
+    def test_tokens_are_summed_per_model_for_main_and_subagents(self):
+        # Sprint 8, Region A: each model's input, cache write, cache read and
+        # output, main and subagents apart: one model in both is two rows.
+        self.write(self.reply(inp=3, write=100, read=5000, out=40) + self.reply(inp=1, read=6000, out=9)
+                   + self.reply(inp=7, write=50, out=2, model="claude-haiku-5-5"))
+        self.agent(self.reply(inp=2, write=7105, out=308, model="claude-haiku-5-5") + self.reply(inp=1, read=200, out=5))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["model_tokens"], [
+            {"model": "claude-opus-5-5", "scope": "main", "input": 4, "cache_write": 100, "cache_read": 11000,
+             "output": 49},
+            {"model": "claude-haiku-5-5", "scope": "main", "input": 7, "cache_write": 50, "cache_read": 0, "output": 2},
+            {"model": "claude-haiku-5-5", "scope": "subagents", "input": 2, "cache_write": 7105, "cache_read": 0,
+             "output": 308},
+            {"model": "claude-opus-5-5", "scope": "subagents", "input": 1, "cache_write": 0, "cache_read": 200,
+             "output": 5}])
+        out = longhaul.inspect_lines(r)
+        head = out.index("Tokens by model [transcript, measured: the API's own counts]")
+        self.assertGreater(head, out.index("Tokens [transcript, measured: the API's own counts]"))
+        self.assertEqual(out[head + 1:head + 6], [
+            "                                   input   cache write    cache read      output",
+            "  main      claude-opus-5-5            4           100        11,000          49",
+            "  main      claude-haiku-5-5           7            50             0           2",
+            "  subagents claude-haiku-5-5           2         7,105             0         308",
+            "  subagents claude-opus-5-5            1             0           200           5"])
+        self.assertTrue(out[head + 6].startswith("Context"), out[head + 6])
+
+    def test_tokens_by_model_add_up_to_the_tokens_and_a_response_with_no_model_is_kept_as_unknown(self):
+        unnamed = self.reply(inp=5, out=3)
+        for line in unnamed:
+            del line["message"]["model"]
+        self.write(self.reply(inp=3, write=100, read=5000, out=40) + unnamed)
+        self.agent(self.reply(out=308))
+        r = longhaul.inspect_transcript(self.path)
+        for scope, kinds in r["tokens"].items():
+            for kind, n in kinds.items():
+                self.assertEqual(sum(m[kind] for m in r["model_tokens"] if m["scope"] == scope), n, (scope, kind))
+        self.assertIn({"model": "?", "scope": "main", "input": 5, "cache_write": 0, "cache_read": 0, "output": 3},
+                      r["model_tokens"])
+        self.assertEqual(r["models"], {"claude-opus-5-5": 2}, "the request count still names models only")
+
+    def test_no_response_no_tokens_by_model(self):
+        self.write([{"type": "user", "message": {"role": "user", "content": "hi"}}])
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["model_tokens"], [])
+        out = longhaul.inspect_lines(r)
+        head = out.index("Tokens by model [transcript, measured: the API's own counts]")
+        self.assertEqual(out[head + 1], "  none")
+
     def test_context_shows_its_first_peak_and_last_size_and_each_compaction(self):
         self.write(self.reply(inp=2, write=20000) + self.reply(inp=1, write=5000, read=900000)
                    + [self.compaction()] + self.reply(inp=5, write=18000))
@@ -1733,10 +1781,20 @@ class Inspect(unittest.TestCase):
         allowed = {("transcript", "measured"), ("transcript", "counted"), ("transcript", "inferred"),
                    ("statusline", "measured"), ("estimate", "estimated")}
         for r in records:
-            self.assertEqual(set(r), {"session", "metric", "scope", "item", "value", "unit", "source", "confidence"}, r)
+            # Sprint 8 gained `kind`, the token kind of a record by model, None elsewhere: --json only gains keys.
+            self.assertEqual(set(r), {"session", "metric", "scope", "item", "kind", "value", "unit", "source",
+                                      "confidence"}, r)
             self.assertIn((r["source"], r["confidence"]), allowed, r)
             self.assertIsInstance(r["value"], (int, float), r)
             self.assertEqual(r["session"], "s1")
+            if r["metric"] != "model_tokens":
+                self.assertIsNone(r["kind"], r)
+        by_model = {(r["scope"], r["item"], r["kind"]): (r["value"], r["unit"], r["source"], r["confidence"])
+                    for r in records if r["metric"] == "model_tokens"}
+        self.assertEqual(len(by_model), 8, "four kinds for each model in each scope")
+        self.assertEqual(by_model[("main", "claude-opus-5-5", "input")], (3 + 2 * 4, "tokens", "transcript", "measured"))
+        self.assertEqual(by_model[("main", "claude-opus-5-5", "cache_read")], (5000, "tokens", "transcript", "measured"))
+        self.assertEqual(by_model[("subagents", "claude-opus-5-5", "output")], (308, "tokens", "transcript", "measured"))
         got = {(r["metric"], r["scope"], r["item"]): (r["value"], r["source"], r["confidence"]) for r in records}
         self.assertEqual(got[("input_tokens", "main", None)], (3 + 2 * 4, "transcript", "measured"))
         self.assertEqual(got[("output_tokens", "subagents", None)], (308, "transcript", "measured"))
