@@ -7078,6 +7078,255 @@ class CheckpointSkill(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/checkpoint/SKILL.md"], cwd=HERE).returncode, 1)
 
 
+class Reminder(unittest.TestCase):
+    """`longhaul reminder` (the owner's decisions of 2026-10-23): once the
+    conversation's context passes LONGHAUL_CHECKPOINT_AT tokens (200,000),
+    and again at each multiple of it, a line for the user and one for the
+    model say to save a checkpoint, so that the work can go on in a fresh
+    context. The history baseline (98 sessions) found re-reads 1.3% of
+    what was read, and long contexts and compactions the cost. The
+    session's guard record keeps the highest multiple said, so each is
+    said once."""
+
+    # A prompt's text: it is in the hook's input and nowhere else.
+    S = "SENTINEL-IBEX-5190"
+    USER = ("Longhaul: this conversation's context is about {}k tokens, and every request carries all of it again. "
+            "To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint comes back.")
+    MODEL = ("Longhaul: the context is about {}k tokens. At your next natural stopping point (not in the middle of an "
+             "edit or a test run), save a checkpoint with /longhaul:checkpoint, then continue the work. After a "
+             "compaction or a /clear it comes back.")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.transcript = self.tmp / "s1.jsonl"
+        self.transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}) + "\n")
+        self.n = 0
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def response(self, size, **fields):
+        """A main-conversation response whose request carried `size` tokens
+        of context: its input, cache write and cache read (the output is not
+        context until the next request)."""
+        self.n += 1
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": size - 2_006,
+                 "output_tokens": 900}
+        return {"type": "assistant", "isSidechain": False, "uuid": f"u{self.n}", **fields,
+                "message": {"id": f"msg_{self.n}", "model": "claude-opus-4-5", "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}], "usage": usage}}
+
+    def grow(self, *lines, path=None):
+        """The transcript's next lines: a number is a response with that much context."""
+        with (path or self.transcript).open("a") as f:
+            for line in lines:
+                f.write((line if isinstance(line, str) else
+                         json.dumps(self.response(line) if isinstance(line, int) else line)) + "\n")
+
+    def compaction(self, before, after):
+        return {"type": "system", "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "auto", "preTokens": before, "postTokens": after}}
+
+    def ask(self, text=None, **fields):
+        """A UserPromptSubmit input as Claude Code sends it: the prompt's text
+        (holding S) beside the session's fields."""
+        return {"session_id": "s1", "transcript_path": str(self.transcript), "cwd": str(self.tmp),
+                "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+                "prompt": f"Carry on with the parser ({self.S})" if text is None else text, **fields}
+
+    def remind(self, data=None, **env):
+        """`longhaul reminder`'s output for `data` (an input, or its raw text;
+        default: ask()), in this process, in a terminal's environment with
+        `env` over it."""
+        data = self.ask() if data is None else data
+        raw = data if isinstance(data, str) else json.dumps(data)
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["reminder"])
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def reminded(self, k):
+        """What the prompt's hook prints at about k thousand tokens, exactly."""
+        return json.dumps({"systemMessage": self.USER.format(k), "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "additionalContext": self.MODEL.format(k)}}) + "\n"
+
+    def record(self, session="s1"):
+        path = self.home / "guard" / f"{session}.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_nothing_is_said_below_the_threshold(self):
+        self.assertEqual(self.remind(), "", "a transcript with no response yet")
+        for size in (1_000, 150_000, 199_999):
+            self.grow(size)
+            self.assertEqual(self.remind(), "", size)
+        self.assertIsNone(self.record(), "nothing is written below it")
+        self.assertFalse((self.home / "guard").exists())
+
+    def test_each_multiple_is_said_once_and_after_a_compaction_only_a_new_one_is(self):
+        self.grow(150_000, 205_400)
+        self.assertEqual(self.remind(), self.reminded(205), "in thousands, rounded down")
+        self.assertEqual(self.record(), {"reminder": {"at": 200_000}}, "the highest multiple said, in tokens")
+        self.grow(210_000)
+        self.assertEqual(self.remind(), "", "200k was said")
+        self.assertEqual(self.remind(), "", "and the same size again")
+        self.grow(401_999)
+        self.assertEqual(self.remind(), self.reminded(401), "the second multiple")
+        # A compaction: the context drops; 200k and 400k were said already.
+        self.grow(self.compaction(402_000, 30_000), 30_000)
+        self.assertEqual(self.remind(), "")
+        self.grow(250_000)
+        self.assertEqual(self.remind(), "", "200k again, after the compaction")
+        self.grow(420_000)
+        self.assertEqual(self.remind(), "", "400k again")
+        self.grow(600_000)
+        self.assertEqual(self.remind(), self.reminded(600), "a multiple above the highest said")
+        self.grow(1_250_000)
+        self.assertEqual(self.remind(), self.reminded(1250), "past several multiples at once: one line")
+        self.assertEqual(self.record(), {"reminder": {"at": 1_200_000}})
+        self.assertEqual(self.remind(self.ask(session_id="s2")), self.reminded(1250), "each session has its own record")
+        self.assertIn("reminder: s1 reminded at 200,000 tokens (the context is 205,400)", self.log())
+
+    def test_the_threshold_is_longhaul_checkpoint_at_and_off_turns_it_off(self):
+        self.grow(450_000)
+        for off in ("off", "OFF", "Off"):
+            self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=off), "", off)
+        self.assertIsNone(self.record(), "off writes nothing")
+        self.assertEqual(self.log(), "")
+        self.grow(150_000)  # a compaction's drop, as far as the hook can tell
+        own = {"LONGHAUL_CHECKPOINT_AT": "100000"}
+        self.assertEqual(self.remind(**own), self.reminded(150))
+        self.grow(199_000)
+        self.assertEqual(self.remind(**own), "")
+        self.grow(205_000)
+        self.assertEqual(self.remind(**own), self.reminded(205))
+        self.assertEqual(self.record(), {"reminder": {"at": 200_000}})
+        self.assertEqual(self.remind(), "", "at the default, 200k was said too")
+        self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=""), "", "empty is unset")
+        self.assertEqual(self.remind(self.ask(session_id="s2"), LONGHAUL_CHECKPOINT_AT=" 50000 "), self.reminded(205))
+        self.assertEqual(self.record("s2"), {"reminder": {"at": 200_000}}, "four times 50,000")
+
+    def test_any_other_threshold_counts_as_the_default_and_is_logged_once_by_kind(self):
+        self.grow(150_000)
+        cases = [("abc", "not a whole number"), ("200k", "not a whole number"), ("2e5", "not a whole number"),
+                 ("1.5", "not a whole number"), ("+5", "not a whole number"), (self.S, "not a whole number"),
+                 ("0", "not above zero"), ("-5", "not above zero")]
+        for value, _ in cases:
+            self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=value), "", (value, "150k is under the default"))
+        self.grow(205_000)
+        for n, (value, _) in enumerate(cases):
+            data = self.ask(session_id=f"j{n}")
+            self.assertEqual(self.remind(data, LONGHAUL_CHECKPOINT_AT=value), self.reminded(205), value)
+            self.assertEqual(self.remind(data, LONGHAUL_CHECKPOINT_AT=value), "", (value, "once"))
+        self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT="abc"), self.reminded(205), "s1, whose kinds were logged")
+        # Once per session and kind, by the kind alone: s1 met both, each j
+        # session one. The lines are whole, so no value is in them.
+        line = "reminder: LONGHAUL_CHECKPOINT_AT is {}, so the default, 200,000 tokens, is used ({})"
+        said = [entry.split(" ", 2)[2] for entry in self.log().splitlines() if "LONGHAUL_CHECKPOINT_AT" in entry]
+        self.assertEqual(said, [line.format("not a whole number", "s1"), line.format("not above zero", "s1")]
+                         + [line.format(kind, f"j{n}") for n, (_, kind) in enumerate(cases)])
+        self.assertNotIn(self.S, self.log())
+
+    def test_only_the_main_conversations_last_response_counts(self):
+        synthetic = self.response(990_000)
+        synthetic["message"]["model"] = "<synthetic>"
+        empty = self.response(1)
+        empty["message"]["usage"] = {"input_tokens": 0, "output_tokens": 0}
+        self.grow(150_000, self.response(900_000, isSidechain=True), self.response(950_000, isApiErrorMessage=True),
+                  synthetic, empty, {"type": "assistant", "message": {"model": "claude-opus-4-5", "content": []}},
+                  {"type": "user", "message": {"role": "user", "content": "assistant usage 900000"}}, "not json {",
+                  "[1]", {"type": "assistant", "message": None}, {"type": "assistant", "message": {"usage": [1]}})
+        self.assertEqual(self.remind(), "", "a subagent's, an error's, the engine's own, and lines with no usage")
+        # A subagent's own transcript, beside the session's, is never read.
+        sub = self.tmp / "s1" / "subagents" / "agent-a1.jsonl"
+        sub.parent.mkdir(parents=True)
+        self.grow(self.response(900_000, isSidechain=True), path=sub)
+        self.assertEqual(self.remind(self.ask(transcript_path=str(sub))), "", "every line of it is a sidechain")
+        self.assertEqual(self.remind(), "")
+        self.grow(205_000)
+        self.assertEqual(self.remind(self.ask(agent_id="a1", agent_type="Explore")), "", "a subagent's input")
+        self.assertEqual(self.remind(), self.reminded(205))
+
+    def test_a_missing_or_unreadable_transcript_or_input_prints_nothing(self):
+        for path in (str(self.tmp / "missing.jsonl"), str(self.tmp), "", None, 7, ["x"]):
+            self.assertEqual(self.remind(self.ask(transcript_path=path)), "", path)
+        self.grow(205_000)
+        for data in ("", "not json {", "[1]", "null", "7", json.dumps({**self.ask(), "session_id": "../s1"}),
+                     json.dumps({**self.ask(), "session_id": None}), json.dumps({k: v for k, v in self.ask().items()
+                                                                                if k != "session_id"})):
+            self.assertEqual(self.remind(data), "", data)
+        self.transcript.chmod(0)
+        try:
+            if not os.access(self.transcript, os.R_OK):  # root reads it all the same
+                self.assertEqual(self.remind(), "", "a transcript that cannot be read")
+                self.assertIsNone(self.record())
+        finally:
+            self.transcript.chmod(0o600)
+        self.assertIsNone(self.record())
+        self.assertEqual(self.remind(), self.reminded(205), "readable again")
+
+    def test_the_last_response_is_read_from_the_tail_alone(self):
+        # A transcript far past the tail the hook reads: what came before it is
+        # never opened, and a cut first line is no line.
+        self.grow(205_000)
+        self.grow({"type": "user", "message": {"role": "user", "content": "x" * (2 * longhaul.ADVISOR_TAIL)}})
+        self.assertEqual(self.remind(), "", "no response in the tail")
+        self.assertIsNone(self.record())
+        self.grow(150_000, 205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+
+    def test_the_guards_own_writes_keep_what_was_said(self):
+        # The record is the guard's too: its PreToolUse hook rewrites it at
+        # each whole read, and a compaction empties its reads. Neither may
+        # take the multiple said with it, or a session would be told again.
+        small = self.tmp / "small.py"
+        small.write_text("y" * 300)
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+        self.assertIsNone(longhaul.guard_counts("s1"), "the reminder's part is no record of the guard's")
+        read = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Read", "cwd": str(self.tmp),
+                "tool_input": {"file_path": str(small)}, "tool_use_id": "t1", "transcript_path": str(self.transcript)}
+        longhaul.guard_check(read, "warn")
+        self.assertIn(str(small), self.record()["reads"])
+        self.assertEqual(self.record()["reminder"], {"at": 200_000}, "kept through the guard's write")
+        longhaul.guard_check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}, "warn")
+        self.assertEqual((self.record()["reads"], self.record()["reminder"]), ({}, {"at": 200_000}),
+                         "kept through a compaction")
+        self.grow(self.compaction(206_000, 30_000), 250_000)
+        self.assertEqual(self.remind(), "")
+        self.assertEqual(longhaul.guard_counts("s1")["repeat"], 0, "the guard's record, now it has one")
+
+    def test_the_prompts_text_is_written_nowhere(self):
+        self.grow(205_000)
+        outs = [self.remind(), self.remind()]
+        self.assertEqual(outs, [self.reminded(205), ""])
+        # An error prints nothing and is logged by its kind alone, never its
+        # text; so is an input past the cap.
+        with mock.patch.object(longhaul, "reminder_size", side_effect=RuntimeError(self.S)):
+            self.assertEqual(self.remind(self.ask(session_id="s2")), "")
+        self.assertEqual(self.remind(json.dumps(self.ask(session_id="s3"))[:-1]), "", "not JSON")
+        self.assertEqual(self.remind(self.ask(text=self.S * 60_000, session_id="s4")), "", "past the cap")
+        for kind in ("RuntimeError", "JSONDecodeError", "over 1,000,000 characters"):
+            self.assertIn(f"reminder hook: no reminder ({kind})", self.log())
+        for out in outs:
+            self.assertNotIn(self.S, out)
+        for path in self.home.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.S.encode(), path.read_bytes(), path)
+
+
 OLD_NAME = "c" + "w"  # spelled in pieces, so this file passes its own check
 OLD_FOLDER = "claude-" + "relay"  # the owner's former private folder, in pieces for the same reason
 

@@ -117,6 +117,10 @@ Usage:
                           hook, traces how the consultation went; advisor-note,
                           its UserPromptSubmit hook, adds a line naming the
                           decision points while the experiment is fully on
+  longhaul reminder             the plugin's UserPromptSubmit hook: once the context
+                          passes LONGHAUL_CHECKPOINT_AT tokens (200000 unless set;
+                          off turns it off), and again at each multiple, says to
+                          save a checkpoint and start fresh
   longhaul clear                forget the recorded limits
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
@@ -3323,6 +3327,7 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
+GUARD_KEPT = ("reminder",)  # a record's keys that are the reminder's: every rewrite of it keeps them
 
 
 def guard_mode() -> str:
@@ -3504,7 +3509,8 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
             reads.update(seen)
         if len(reads) > GUARD_KEEP:
             reads = dict(sorted(reads.items(), key=lambda kv: as_number(kv[1].get("at")) or 0)[-GUARD_KEEP:])
-        write_json(record, {"reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged})
+        write_json(record, {**{k: kept[k] for k in GUARD_KEPT if k in kept},
+                            "reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged})
     if nudge:  # a search fires no rule, so the note is the whole answer; in block mode too, it is never a denial
         log(f"guard: {record.stem} was told of the CodeGraph index after {searches} searches")
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": nudge}}
@@ -3540,7 +3546,8 @@ def guard_forget(data: dict) -> None:
             if not (isinstance(kept, dict) and (dict_at(kept, "reads") or kept.get("searches") or kept.get("nudged"))):
                 continue
             try:
-                write_json(file, {"reads": {}, "fired": dict_at(kept, "fired"), "bytes": dict_at(kept, "bytes"),
+                write_json(file, {**{k: kept[k] for k in GUARD_KEPT if k in kept}, "reads": {},
+                                  "fired": dict_at(kept, "fired"), "bytes": dict_at(kept, "bytes"),
                                   "searches": 0, "nudged": False})
                 continue
             except OSError as e:
@@ -3565,7 +3572,7 @@ def guard_counts(sid: str):
     found = False
     for file in guard_records(sid):
         kept = read_json(file) if file.is_file() else None
-        if not isinstance(kept, dict):
+        if not isinstance(kept, dict) or set(kept) <= set(GUARD_KEPT):  # the reminder's alone: no record of the guard's
             continue
         found = True
         for k in GUARD_RULES:
@@ -5305,6 +5312,133 @@ def advisor(opts) -> int:
     return 0
 
 
+# ------------------------------------------------------------- reminder
+#
+# `longhaul reminder`, the plugin's UserPromptSubmit hook (the owner's
+# decisions of 2026-10-23): every request carries the whole context
+# again, and the history baseline (98 sessions) found re-reads 1.3% of
+# what was read, where long contexts and compactions (48 in 49 sessions)
+# make the cost. Once the context passes LONGHAUL_CHECKPOINT_AT tokens
+# (REMINDER_AT; off turns it off), and again at each multiple of it, the
+# user is told how to save a checkpoint and start fresh (REMINDER_USER)
+# and the model is asked to save one at its next stopping point
+# (REMINDER_MODEL). The size is the last main-conversation response's
+# input, cache write and cache read, as inspect's context figures count
+# it, from the transcript's tail. The session's guard record keeps the
+# highest multiple said, under the guard's lock, so each is said once;
+# after a compaction the context drops, and only a multiple above that
+# one is said. Of the input only session_id, transcript_path and agent_id (a subagent's call is
+# never reminded) are used: the prompt's text is never used, logged,
+# kept or said. Like the other hooks it fails open:
+# an error prints nothing, and the hook never blocks a prompt.
+
+REMINDER_AT = 200_000  # tokens: the default threshold
+REMINDER_USER = ("Longhaul: this conversation's context is about {k}k tokens, and every request carries all of it "
+                 "again. To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint "
+                 "comes back.")
+REMINDER_MODEL = ("Longhaul: the context is about {k}k tokens. At your next natural stopping point (not in the middle "
+                  "of an edit or a test run), save a checkpoint with /longhaul:checkpoint, then continue the work. "
+                  "After a compaction or a /clear it comes back.")
+
+
+def reminder_threshold() -> tuple:
+    """LONGHAUL_CHECKPOINT_AT, read at call time: (tokens, None); (None,
+    None) for off, in any case; or (REMINDER_AT, the kind of value it is)
+    for anything else, which the caller logs by that kind, never the
+    value. Unset or empty is the default."""
+    raw = (os.environ.get("LONGHAUL_CHECKPOINT_AT") or "").strip()
+    if not raw:
+        return REMINDER_AT, None
+    if raw.lower() == "off":
+        return None, None
+    if not re.fullmatch(r"-?[0-9]+", raw):
+        return REMINDER_AT, "not a whole number"
+    return (int(raw), None) if int(raw) > 0 else (REMINDER_AT, "not above zero")
+
+
+def reminder_size(tail: list):
+    """The context's size, in tokens, from the transcript's tail
+    (advisor_tail()): the last main-conversation response's input, cache
+    write and cache read, as inspect's context figures count it (no
+    subagent's line, no API error, none of the engine's own, none
+    without them); or None."""
+    for raw in reversed(tail):
+        if b'"assistant"' not in raw or b'"usage"' not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") \
+                or entry.get("isApiErrorMessage"):
+            continue
+        msg = dict_at(entry, "message")
+        if msg.get("model") == "<synthetic>":
+            continue
+        usage = dict_at(msg, "usage")
+        size = sum(as_int(usage.get(field)) for k, field in TOKEN_KINDS if k != "output")
+        if size:
+            return size
+    return None
+
+
+def reminder_due(data: dict):
+    """The context's size when it has crossed a multiple of the threshold
+    above the highest this session was told of, which is recorded; else
+    None. A subagent's input is never reminded: its context is not the
+    conversation's. A threshold that is neither a number nor off is
+    logged once per session and kind."""
+    at, junk = reminder_threshold()
+    if at is None or data.get("agent_id") is not None:
+        return None
+    record = guard_record_path({"session_id": data.get("session_id")})
+    if record is None:
+        return None
+    size = reminder_size(advisor_tail(data.get("transcript_path")))
+    if size is None:
+        return None
+    crossed = size // at * at
+    if not crossed and not junk:
+        return None
+    with locked("guard"):  # the guard's record, written by its hook at the same moments
+        kept = read_json(record)
+        kept = kept if isinstance(kept, dict) else {}
+        said = dict_at(kept, "reminder")
+        before = dict(said)
+        logged = said.get("junk") if isinstance(said.get("junk"), list) else []
+        if junk and junk not in logged:
+            log(f"reminder: LONGHAUL_CHECKPOINT_AT is {junk}, so the default, {REMINDER_AT:,} tokens, is used "
+                f"({record.stem})")
+            said["junk"] = [*logged, junk]
+        due = crossed > as_int(said.get("at"))
+        if due:
+            said["at"] = crossed
+        if said != before:
+            write_json(record, {**kept, "reminder": said})
+    if due:
+        log(f"reminder: {record.stem} reminded at {crossed:,} tokens (the context is {size:,})")
+    return size if due else None
+
+
+def reminder(_opts) -> int:
+    """The UserPromptSubmit hook command: stdin in, the reminder's JSON or
+    nothing out, exit 0 always. An error prints nothing and is logged by
+    its kind alone, as advisor_note() does."""
+    try:
+        raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
+        if len(raw) > ADVISOR_STDIN_MAX:
+            log(f"reminder hook: no reminder (over {ADVISOR_STDIN_MAX:,} characters)")
+            return 0
+        data = json.loads(raw) if raw.strip() else {}
+        size = reminder_due(data if isinstance(data, dict) else {})
+        if size is not None:
+            print(json.dumps({"systemMessage": REMINDER_USER.format(k=size // 1000), "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": REMINDER_MODEL.format(k=size // 1000)}}))
+    except Exception as e:
+        log(f"reminder hook: no reminder ({type(e).__name__})")
+    return 0
+
+
 # ------------------------------------------------------------- VS Code
 #
 # The Claude Code VS Code extension (2.1.300, 2.1.301) runs the program in
@@ -6489,7 +6623,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note"):
+                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -6529,7 +6663,7 @@ def main(argv: list[str]) -> int:
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
-                "advisor-note": advisor_note}[cmd](opts)
+                "advisor-note": advisor_note, "reminder": reminder}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
