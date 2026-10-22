@@ -19,8 +19,8 @@
           {
             "type": "command",
             "command": "python3",
-            "args": ["-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; sys.exit(longhaul.main(['advisor-hook']))", "${CLAUDE_PLUGIN_ROOT}"],
-            "timeout": 5,
+            "args": ["-I", "-c", "import sys, io, json, re\nraw = sys.stdin.buffer.read(1000001).decode('utf-8', 'replace')\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; sys.stdin = io.StringIO(raw); code = longhaul.main(['advisor-hook'])\nexcept Exception:\n    code = 0\n    try: d = json.loads(raw); t = d.get('tool_input') if isinstance(d, dict) else None; s = t.get('subagent_type') if isinstance(t, dict) else None; named = isinstance(s, str) and re.sub(r'\\s', '', s).lower() in ('longhaul:advisor', 'advisor')\n    except Exception: named = 'advisor' in raw.lower()\n    if named: print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': 'longhaul advisor: denied (error): the hook could not finish its checks. Continue without advice; do not retry.'}}))\nsys.exit(code)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 30,
             "statusMessage": "Checking for an advisor consultation (longhaul advisor)"
           }
         ]

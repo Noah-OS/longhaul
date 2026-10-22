@@ -2084,7 +2084,7 @@ TOKEN_KINDS = (("input", "input_tokens"), ("cache_write", "cache_creation_input_
 # order the report lists them. Region B builds its patterns from them; the
 # agent type is its ADVISOR_TYPE and the reasons its ADVISOR_DENIALS (F6).
 CONSULTATION_TRIGGERS = ("early", "stuck", "change", "done")
-CONSULTATION_OUTCOMES = ("ok", "failed", "malformed")
+CONSULTATION_OUTCOMES = ("ok", "failed", "malformed", "unadmitted")
 CONSULTATION_VERDICTS = ("proceed", "adjust", "stop")
 
 
@@ -2258,32 +2258,40 @@ def search_advice(s: dict) -> str:
             "unless told not to; `codegraph init` writes `.codegraph/` in the project. Longhaul installs nothing.")
 
 
-def agent_type(transcript: Path):
-    """The agent type a subagent ran as, from the meta.json Claude Code
-    writes beside its transcript (agent-<id>.meta.json, `agentType`: the
-    Agent tool's subagent_type), else None: no such file, or junk."""
+def agent_meta(transcript: Path) -> dict:
+    """The meta.json Claude Code writes beside a subagent's transcript
+    (agent-<id>.meta.json: `agentType`, the Agent tool's subagent_type,
+    and `toolUseId`, the call's id, on 2.1.307), else {}: no such file,
+    or junk."""
     try:
         meta = json.loads(transcript.with_name(transcript.stem + ".meta.json").read_text(errors="replace"))
     except (OSError, ValueError, RecursionError):
-        return None
-    kind = meta.get("agentType") if isinstance(meta, dict) else None
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def agent_type(transcript: Path):
+    """The agent type a subagent ran as, from its meta.json, else None."""
+    kind = agent_meta(transcript).get("agentType")
     return kind if isinstance(kind, str) else None
 
 
-def consultations(sid: str):
+def consultations(sid: str, keep: bool = False):
     """The Advisor experiment's consultations in a conversation (Sprint 8),
     from its trace: a decision line for each one the executor asked for,
     admitted or denied with a reason code, and an outcome line for each
-    one that ran, with its verdict and the size of its reply. None when
-    there is no trace, or no line of this conversation's in it. The trace
-    is only read here (its hooks write it), and only its codes and
-    numbers: each code is one of those it may be, else "other", so a line
-    is never passed on as written."""
+    one that ran, with its verdict and the size of its reply; how many
+    admitted ones have no outcome (F1), and their ids, for inspect to
+    match the advisor's transcripts to. None when there is no trace, or
+    no line of this conversation's in it, unless `keep`. The trace is only
+    read here (its hooks write it), and only its codes and numbers: each
+    code is one of those it may be, else "other", so a line is never
+    passed on as written."""
     try:
         text = advisor_path("trace.jsonl").read_text(errors="replace")
     except OSError:
-        return None
-    found, admitted, replies = False, 0, []
+        text = ""
+    found, admitted, replies, admitted_ids, outcome_ids = False, 0, [], set(), set()
     denied, outcomes, verdicts = collections.Counter(), collections.Counter(), collections.Counter()
     asked, allowed = collections.Counter(), collections.Counter()  # by trigger
     for raw in text.splitlines():
@@ -2301,6 +2309,8 @@ def consultations(sid: str):
             if line["decision"] == "allow":
                 admitted += 1
                 allowed[trigger] += 1
+                if isinstance(line.get("id"), str):
+                    admitted_ids.add(line["id"])
             else:
                 reason = line.get("reason")
                 denied[reason if isinstance(reason, str) and reason in ADVISOR_DENIALS else "other"] += 1
@@ -2310,7 +2320,9 @@ def consultations(sid: str):
             if line.get("verdict") is not None:
                 verdicts[line["verdict"] if line["verdict"] in CONSULTATION_VERDICTS else "other"] += 1
             replies.append(as_int(line.get("reply_chars")))
-    if not found:
+            if isinstance(line.get("id"), str):
+                outcome_ids.add(line["id"])
+    if not (found or keep):
         return None
 
     def ordered(counts, order=()):
@@ -2322,7 +2334,8 @@ def consultations(sid: str):
             "triggers": {t: {"attempts": n, "admitted": allowed[t]}
                          for t, n in ordered(asked, CONSULTATION_TRIGGERS + ("none",)).items()},
             "outcomes": ordered(outcomes, CONSULTATION_OUTCOMES), "verdicts": ordered(verdicts, CONSULTATION_VERDICTS),
-            "reply_chars": sum(replies), "reply_chars_max": max(replies, default=0)}
+            "reply_chars": sum(replies), "reply_chars_max": max(replies, default=0),
+            "no_outcome": len(admitted_ids - outcome_ids), "admitted_ids": admitted_ids}
 
 
 def inspect_transcript(path: Path) -> dict:
@@ -2431,11 +2444,16 @@ def inspect_transcript(path: Path) -> dict:
             context.append(size)
 
     # The consultations' own tokens (Sprint 8): those of the subagents that
-    # ran as the advisor, looked for only when the trace has a line of
-    # this conversation's.
-    consulted = consultations(path.stem)
+    # ran as the advisor, by their meta.json. One whose call has no
+    # admitted decision ran unchecked (F1); with no trace line of this
+    # conversation's, such a one alone makes the section.
+    metas = {n: agent_meta(file) for n, file in enumerate(files) if n}
+    advisors = {n for n, meta in metas.items() if advisor_named(meta.get("agentType"))}
+    consulted = consultations(path.stem, keep=bool(advisors))
     if consulted is not None:
-        advisors = {n for n, file in enumerate(files) if n and advisor_named(agent_type(file))}
+        admitted_ids = consulted.pop("admitted_ids")
+        consulted["unmatched"] = sum(not (isinstance(metas[n].get("toolUseId"), str) and metas[n]["toolUseId"] in admitted_ids)
+                                     for n in advisors)
         own: dict = {}  # model -> {kind: tokens}
         for _, model, usage, where in responses.values():
             if where in advisors:
@@ -2645,6 +2663,8 @@ def inspect_lines(r: dict) -> list[str]:
         out.append("  verdicts: " + listed(c["verdicts"]))
         out.append(f"  replies: {c['reply_chars']:,} chars in all, the longest {c['reply_chars_max']:,}"
                    if c["outcomes"] else "  replies: none")
+        out.append(f"  admitted with no outcome traced: {c['no_outcome']}")
+        out.append(f"  advisor transcripts with no admitted decision: {c['unmatched']}")
         if c["transcripts"]:
             out.append(f"  own tokens, from {c['transcripts']} advisor transcript{'s' * (c['transcripts'] != 1)}:")
             out.extend(token_table(c["tokens"], "    ", lambda t: t["model"]))
@@ -2737,7 +2757,9 @@ def inspect_records(r: dict) -> list[dict]:
             add("consultation_verdicts", n, *counted, verdict)
         add("consultation_reply_chars", c["reply_chars"], "chars", "all", "advisor", "counted")
         add("consultation_reply_chars_max", c["reply_chars_max"], "chars", "all", "advisor", "counted")
+        add("consultation_no_outcome", c["no_outcome"], *counted)
         add("consultation_transcripts", c["transcripts"], "files", "subagents", "transcript", "counted")
+        add("consultation_unadmitted_transcripts", c["unmatched"], "files", "subagents", "transcript", "counted")
         for t in c["tokens"]:
             for kind, _ in TOKEN_KINDS:
                 add("consultation_tokens", t[kind], "tokens", "subagents", "transcript", "measured", t["model"], kind)
@@ -3927,8 +3949,8 @@ ADVISOR_DENIALS = {
                    "false. Drop every other field and call again once.",
     "brief-too-long": "the brief is {chars:,} characters, over the {limit:,} allowed. Shorten it (paths and line "
                       "ranges, not pasted files) and resubmit once.",
-    "brief-sections": "the brief has no line starting {missing}. Give each of Task:, Constraints:, Findings:, "
-                      "Approach: and Question: its line and resubmit once.",
+    "brief-sections": "{problem}. Give each of Task:, Constraints:, Findings:, Approach: and Question: its line, "
+                      "leave out any Admission: line (the hook adds that one), and resubmit once.",
     "trigger-missing": "the brief's first line must be Trigger: early, stuck, change or done. Put it first and "
                        "resubmit once.",
     "credential": "the brief holds what looks like a credential. Remove the credential from the brief and resubmit once.",
@@ -4141,7 +4163,8 @@ def advisor_line(data: dict, now: float) -> dict:
             "prompt_id": advisor_id(data.get("prompt_id")), "event": "decision", "decision": None, "reason": None,
             "kind": None, "trigger": advisor_trigger(brief), "reconcile": advisor_reconcile(brief), "executor": None,
             "advisor": None, "brief_chars": len(brief), "brief_hash": advisor_hash(brief),
-            "allowance": "checked"}  # "unchecked" only when admitted with no fresh reading (advisor_allowance)
+            "allowance": "checked",  # "unchecked" only when admitted with no fresh reading (advisor_allowance)
+            "admission": None}  # admitted: the 12-hex hash of the nonce on the Admission: line (F1)
 
 
 def advisor_denial(reason: str, **detail) -> tuple:
@@ -4221,7 +4244,9 @@ def advisor_brief_problem(brief: str):
     lines = [line.lstrip() for line in brief.splitlines()]
     missing = [section for section in ADVISOR_SECTIONS if not any(line.startswith(section) for line in lines)]
     if missing:
-        return advisor_denial("brief-sections", missing=" or ".join(missing))
+        return advisor_denial("brief-sections", problem=f"the brief has no line starting {' or '.join(missing)}")
+    if any(re.match(r"admission\s*:", line, re.IGNORECASE) for line in lines):  # the hook's alone (F1)
+        return advisor_denial("brief-sections", problem="the brief has an Admission: line")
     if advisor_trigger(brief) is None:
         return advisor_denial("trigger-missing")
     if any(shape in brief for shape in CHECKPOINT_SECRET_SHAPES):
@@ -4257,24 +4282,26 @@ def advisor_decide(data: dict, now: float) -> dict:
     is read or the lock taken (F3)."""
     line = advisor_line(data, now)
     early, rest = (advisor_denial("off"), None) if not advisor_switch() else advisor_gate(data, line)
+    nonce = os.urandom(8).hex()  # the Admission: line's, if it is admitted (F1)
     with advisor_locked():  # parallel calls run their hooks at once
-        denial = early or advisor_admit(line, rest, now)
+        denial = early or advisor_admit(line, rest, now, nonce)
         advisor_trace(advisor_decided(line, denial), now)
-    return advisor_answer(data, line, denial)
+    return advisor_answer(data, line, denial, nonce)
 
 
-def advisor_admit(line: dict, rest, now: float):
+def advisor_admit(line: dict, rest, now: float, nonce: str):
     """Under the lock: the session's record, then `rest` (advisor_fit()'s
     denial), the checks on the counts, then the allowance; when all pass,
-    the consultation counted and None. With no session there is no record
-    to check or cap to keep, so the call is denied."""
+    the consultation counted with its nonce, and None. With no session
+    there is no record to check or cap to keep, so the call is denied."""
     if line["session"] is None:
         return advisor_denial("error")
     state = advisor_state()
     entry = advisor_entry(state, line["session"])
     denial = rest or advisor_counted(line, entry, advisor_traced(line["session"])) or advisor_allowance(line, now)
     if denial is None:
-        advisor_count(state, entry, line, now)
+        line["admission"] = advisor_hash(nonce)
+        advisor_count(state, entry, line, now, nonce)
     return denial
 
 
@@ -4400,12 +4427,12 @@ def advisor_fresh(reading, now: float) -> bool:
             and (as_number(five.get("resets_at")) or 0) > now and as_number(five.get("used_percentage")) is not None)
 
 
-def advisor_count(state: dict, entry: dict, line: dict, now: float) -> None:
-    """The consultation counted and its hash kept, when admitted: one that
-    then fails counts too (D2.4). Sessions last written over
-    ADVISOR_KEEP_DAYS ago go."""
+def advisor_count(state: dict, entry: dict, line: dict, now: float, nonce: str) -> None:
+    """The consultation counted, with its nonce, and its hash kept, when
+    admitted: one that then fails counts too (D2.4). Sessions last written
+    over ADVISOR_KEEP_DAYS ago go."""
     entry["admitted"].append({"id": line["id"], "advisor": line["advisor"], "prompt_id": line["prompt_id"],
-                              "reconcile": line["reconcile"]})
+                              "reconcile": line["reconcile"], "nonce": nonce})
     entry["hashes"].append(line["brief_hash"])
     entry["at"] = round(now, 3)
     cutoff = now - ADVISOR_KEEP_DAYS * 86400
@@ -4425,10 +4452,11 @@ def advisor_decided(line: dict, denial) -> dict:
     return {**line, "decision": "deny" if denial else "allow", "reason": reason, "kind": kind}
 
 
-def advisor_answer(data: dict, line: dict, denial) -> dict:
+def advisor_answer(data: dict, line: dict, denial, nonce: str = "") -> dict:
     """The engine's JSON: a deny with its reason, or an allow whose
     updatedInput is built from scratch (F4), never copied from the input:
-    its description, its brief, the plugin's agent type, no background
+    its description, its brief under the Admission: line (F1: the advisor
+    answers nothing without it), the plugin's agent type, no background
     run, and the advisor's model."""
     if denial:
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -4439,7 +4467,7 @@ def advisor_answer(data: dict, line: dict, denial) -> dict:
         "hookEventName": "PreToolUse", "permissionDecision": "allow",
         "permissionDecisionReason": f"longhaul advisor: admitted; the {line['advisor']} advisor for your "
                                     f"model ({line['executor']}).",
-        "updatedInput": {**given, "prompt": advisor_brief(data), "subagent_type": ADVISOR_TYPE,
+        "updatedInput": {**given, "prompt": f"Admission: {nonce}\n{advisor_brief(data)}", "subagent_type": ADVISOR_TYPE,
                          "run_in_background": False, "model": line["advisor"]}}}
 
 
@@ -4550,8 +4578,8 @@ def advisor_verdict(text: str) -> tuple:
 
 
 def advisor_decided_at(tool_id):
-    """When the consultation `tool_id` was admitted, from its decision
-    line, or None."""
+    """The consultation `tool_id`'s admitted decision line, or None: none
+    was written, or it was denied."""
     if tool_id is None:
         return None
     for raw in reversed(advisor_lines()):
@@ -4563,15 +4591,18 @@ def advisor_decided_at(tool_id):
             continue
         if isinstance(entry, dict) and entry.get("id") == tool_id and entry.get("event") == "decision" \
                 and entry.get("decision") == "allow":
-            return as_number(entry.get("t"))
+            return entry
     return None
 
 
 def advisor_outcome(data, now: float | None = None) -> None:
     """advisor-result's work: for a consultation, the outcome line (ok,
     failed when the response holds no reply, malformed when its first
-    line is no verdict), with the verdict, the confidence, the reply's
-    size and the seconds since it was admitted; never the reply."""
+    line is no verdict, unadmitted when no admitted decision has its
+    tool_use_id: the PreToolUse hook did not answer, or its deny was not
+    kept, F1), with the verdict, the confidence, the reply's size and the
+    seconds since it was admitted; never the reply. An unadmitted one is
+    logged too, by its code."""
     if not advisor_consultation(data):
         return None
     now = time.time() if now is None else now
@@ -4582,9 +4613,13 @@ def advisor_outcome(data, now: float | None = None) -> None:
             "verdict": verdict, "confidence": confidence, "reply_chars": None if reply is None else len(reply),
             "seconds": None}
     with advisor_locked():
-        started = advisor_decided_at(line["id"])
+        decided = advisor_decided_at(line["id"])
+        started = as_number(decided.get("t")) if decided else None
+        line["outcome"] = "unadmitted" if decided is None else line["outcome"]
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
         advisor_trace(line, now)
+    if decided is None:
+        log("advisor-result hook: an advisor ran with no admitted decision (unadmitted)")
     return None
 
 
@@ -4617,7 +4652,8 @@ def advisor_status_lines() -> list:
              if record else "Probe record: none",
              f"Running Claude Code: {running or 'unknown'}", f"Enabled key: {key}",
              f"Allowance: {advisor_allowance_said()}",
-             f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}"]
+             f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}",
+             f"Unadmitted advisor runs traced: {advisor_unadmitted()}"]
     why = ("LONGHAUL_ADVISOR is not experiment" if not switch
            else "not enabled (longhaul advisor enable, in a terminal)" if enabled is None
            else "no passing probe record" if record is None
@@ -4626,6 +4662,18 @@ def advisor_status_lines() -> list:
            else "the running Claude Code version is unknown" if running is None
            else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded else None)
     return lines + [f"off: {why}" if why else "enabled"]
+
+
+def advisor_unadmitted() -> int:
+    """The outcome lines in the trace (its last 30 days) of an advisor that
+    ran with no admitted decision (F1)."""
+    count = 0
+    for raw in advisor_lines():
+        if '"unadmitted"' in raw:
+            with contextlib.suppress(ValueError, RecursionError):
+                entry = json.loads(raw)
+                count += isinstance(entry, dict) and entry.get("event") == "outcome" and entry.get("outcome") == "unadmitted"
+    return count
 
 
 def advisor_allowance_said() -> str:

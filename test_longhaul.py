@@ -41,6 +41,14 @@ def longhaul_lock(home: Path, sid: str):
     return f
 
 
+def registered_hook(event: str, command: str) -> list:
+    """The command line hooks/hooks.json registers for `command` on `event`,
+    run with this Python and this checkout as the plugin's root."""
+    entries = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"][event]
+    [args] = [e["hooks"][0]["args"] for e in entries if f"main(['{command}'])" in e["hooks"][0]["args"][2]]
+    return [sys.executable, *args[:-1], str(HERE)]
+
+
 def requires_git(test: unittest.TestCase):
     """Skip a test that asks git about the checkout, so the suite runs from
     a tarball (no .git) and where git is not installed."""
@@ -1330,18 +1338,20 @@ class Inspect(unittest.TestCase):
             "triggers": {"early": {"attempts": 2, "admitted": 1}, "stuck": {"attempts": 1, "admitted": 1},
                          "change": {"attempts": 1, "admitted": 0}, "none": {"attempts": 1, "admitted": 0}},
             "outcomes": {"ok": 2}, "verdicts": {"proceed": 1, "adjust": 1},
-            "reply_chars": 1100, "reply_chars_max": 700, "transcripts": 0, "tokens": []})
+            "reply_chars": 1100, "reply_chars_max": 700, "no_outcome": 0, "transcripts": 0, "unmatched": 0, "tokens": []})
         out = longhaul.inspect_lines(r)
         head = out.index(self.CONSULTATIONS)
         self.assertGreater(head, out.index("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, "
                                            "cat or search]"))
-        self.assertEqual(out[head + 1:head + 9], [
+        self.assertEqual(out[head + 1:head + 11], [
             "  5 consultations asked for: 2 admitted, 3 denied",
             "  denied by reason: cap-task 2, brief-sections 1",
             "  by trigger: early 2 (1 admitted), stuck 1 (1 admitted), change 1 (0 admitted), none 1 (0 admitted)",
             "  outcomes: ok 2",
             "  verdicts: proceed 1, adjust 1",
             "  replies: 1,100 chars in all, the longest 700",
+            "  admitted with no outcome traced: 0",
+            "  advisor transcripts with no admitted decision: 0",
             "  own tokens: no advisor transcript",
             "Failures [transcript, counted]"])
         got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
@@ -1360,7 +1370,9 @@ class Inspect(unittest.TestCase):
             ("consultation_verdicts", "all", "proceed"): (1, *n), ("consultation_verdicts", "all", "adjust"): (1, *n),
             ("consultation_reply_chars", "all", None): (1100, "chars", "advisor", "counted"),
             ("consultation_reply_chars_max", "all", None): (700, "chars", "advisor", "counted"),
-            ("consultation_transcripts", "subagents", None): (0, "files", "transcript", "counted")})
+            ("consultation_no_outcome", "all", None): (0, *n),
+            ("consultation_transcripts", "subagents", None): (0, "files", "transcript", "counted"),
+            ("consultation_unadmitted_transcripts", "subagents", None): (0, "files", "transcript", "counted")})
 
     def test_a_consultations_own_tokens_come_from_the_subagents_whose_agent_type_is_the_advisor(self):
         self.write(self.reply())
@@ -1395,10 +1407,54 @@ class Inspect(unittest.TestCase):
             ("consultation_tokens", "subagents", "claude-opus-5-5", "cache_read"): (5000, *t),
             ("consultation_tokens", "subagents", "claude-opus-5-5", "output"): (40, *t)})
 
+    def test_runs_the_hook_did_not_admit_are_counted(self):
+        # Sprint 8, F1: an outcome line marked unadmitted, an admitted
+        # decision with no outcome (the result hook never ran), and an
+        # advisor's transcript (by its meta.json) with no admitted decision.
+        self.write(self.reply())
+        self.trace(self.decision("c1"), self.outcome("c1"), self.decision("c2"),
+                   self.decision("c3", "brief-sections"), self.outcome("c3", verdict=None, outcome="unadmitted"),
+                   self.outcome("c4", verdict=None, outcome="unadmitted"))
+        for name, meta in (("agent-a1", {"agentType": "longhaul:advisor", "toolUseId": "c1"}),
+                           ("agent-a2", {"agentType": "longhaul:advisor", "toolUseId": "c3"}),  # denied, and ran
+                           ("agent-a3", {"agentType": " Advisor"}),  # the bare name, and no toolUseId
+                           ("agent-a4", {"agentType": "general-purpose", "toolUseId": "c9"})):
+            self.agent(self.reply(), name)
+            self.meta(name, **meta)
+        r = longhaul.inspect_transcript(self.path)
+        c = r["consultations"]
+        self.assertEqual((c["outcomes"], c["no_outcome"], c["unmatched"], c["transcripts"]),
+                         ({"ok": 1, "unadmitted": 2}, 1, 2, 3))
+        self.assertNotIn("admitted_ids", c, "the ids stay inside inspect")
+        out = longhaul.inspect_lines(r)
+        head = out.index(self.CONSULTATIONS)
+        self.assertIn("  outcomes: ok 1, unadmitted 2", out[head:])
+        self.assertIn("  admitted with no outcome traced: 1", out[head:])
+        self.assertIn("  advisor transcripts with no admitted decision: 2", out[head:])
+        got = {(x["metric"], x["scope"]): (x["value"], x["unit"], x["source"], x["confidence"]) for x in self.records("s1")
+               if x["metric"] in ("consultation_no_outcome", "consultation_unadmitted_transcripts")}
+        self.assertEqual(got, {("consultation_no_outcome", "all"): (1, "consultations", "advisor", "counted"),
+                               ("consultation_unadmitted_transcripts", "subagents"): (2, "files", "transcript", "counted")})
+        self.assertEqual([x["value"] for x in self.records("s1") if x["metric"] == "consultation_outcomes"
+                          and x["item"] == "unadmitted"], [2])
+
+    def test_an_advisor_transcript_with_no_trace_at_all_is_shown(self):
+        # The hooks never ran (off, or python3 missing): no trace, and an
+        # advisor ran all the same. The section says so.
+        self.write(self.reply())
+        self.agent(self.reply(inp=3, out=40), "agent-a1")
+        self.meta("agent-a1", agentType="longhaul:advisor", toolUseId="c1")
+        c = longhaul.inspect_transcript(self.path)["consultations"]
+        self.assertEqual((c["attempts"], c["admitted"], c["unmatched"], c["no_outcome"], c["transcripts"]), (0, 0, 1, 0, 1))
+        self.assertEqual(c["tokens"][0]["input"], 3)
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        self.assertIn("  0 consultations asked for: 0 admitted, 0 denied", out)
+        self.assertIn("  advisor transcripts with no admitted decision: 1", out)
+
     def test_no_trace_line_of_this_conversation_no_consultations(self):
         self.write(self.reply())
         self.agent(self.reply(), "agent-a1")
-        self.meta("agent-a1", agentType="longhaul:advisor")
+        self.meta("agent-a1", agentType="general-purpose")  # no advisor's transcript either: no section
         for lines in ((), (self.decision("x1", session="s2"), "junk", '{"session": "s1", "event": "noise"}')):
             if lines:
                 self.trace(*lines)
@@ -2206,9 +2262,9 @@ class Plugin(unittest.TestCase):
                 matching = [row for row in rows if named in row]
                 self.assertEqual(len(matching), 1, (named, "one row names this hook by its event and matchers"))
                 self.assertIn(f'"{handler["statusMessage"]}"', matching[0], (named, "its row quotes its status message"))
-            [timeout] = timeouts
-            self.assertEqual(set(re.findall(r"(\d+)[- ]second", section)), {str(timeout)},
-                             "the timeout, wherever the section gives it")
+            # Sprint 8, F1: the consultation check has 30 s, every other hook 5.
+            self.assertEqual(set(re.findall(r"(\d+)[- ]second", section)), {str(t) for t in timeouts},
+                             "each hook timeout, wherever the section gives it")
 
 
 class Guard(unittest.TestCase):
@@ -3773,10 +3829,10 @@ class Advisor(unittest.TestCase):
     # A brief's or a reply's text: it belongs in the tool's input and in the
     # engine's answer, and never in the trace, the state, the log or a reason.
     S = "SENTINEL-OKAPI-4412"
-    HOOK = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
-                                        "sys.exit(longhaul.main(['advisor-hook']))", str(HERE)]
-    RESULT = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
-                                          "sys.exit(longhaul.main(['advisor-result']))", str(HERE)]
+    # The hooks as the plugin registers them (F1: the PreToolUse one reads its
+    # input before it imports longhaul, and denies a consultation without it).
+    HOOK = registered_hook("PreToolUse", "advisor-hook")
+    RESULT = registered_hook("PostToolUse", "advisor-result")
     # What the hooks read of the session's environment: each test gives its own.
     VARS = ("CLAUDE_CODE_EXECPATH", "CLAUDE_CONFIG_DIR")
 
@@ -3908,20 +3964,104 @@ class Advisor(unittest.TestCase):
         guard, pre = hooks["PreToolUse"]
         [post] = hooks["PostToolUse"]
         [guard] = guard["hooks"]
-        for entry, command, cmd, says in ((pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation"),
-                                          (post, "advisor-result", self.RESULT, "Tracing an advisor consultation")):
+        for entry, command, cmd, says, timeout in (
+                (pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation", 30),
+                (post, "advisor-result", self.RESULT, "Tracing an advisor consultation", 5)):
             self.assertEqual(entry["matcher"], "Agent|Task", "the subagent tool's name, and its name before 2.1.63")
             [handler] = entry["hooks"]
-            # The guard's command line with the command alone changed, run the
-            # way the tests run it.
-            self.assertEqual(handler["args"], [*guard["args"][:2], guard["args"][2].replace("'guard'", f"'{command}'"),
-                                               "${CLAUDE_PLUGIN_ROOT}"])
-            self.assertEqual(cmd[1:-1], handler["args"][:-1])
+            self.assertEqual(cmd[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+            self.assertEqual((handler["args"][:2], handler["args"][3]), (["-I", "-c"], "${CLAUDE_PLUGIN_ROOT}"))
             self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
-            # A hook past its timeout lets the call run: the deny must come first.
-            self.assertEqual(handler["timeout"], 5)
-            self.assertLess(longhaul.ADVISOR_VERSION_TIMEOUT, handler["timeout"] / 2)
+            # A hook past its timeout lets the call run (F1): the consultation
+            # check has 30 s, and its every wait is bounded well inside 10.
+            self.assertEqual(handler["timeout"], timeout)
             self.assertEqual(handler["statusMessage"], f"{says} (longhaul advisor)")
+        self.assertLess(longhaul.ADVISOR_VERSION_TIMEOUT + 2 * longhaul.ADVISOR_LOCK_WAIT, 10)
+        # The result hook is the guard's command line with the command alone
+        # changed, and fails open. The consultation check reads its input
+        # first (at most 1 MB and a byte), so that a longhaul it cannot import
+        # still denies a consultation.
+        [result] = post["hooks"]
+        self.assertEqual(result["args"], [*guard["args"][:2], guard["args"][2].replace("'guard'", "'advisor-result'"),
+                                          "${CLAUDE_PLUGIN_ROOT}"])
+        [check] = pre["hooks"]
+        wrapper = check["args"][2]
+        self.assertLess(wrapper.index("sys.stdin.buffer.read(1000001)"), wrapper.index("import longhaul"))
+        self.assertIn("longhaul.main(['advisor-hook'])", wrapper)
+        reason = longhaul.advisor_answer({}, {}, longhaul.advisor_denial("error"))["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn(reason.replace("'", "\\'"), wrapper, "the wrapper's deny is the hook's own, word for word")
+
+    def test_a_check_that_cannot_import_longhaul_still_denies_a_consultation(self):
+        # F1: a plugin root whose longhaul.py cannot be imported, or whose
+        # call raises, would otherwise exit 1, and the call would run.
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n", "empty": None}
+        deny = longhaul.advisor_answer({}, {}, longhaul.advisor_denial("error"))
+        huge = json.dumps(self.call(self.brief(extra="x" * 1_100_000)))
+        cases = [(self.call(), deny), (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
+                 (self.call(agent="Explore"), None), ("{not json, an advisor", deny), ("{not json", None), ("", None),
+                 ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), None)]
+        for name, source in roots.items():
+            root = self.tmp / name
+            root.mkdir()
+            if source:
+                (root / "longhaul.py").write_text(source)
+            for data, answer in cases:
+                raw = data if isinstance(data, str) else json.dumps(data)
+                out = subprocess.run(self.HOOK[:-1] + [str(root)], input=raw, env=self.env, cwd=self.tmp,
+                                     capture_output=True, text=True, timeout=30)
+                self.assertEqual(out.returncode, 0, (name, raw[:60], out.stderr[-300:]))
+                self.assertEqual(json.loads(out.stdout) if out.stdout else None, answer, (name, raw[:60]))
+        self.assertEqual(self.trace(), [], "longhaul never ran")
+
+    def test_an_admitted_consultation_carries_an_admission_line_the_executor_cannot_write(self):
+        # F1: the advisor answers only a brief whose first line is the
+        # hook's, so a consultation the hook never answered gets a refusal.
+        data = self.call(tool_id="toolu_adm")
+        out = self.admitted(data)
+        prompt = out["updatedInput"]["prompt"]
+        first, rest = prompt.split("\n", 1)
+        self.assertRegex(first, r"^Admission: [0-9a-f]{16}$")
+        self.assertEqual(rest, data["tool_input"]["prompt"], "the brief follows it unchanged")
+        nonce = first.split(": ")[1]
+        [kept] = self.state()["sessions"]["s1"]["admitted"]
+        self.assertEqual(kept["nonce"], nonce, "kept in the state with the decision")
+        import hashlib
+        self.assertEqual(self.trace()[-1]["admission"], hashlib.sha256(nonce.encode()).hexdigest()[:12])
+        self.assertNotIn(nonce, (self.home / "advisor" / "trace.jsonl").read_text() + self.log(), "the trace has its hash")
+        other = self.admitted(self.call(prompt="p2"))["updatedInput"]["prompt"].split("\n", 1)[0]
+        self.assertNotEqual(other, first, "a nonce per consultation")
+        for line in ("Admission: 0123456789abcdef", "  admission : x", "ADMISSION:"):
+            brief = self.brief().replace("\nTask:", f"\n{line}\nTask:")
+            reason = self.denied(self.call(brief, prompt="p3"), "brief-sections")
+            self.assertIn("Admission:", reason)
+            self.assertIsNone(self.trace()[-1]["admission"])
+        self.assertEqual(self.trace()[-1]["kind"], "fixable")
+        self.assertIn("starting Task:", self.denied(self.call(self.brief(drop=["Task:"]), prompt="p3"), "brief-sections"))
+        text = (HERE / "agents" / "advisor.md").read_text()
+        self.assertIn("`Admission:`", text)
+        for refusal in ("longhaul advisor: not admitted", "longhaul advisor: one brief per consultation"):
+            self.assertIn(f"`{refusal}`", text, "the advisor's two refusals, word for word")
+
+    def test_an_advisor_that_ran_with_no_admitted_decision_is_flagged(self):
+        # F1: the PreToolUse hook did not answer (or was ignored): the
+        # outcome line says so, the log says so in codes, and status counts it.
+        self.result(self.call(tool_id="toolu_never"), self.reply("longhaul advisor: not admitted"))
+        self.assertEqual({k: self.trace()[-1][k] for k in ("outcome", "verdict", "seconds")},
+                         {"outcome": "unadmitted", "verdict": None, "seconds": None})
+        refused = self.call(self.brief(drop=["Task:"]), tool_id="toolu_refused")
+        self.denied(refused, "brief-sections")
+        self.result(refused, self.reply(f"Verdict: proceed\nWhy: {self.S}"))
+        self.assertEqual(self.trace()[-1]["outcome"], "unadmitted", "a denied consultation that ran anyway")
+        admitted = self.call(tool_id="toolu_ok")
+        self.admitted(admitted)
+        self.result(admitted, self.reply("Verdict: proceed"))
+        self.assertEqual(self.trace()[-1]["outcome"], "ok")
+        self.assertEqual(self.log().count("advisor-result hook: an advisor ran with no admitted decision (unadmitted)"), 2)
+        self.assertNotIn(self.S, self.log())
+        self.assertIn("unadmitted", longhaul.CONSULTATION_OUTCOMES)
+        lines, last = self.status()
+        self.assertEqual((lines["Unadmitted advisor runs traced"], last), ("2", "enabled"))
 
     def test_off_by_default_and_admitted_only_with_experiment_and_a_probe_for_this_version(self):
         for value in (None, "", "off", "on", "true", "1", "Experiment", " experiment"):
@@ -4552,7 +4692,9 @@ class Advisor(unittest.TestCase):
         self.denied(self.call(), "near-full", CLAUDE_CONFIG_DIR=str(pro))
         data = self.call()
         out = self.admitted(data)  # no CLAUDE_CONFIG_DIR: ~/.claude, Max's folder
-        self.assertEqual(out["updatedInput"], {**data["tool_input"], "model": "opus"}, "the model and nothing else")
+        given = out["updatedInput"]
+        self.assertEqual({**given, "prompt": given["prompt"].split("\n", 1)[1]}, {**data["tool_input"], "model": "opus"},
+                         "the model and the admission line (F1), nothing else")
         self.assertEqual(set(out), {"hookEventName", "permissionDecision", "permissionDecisionReason", "updatedInput"})
         # Pro may be used elsewhere only. Before F9 the hook let this session
         # consult on it all the same; now it checks A2 again, and fails closed.
@@ -4566,7 +4708,7 @@ class Advisor(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.home / "advisor").iterdir()), ["enabled.json", "probe.json", "state.json", "trace.jsonl"])
 
     DECISION = ("t", "id", "session", "prompt_id", "event", "decision", "reason", "kind", "trigger", "reconcile",
-                "executor", "advisor", "brief_chars", "brief_hash", "allowance")
+                "executor", "advisor", "brief_chars", "brief_hash", "allowance", "admission")
 
     def test_the_trace_has_the_documented_shape(self):
         import hashlib
@@ -4580,10 +4722,12 @@ class Advisor(unittest.TestCase):
                          {"id": "toolu_1", "session": "s1", "prompt_id": "p1", "event": "decision", "decision": "allow",
                           "reason": None, "kind": None, "trigger": "stuck", "reconcile": False, "executor": "sonnet",
                           "advisor": "opus", "brief_chars": len(brief),
-                          "brief_hash": hashlib.sha256(brief.encode()).hexdigest()[:12], "allowance": "checked"})
+                          "brief_hash": hashlib.sha256(brief.encode()).hexdigest()[:12], "allowance": "checked",
+                          "admission": hashlib.sha256(self.state()["sessions"]["s1"]["admitted"][0]["nonce"].encode())
+                          .hexdigest()[:12]})
         self.assertAlmostEqual(allow["t"], self.now, places=2)
-        self.assertEqual((deny["decision"], deny["reason"], deny["kind"], deny["prompt_id"]),
-                         ("deny", "brief-sections", "fixable", None))
+        self.assertEqual((deny["decision"], deny["reason"], deny["kind"], deny["prompt_id"], deny["admission"]),
+                         ("deny", "brief-sections", "fixable", None, None))
         # What is not a plain id is not kept; with no session there is no
         # cap to keep, so the call is denied.
         self.denied(self.call(session="../s1", tool_id="toolu 2", prompt="p\n1"), "error")
@@ -4600,7 +4744,7 @@ class Advisor(unittest.TestCase):
             answer = json.loads(out.stdout)["hookSpecificOutput"]
             given = answer.pop("updatedInput", None)
             if given is not None:  # the subagent's prompt: the brief belongs there
-                self.assertEqual(given, {**data["tool_input"], "model": "opus"})
+                self.assertEqual({**given, "prompt": given["prompt"].split("\n", 1)[1]}, {**data["tool_input"], "model": "opus"})
             self.assertNotIn(self.S, json.dumps(answer))
         self.assertEqual([line["decision"] for line in self.trace()], ["allow"] + ["deny"] * 5)
         written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
@@ -4708,11 +4852,11 @@ class Advisor(unittest.TestCase):
             self.assertEqual((line["outcome"], line["verdict"], line["confidence"]), (outcome, verdict, confidence), response)
         self.assertIsNone(self.trace()[-1]["reply_chars"], "no reply, no size")
         self.result(self.call(tool_id="toolu_none"), self.reply("Verdict: proceed"))
-        self.assertIsNone(self.trace()[-1]["seconds"], "never admitted: no duration")
+        self.assertEqual((self.trace()[-1]["outcome"], self.trace()[-1]["seconds"]), ("unadmitted", None), "never admitted")
         refused = self.call(self.brief(drop=["Task:"]), tool_id="toolu_d")
         self.denied(refused, "brief-sections")
         self.result(refused, self.reply("Verdict: proceed"))
-        self.assertIsNone(self.trace()[-1]["seconds"], "denied: no duration")
+        self.assertEqual((self.trace()[-1]["outcome"], self.trace()[-1]["seconds"]), ("unadmitted", None), "denied")
         before = self.trace()
         self.assertIsNone(self.result(self.call(agent="Explore"), self.reply("Verdict: stop")))
         self.assertEqual(self.trace(), before, "another agent type: nothing written")
@@ -4853,7 +4997,7 @@ class Advisor(unittest.TestCase):
         self.assertEqual(lines, {"LONGHAUL_ADVISOR": "experiment", "Probe record": f"Claude Code 2.1.307, passed {day}",
                                  "Running Claude Code": "2.1.307", "Enabled key": "present, for Claude Code 2.1.307",
                                  "Allowance": "checked: a fresh status-line reading of the session's account is needed",
-                                 "Home": str(self.home)})
+                                 "Home": str(self.home), "Unadmitted advisor runs traced": "0"})
         self.assertEqual(last, "enabled", "the skill's contract: the last line")
         other = self.tmp / "claude" / "versions" / "2.1.308"
         other.write_text("")
