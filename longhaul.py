@@ -107,6 +107,10 @@ Usage:
                           writes the probe record from EVIDENCE, a JSON file naming
                           claude_version and five checks, when all five are true;
                           turns nothing on
+  longhaul advisor enable | disable
+                          writes, or removes, the key the gate needs beside the
+                          switch, for the probe record's version; enable runs
+                          only from a terminal of your own, never a session's
   longhaul advisor-hook         the plugin's PreToolUse hook on Agent and Task: admits
                           or denies a call of the longhaul:advisor agent type and
                           leaves any other alone; advisor-result, its PostToolUse
@@ -3889,6 +3893,9 @@ ADVISOR_SECTIONS = ("Task:", "Constraints:", "Findings:", "Approach:", "Question
 ADVISOR_TASK_CAP_PER_MODEL = {"opus": 2, "fable": 1}
 ADVISOR_TASK_RECONCILES_PER_MODEL = 1
 ADVISOR_SESSION_CAP_PER_MODEL = {"opus": 6, "fable": 3}
+# The near-full share for the Advisor: LONGHAUL_NEAR_FULL can lower it,
+# never raise it (F8), since the setting is the supervisor's.
+ADVISOR_NEAR_FULL = 95
 # Seconds a status line reading of the session's account stays good for
 # the near-full rule. The status line runs after every reply; an older
 # reading says too little of the use now.
@@ -3902,6 +3909,8 @@ ADVISOR_FIXABLE = ("call-fields", "brief-too-long", "brief-sections", "trigger-m
 # None names the switch: turning the Advisor on is for the user.
 ADVISOR_DENIALS = {
     "off": "the Advisor is off. Continue without advice; do not retry.",
+    "not-enabled": "the Advisor experiment is not enabled for this Claude Code version. Continue without advice; "
+                   "do not retry.",
     "no-probe": "no passing capability probe is recorded, so no consultation is admitted. "
                 "Continue without advice; do not retry.",
     "version-unknown": "the running Claude Code version could not be found, so it cannot be matched to the probe's. "
@@ -3954,6 +3963,30 @@ def advisor_locked():
 def advisor_switch() -> bool:
     """LONGHAUL_ADVISOR=experiment, exactly; anything else is off (D2.8)."""
     return os.environ.get("LONGHAUL_ADVISOR") == "experiment"
+
+
+def advisor_default_home() -> bool:
+    """Whether LONGHAUL_HOME is ~/.longhaul, by real path: the home real
+    sessions keep their records in, never a scratch one."""
+    return os.path.realpath(LONGHAUL_HOME) == os.path.realpath(HOME / ".longhaul")
+
+
+def advisor_unchecked() -> bool:
+    """LONGHAUL_ADVISOR_ALLOWANCE=unchecked, which counts outside the
+    default home alone (F8): the benchmark's scratch runs set it, and in a
+    real home it would lift the near-full rule."""
+    return os.environ.get("LONGHAUL_ADVISOR_ALLOWANCE") == "unchecked" and not advisor_default_home()
+
+
+def advisor_enabled():
+    """The Claude Code version enabled.json names, else None. Only
+    `longhaul advisor enable` writes it, from a terminal, for the probe
+    record's version (F8): the gate needs it beside the switch."""
+    key = read_json(advisor_path("enabled.json"))
+    if not (isinstance(key, dict) and type(key.get("schema")) is int and key["schema"] == 1):
+        return None
+    version = key.get("probe_version")
+    return version if isinstance(version, str) and re.fullmatch(ADVISOR_VERSION, version) else None
 
 
 def advisor_probe():
@@ -4108,7 +4141,7 @@ def advisor_line(data: dict, now: float) -> dict:
             "prompt_id": advisor_id(data.get("prompt_id")), "event": "decision", "decision": None, "reason": None,
             "kind": None, "trigger": advisor_trigger(brief), "reconcile": advisor_reconcile(brief), "executor": None,
             "advisor": None, "brief_chars": len(brief), "brief_hash": advisor_hash(brief),
-            "allowance": "unchecked" if os.environ.get("LONGHAUL_ADVISOR_ALLOWANCE") == "unchecked" else "checked"}
+            "allowance": "checked"}  # "unchecked" only when admitted with no fresh reading (advisor_allowance)
 
 
 def advisor_denial(reason: str, **detail) -> tuple:
@@ -4118,12 +4151,19 @@ def advisor_denial(reason: str, **detail) -> tuple:
 def advisor_gate(data: dict, line: dict) -> tuple:
     """The checks that need no count, run before the lock is taken, as
     (the first to fail before model-mismatch, the first after it): the
-    probe record and the version; then advisor_fit(), only when those
-    pass. model-mismatch needs the session's record, so it is read under
-    the lock, and the order is kept by checking it before the second."""
+    enabled key, the probe record and the version; then advisor_fit(),
+    only when those pass. model-mismatch needs the session's record, so
+    it is read under the lock, and the order is kept by checking it
+    before the second. A key for another version than the record's is
+    not-enabled too: a new record needs a new enable."""
+    enabled = advisor_enabled()
+    if enabled is None:
+        return advisor_denial("not-enabled"), None
     record = advisor_probe()
     if record is None:
         return advisor_denial("no-probe"), None
+    if enabled != record["claude_version"]:
+        return advisor_denial("not-enabled"), None
     running = advisor_running_version()
     if running is None:
         return advisor_denial("version-unknown"), None
@@ -4331,15 +4371,21 @@ def advisor_counted(line: dict, entry: dict, traced: list):
 def advisor_allowance(line: dict, now: float):
     """D2.4's near-full rule on the session's own account, named as the
     status line names its readings (session_account()). No fresh reading
-    is a denial too, unless LONGHAUL_ADVISOR_ALLOWANCE=unchecked, which the
-    benchmark's scratch runs set (they have no status line); a fresh
-    reading that is nearly full is a denial even then."""
+    is a denial too, unless advisor_unchecked(), which the benchmark's
+    scratch runs set (they have no status line), and the trace then says
+    "unchecked"; a fresh reading that is nearly full is a denial even
+    then. Nearly full is ADVISOR_NEAR_FULL, or LONGHAUL_NEAR_FULL when it
+    is lower (F8)."""
     acct, _ = session_account(os.environ.get("CLAUDE_CONFIG_DIR"))
     reading = readings([{"name": acct}])[acct]
     if not advisor_fresh(reading, now):
-        return None if line["allowance"] == "unchecked" else advisor_denial("allowance-unknown")
-    if near_full(reading, now):
-        return advisor_denial("near-full", limit=NEAR_FULL)
+        if not advisor_unchecked():
+            return advisor_denial("allowance-unknown")
+        line["allowance"] = "unchecked"
+        return None
+    limit = min(NEAR_FULL, ADVISOR_NEAR_FULL)
+    if any(used >= limit for used, _ in windows(reading, now)):
+        return advisor_denial("near-full", limit=limit)
     return None
 
 
@@ -4559,19 +4605,36 @@ def advisor_result(_opts) -> int:
 
 def advisor_status_lines() -> list:
     """`longhaul advisor status`: the switch, the probe record's version,
-    the running version, and "enabled" or "off: <why>", the first of the
-    three gates that is shut. The skill's first step runs it and stops
-    when it is off."""
-    switch, record, running = advisor_switch(), advisor_probe(), advisor_running_version()
+    the running version, the enabled key, the allowance rule and the home
+    (F8), then "enabled" or "off: <why>", the first gate that is shut. The
+    skill's first step runs it and stops unless its last line is enabled."""
+    switch, record, running, enabled = advisor_switch(), advisor_probe(), advisor_running_version(), advisor_enabled()
+    recorded = record["claude_version"] if record else None
+    key = ("missing" if enabled is None else f"present, for Claude Code {enabled}"
+           + ("" if recorded in (None, enabled) else f", not the probe record's {recorded}"))
     lines = [f"LONGHAUL_ADVISOR: {'experiment' if switch else 'off'}",
-             f"Probe record: Claude Code {record['claude_version']}, passed {advisor_day(record.get('passed_at'))}"
+             f"Probe record: Claude Code {recorded}, passed {advisor_day(record.get('passed_at'))}"
              if record else "Probe record: none",
-             f"Running Claude Code: {running or 'unknown'}"]
-    why = ("LONGHAUL_ADVISOR is not experiment" if not switch else "no passing probe record" if record is None
+             f"Running Claude Code: {running or 'unknown'}", f"Enabled key: {key}",
+             f"Allowance: {advisor_allowance_said()}",
+             f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}"]
+    why = ("LONGHAUL_ADVISOR is not experiment" if not switch
+           else "not enabled (longhaul advisor enable, in a terminal)" if enabled is None
+           else "no passing probe record" if record is None
+           else f"the enabled key is for {enabled}, not the probe record's {recorded}; run longhaul advisor enable again"
+           if enabled != recorded
            else "the running Claude Code version is unknown" if running is None
-           else f"the probe passed on {record['claude_version']}, not on {running}, the version running"
-           if running != record["claude_version"] else None)
+           else f"the probe passed on {recorded}, not on {running}, the version running" if running != recorded else None)
     return lines + [f"off: {why}" if why else "enabled"]
+
+
+def advisor_allowance_said() -> str:
+    """How the near-full rule is kept here, for `status` (F8)."""
+    if advisor_unchecked():
+        return "unchecked when no fresh reading exists (LONGHAUL_ADVISOR_ALLOWANCE=unchecked, a scratch home)"
+    if os.environ.get("LONGHAUL_ADVISOR_ALLOWANCE") == "unchecked":
+        return "checked: LONGHAUL_ADVISOR_ALLOWANCE=unchecked is ignored in the default home"
+    return "checked: a fresh status-line reading of the session's account is needed"
 
 
 def advisor_day(epoch) -> str:
@@ -4606,14 +4669,58 @@ def advisor_record(path: str) -> tuple:
             "evidence": evidence if isinstance(evidence, str) and evidence.strip() else os.path.abspath(path)}, None
 
 
+def advisor_enable() -> int:
+    """`longhaul advisor enable`: the key the gate needs beside the switch
+    (F8), for the probe record's version. Refused, with nothing written,
+    from inside a Claude Code session (any SESSION_ENV variable set, so
+    CLAUDECODE too), with no passing probe record, and in the default home
+    when stdin is not a terminal: the owner turns it on, never a session
+    or a script."""
+    inside = [name for name in SESSION_ENV if name in os.environ]
+    record = advisor_probe()
+    why = (f"it runs inside a Claude Code session ({', '.join(inside)} set); run it in a terminal of your own" if inside
+           else "no passing probe record; record one first with longhaul advisor record-probe" if record is None
+           else "stdin is not a terminal; in the default home only a person at a terminal enables it"
+           if advisor_default_home() and not (sys.stdin and sys.stdin.isatty()) else None)
+    if why:
+        print(f"longhaul advisor enable: not enabled: {why}", file=sys.stderr)
+        return 2
+    path = advisor_path("enabled.json")
+    with locked("advisor"):
+        write_json(path, {"schema": 1, "enabled_at": round(time.time()), "probe_version": record["claude_version"]})
+    print(f"Enabled for Claude Code {record['claude_version']} in {home_path(str(path))}. A consultation is admitted only "
+          "with LONGHAUL_ADVISOR=experiment as well; a probe record for another version needs a new enable. "
+          "longhaul advisor disable removes the key.")
+    return 0
+
+
+def advisor_disable() -> int:
+    """`longhaul advisor disable`: the enabled key removed. It always works,
+    from anywhere, with or without a key; only a disk that refuses to
+    remove it is an error."""
+    path = advisor_path("enabled.json")
+    with contextlib.suppress(OSError):
+        path.unlink()
+    if path.is_file():
+        print(f"longhaul advisor disable: could not remove {home_path(str(path))}", file=sys.stderr)
+        return 1
+    print("Disabled: no consultation is admitted until longhaul advisor enable runs again, in a terminal.")
+    return 0
+
+
 def advisor(opts) -> int:
-    """`longhaul advisor status` and `longhaul advisor record-probe
-    EVIDENCE`. Neither turns the Advisor on: that is LONGHAUL_ADVISOR=
+    """`longhaul advisor status`, `record-probe EVIDENCE`, `enable` and
+    `disable`. A consultation is admitted only with LONGHAUL_ADVISOR=
     experiment, which the user sets where Claude Code gets its
-    environment. bin/longhaul lets `status` alone through from a session."""
+    environment, and the key `enable` writes. bin/longhaul lets `status`
+    alone through from a session."""
     if opts.action == "status":
         print("\n".join(advisor_status_lines()))
         return 0
+    if opts.action == "enable":
+        return advisor_enable()
+    if opts.action == "disable":
+        return advisor_disable()
     record, why = (advisor_record(opts.evidence) if opts.evidence else
                    (None, "name the evidence file, a JSON object with claude_version and the five checks"))
     if record is None:
@@ -4623,7 +4730,8 @@ def advisor(opts) -> int:
         write_json(advisor_path("probe.json"), record)
     print(json.dumps(record, indent=2))
     print(f"Recorded in {home_path(str(advisor_path('probe.json')))}. This turns nothing on: a consultation is admitted "
-          f"only with LONGHAUL_ADVISOR=experiment as well, and only on Claude Code {record['claude_version']}.")
+          f"only with LONGHAUL_ADVISOR=experiment and longhaul advisor enable as well, and only on Claude Code "
+          f"{record['claude_version']}.")
     return 0
 
 
@@ -5806,9 +5914,10 @@ def main(argv: list[str]) -> int:
                            help="save: read the state from this file instead of stdin "
                                 "(a .state.json under LONGHAUL_HOME/checkpoints is removed once saved)")
         if cmd == "advisor":
-            p.add_argument("action", choices=["status", "record-probe"],
-                           help="status: the switch, the probe record and the running version; "
-                                "record-probe: write the probe record from EVIDENCE")
+            p.add_argument("action", choices=["status", "record-probe", "enable", "disable"],
+                           help="status: the switch, the probe record, the running version and the enabled key; "
+                                "record-probe: write the probe record from EVIDENCE; enable: write the key for the "
+                                "probe record's version, from a terminal; disable: remove it")
             p.add_argument("evidence", nargs="?", metavar="EVIDENCE",
                            help="record-probe: a JSON file naming claude_version and the five checks, all true")
         if cmd == "inspect":

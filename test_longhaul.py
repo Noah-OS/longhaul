@@ -3796,6 +3796,7 @@ class Advisor(unittest.TestCase):
         self.transcript = self.tmp / "s1.jsonl"
         self.executor("claude-sonnet-4-5")
         self.probe()
+        self.enable()
         self.reading()
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("LONGHAUL_") and k not in self.VARS + Checkpoint.SESSION_VARS}
@@ -3819,6 +3820,12 @@ class Advisor(unittest.TestCase):
                   "checks": {**dict.fromkeys(longhaul.ADVISOR_CHECKS, True), **checks}, "evidence": "a test"}
         (self.home / "advisor").mkdir(exist_ok=True)
         (self.home / "advisor" / "probe.json").write_text(json.dumps(record))
+
+    def enable(self, version="2.1.307", home=None):
+        """The key `longhaul advisor enable` writes (F8), for the probe record's version."""
+        path = (home or self.home) / "advisor" / "enabled.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "enabled_at": self.now, "probe_version": version}))
 
     def reading(self, five=40, at=None, name="main", week=10):
         """The status line's latest reading for account `name`."""
@@ -3922,9 +3929,12 @@ class Advisor(unittest.TestCase):
         (self.home / "advisor" / "probe.json").unlink()
         self.denied(self.call(), "no-probe")
         self.probe("2.1.304")
+        self.denied(self.call(), "not-enabled")  # the key is for 2.1.307's record
+        self.enable("2.1.304")
         self.denied(self.call(), "version-mismatch")
         self.assertEqual(self.state(), {}, "nothing denied was counted")
         self.probe()
+        self.enable()
         self.assertEqual(self.admitted(self.call())["updatedInput"]["model"], "opus")
         self.assertEqual(self.trace()[0]["kind"], "hard", "off is no fault of the brief")
 
@@ -4043,7 +4053,7 @@ class Advisor(unittest.TestCase):
         out = self.run_hook(self.HOOK, "")
         self.assertEqual((out.returncode, out.stdout), (0, ""))
         written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
-        self.assertEqual(written, ["advisor/probe.json", "usage/main.json"], "the fixture's own files alone")
+        self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "the fixture's own files alone")
         # The agent type's name, however it is cased or spaced, is a consultation.
         self.assertTrue(longhaul.advisor_consultation(self.call(agent=" Longhaul:Advisor ")))
 
@@ -4254,11 +4264,14 @@ class Advisor(unittest.TestCase):
                                                for p in ("p1", "p1", "p2", "p3", "p4", "p0")]
         (self.home / "advisor" / "state.json").write_text(json.dumps(state))
         (self.home / "advisor" / "probe.json").unlink()
+        (self.home / "advisor" / "enabled.json").unlink()
         self.transcript.unlink()
         self.reading(five=97)
         (self.home / "accounts.json").write_text(json.dumps([{"name": "main", "repositories": [str(self.tmp / "elsewhere")]}]))
         bad = "Reconcile: yes\nfindings in sk-ant-x\n" + "x" * 9_000
         step(call(bad, None), LONGHAUL_ADVISOR=None, CLAUDE_CODE_EXECPATH=None)
+        step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
+        self.enable()
         step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
         self.probe()
         step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
@@ -4288,12 +4301,14 @@ class Advisor(unittest.TestCase):
         step(call(self.brief(), session="s2", extra=False))
         self.reading(five=40)
         step(call(self.brief(), session="s2", extra=False))
-        self.assertEqual(said, ["off", "no-probe", "version-unknown", "version-mismatch", "executor-unknown",
+        # F5's model-mismatch (after version-mismatch) and model-unprobed (after
+        # no-stronger-advisor) are merged into this order at integration.
+        self.assertEqual(said, ["off", "not-enabled", "no-probe", "version-unknown", "version-mismatch", "executor-unknown",
                                 "no-stronger-advisor", "repository", "call-fields", "brief-too-long", "brief-sections",
                                 "trigger-missing", "credential", "task-unknown", "reconcile-invalid", "repeat", "cap-task",
                                 "cap-session", "near-full", "allowance-unknown", "allow"])
         self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
-                         ["hard"] * 7 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
+                         ["hard"] * 8 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
 
     def test_the_brief_is_at_most_8000_characters(self):
         base = self.brief()
@@ -4548,7 +4563,7 @@ class Advisor(unittest.TestCase):
         self.denied(self.call(), "repository", CLAUDE_CONFIG_DIR=str(pro))
         self.assertEqual((self.home / "accounts.json").read_bytes(), before)
         self.assertFalse((self.home / "state.json").exists(), "the supervisor's state is untouched")
-        self.assertEqual(sorted(p.name for p in (self.home / "advisor").iterdir()), ["probe.json", "state.json", "trace.jsonl"])
+        self.assertEqual(sorted(p.name for p in (self.home / "advisor").iterdir()), ["enabled.json", "probe.json", "state.json", "trace.jsonl"])
 
     DECISION = ("t", "id", "session", "prompt_id", "event", "decision", "reason", "kind", "trigger", "reconcile",
                 "executor", "advisor", "brief_chars", "brief_hash", "allowance")
@@ -4727,30 +4742,151 @@ class Advisor(unittest.TestCase):
         """`longhaul advisor ...` from a terminal, the session's variables over it (None unsets a name)."""
         values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
         return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "advisor", *args], env=values,
-                              capture_output=True, text=True, timeout=30)
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+
+    def default_home(self):
+        """A HOME whose ~/.longhaul is this test's home, by a link: the default home, in scratch."""
+        fake = self.tmp / "user"
+        fake.mkdir(exist_ok=True)
+        if not (fake / ".longhaul").exists():
+            (fake / ".longhaul").symlink_to(self.home)
+        return fake
+
+    def test_the_gate_needs_the_enabled_key_for_the_probe_records_version(self):
+        # F8: the switch alone is not enough; the key names the version.
+        key = self.home / "advisor" / "enabled.json"
+        key.unlink()
+        reason = self.denied(self.call(prompt="p1"), "not-enabled")
+        self.assertNotIn("LONGHAUL_ADVISOR", reason, "the denial never names the switch")
+        for text in ("not json", "[]", json.dumps({"schema": 2, "probe_version": "2.1.307"}),
+                     json.dumps({"schema": True, "probe_version": "2.1.307"}), json.dumps({"schema": 1}),
+                     json.dumps({"schema": 1, "probe_version": "latest"})):
+            key.write_text(text)
+            self.denied(self.call(prompt="p1"), "not-enabled")
+        self.enable()
+        self.admitted(self.call(prompt="p1"))
+        # A probe record for another version needs a new enable.
+        self.probe("2.1.308")
+        other = self.tmp / "claude" / "versions" / "2.1.308"
+        other.write_text("")
+        self.denied(self.call(prompt="p2"), "not-enabled", CLAUDE_CODE_EXECPATH=str(other))
+        self.enable("2.1.308")
+        self.admitted(self.call(prompt="p2"), CLAUDE_CODE_EXECPATH=str(other))
+        self.assertEqual(self.trace()[0]["kind"], "hard")
+
+    def test_enable_is_the_owners_and_disable_always_works(self):
+        # F8: refused, with nothing written, inside a session, without a
+        # passing probe record, and for the default home without a terminal.
+        key = self.home / "advisor" / "enabled.json"
+        key.unlink()
+        terminal = dict.fromkeys(longhaul.SESSION_ENV + list(self.VARS))  # a terminal of the owner's: no session's variables
+        for name in longhaul.SESSION_ENV:
+            out = self.command("enable", **{**terminal, name: "1"})
+            self.assertEqual((out.returncode, out.stdout), (2, ""), name)
+            self.assertIn(f"not enabled: it runs inside a Claude Code session ({name} set)", out.stderr)
+            self.assertFalse(key.exists(), name)
+        self.assertIn("CLAUDECODE", longhaul.SESSION_ENV)
+        self.probe(read_only=False)
+        out = self.command("enable", **terminal)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("not enabled: no passing probe record", out.stderr)
+        self.probe()
+        fake = self.default_home()
+        out = self.command("enable", **terminal, HOME=str(fake), LONGHAUL_HOME=None)  # stdin is no terminal here
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("not enabled: stdin is not a terminal", out.stderr)
+        self.assertFalse(key.exists())
+        primary, secondary = pty.openpty()
+        self.addCleanup(os.close, primary)
+        with open(secondary, "rb") as tty:  # a person at a terminal: the default home is enabled
+            out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "advisor", "enable"], stdin=tty,
+                                 env={k: v for k, v in {**self.env, **terminal, "HOME": str(fake)}.items()
+                                      if v is not None and k != "LONGHAUL_HOME"},
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        key.unlink()
+        out = self.command("enable", **terminal)  # a scratch home: no terminal needed
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertIn("Enabled for Claude Code 2.1.307", out.stdout)
+        written = json.loads(key.read_text())
+        self.assertEqual((set(written), written["schema"], written["probe_version"]),
+                         ({"schema", "enabled_at", "probe_version"}, 1, "2.1.307"))
+        self.assertAlmostEqual(written["enabled_at"], time.time(), delta=60)
+        self.assertEqual(oct(key.stat().st_mode & 0o777), oct(0o600))
+        for env in ({"CLAUDECODE": "1"}, {}):  # disable: inside a session too, and with no key
+            out = self.command("disable", **env)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), env)
+            self.assertFalse(key.exists())
+        self.denied(self.call(), "not-enabled")
+
+    def test_the_allowance_opt_out_is_ignored_in_the_default_home_and_near_full_only_stricter(self):
+        # F8: LONGHAUL_ADVISOR_ALLOWANCE=unchecked counts in a scratch home
+        # alone; LONGHAUL_NEAR_FULL can lower the Advisor's 95 and never raise it.
+        (self.home / "usage" / "main.json").unlink()
+        self.admitted(self.call(prompt="p1"), LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
+        with mock.patch.object(longhaul, "HOME", self.default_home()):
+            self.denied(self.call(prompt="p2"), "allowance-unknown", LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
+            self.assertEqual(self.trace()[-1]["allowance"], "checked")
+        self.assertEqual(longhaul.ADVISOR_NEAR_FULL, 95)
+        for n, (setting, five, verdict, limit) in enumerate(((99, 96, "near-full", "95%"), (99, 94.9, "allow", None),
+                                                             (80, 85, "near-full", "80%"), (80, 79, "allow", None))):
+            self.reading(five=five)
+            with mock.patch.object(longhaul, "NEAR_FULL", setting):
+                if verdict == "allow":
+                    self.admitted(self.call(prompt=f"q{n}"))
+                else:
+                    self.assertIn(limit, self.denied(self.call(prompt=f"q{n}"), "near-full"))
+        # unchecked in the trace only when no fresh reading was checked
+        self.admitted(self.call(prompt="r1", session="s2"), LONGHAUL_ADVISOR_ALLOWANCE="unchecked")
+        self.assertEqual(self.trace()[-1]["allowance"], "checked", "a fresh reading was checked")
+
+    def status(self, **env):
+        """`longhaul advisor status`: its lines but the last, by what each names (the text before its colon), and the last."""
+        out = self.command("status", **env)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), env)
+        lines = out.stdout.splitlines()
+        return dict(line.split(": ", 1) for line in lines[:-1]), lines[-1]
 
     def test_advisor_status_names_the_switch_both_versions_and_whether_it_is_enabled(self):
         day = dt.datetime.fromtimestamp(self.now).strftime("%Y-%m-%d")
-        out = self.command("status")
-        self.assertEqual((out.returncode, out.stderr), (0, ""))
-        self.assertEqual(out.stdout.splitlines(), ["LONGHAUL_ADVISOR: experiment", f"Probe record: Claude Code 2.1.307, passed {day}",
-                                                   "Running Claude Code: 2.1.307", "enabled"])
+        lines, last = self.status()
+        self.assertEqual(lines, {"LONGHAUL_ADVISOR": "experiment", "Probe record": f"Claude Code 2.1.307, passed {day}",
+                                 "Running Claude Code": "2.1.307", "Enabled key": "present, for Claude Code 2.1.307",
+                                 "Allowance": "checked: a fresh status-line reading of the session's account is needed",
+                                 "Home": str(self.home)})
+        self.assertEqual(last, "enabled", "the skill's contract: the last line")
         other = self.tmp / "claude" / "versions" / "2.1.308"
         other.write_text("")
-        for env, lines in (
-                ({"LONGHAUL_ADVISOR": None}, {0: "LONGHAUL_ADVISOR: off", 3: "off: LONGHAUL_ADVISOR is not experiment"}),
-                ({"LONGHAUL_ADVISOR": "on"}, {0: "LONGHAUL_ADVISOR: off", 3: "off: LONGHAUL_ADVISOR is not experiment"}),
-                ({"CLAUDE_CODE_EXECPATH": None}, {2: "Running Claude Code: unknown",
-                                                  3: "off: the running Claude Code version is unknown"}),
-                ({"CLAUDE_CODE_EXECPATH": str(other)},
-                 {2: "Running Claude Code: 2.1.308", 3: "off: the probe passed on 2.1.307, not on 2.1.308, the version running"})):
-            got = self.command("status", **env).stdout.splitlines()
-            self.assertEqual({n: got[n] for n in lines}, lines, env)
+        for env, named, why in (
+                ({"LONGHAUL_ADVISOR": None}, {"LONGHAUL_ADVISOR": "off"}, "LONGHAUL_ADVISOR is not experiment"),
+                ({"LONGHAUL_ADVISOR": "on"}, {"LONGHAUL_ADVISOR": "off"}, "LONGHAUL_ADVISOR is not experiment"),
+                ({"CLAUDE_CODE_EXECPATH": None}, {"Running Claude Code": "unknown"}, "the running Claude Code version is unknown"),
+                ({"CLAUDE_CODE_EXECPATH": str(other)}, {"Running Claude Code": "2.1.308"},
+                 "the probe passed on 2.1.307, not on 2.1.308, the version running"),
+                ({"LONGHAUL_ADVISOR_ALLOWANCE": "unchecked"},
+                 {"Allowance": "unchecked when no fresh reading exists (LONGHAUL_ADVISOR_ALLOWANCE=unchecked, a scratch home)"},
+                 None)):
+            lines, last = self.status(**env)
+            self.assertEqual({k: lines[k] for k in named}, named, env)
+            self.assertEqual(last, f"off: {why}" if why else "enabled", env)
+        # The default home: the opt-out is ignored there, and status says so.
+        lines, _ = self.status(LONGHAUL_ADVISOR_ALLOWANCE="unchecked", HOME=str(self.default_home()), LONGHAUL_HOME=None)
+        self.assertEqual((lines["Allowance"], lines["Home"]),
+                         ("checked: LONGHAUL_ADVISOR_ALLOWANCE=unchecked is ignored in the default home", "~/.longhaul (the default)"))
+        self.enable("2.1.306")
+        lines, last = self.status()
+        self.assertEqual((lines["Enabled key"], last), ("present, for Claude Code 2.1.306, not the probe record's 2.1.307",
+                                                        "off: the enabled key is for 2.1.306, not the probe record's 2.1.307; "
+                                                        "run longhaul advisor enable again"))
+        (self.home / "advisor" / "enabled.json").unlink()
+        lines, last = self.status()
+        self.assertEqual((lines["Enabled key"], last), ("missing", "off: not enabled (longhaul advisor enable, in a terminal)"))
+        self.enable()
         self.probe(read_only=False)
-        self.assertEqual(self.command("status").stdout.splitlines()[1:], ["Probe record: none", "Running Claude Code: 2.1.307",
-                                                                          "off: no passing probe record"])
+        lines, last = self.status()
+        self.assertEqual((lines["Probe record"], last), ("none", "off: no passing probe record"))
         written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
-        self.assertEqual(written, ["advisor/probe.json", "usage/main.json"], "status writes nothing")
+        self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "status writes nothing")
 
     def test_record_probe_writes_a_passing_record_and_refuses_anything_else(self):
         path = self.home / "advisor" / "probe.json"
@@ -5534,10 +5670,13 @@ class Shim(unittest.TestCase):
         exe = str(self.tmp / "versions" / "2.1.307" / "claude")  # never the session's own claude
         out = self.shim("advisor", "status", CLAUDE_CODE_EXECPATH=exe)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout.splitlines(), ["LONGHAUL_ADVISOR: off", "Probe record: none",
-                                                   "Running Claude Code: 2.1.307", "off: LONGHAUL_ADVISOR is not experiment"])
+        lines = out.stdout.splitlines()
+        self.assertEqual(lines[:3], ["LONGHAUL_ADVISOR: off", "Probe record: none", "Running Claude Code: 2.1.307"])
+        self.assertIn("Enabled key: missing", lines)
+        self.assertEqual(lines[-1], "off: LONGHAUL_ADVISOR is not experiment")
+        # F8: enabling is the owner's, in a terminal; disable too goes there.
         for args in (("advisor",), ("advisor", "record-probe", "x.json"), ("advisor", "-h"), ("advisor-hook",),
-                     ("advisor-result",)):
+                     ("advisor-result",), ("advisor", "enable"), ("advisor", "disable")):
             out = self.shim(*args, CLAUDE_CODE_EXECPATH=exe)
             self.assertEqual((out.returncode, out.stdout), (2, ""), args)
             self.assertIn("run it in a terminal", out.stderr, args)
