@@ -4029,6 +4029,7 @@ class Advisor(unittest.TestCase):
         cases = [(self.call(), deny), (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
                  (self.call(agent="Explore"), None), ("{not json, an advisor", deny), ("{not json", None), ("", None),
                  ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), None),
+                 ("{not json, an ADVISOR", deny), (huge.replace("advisor", "ADVISOR"), deny),  # any case (F20)
                  # F17: a Workflow call is read as text, as the hook reads it.
                  (self.workflow({"script": "agent({subagent_type: 'ADVISOR'})"}), deny),
                  (self.workflow({"script": "agent({subagent_type: 'Explore'})"}), None)]
@@ -4666,6 +4667,21 @@ class Advisor(unittest.TestCase):
         out = self.run_hook(self.RESULT, {**big, "hook_event_name": "PostToolUse", "tool_response": self.reply("x")})
         self.assertEqual((out.returncode, out.stdout), (0, ""))
         self.assertIn("advisor-result hook: no outcome traced (over 1,000,000 characters)", self.log())
+
+    def test_past_the_cap_the_advisor_is_named_in_any_case(self):
+        # F20: the over-cap check reads the input lowercased, so an advisor
+        # named in capitals alone is denied too; a check that read it as
+        # written would let this call run. The name is in the first 1 MB,
+        # the part the hook reads.
+        for agent, description in (("Longhaul:Advisor", "Consult the ADVISOR"), ("ADVISOR", "Ask it")):
+            big = {"session_id": "s1", "tool_use_id": "toolu_f20", "hook_event_name": "PreToolUse", "tool_name": "Agent",
+                   "tool_input": {"subagent_type": agent, "description": description, "prompt": "x" * 1_000_001}}
+            raw = json.dumps(big)
+            self.assertNotIn("advisor", raw)
+            out = self.run_hook(self.HOOK, raw)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("denied (brief-too-long)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertEqual(self.trace()[-1]["reason"], "brief-too-long")
 
     def test_the_checks_run_in_the_documented_order(self):
         # Every check failing at once, then put right one at a time: each
