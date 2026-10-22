@@ -4478,6 +4478,29 @@ class Advisor(unittest.TestCase):
     def test_the_tail_read_for_the_executor_is_at_least_200_kb(self):
         self.assertGreaterEqual(longhaul.ADVISOR_TAIL, 200 * 1024, "an assistant line can be long; a short tail misses it")
 
+    def test_a_junk_version_cache_is_asked_past_and_written_over(self):
+        # F11, item 13: a cache that cannot be trusted is no answer; claude
+        # is asked, and the cache written whole again.
+        exe, mark = self.fake_claude()
+        cache = self.home / "advisor" / "version-cache.json"
+        st = exe.stat()
+        key = {"realpath": str(exe), "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+        junk = [b"not json", b"\xff\xfe", b"[]", b"null", self.DEEP.encode(),
+                json.dumps({**key, "version": "2.1"}).encode(), json.dumps({**key, "version": None}).encode(),
+                json.dumps({**key, "mtime_ns": str(st.st_mtime_ns), "version": "2.1.307"}).encode(),
+                json.dumps({**key, "size": float(st.st_size), "version": "2.1.307"}).encode(),
+                json.dumps({**key, "size": st.st_size + 1, "version": "2.1.307"}).encode(),
+                json.dumps({**key, "realpath": str(self.exe), "version": "2.1.307"}).encode(),
+                json.dumps({"realpath": str(exe), "mtime": st.st_mtime, "version": "2.1.307"}).encode()]  # before F7
+        with mock.patch.object(longhaul, "ADVISOR_VERSION_TIMEOUT", 10):
+            for n, raw in enumerate(junk, 1):
+                cache.write_bytes(raw)
+                self.admitted(self.call(session=f"s{n}"), CLAUDE_CODE_EXECPATH=str(exe))
+                self.assertEqual(mark.read_text(), "--version\n" * n, raw[:40])
+                self.assertEqual(json.loads(cache.read_text()), {**key, "version": "2.1.307"})
+            self.admitted(self.call(session="s0"), CLAUDE_CODE_EXECPATH=str(exe))
+        self.assertEqual(mark.read_text(), "--version\n" * len(junk), "the cache written over is the answer")
+
     def hold(self, name="advisor"):
         """The lock `name` held by this process, as another hook would hold it, until the file is closed."""
         f = open(self.home / f".{name}.lock", "a")
