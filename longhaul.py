@@ -4799,14 +4799,13 @@ def advisor_hook(_opts) -> int:
     """The PreToolUse hook command: stdin in, JSON or nothing out, exit 0.
     Not run_hook(): its silent exit on an error lets a call run, which is
     right for any other agent type and wrong for a consultation. Input
-    that is not JSON could be a consultation, so it is denied; so is
-    input past run_hook's cap that names an advisor (F3)."""
+    that is not JSON could be a consultation, so it is denied; so is any
+    input past run_hook's cap, since the part not read could name the
+    advisor (F3, F21): no real subagent call or message is that large."""
     data = None
     try:
         raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
         if len(raw) > ADVISOR_STDIN_MAX:
-            if "advisor" not in raw.lower():
-                return 0
             return advisor_fail({}, None, "brief-too-long", chars=len(raw), limit=ADVISOR_BRIEF_MAX)
         data = json.loads(raw) if raw.strip() else {}
         answer = advisor_check(data, time.time())

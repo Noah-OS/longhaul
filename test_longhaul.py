@@ -4036,7 +4036,7 @@ class Advisor(unittest.TestCase):
         huge = json.dumps(self.call(self.brief(extra="x" * 1_100_000)))
         cases = [(self.call(), deny), (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
                  (self.call(agent="Explore"), None), ("{not json, an advisor", deny), ("{not json", None), ("", None),
-                 ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), None),
+                 ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), deny),  # past the cap: all (F21)
                  ("{not json, an ADVISOR", deny), (huge.replace("advisor", "ADVISOR"), deny),  # any case (F20)
                  # F17: a Workflow call is read as text, as the hook reads it.
                  (self.workflow({"script": "agent({subagent_type: 'ADVISOR'})"}), deny),
@@ -4660,7 +4660,7 @@ class Advisor(unittest.TestCase):
                 mock.patch.object(longhaul, "advisor_running_version", side_effect=AssertionError("the version was asked")):
             self.denied(self.call(), "off", LONGHAUL_ADVISOR=None)
 
-    def test_stdin_is_read_up_to_1_mb_and_past_it_a_consultation_is_denied(self):
+    def test_stdin_is_read_up_to_1_mb_and_past_it_every_call_is_denied(self):
         self.assertEqual(longhaul.ADVISOR_STDIN_MAX, 1_000_000, "run_hook's cap")
         big = self.call(self.brief(extra="x" * 1_000_000))
         out = self.run_hook(self.HOOK, big)
@@ -4671,7 +4671,17 @@ class Advisor(unittest.TestCase):
         other = self.call("y" * 1_000_000, agent="Explore")
         other["tool_input"]["description"] = "Explore the parser"
         out = self.run_hook(self.HOOK, other)
-        self.assertEqual((out.returncode, out.stdout), (0, ""), "another agent type, past the cap: nothing")
+        # F21: past the cap the part the hook did not read could name the
+        # advisor, so another agent type is denied too; no real call is
+        # that large.
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("denied (brief-too-long)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        late = json.dumps({"session_id": "s1", "tool_use_id": "toolu_f21", "hook_event_name": "PreToolUse",
+                           "tool_name": "Agent", "tool_input": {"description": "d", "prompt": "z" * 1_000_100,
+                                                                "subagent_type": "longhaul:advisor"}})
+        self.assertNotIn("advisor", late[:1_000_001], "the advisor is named only past the part read")
+        out = self.run_hook(self.HOOK, late)
+        self.assertIn("denied (brief-too-long)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
         out = self.run_hook(self.RESULT, {**big, "hook_event_name": "PostToolUse", "tool_response": self.reply("x")})
         self.assertEqual((out.returncode, out.stdout), (0, ""))
         self.assertIn("advisor-result hook: no outcome traced (over 1,000,000 characters)", self.log())
