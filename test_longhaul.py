@@ -2185,10 +2185,14 @@ class Plugin(unittest.TestCase):
     def test_the_readme_matches_the_code(self):
         # Review, Sprint 5 (G1): the README is read against what it
         # describes, so a placeholder left for a later pass, a Python floor
-        # or a Claude Code range the code has moved past, a test command
-        # that drifted from CI's, or a hook described with another matcher
-        # or message fails here, not in a reader's hands. One subTest per
-        # claim, so one run names every gap.
+        # or a Claude Code range the code has moved past, or a test command
+        # that drifted from CI's fails here, not in a reader's hands. One
+        # subTest per claim, so one run names every gap. Since the README
+        # became a landing page (the owner's decision, 2026-10-22), the
+        # detail it held (the hooks table, the code index, the files table,
+        # the advanced feature, the CodeGraph install) is in the GitHub
+        # wiki, which this suite cannot read, and the checks of that detail
+        # went with it.
         readme = (HERE / "README.md").read_text()
         changelog = (HERE / "CHANGELOG.md").read_text()
 
@@ -2207,36 +2211,8 @@ class Plugin(unittest.TestCase):
                              "every Python version the README names is the floor")
         first, last = (".".join(map(str, version)) for version in longhaul.TESTED_VERSIONS)
         with self.subTest("the Claude Code range", first=first, last=last):
-            self.assertEqual(set(re.findall(r"\b(\d+\.\d+\.\d+) to (\d+\.\d+\.\d+)\b", readme)), {(first, last)},
-                             "the one version range the README gives is TESTED_VERSIONS")
-        with self.subTest("the CodeGraph install"):  # Sprint 6, G3: the paragraph repeats the advice line's constant
-            for key, text in longhaul.CODEGRAPH_INSTALL.items():
-                self.assertTrue(lines(readme, text), f"no README.md line holds CODEGRAPH_INSTALL[{key!r}]: {text}")
-        with self.subTest("the index commands"):  # Sprint 7, G4: the README quotes each init command as the code runs it
-            # The headings the two sections are found by, said as such when
-            # one is renamed, not an IndexError (review, Sprint 7, F15).
-            headings = re.findall(r"^## .*$", readme, re.M)
-            for heading in ("## A code index, built for you", "## Pairs well with CodeGraph and Trail-Code"):
-                self.assertIn(heading, headings, "the README's heading the subtest splits on")
-            section = readme.split("\n## A code index, built for you", 1)[1].split("\n## ", 1)[0]
-            for program, command in longhaul.INDEX_COMMANDS.items():
-                self.assertTrue(lines(section, f"`{' '.join(command)}`"), f"the section quotes {program}'s command verbatim")
-                self.assertTrue(lines(section, f"`{longhaul.INDEX_MAPS[program]}/`"), f"the section names {program}'s map folder")
-            self.assertTrue(lines(section, "`LONGHAUL_INDEX=on`"), "the section names the switch")
-            self.assertTrue(lines(section, "24 hours"), "the section states the retry rule")
-            self.assertTrue(lines(readme, "| `index/<key>.json`, `index/<key>.<program>.log` |"), "the files table has the index row")
-            self.assertTrue(lines(readme, "`.index.lock`"), "the files table names the index lock")
-            pairs = readme.split("\n## Pairs well with CodeGraph and Trail-Code", 1)[1].split("\n## ", 1)[0]
-            for name in ("CodeGraph", "Trail-Code", "self-reported"):
-                self.assertTrue(lines(pairs, name), f"the Pairs well section names {name}")
-        # Sprint 7, A2: an account's repositories, the field and the flag, where a reader looks.
-        with self.subTest("the files table names the repositories field"):
-            rows = [line for line in readme.splitlines() if line.startswith("| `accounts.json`")]
-            self.assertEqual(len(rows), 1, "one files-table row for accounts.json")
-            self.assertIn("repositories", rows[0], "the files table's accounts.json row names the field")
-        with self.subTest("the advanced section gives --repo"):
-            advanced = readme.split("\n## Advanced, experimental", 1)[1].split("\n## ", 1)[0]
-            self.assertTrue(lines(advanced, "--repo"), "the advanced section says how to restrict an account")
+            self.assertLessEqual(set(re.findall(r"\b(\d+\.\d+\.\d+) to (\d+\.\d+\.\d+)\b", readme)), {(first, last)},
+                                 "any version range the README gives is TESTED_VERSIONS")
         _, jobs = self.workflow()
         with self.subTest("the test command"):
             fenced = re.findall(r"^```[^\n]*\n(.*?)\n```$", readme, re.M | re.S)
@@ -2245,26 +2221,6 @@ class Plugin(unittest.TestCase):
             self.assertEqual(commands[0], self.SUITE, "the README's test command is the onboarding's")
             for job in ("macos", "linux"):
                 self.assertEqual(self.runs(jobs[job]), commands, (job, "CI runs the command the README gives"))
-        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        section = readme.split("\n## What the hooks do", 1)[1].split("\n## ", 1)[0]
-        rows = [line for line in section.splitlines() if line.startswith("| `")]
-        with self.subTest("the hooks table"):
-            entries = [(event, entry) for event, entries in hooks["hooks"].items() for entry in entries]
-            self.assertEqual(len(entries), 6, "the six hooks the README describes, and nothing else")
-            self.assertEqual(len(rows), len(entries), "one row per hook")
-            timeouts = set()
-            for event, entry in entries:
-                [handler] = entry["hooks"]
-                timeouts.add(handler["timeout"])
-                *rest, end = [f"`{matcher}`" for matcher in entry["matcher"].split("|")]
-                # "on `a`, `b` and `c`", or "on `a`" for a hook with one matcher
-                named = f"`{event}` on " + (f"{', '.join(rest)} and {end}" if rest else end)
-                matching = [row for row in rows if named in row]
-                self.assertEqual(len(matching), 1, (named, "one row names this hook by its event and matchers"))
-                self.assertIn(f'"{handler["statusMessage"]}"', matching[0], (named, "its row quotes its status message"))
-            # Sprint 8, F1: the consultation check has 30 s, every other hook 5.
-            self.assertEqual(set(re.findall(r"(\d+)[- ]second", section)), {str(t) for t in timeouts},
-                             "each hook timeout, wherever the section gives it")
 
 
 class Guard(unittest.TestCase):
