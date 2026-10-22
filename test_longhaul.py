@@ -4140,6 +4140,12 @@ class Advisor(unittest.TestCase):
         self.assertIsNone(longhaul.advisor_version_in("/a/claude-2.1/claude"))
 
     def test_with_no_version_in_the_path_claude_is_asked_once_and_the_answer_cached(self):
+        # F11, item 14: on a loaded machine the fake can take past 2 s to
+        # start, and its call is then denied. The timeout is the slow
+        # case's to test, so every other call here gets 10 s.
+        patched = mock.patch.object(longhaul, "ADVISOR_VERSION_TIMEOUT", 10)
+        patched.start()
+        self.addCleanup(patched.stop)
         exe, mark = self.fake_claude()
         self.assertIsNone(longhaul.advisor_version_in(str(exe)), "the fixture's path names no version")
         self.admitted(self.call(prompt="p1"), CLAUDE_CODE_EXECPATH=str(exe))
@@ -4957,6 +4963,11 @@ class Advisor(unittest.TestCase):
         # Claude Code lets a call run when its hook overruns the timeout (5 s
         # here), so the hook must stay fast; its speed is in the work log.
         # This catches one that hangs or crawls, on a 6 MB transcript.
+        # Left out of Settings' child run of this class (F11, item 14): a
+        # timing under that run's load says nothing, and the child is there
+        # for the programs run, which this test runs none of beyond its fake.
+        if os.environ.get("LONGHAUL_TEST_CHILD"):
+            self.skipTest("the child run of Settings")
         self.executor("claude-sonnet-4-5", before=(json.dumps({"type": "user", "message": {"content": "y" * 2_000}}) + "\n").encode() * 3_000)
         exe, mark = self.fake_claude()
         took = []
