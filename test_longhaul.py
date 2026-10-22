@@ -4616,6 +4616,10 @@ class InspectSkill(unittest.TestCase):
         # name: the report is tool output in the model's context.
         self.assertIn("searches (their chains and big results, and whether a code index was seen)", head)
         self.assertIn("The report may name an install command; show it, take no install step.", body)
+        # Sprint 8: the two new sections, and the trace among the sources the body names.
+        self.assertIn("usage by kind and by model", head)
+        self.assertIn("the Advisor's consultations when there were any", head)
+        self.assertIn("the guard's record and the Advisor experiment's trace", " ".join(body.split()))
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/inspect/SKILL.md"], cwd=HERE).returncode, 1)
 

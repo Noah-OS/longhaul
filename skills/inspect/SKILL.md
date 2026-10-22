@@ -1,15 +1,15 @@
 ---
 name: inspect
-description: "Show where this conversation's tokens went: usage by kind, context growth, the cache, the biggest tool outputs, searches (their chains and big results, and whether a code index was seen), repeated reads, and what the guard caught. Numbers only, each with its source."
+description: "Show where this conversation's tokens went: usage by kind and by model, context growth, the cache, the biggest tool outputs, searches (their chains and big results, and whether a code index was seen), repeated reads, what the guard caught, and the Advisor's consultations when there were any. Numbers only, each with its source."
 argument-hint: "[conversation id, or nothing for this one]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul inspect *)
 ---
 
 The report below is Longhaul's reading of this conversation's own transcript,
-its subagents' transcripts, the ledger and the guard's record. It holds
-numbers, model names, tool names and file paths only; never message text or
-tool output. Each heading names where its numbers came from and how sure
-they are: measured, counted, inferred or estimated.
+its subagents' transcripts, the ledger, the guard's record and the Advisor
+experiment's trace. It holds numbers, model names, tool names and file paths
+only; never message text or tool output. Each heading names where its numbers
+came from and how sure they are: measured, counted, inferred or estimated.
 
 !`${CLAUDE_PLUGIN_ROOT}/bin/longhaul inspect "${CLAUDE_SESSION_ID}"`
 
