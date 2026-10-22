@@ -4425,9 +4425,33 @@ class Advisor(unittest.TestCase):
         self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
         written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
         self.assertNotIn(self.S, written)
-        # A state that cannot be read cannot rule a follow-up out: denied.
-        (self.home / "advisor" / "state.json").write_text("not json")
+
+    def test_a_state_that_cannot_be_read_still_denies_a_message_to_an_advisor_and_passes_any_other(self):
+        # F18: a junk state.json no longer blocks every message. The advisor's
+        # name and a meta.json of its agent type still deny one; an id the
+        # record alone names cannot be told from any other, so it passes, as
+        # every other message does. A consultation is still denied (error).
+        data = self.call(tool_id="toolu_f18")
+        self.admitted(data)
+        self.subagent("a1f2e3", "toolu_f18", model="opus")
+        self.subagent("b77", "toolu_other", agent_type="Explore")
+        self.result(data, self.reply("Verdict: proceed\nConfidence: high", agent="abeef7f4ab1007404"))
+        self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["abeef7f4ab1007404", "a1f2e3"])
+        path = self.home / "advisor" / "state.json"
+        for text in ("not json", "[]", '{"sessions": []}', self.DEEP):
+            path.write_text(text)
+            for to in ("a1f2e3", "longhaul:advisor", " Advisor "):
+                self.denied(self.message(to), "follow-up")
+            before = self.trace()
+            for to in ("abeef7f4ab1007404", "zz", "b77", "main"):
+                self.assertIsNone(self.decide(self.message(to)), (text[:20], to))
+            self.assertEqual(self.trace(), before, "nothing written for a message that passes")
+        path.write_text("not json")
         out = self.run_hook(self.HOOK, self.message("zz"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        out = self.run_hook(self.HOOK, self.message("a1f2e3"))
+        self.assertIn("denied (follow-up)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.run_hook(self.HOOK, self.call())
         self.assertIn("denied (error)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_only_the_calls_known_fields_reach_claude_code(self):

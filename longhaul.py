@@ -4242,10 +4242,14 @@ def advisor_follow_up(data) -> bool:
 
 def advisor_agents() -> set:
     """The advisors' agent ids every session's record holds (F2). A state
-    that cannot be read raises, as for a consultation: a follow-up it
-    cannot rule out is denied (error). A session's entry not in its shape
-    holds no id this can read, and the meta.json check still runs."""
-    sessions = advisor_state()["sessions"].values()
+    that cannot be read holds none (F18), so it no longer blocks every
+    message: the advisor's name and its meta.json still deny one, and a
+    consultation is still denied (error). A session's entry not in its
+    shape holds no id this can read either."""
+    try:
+        sessions = advisor_state()["sessions"].values()
+    except (ValueError, RecursionError):  # advisor_state() has logged it
+        return set()
     return {agent for entry in sessions if isinstance(entry, dict) and isinstance(entry.get("agents"), list)
             for agent in entry["agents"] if advisor_id(agent)}
 
@@ -4843,7 +4847,7 @@ def advisor_keep(line: dict, agents: list, now: float) -> None:
     A record that cannot be read or written keeps nothing, said in the
     log by the error's kind: the outcome is traced already, the trace
     keeps the mark too, a message to the advisor is still found by its
-    meta.json, and a state that cannot be read denies them all."""
+    meta.json, and a state that cannot be read denies every consultation."""
     if line["session"] is None or (not agents and line["model_seen"] == "unknown"):
         return
     try:
