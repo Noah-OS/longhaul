@@ -3886,6 +3886,10 @@ ADVISOR_VERDICT = re.compile(r"verdict:\s*(" + "|".join(CONSULTATION_VERDICTS) +
 # user prompt, updatedInput sets the subagent's model, and the agent
 # type's tools hold. A record with any of them missing or false is none.
 ADVISOR_CHECKS = ("recognise", "deny", "prompt_id", "model_rewrite", "read_only")
+# The aliases the Agent tool's model takes. A record's rewrite_models lists
+# those a probe saw take effect (the subagent's meta.json model), and only
+# an advisor model among them is set (F5): a record without it has none.
+ADVISOR_REWRITES = ("haiku", "sonnet", "opus", "fable")
 ADVISOR_VERSION = r"\d+\.\d+\.\d+"
 # Seconds `claude --version` may take when the path names no version:
 # well inside the hook's 5, past which Claude Code lets the call run.
@@ -3940,10 +3944,15 @@ ADVISOR_DENIALS = {
                        "Continue without advice; do not retry.",
     "version-mismatch": "the probe passed on Claude Code {recorded}, not on {running}, the version running; it must "
                         "pass on this one first. Continue without advice; do not retry.",
+    "model-mismatch": "an earlier consultation in this session ran on {seen}, not on the {decided} advisor it was "
+                      "admitted with, so the advisor's model is not trusted for the rest of the session. Continue "
+                      "without advice; do not retry.",
     "executor-unknown": "your model could not be read from the session's transcript, so no advisor can be chosen. "
                         "Continue without advice; do not retry.",
     "no-stronger-advisor": "no advisor stronger than your model ({executor}) is set, and no other model stands in. "
                            "Continue without advice; do not retry.",
+    "model-unprobed": "no probe has seen the hook set the {advisor} advisor's model on this Claude Code version, so "
+                      "it is not set. Continue without advice; do not retry.",
     "repository": "this session's account may not be used in this repository (its repositories in Longhaul's "
                   "accounts.json), so no consultation runs here. Continue without advice; do not retry.",
     "call-fields": "the call may hold only description, prompt and subagent_type, and run_in_background only as "
@@ -4026,6 +4035,15 @@ def advisor_probe():
     if not (isinstance(checks, dict) and all(checks.get(check) is True for check in ADVISOR_CHECKS)):
         return None
     return record
+
+
+def advisor_rewrites(found):
+    """A record's rewrite_models (F5) when each is one of ADVISOR_REWRITES'
+    aliases, else None: a record without the list, or with one in another
+    shape, has seen no rewrite take effect."""
+    if isinstance(found, list) and all(isinstance(model, str) and model in ADVISOR_REWRITES for model in found):
+        return found
+    return None
 
 
 def advisor_version_in(text: str):
@@ -4245,20 +4263,23 @@ def advisor_gate(data: dict, line: dict) -> tuple:
         return advisor_denial("version-unknown"), None
     if running != record["claude_version"]:
         return advisor_denial("version-mismatch", recorded=record["claude_version"], running=running), None
-    return None, advisor_fit(data, line)
+    return None, advisor_fit(data, line, record)
 
 
-def advisor_fit(data: dict, line: dict):
+def advisor_fit(data: dict, line: dict, record: dict):
     """The rest of the checks that need no count, in their order: the
-    executor's model and its advisor (D3, into `line`), the repository
-    (A2), the call's fields, the brief, the task. The first that fails is
-    the denial; None when all pass."""
+    executor's model and its advisor (D3, into `line`), whether the probe
+    saw that advisor's model set (F5), the repository (A2), the call's
+    fields, the brief, the task. The first that fails is the denial; None
+    when all pass."""
     line["executor"] = advisor_executor(data.get("transcript_path"))
     if line["executor"] is None:
         return advisor_denial("executor-unknown")
     line["advisor"] = ADVISOR_FOR.get(line["executor"])
     if line["advisor"] is None:
         return advisor_denial("no-stronger-advisor", executor=line["executor"])
+    if line["advisor"] not in (advisor_rewrites(record.get("rewrite_models")) or []):
+        return advisor_denial("model-unprobed", advisor=line["advisor"])
     if not advisor_repository(data):
         return advisor_denial("repository")
     denial = advisor_fields_problem(data["tool_input"]) or advisor_brief_problem(advisor_brief(data))
@@ -4346,15 +4367,17 @@ def advisor_decide(data: dict, now: float) -> dict:
 
 
 def advisor_admit(line: dict, rest, now: float, nonce: str):
-    """Under the lock: the session's record, then `rest` (advisor_fit()'s
-    denial), the checks on the counts, then the allowance; when all pass,
-    the consultation counted with its nonce, and None. With no session
-    there is no record to check or cap to keep, so the call is denied."""
+    """Under the lock: the session's record (model-mismatch), then `rest`
+    (advisor_fit()'s denial), the checks on the counts, then the
+    allowance; when all pass, the consultation counted with its nonce,
+    and None. With no session there is no record to check or cap to
+    keep, so the call is denied."""
     if line["session"] is None:
         return advisor_denial("error")
     state = advisor_state()
     entry = advisor_entry(state, line["session"])
-    denial = rest or advisor_counted(line, entry, advisor_traced(line["session"])) or advisor_allowance(line, now)
+    denial = (advisor_mismatch(entry, line["session"]) or rest
+              or advisor_counted(line, entry, advisor_traced(line["session"])) or advisor_allowance(line, now))
     if denial is None:
         line["admission"] = advisor_hash(nonce)
         advisor_count(state, entry, line, now, nonce)
@@ -4379,15 +4402,16 @@ def advisor_entry(state: dict, sid: str) -> dict:
     """This session's record, fresh for a new session: "admitted", a line
     per consultation admitted ({"id", "advisor", "prompt_id",
     "reconcile", "nonce"}), the briefs' "hashes" and, once one has run,
-    the advisors' "agents" (their ids, F2). One not in this shape raises,
-    as a state that cannot be read does."""
+    the advisors' "agents" (their ids, F2) and the "mismatch" mark (F5).
+    One not in this shape raises, as a state that cannot be read does."""
     entry = state["sessions"].get(sid)
     if entry is None:
         return {"admitted": [], "hashes": []}
     admitted = entry.get("admitted") if isinstance(entry, dict) else None
     agents = entry.get("agents", []) if isinstance(entry, dict) else None
     if not (isinstance(admitted, list) and isinstance(entry.get("hashes"), list) and all(map(advisor_counted_ok, admitted))
-            and isinstance(agents, list) and all(map(advisor_id, agents))):
+            and isinstance(agents, list) and all(map(advisor_id, agents))
+            and (entry.get("mismatch") is None or advisor_mark_ok(entry["mismatch"]))):
         log(f"advisor: {home_path(str(advisor_path('state.json')))} could not be read; consultations are denied "
             "until it is deleted")
         raise ValueError("the advisor's state could not be read")
@@ -4420,6 +4444,44 @@ def advisor_traced(sid: str) -> list:
             found.append({"advisor": entry["advisor"], "prompt_id": advisor_id(entry.get("prompt_id")),
                           "reconcile": entry.get("reconcile") is True})
     return found
+
+
+def advisor_mark_ok(mark) -> bool:
+    """F5's mark in its shape: the advisor model a consultation was
+    admitted with, and the family its subagent ran on instead."""
+    return (isinstance(mark, dict) and isinstance(mark.get("decided"), str) and mark["decided"] in ADVISOR_SESSION_CAP_PER_MODEL
+            and isinstance(mark.get("seen"), str) and mark["seen"] in ADVISOR_FAMILIES + ("other",))
+
+
+def advisor_mismatch(entry: dict, sid: str):
+    """F5: model-mismatch, once an advisor of this session ran on another
+    family than the one it was admitted with: the session's mark in the
+    state or, the state deleted since, in the trace."""
+    mark = entry.get("mismatch") or advisor_traced_mismatch(sid)
+    return advisor_denial("model-mismatch", **mark) if mark else None
+
+
+def advisor_traced_mismatch(sid: str):
+    """The mark as the trace keeps it: the first of the session's outcome
+    lines whose model_seen is another family than its admitted decision's
+    advisor, as {"decided", "seen"}, else None. unknown marks nothing, and
+    a line that is not JSON is passed over."""
+    decided, seen = {}, []
+    for raw in advisor_lines():
+        if sid not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if not (isinstance(entry, dict) and entry.get("session") == sid and advisor_id(entry.get("id"))):
+            continue
+        if entry.get("event") == "decision" and entry.get("decision") == "allow":
+            decided[entry["id"]] = entry.get("advisor")
+        elif entry.get("event") == "outcome":
+            seen.append((entry["id"], entry.get("model_seen")))
+    marks = ({"decided": decided.get(tool_id), "seen": family} for tool_id, family in seen)
+    return next((mark for mark in marks if advisor_mark_ok(mark) and mark["seen"] != mark["decided"]), None)
 
 
 def advisor_tally(admitted: list) -> collections.Counter:
@@ -4676,13 +4738,14 @@ def advisor_outcome(data, now: float | None = None) -> None:
     line = {"t": round(now, 3), "id": advisor_id(data.get("tool_use_id")), "session": advisor_id(data.get("session_id")),
             "event": "outcome", "outcome": "failed" if reply is None else "ok" if verdict else "malformed",
             "verdict": verdict, "confidence": confidence, "reply_chars": None if reply is None else len(reply),
-            "seconds": None}
+            "seconds": None, "model_seen": None}
     with advisor_locked():
         decided = advisor_decided_at(line["id"])
         started = as_number(decided.get("t")) if decided else None
         line["outcome"] = "unadmitted" if decided is None else line["outcome"]
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
-        agent, _ = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
+        agent, meta = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
+        line["model_seen"] = advisor_seen(meta)
         advisor_trace(line, now)
         advisor_keep(line, agent, now)
     if decided is None:
@@ -4690,20 +4753,36 @@ def advisor_outcome(data, now: float | None = None) -> None:
     return None
 
 
+def advisor_seen(meta: dict) -> str:
+    """F5's cross-check: the family of the model the advisor's meta.json
+    names, or "unknown" when it names none. An alias the rewrite did not
+    take, such as inherit, names no family: other, so it is a mismatch."""
+    model = meta.get("model")
+    return advisor_family(model) if isinstance(model, str) and model.strip() else "unknown"
+
+
 def advisor_keep(line: dict, agent, now: float) -> None:
-    """The advisor's agent id, from its meta.json, kept in its session's
-    record for the follow-up rule (F2), whether or not it was admitted: a
-    message to it is a follow-up either way. A record that cannot be read
-    or written keeps nothing, said in the log by the error's kind; the
-    outcome is traced already, a message to the advisor is still found by
-    its meta.json, and a state that cannot be read denies them all."""
-    if line["session"] is None or agent is None:
+    """What the session's record keeps of the advisor that ran: its agent
+    id, from its meta.json, for the follow-up rule (F2), whether or not it
+    was admitted, since a message to it is a follow-up either way; and
+    F5's mark when the consultation the state admitted with this id ran
+    on another family (unknown marks nothing). A record that cannot be
+    read or written keeps nothing, said in the log by the error's kind:
+    the outcome is traced already, the trace keeps the mark too, a
+    message to the advisor is still found by its meta.json, and a state
+    that cannot be read denies them all."""
+    if line["session"] is None or (agent is None and line["model_seen"] == "unknown"):
         return
     try:
         state = advisor_state()
         entry = advisor_entry(state, line["session"])
-        if agent not in entry.setdefault("agents", []):
-            entry["agents"].append(agent)
+        kept = {k: entry.get(k) for k in ("agents", "mismatch")}
+        if agent is not None and agent not in entry.get("agents", []):
+            entry["agents"] = entry.get("agents", []) + [agent]
+        decided = next((a["advisor"] for a in entry["admitted"] if line["id"] and a["id"] == line["id"]), None)
+        if decided and line["model_seen"] not in ("unknown", decided) and not entry.get("mismatch"):
+            entry["mismatch"] = {"decided": decided, "seen": line["model_seen"]}
+        if kept != {k: entry.get(k) for k in ("agents", "mismatch")}:
             advisor_save(state, line["session"], entry, now)
     except (OSError, ValueError) as e:
         log(f"advisor-result hook: the session's record was not updated ({type(e).__name__})")
@@ -4725,17 +4804,19 @@ def advisor_result(_opts) -> int:
 
 
 def advisor_status_lines() -> list:
-    """`longhaul advisor status`: the switch, the probe record's version,
-    the running version, the enabled key, the allowance rule and the home
-    (F8), then "enabled" or "off: <why>", the first gate that is shut. The
-    skill's first step runs it and stops unless its last line is enabled."""
+    """`longhaul advisor status`: the switch, the probe record's version
+    and the rewrites it saw (F5), the running version, the enabled key,
+    the allowance rule and the home (F8), then "enabled" or "off: <why>",
+    the first gate that is shut. The skill's first step runs it and stops
+    unless its last line is enabled."""
     switch, record, running, enabled = advisor_switch(), advisor_probe(), advisor_running_version(), advisor_enabled()
     recorded = record["claude_version"] if record else None
     key = ("missing" if enabled is None else f"present, for Claude Code {enabled}"
            + ("" if recorded in (None, enabled) else f", not the probe record's {recorded}"))
+    rewrites = ", ".join(advisor_rewrites(record.get("rewrite_models")) or []) if record else ""
     lines = [f"LONGHAUL_ADVISOR: {'experiment' if switch else 'off'}",
-             f"Probe record: Claude Code {recorded}, passed {advisor_day(record.get('passed_at'))}"
-             if record else "Probe record: none",
+             f"Probe record: Claude Code {recorded}, passed {advisor_day(record.get('passed_at'))}; "
+             f"rewrites seen: {rewrites or 'none'}" if record else "Probe record: none",
              f"Running Claude Code: {running or 'unknown'}", f"Enabled key: {key}",
              f"Allowance: {advisor_allowance_said()}",
              f"Home: {home_path(str(LONGHAUL_HOME))}{' (the default)' if advisor_default_home() else ''}",
@@ -4780,9 +4861,11 @@ def advisor_day(epoch) -> str:
 
 def advisor_record(path: str) -> tuple:
     """(the probe record, None) from an evidence file, a JSON object with
-    claude_version and the five checks (and, if it has them, evidence: a
-    path or a sentence, and passed_at), or (None, why it is refused).
-    Only a record with all five checks true is ever written."""
+    claude_version and the five checks (and, if it has them,
+    rewrite_models: the aliases whose rewrite the probe saw take effect,
+    F5; evidence: a path or a sentence; and passed_at), or (None, why it
+    is refused). Only a record with all five checks true is ever
+    written; one without rewrite_models has none, so it admits nothing."""
     try:
         found = json.loads(Path(path).read_text())
     except OSError as e:
@@ -4797,9 +4880,12 @@ def advisor_record(path: str) -> tuple:
     failing = [check for check in ADVISOR_CHECKS if not (isinstance(checks, dict) and checks.get(check) is True)]
     if failing:
         return None, f"these checks are not true: {', '.join(failing)}"
+    rewrites = advisor_rewrites(found.get("rewrite_models", []))
+    if rewrites is None:
+        return None, f"rewrite_models must be a list of {', '.join(ADVISOR_REWRITES)}"
     evidence, passed = found.get("evidence"), as_number(found.get("passed_at"))
     return {"schema": 1, "claude_version": version, "passed_at": passed if passed and passed > 0 else round(time.time()),
-            "checks": dict.fromkeys(ADVISOR_CHECKS, True),
+            "checks": dict.fromkeys(ADVISOR_CHECKS, True), "rewrite_models": list(dict.fromkeys(rewrites)),
             "evidence": evidence if isinstance(evidence, str) and evidence.strip() else os.path.abspath(path)}, None
 
 

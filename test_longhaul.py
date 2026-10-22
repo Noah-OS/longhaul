@@ -3871,9 +3871,14 @@ class Advisor(unittest.TestCase):
                  {"type": "assistant", "message": {"model": model, "role": "assistant", "content": []}}]
         (path or self.transcript).write_bytes(before + "".join(json.dumps(line) + "\n" for line in lines).encode())
 
-    def probe(self, version="2.1.307", **checks):
+    def probe(self, version="2.1.307", rewrites=("opus", "fable"), **checks):
+        """A passing record whose probe saw both advisor models' rewrites
+        take effect (F5); rewrites=None leaves the list out, as the
+        2.1.307 record of 2026-10-22 does."""
         record = {"schema": 1, "claude_version": version, "passed_at": self.now,
                   "checks": {**dict.fromkeys(longhaul.ADVISOR_CHECKS, True), **checks}, "evidence": "a test"}
+        if rewrites is not None:
+            record["rewrite_models"] = list(rewrites) if isinstance(rewrites, tuple) else rewrites
         (self.home / "advisor").mkdir(exist_ok=True)
         (self.home / "advisor" / "probe.json").write_text(json.dumps(record))
 
@@ -3969,13 +3974,15 @@ class Advisor(unittest.TestCase):
                                     "spawnDepth": 1, **fields}))
         return path
 
-    def message(self, to, session="s1"):
-        """A PreToolUse input for a SendMessage call. Unprobed (F12 is to show
-        its tool_name and its to): the Agent call's fields, the tool's input."""
+    def message(self, to, session="s1", **fields):
+        """A PreToolUse input for a SendMessage call, as the second probe saw
+        one on 2.1.307: tool_name SendMessage, and `to` the advisor's agent
+        id. Its input held content, recipient, recipient_kind and type too,
+        whose values it did not log; a test gives those it needs."""
         return {"session_id": session, "prompt_id": "p1", "tool_use_id": f"toolu_{uuid.uuid4().hex[:12]}",
                 "transcript_path": str(self.transcript), "cwd": str(self.tmp), "hook_event_name": "PreToolUse",
                 "tool_name": "SendMessage", "tool_input": {"to": to, "message": f"One more question ({self.S})",
-                                                           "summary": "a follow-up"}}
+                                                           "summary": "a follow-up", **fields}}
 
     def test_the_plugin_registers_both_hooks_on_agent_task_and_sendmessage(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
@@ -4202,6 +4209,27 @@ class Advisor(unittest.TestCase):
             else:
                 self.assertIn(f"({family})", self.denied(data, "no-stronger-advisor"), model)
             self.assertEqual((self.trace()[-1]["executor"], self.trace()[-1]["advisor"]), (family, advisor), model)
+
+    def test_only_an_advisor_model_whose_rewrite_the_probe_saw_is_admitted(self):
+        # F5: the record lists the aliases a probe saw take effect (the
+        # subagent's meta.json model). The 2.1.307 record has no list, so
+        # it admits nothing until a new probe passes: the closed state.
+        self.assertEqual(longhaul.ADVISOR_REWRITES, ("haiku", "sonnet", "opus", "fable"))
+        self.probe(rewrites=None)
+        reason = self.denied(self.call(), "model-unprobed")
+        self.assertIn("the opus advisor", reason)
+        self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.probe(rewrites=["opus"])
+        self.admitted(self.call())
+        self.executor("claude-opus-4-5")
+        self.assertIn("the fable advisor", self.denied(self.call(prompt="p2"), "model-unprobed"))
+        self.executor("claude-sonnet-4-5")
+        path = self.home / "advisor" / "probe.json"
+        good = json.loads(path.read_text())
+        for junk in ("opus", None, ["opus", "gpt"], ["Opus"], [["opus"]], {"opus": True}, [7]):
+            path.write_text(json.dumps({**good, "rewrite_models": junk}))  # a list not in its shape is none
+            self.denied(self.call(prompt="p3"), "model-unprobed")
+        self.assertEqual(self.counted(), [("opus", "p1", False)], "nothing denied was counted")
 
     def test_a_call_of_another_agent_type_gets_no_answer_and_nothing_is_written(self):
         others = [self.call(agent="Explore"), self.call(agent="general-purpose"), self.call(agent=None),
@@ -4477,10 +4505,18 @@ class Advisor(unittest.TestCase):
         self.probe()
         step(call(bad, None), CLAUDE_CODE_EXECPATH=None)
         step(call(bad, None), CLAUDE_CODE_EXECPATH=str(self.tmp / "versions" / "2.1.304" / "claude"))
+        marked = self.state()
+        marked["sessions"]["s1"]["mismatch"] = {"decided": "opus", "seen": "sonnet"}
+        (self.home / "advisor" / "state.json").write_text(json.dumps(marked))
+        step(call(bad, None))
+        (self.home / "advisor" / "state.json").write_text(json.dumps(state))
         step(call(bad, None))
         self.executor("claude-fable-5")
         step(call(bad, None))
         self.executor("claude-sonnet-4-5")
+        self.probe(rewrites=["fable"])
+        step(call(bad, None))
+        self.probe()
         step(call(bad, None))
         (self.home / "accounts.json").unlink()
         step(call(bad, None))
@@ -4502,14 +4538,13 @@ class Advisor(unittest.TestCase):
         step(call(self.brief(), session="s2", extra=False))
         self.reading(five=40)
         step(call(self.brief(), session="s2", extra=False))
-        # F5's model-mismatch (after version-mismatch) and model-unprobed (after
-        # no-stronger-advisor) are merged into this order at integration.
-        self.assertEqual(said, ["off", "not-enabled", "no-probe", "version-unknown", "version-mismatch", "executor-unknown",
-                                "no-stronger-advisor", "repository", "call-fields", "brief-too-long", "brief-sections",
-                                "trigger-missing", "credential", "task-unknown", "reconcile-invalid", "repeat", "cap-task",
-                                "cap-session", "near-full", "allowance-unknown", "allow"])
+        self.assertEqual(said, ["off", "not-enabled", "no-probe", "version-unknown", "version-mismatch", "model-mismatch",
+                                "executor-unknown", "no-stronger-advisor", "model-unprobed", "repository", "call-fields",
+                                "brief-too-long", "brief-sections", "trigger-missing", "credential", "task-unknown",
+                                "reconcile-invalid", "repeat", "cap-task", "cap-session", "near-full", "allowance-unknown",
+                                "allow"])
         self.assertEqual([line["kind"] for line in self.trace()[1:-1]],
-                         ["hard"] * 8 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
+                         ["hard"] * 10 + ["fixable"] * 5 + ["hard"] + ["fixable"] + ["hard"] * 5, "D2.6's two kinds of denial")
 
     def test_the_brief_is_at_most_8000_characters(self):
         base = self.brief()
@@ -4842,7 +4877,9 @@ class Advisor(unittest.TestCase):
         entry = {"admitted": [good], "hashes": []}
         junk = [{**entry, "admitted": None}, {**entry, "admitted": {}}, {**entry, "hashes": None}, {"hashes": []},
                 {**entry, "admitted": ["x"]}, {"count": 1, "fable": 0, "prompts": {}, "hashes": []},  # the shape before F9
-                {**entry, "agents": "a1"}, {**entry, "agents": ["../a1"]}, {**entry, "agents": None}]  # F2's ids
+                {**entry, "agents": "a1"}, {**entry, "agents": ["../a1"]}, {**entry, "agents": None},  # F2's ids
+                {**entry, "mismatch": True}, {**entry, "mismatch": {"decided": "opus"}},  # F5's mark
+                {**entry, "mismatch": {"decided": "opus", "seen": "gpt"}}, {**entry, "mismatch": {"decided": "x", "seen": "sonnet"}}]
         junk += [{**entry, "admitted": [{**good, key: value}]} for key, value in (
             ("advisor", "haiku"), ("advisor", ["opus"]), ("prompt_id", None), ("prompt_id", "p 1"), ("reconcile", 0))]
         for text in ["not json", "[]", '{"sessions": []}'] + [json.dumps({"sessions": {"s1": e}}) for e in junk]:
@@ -4881,11 +4918,13 @@ class Advisor(unittest.TestCase):
         self.assertTrue(mark.exists(), "the --version path was timed")
         self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
 
-    OUTCOME = ("t", "id", "session", "event", "outcome", "verdict", "confidence", "reply_chars", "seconds")
+    OUTCOME = ("t", "id", "session", "event", "outcome", "verdict", "confidence", "reply_chars", "seconds", "model_seen")
 
-    def reply(self, text):
-        """The Agent tool's response to the executor, as PostToolUse gets it."""
-        return {"status": "completed", "content": [{"type": "text", "text": text}], "totalDurationMs": 1_000}
+    def reply(self, text, agent=None):
+        """The Agent tool's response to the executor, as PostToolUse gets it;
+        on 2.1.307 it names the subagent's id (agentId) too."""
+        response = {"status": "completed", "content": [{"type": "text", "text": text}], "totalDurationMs": 1_000}
+        return response if agent is None else {"agentId": agent, "agentType": "longhaul:advisor", **response}
 
     def result(self, data, response, now=None):
         return longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse", "tool_response": response}, now)
@@ -4899,7 +4938,7 @@ class Advisor(unittest.TestCase):
         self.assertEqual(list(line), list(self.OUTCOME))
         self.assertEqual({k: v for k, v in line.items() if k != "t"},
                          {"id": "toolu_r1", "session": "s1", "event": "outcome", "outcome": "ok", "verdict": "adjust",
-                          "confidence": "medium", "reply_chars": len(text), "seconds": 12.3})
+                          "confidence": "medium", "reply_chars": len(text), "seconds": 12.3, "model_seen": "unknown"})
         for response, outcome, verdict, confidence in (
                 (self.reply("**Verdict:** stop\nConfidence: high"), "ok", "stop", "high"),
                 (self.reply("\nVerdict: Proceed\n"), "ok", "proceed", None),
@@ -4923,6 +4962,50 @@ class Advisor(unittest.TestCase):
         self.assertIsNone(self.result(self.call(agent="Explore"), self.reply("Verdict: stop")))
         self.assertEqual(self.trace(), before, "another agent type: nothing written")
         self.assertEqual(len(self.counted()), 1, "a failed consultation still counts")
+
+    def test_an_advisor_that_ran_on_another_family_blocks_the_rest_of_the_session(self):
+        # F5: advisor-result reads the model in the advisor's meta.json, as a
+        # family. Another family than the one admitted marks the session,
+        # in the state and in the trace, so either one alone keeps the mark;
+        # unknown (no meta.json, or no model in it) is recorded only.
+        def ran(tool_id, prompt, session="s1", **meta):
+            data = self.call(session=session, prompt=prompt, tool_id=tool_id)
+            self.admitted(data)
+            if meta:
+                self.subagent(tool_id[-2:], tool_id, **meta)
+            self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
+            return self.trace()[-1]["model_seen"]
+        self.assertEqual(ran("toolu_m1", "p1", model="opus"), "opus")
+        self.assertEqual(ran("toolu_m2", "p2"), "unknown", "no meta.json")
+        self.assertEqual(ran("toolu_m3", "p3", spawnDepth=1), "unknown", "no model in it")
+        self.assertEqual(ran("toolu_m4", "p4", model=None), "unknown", "null, as the probe saw for a call not rewritten")
+        self.assertEqual([longhaul.advisor_seen({"model": junk}) for junk in (7, "", " ", ["opus"])], ["unknown"] * 4)
+        self.assertNotIn("mismatch", self.state()["sessions"]["s1"])
+        self.assertEqual(ran("toolu_m5", "p5", model="claude-sonnet-4-5"), "sonnet")
+        self.assertEqual(self.state()["sessions"]["s1"]["mismatch"], {"decided": "opus", "seen": "sonnet"})
+        reason = self.denied(self.call(prompt="p6"), "model-mismatch")
+        self.assertIn("sonnet", reason)
+        self.assertIn("the opus advisor", reason)
+        self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.denied(self.call(self.brief(reconcile=True), prompt="p5"), "model-mismatch")
+        self.admitted(self.call(session="s2"))  # another session's are its own
+        state, trace = self.home / "advisor" / "state.json", self.home / "advisor" / "trace.jsonl"
+        saved = state.read_text()
+        state.unlink()
+        self.denied(self.call(prompt="p7"), "model-mismatch")  # the trace alone
+        state.write_text(saved)
+        trace.write_text("")
+        self.denied(self.call(prompt="p8"), "model-mismatch")  # the state alone
+        state.unlink()
+        trace.write_text("")
+        self.admitted(self.call(prompt="p9"))  # both gone: nothing left to say it
+        # A model that names no family, as an alias the rewrite did not take
+        # would (inherit), is another family: other.
+        self.assertEqual(ran("toolu_n1", "p1", session="s3", model="inherit"), "other")
+        self.denied(self.call(session="s3", prompt="p2"), "model-mismatch")
+        self.executor("claude-opus-4-5")
+        self.assertEqual(ran("toolu_f1", "p1", session="s4", model="fable"), "fable")
+        self.admitted(self.call(session="s4", prompt="p2"))
 
     def test_the_result_hook_prints_nothing_and_never_keeps_the_reply(self):
         data = self.call(tool_id="toolu_r2")
@@ -5056,11 +5139,15 @@ class Advisor(unittest.TestCase):
     def test_advisor_status_names_the_switch_both_versions_and_whether_it_is_enabled(self):
         day = dt.datetime.fromtimestamp(self.now).strftime("%Y-%m-%d")
         lines, last = self.status()
-        self.assertEqual(lines, {"LONGHAUL_ADVISOR": "experiment", "Probe record": f"Claude Code 2.1.307, passed {day}",
+        self.assertEqual(lines, {"LONGHAUL_ADVISOR": "experiment",
+                                 "Probe record": f"Claude Code 2.1.307, passed {day}; rewrites seen: opus, fable",
                                  "Running Claude Code": "2.1.307", "Enabled key": "present, for Claude Code 2.1.307",
                                  "Allowance": "checked: a fresh status-line reading of the session's account is needed",
                                  "Home": str(self.home), "Unadmitted advisor runs traced": "0"})
         self.assertEqual(last, "enabled", "the skill's contract: the last line")
+        self.probe(rewrites=None)  # F5: the list, none when the record has none
+        self.assertEqual(self.status()[0]["Probe record"], f"Claude Code 2.1.307, passed {day}; rewrites seen: none")
+        self.probe()
         other = self.tmp / "claude" / "versions" / "2.1.308"
         other.write_text("")
         for env, named, why in (
@@ -5099,8 +5186,13 @@ class Advisor(unittest.TestCase):
         path.unlink()
         evidence = self.tmp / "evidence.json"
         good = {"claude_version": "2.1.307", "checks": dict.fromkeys(longhaul.ADVISOR_CHECKS, True),
+                "rewrite_models": ["opus", "fable", "opus"],
                 "evidence": "the probe's transcripts of 2026-10-22", "passed_at": 1_792_600_000}
+        rewrites = "rewrite_models must be a list of haiku, sonnet, opus, fable"
         refusals = [("not JSON", "it is not JSON"), ([], "it is not a JSON object"),
+                    ({**good, "rewrite_models": "opus"}, rewrites), ({**good, "rewrite_models": None}, rewrites),
+                    ({**good, "rewrite_models": ["opus", "gpt"]}, rewrites), ({**good, "rewrite_models": ["Opus"]}, rewrites),
+                    ({**good, "rewrite_models": [7]}, rewrites),
                     ({**good, "claude_version": None}, "it names no claude_version"),
                     ({**good, "claude_version": "latest"}, "it names no claude_version"),
                     ({**good, "checks": {**good["checks"], "deny": "true"}}, "these checks are not true: deny"),
@@ -5121,7 +5213,8 @@ class Advisor(unittest.TestCase):
         out = self.command("record-probe", str(evidence))
         self.assertEqual((out.returncode, out.stderr), (0, ""))
         record = {"schema": 1, "claude_version": "2.1.307", "passed_at": 1_792_600_000,
-                  "checks": dict.fromkeys(longhaul.ADVISOR_CHECKS, True), "evidence": "the probe's transcripts of 2026-10-22"}
+                  "checks": dict.fromkeys(longhaul.ADVISOR_CHECKS, True), "rewrite_models": ["opus", "fable"],
+                  "evidence": "the probe's transcripts of 2026-10-22"}
         self.assertEqual(json.loads(path.read_text()), record)
         self.assertEqual(oct(path.stat().st_mode & 0o777), oct(0o600))
         self.assertTrue(out.stdout.startswith(json.dumps(record, indent=2) + "\n"), out.stdout)
@@ -5129,12 +5222,15 @@ class Advisor(unittest.TestCase):
         # The record is the gate's half; the switch is the user's.
         self.denied(self.call(), "off", LONGHAUL_ADVISOR=None)
         self.admitted(self.call())
-        # With no evidence named in it, the evidence is the file itself.
-        evidence.write_text(json.dumps({k: v for k, v in good.items() if k not in ("evidence", "passed_at")}))
+        # With no evidence named in it, the evidence is the file itself; with
+        # no rewrite_models, the probe saw none, and nothing is admitted (F5).
+        evidence.write_text(json.dumps({k: v for k, v in good.items() if k not in ("evidence", "passed_at", "rewrite_models")}))
         self.assertEqual(self.command("record-probe", str(evidence)).returncode, 0)
         kept = json.loads(path.read_text())
         self.assertEqual(kept["evidence"], str(evidence))
         self.assertAlmostEqual(kept["passed_at"], time.time(), delta=60)
+        self.assertEqual(kept["rewrite_models"], [])
+        self.denied(self.call(), "model-unprobed")
 
 
 class Settings(unittest.TestCase):
