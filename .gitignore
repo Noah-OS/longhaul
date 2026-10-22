@@ -27,6 +27,8 @@
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
+!.github/assets/
+!.github/assets/*.svg
 
 # Never tracked, even if a line above is widened one day: git obeys the last
 # line that matches, so these win over any "!" above.
