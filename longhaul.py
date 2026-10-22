@@ -2261,8 +2261,8 @@ def search_advice(s: dict) -> str:
 def agent_meta(transcript: Path) -> dict:
     """The meta.json Claude Code writes beside a subagent's transcript
     (agent-<id>.meta.json: `agentType`, the Agent tool's subagent_type,
-    and `toolUseId`, the call's id, on 2.1.307), else {}: no such file,
-    or junk."""
+    `toolUseId`, the call's id, and `model`, the one the call set, on
+    2.1.307), else {}: no such file, or junk. Region B reads it too."""
     try:
         meta = json.loads(transcript.with_name(transcript.stem + ".meta.json").read_text(errors="replace"))
     except (OSError, ValueError, RecursionError):
@@ -3849,8 +3849,9 @@ def checkpoint(opts) -> int:
 # D3): a stronger model the executor consults at a few decision points
 # through the /longhaul:advise skill, which calls the Agent tool with
 # subagent_type longhaul:advisor (agents/advisor.md: Read, Grep and Glob
-# alone). `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent
-# and Task, is what enforces it: it admits a consultation only when
+# alone). `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent,
+# Task and SendMessage (a message to an advisor is denied: F2), is what
+# enforces it: it admits a consultation only when
 # LONGHAUL_ADVISOR=experiment and a passing probe is recorded for the
 # Claude Code version running, then only on the advisor D3 names for the
 # executor's model (set through updatedInput, whose one change is the
@@ -3966,9 +3967,11 @@ ADVISOR_DENIALS = {
                  "do not retry.",
     "allowance-unknown": "no fresh allowance reading exists for this session's account, so the near-full rule cannot "
                          "be checked. Continue without advice; do not retry.",
-    # Outside the order: a call of any other agent type.
+    # Outside the order: a call of any other agent type, and a message.
     "stand-in": "a brief (a first line Trigger:) goes to the longhaul:advisor agent type alone, through "
                 "/longhaul:advise, never to another agent. Continue without advice; do not retry.",
+    "follow-up": "an advisor answers one brief, so no message goes to it after that. More advice is a new "
+                 "consultation through /longhaul:advise, within its caps; do not send this message again.",
     "error":"the hook could not finish its checks. Continue without advice; do not retry.",
 }
 
@@ -4129,6 +4132,56 @@ def advisor_stand_in(data) -> bool:
     return re.match(r"trigger\s*:", first, re.IGNORECASE) is not None
 
 
+def advisor_follow_up(data) -> bool:
+    """F2: a message to an advisor (SendMessage's `to`, a ` [ref]` after
+    it aside), which would resume it past every check: the agent type's
+    own name, an agent id advisor-result kept in any session's record,
+    or one whose meta.json beside the session's transcript has the
+    advisor's agent type. The hook's input for this tool is unprobed, so
+    the field alone is checked, never the tool's name."""
+    to = dict_at(data, "tool_input").get("to")
+    if not isinstance(to, str):
+        return False
+    name = re.sub(r"\s*\[[^\]]*\]\s*$", "", to).strip()
+    if advisor_named(name):
+        return True
+    agent = advisor_id(name)
+    if agent is None:
+        return False
+    path = data.get("transcript_path")
+    folder = Path(path).with_suffix("") / "subagents" if isinstance(path, str) and path else None
+    return agent in advisor_agents() or (folder is not None and advisor_named(agent_type(folder / f"agent-{agent}.jsonl")))
+
+
+def advisor_agents() -> set:
+    """The advisors' agent ids every session's record holds (F2). A state
+    that cannot be read raises, as for a consultation: a follow-up it
+    cannot rule out is denied (error). A session's entry not in its shape
+    holds no id this can read, and the meta.json check still runs."""
+    sessions = advisor_state()["sessions"].values()
+    return {agent for entry in sessions if isinstance(entry, dict) and isinstance(entry.get("agents"), list)
+            for agent in entry["agents"] if advisor_id(agent)}
+
+
+def advisor_subagent(path, tool_id):
+    """The subagent the call `tool_id` started, as (its agent id, its
+    meta.json), or None: of the meta.json files beside the session's
+    subagent transcripts (read by Region A's agent_meta()), the one whose
+    toolUseId is the call's. The id is the file's: agent-<id>.meta.json."""
+    if tool_id is None or not (isinstance(path, str) and path):
+        return None
+    try:
+        found = sorted(files_of(Path(path).with_suffix("").glob("subagents/agent-*.meta.json")))
+    except (OSError, ValueError):  # a path with a NUL in it
+        return None
+    for meta_path in found:
+        agent = meta_path.name[len("agent-"):-len(".meta.json")]
+        meta = agent_meta(meta_path.with_name(f"agent-{agent}.jsonl"))
+        if meta.get("toolUseId") == tool_id:
+            return advisor_id(agent), meta
+    return None
+
+
 def advisor_id(value):
     """An id from the engine (a session's, a prompt's, a tool call's), or
     None for anything that is not a plain id: the trace holds no text."""
@@ -4256,12 +4309,15 @@ def advisor_brief_problem(brief: str):
 
 def advisor_check(data, now: float):
     """The hook's answer to one call, or None for a call it leaves alone:
-    a consultation is decided; a brief sent to any other agent type is
-    denied (stand-in), whether or not the experiment is on."""
+    a consultation is decided; a message to an advisor (follow-up) and a
+    brief sent to any other agent type (stand-in) are denied, whether or
+    not the experiment is on."""
     if not isinstance(data, dict):
         return None
     if advisor_consultation(data):
         return advisor_decide(data, now)
+    if advisor_follow_up(data):
+        return advisor_refuse(data, "follow-up", now)
     if advisor_stand_in(data):
         return advisor_refuse(data, "stand-in", now)
     return None
@@ -4322,13 +4378,16 @@ def advisor_state() -> dict:
 def advisor_entry(state: dict, sid: str) -> dict:
     """This session's record, fresh for a new session: "admitted", a line
     per consultation admitted ({"id", "advisor", "prompt_id",
-    "reconcile"}), and the briefs' "hashes". One not in this shape raises,
+    "reconcile", "nonce"}), the briefs' "hashes" and, once one has run,
+    the advisors' "agents" (their ids, F2). One not in this shape raises,
     as a state that cannot be read does."""
     entry = state["sessions"].get(sid)
     if entry is None:
         return {"admitted": [], "hashes": []}
     admitted = entry.get("admitted") if isinstance(entry, dict) else None
-    if not (isinstance(admitted, list) and isinstance(entry.get("hashes"), list) and all(map(advisor_counted_ok, admitted))):
+    agents = entry.get("agents", []) if isinstance(entry, dict) else None
+    if not (isinstance(admitted, list) and isinstance(entry.get("hashes"), list) and all(map(advisor_counted_ok, admitted))
+            and isinstance(agents, list) and all(map(advisor_id, agents))):
         log(f"advisor: {home_path(str(advisor_path('state.json')))} could not be read; consultations are denied "
             "until it is deleted")
         raise ValueError("the advisor's state could not be read")
@@ -4429,15 +4488,21 @@ def advisor_fresh(reading, now: float) -> bool:
 
 def advisor_count(state: dict, entry: dict, line: dict, now: float, nonce: str) -> None:
     """The consultation counted, with its nonce, and its hash kept, when
-    admitted: one that then fails counts too (D2.4). Sessions last written
-    over ADVISOR_KEEP_DAYS ago go."""
+    admitted: one that then fails counts too (D2.4); advisor_save() writes
+    it."""
     entry["admitted"].append({"id": line["id"], "advisor": line["advisor"], "prompt_id": line["prompt_id"],
                               "reconcile": line["reconcile"], "nonce": nonce})
     entry["hashes"].append(line["brief_hash"])
+    advisor_save(state, line["session"], entry, now)
+
+
+def advisor_save(state: dict, sid: str, entry: dict, now: float) -> None:
+    """The session's record written back, with the time it was: sessions
+    last written over ADVISOR_KEEP_DAYS ago go."""
     entry["at"] = round(now, 3)
     cutoff = now - ADVISOR_KEEP_DAYS * 86400
-    sessions = {sid: kept for sid, kept in state["sessions"].items() if not advisor_old(kept, cutoff)}
-    sessions[line["session"]] = entry
+    sessions = {kept_sid: kept for kept_sid, kept in state["sessions"].items() if not advisor_old(kept, cutoff)}
+    sessions[sid] = entry
     write_json(advisor_path("state.json"), {"sessions": sessions})
 
 
@@ -4617,10 +4682,31 @@ def advisor_outcome(data, now: float | None = None) -> None:
         started = as_number(decided.get("t")) if decided else None
         line["outcome"] = "unadmitted" if decided is None else line["outcome"]
         line["seconds"] = None if started is None else round(max(0.0, now - started), 1)
+        agent, _ = advisor_subagent(data.get("transcript_path"), line["id"]) or (None, {})
         advisor_trace(line, now)
+        advisor_keep(line, agent, now)
     if decided is None:
         log("advisor-result hook: an advisor ran with no admitted decision (unadmitted)")
     return None
+
+
+def advisor_keep(line: dict, agent, now: float) -> None:
+    """The advisor's agent id, from its meta.json, kept in its session's
+    record for the follow-up rule (F2), whether or not it was admitted: a
+    message to it is a follow-up either way. A record that cannot be read
+    or written keeps nothing, said in the log by the error's kind; the
+    outcome is traced already, a message to the advisor is still found by
+    its meta.json, and a state that cannot be read denies them all."""
+    if line["session"] is None or agent is None:
+        return
+    try:
+        state = advisor_state()
+        entry = advisor_entry(state, line["session"])
+        if agent not in entry.setdefault("agents", []):
+            entry["agents"].append(agent)
+            advisor_save(state, line["session"], entry, now)
+    except (OSError, ValueError) as e:
+        log(f"advisor-result hook: the session's record was not updated ({type(e).__name__})")
 
 
 def advisor_result(_opts) -> int:

@@ -3959,7 +3959,25 @@ class Advisor(unittest.TestCase):
         exe.chmod(0o755)
         return exe, mark
 
-    def test_the_plugin_registers_both_hooks_on_agent_and_task(self):
+    def subagent(self, agent, tool_id, agent_type="longhaul:advisor", **fields):
+        """A subagent's meta.json beside the session's transcript, as Claude
+        Code writes it: its agent type, the call that started it and, when
+        the call set one, its model."""
+        path = self.transcript.with_suffix("") / "subagents" / f"agent-{agent}.meta.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"agentType": agent_type, "description": "Consult the advisor", "toolUseId": tool_id,
+                                    "spawnDepth": 1, **fields}))
+        return path
+
+    def message(self, to, session="s1"):
+        """A PreToolUse input for a SendMessage call. Unprobed (F12 is to show
+        its tool_name and its to): the Agent call's fields, the tool's input."""
+        return {"session_id": session, "prompt_id": "p1", "tool_use_id": f"toolu_{uuid.uuid4().hex[:12]}",
+                "transcript_path": str(self.transcript), "cwd": str(self.tmp), "hook_event_name": "PreToolUse",
+                "tool_name": "SendMessage", "tool_input": {"to": to, "message": f"One more question ({self.S})",
+                                                           "summary": "a follow-up"}}
+
+    def test_the_plugin_registers_both_hooks_on_agent_task_and_sendmessage(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
         guard, pre = hooks["PreToolUse"]
         [post] = hooks["PostToolUse"]
@@ -3967,7 +3985,9 @@ class Advisor(unittest.TestCase):
         for entry, command, cmd, says, timeout in (
                 (pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation", 30),
                 (post, "advisor-result", self.RESULT, "Tracing an advisor consultation", 5)):
-            self.assertEqual(entry["matcher"], "Agent|Task", "the subagent tool's name, and its name before 2.1.63")
+            # The subagent tool's name, its name before 2.1.63, and the tool
+            # that sends a running or finished agent a message (F2).
+            self.assertEqual(entry["matcher"], "Agent|Task|SendMessage")
             [handler] = entry["hooks"]
             self.assertEqual(cmd[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
             self.assertEqual((handler["args"][:2], handler["args"][3]), (["-I", "-c"], "${CLAUDE_PLUGIN_ROOT}"))
@@ -4229,6 +4249,47 @@ class Advisor(unittest.TestCase):
         out = self.run_hook(self.HOOK, self.call(self.brief(), agent="Explore"), LONGHAUL_ADVISOR="off")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("denied (stand-in)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_a_message_to_an_advisor_is_denied_and_any_other_passes(self):
+        # F2: a SendMessage resumes the advisor past every check. Its agent id
+        # is kept by advisor-result, from the subagent's meta.json whose
+        # toolUseId is the call's; a meta.json of the advisor's agent type
+        # names one too. Outside the order, and whether or not it is on.
+        data = self.call(tool_id="toolu_f1")
+        self.admitted(data)
+        meta = self.subagent("a1f2e3", "toolu_f1", model="opus")
+        self.subagent("b77", "toolu_other", agent_type="Explore")
+        self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
+        self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["a1f2e3"])
+        self.result(data, self.reply("Verdict: proceed\nConfidence: high"))
+        self.assertEqual(self.state()["sessions"]["s1"]["agents"], ["a1f2e3"], "kept once")
+        meta.unlink()  # the record alone names it now
+        for to, session in (("a1f2e3", "s1"), (" a1f2e3 ", "s1"), ("a1f2e3 [3fa9c1]", "s1"), ("a1f2e3", "s2")):
+            reason = self.denied(self.message(to, session), "follow-up", LONGHAUL_ADVISOR=None)
+            self.assertIn("/longhaul:advise", reason)
+            self.assertEqual(self.trace()[-1]["kind"], "hard")
+        self.subagent("c9", "toolu_never")  # an advisor whose result was never traced
+        self.denied(self.message("c9"), "follow-up")
+        for to in ("longhaul:advisor", " Advisor "):  # the agent type's own name, as a consultation is named
+            self.denied(self.message(to), "follow-up")
+        before = self.trace()
+        for to in ("b77", "main", "researcher", "worker [3fa9c1]", "zz", "../c9", "", None, 7, "other:advisor"):
+            self.assertIsNone(self.decide(self.message(to)), to)
+        self.assertIsNone(self.decide({**self.message("c9"), "transcript_path": None}), "no folder to look in")
+        self.assertEqual(self.trace(), before, "nothing written for a message that passes")
+        self.assertIsNone(self.result(self.message("a1f2e3"), self.reply("ok")))
+        self.assertEqual(self.trace(), before, "nor for its result")
+        out = self.run_hook(self.HOOK, self.message("a1f2e3"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("denied (follow-up)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.run_hook(self.HOOK, self.message("b77"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        written = "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertNotIn(self.S, written)
+        # A state that cannot be read cannot rule a follow-up out: denied.
+        (self.home / "advisor" / "state.json").write_text("not json")
+        out = self.run_hook(self.HOOK, self.message("zz"))
+        self.assertIn("denied (error)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_only_the_calls_known_fields_reach_claude_code(self):
         # F4: any other field (a background run, an isolation, a name) would
@@ -4780,7 +4841,8 @@ class Advisor(unittest.TestCase):
         good = {"id": "toolu_1", "advisor": "opus", "prompt_id": "p0", "reconcile": False}
         entry = {"admitted": [good], "hashes": []}
         junk = [{**entry, "admitted": None}, {**entry, "admitted": {}}, {**entry, "hashes": None}, {"hashes": []},
-                {**entry, "admitted": ["x"]}, {"count": 1, "fable": 0, "prompts": {}, "hashes": []}]  # the shape before F9
+                {**entry, "admitted": ["x"]}, {"count": 1, "fable": 0, "prompts": {}, "hashes": []},  # the shape before F9
+                {**entry, "agents": "a1"}, {**entry, "agents": ["../a1"]}, {**entry, "agents": None}]  # F2's ids
         junk += [{**entry, "admitted": [{**good, key: value}]} for key, value in (
             ("advisor", "haiku"), ("advisor", ["opus"]), ("prompt_id", None), ("prompt_id", "p 1"), ("reconcile", 0))]
         for text in ["not json", "[]", '{"sessions": []}'] + [json.dumps({"sessions": {"s1": e}}) for e in junk]:
@@ -5445,8 +5507,8 @@ class Checkpoint(unittest.TestCase):
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
         self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse"}, "these three events and nothing else")
-        # The Advisor's two entries on Agent and Task are pinned in Advisor (Sprint 8).
-        self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]], ["Read|Bash", "Agent|Task"])
+        # The Advisor's two entries on Agent, Task and SendMessage are pinned in Advisor (Sprint 8).
+        self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]], ["Read|Bash", "Agent|Task|SendMessage"])
         calls = hooks["hooks"]["PreToolUse"][0]
         self.assertEqual(len(hooks["hooks"]["SessionStart"]), 3)
         starts = {entry["matcher"]: entry for entry in hooks["hooks"]["SessionStart"]}
