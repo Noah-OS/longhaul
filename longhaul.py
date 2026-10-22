@@ -1883,10 +1883,27 @@ def session_account(config_dir, home: Path | None = None) -> tuple:
     reading from ~/.claude after it: with no accounts.json a session there
     is "main". The status line and the Advisor's hook both name the
     account so (Sprint 8, F9); the hook asks the default home's file too,
-    by `home` (F13)."""
-    accounts = read_json((home or LONGHAUL_HOME) / "accounts.json") or []
+    by `home` (F13). A file that cannot be read (read_accounts_file())
+    names it as no file does, so the status line goes on, and is logged
+    once, by its kind; the entry then holds "unreadable", which
+    advisor_repository() denies: as no accounts, a trailing comma lifted
+    every restriction (UX review, Sprint 8)."""
+    path = (home or LONGHAUL_HOME) / "accounts.json"
+    accounts, problem = read_accounts_file(home)
+    if problem:
+        if (str(path), problem) not in UNREADABLE_SAID:
+            UNREADABLE_SAID.add((str(path), problem))
+            log(f"{unreadable_text(problem)} ({home_path(str(path))}); the status line names the account as with "
+                "no file, and the Advisor admits no consultation")
+        name = account_for_config(config_dir, [])
+        return name, {"name": name, "unreadable": problem}
     name = account_for_config(config_dir, accounts)
-    return name, next((a for a in accounts if isinstance(a, dict) and a.get("name") == name), {"name": name})
+    return name, next((a for a in accounts if a.get("name") == name), {"name": name})
+
+
+# The accounts.json problems session_account() has logged in this process:
+# the Advisor's hook asks it up to three times a call.
+UNREADABLE_SAID: set = set()
 
 
 def save_label(sid: str, label: str) -> None:
@@ -4522,9 +4539,12 @@ def advisor_repository(data: dict) -> bool:
     absolute path allows only an account unrestricted in both (the home
     check has denied it already). An account not in a file has no list
     there; one not in LONGHAUL_HOME's has no reading either, so the
-    allowance check denies it."""
+    allowance check denies it. A file that cannot be read allows nothing:
+    the restriction in it cannot be known (UX review, Sprint 8)."""
     homes = [LONGHAUL_HOME] if advisor_default_home() else [LONGHAUL_HOME, HOME / ".longhaul"]
     accts = [session_account(os.environ.get("CLAUDE_CONFIG_DIR"), home)[1] for home in homes]
+    if any("unreadable" in acct for acct in accts):
+        return False
     cwd = data.get("cwd")
     if not (isinstance(cwd, str) and os.path.isabs(cwd)):
         return all(repositories_of(acct) == [] for acct in accts)

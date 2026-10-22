@@ -1006,6 +1006,38 @@ class Usage(unittest.TestCase):
         longhaul.record_usage(self.reading(cost=0.5), None)
         self.assertEqual(json.loads(record.read_text())["account"], "main")
 
+    def test_an_accounts_file_that_cannot_be_read_keeps_the_status_line_and_usage_working(self):
+        # UX review, Sprint 8: they only show or record, so they go on, naming
+        # the account as with no file, and the problem is logged once, by
+        # its kind: never the file's text.
+        secret = "sentinel-owner@example.com"
+        cases = unreadable_accounts({"name": "Max", "config_dir": None, "email": secret},
+                                    {"name": "Pro", "config_dir": str(self.pro), "email": secret})
+        log, record = self.relay / "longhaul.log", longhaul.USAGE_DIR / "sessions" / "s1.json"
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "none"))
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        for case, text in cases.items():
+            with self.subTest(case):
+                (self.relay / "accounts.json").write_text(text)
+                log.unlink(missing_ok=True)
+                self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mmain"))
+                self.assertEqual(json.loads(record.read_text())["account"], "main", "as with no file")
+                self.assertTrue(longhaul.record_usage(self.reading(), str(self.pro)).startswith("\033[1mpro"))
+                said = [line for line in log.read_text().splitlines() if "accounts.json is not readable: " in line]
+                self.assertEqual(len(said), 1, log.read_text())
+                self.assertNotIn(secret, log.read_text())
+                out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], env=env, text=True,
+                                     input=json.dumps(self.reading()), capture_output=True, timeout=30)
+                self.assertEqual((out.returncode, out.stderr), (0, ""))
+                self.assertTrue(out.stdout.startswith("\033[1mmain"), out.stdout)
+                self.assertNotIn("statusline error", log.read_text())
+                out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "usage"], env=env, text=True,
+                                     capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+                self.assertEqual((out.returncode, out.stderr), (0, ""))
+                self.assertIn("accounts.json is not readable: ", out.stdout)
+                self.assertIn("main ", out.stdout, "the readings are still shown")
+                self.assertNotIn(secret, out.stdout + log.read_text())
+
     def test_a_compaction_writes_a_ledger_row_though_the_cost_stays(self):
         longhaul.record_usage(self.full_reading(ctx=80), str(self.pro))
         longhaul.record_usage(self.full_reading(ctx=9), str(self.pro))
@@ -5074,6 +5106,30 @@ class Advisor(unittest.TestCase):
         accounts.write_text(json.dumps([{"name": "Max", "config_dir": None, "repositories": [str(repo)]}]))
         self.assertEqual(longhaul.session_account(None), ("Max", {"name": "Max", "config_dir": None, "repositories": [str(repo)]}))
         self.assertEqual(longhaul.session_account(str(self.tmp / "pro")), ("pro", {"name": "pro"}), "not in the file: no list")
+
+    def test_an_accounts_file_that_cannot_be_read_denies_the_consultation(self):
+        # UX review, Sprint 8: session_account() read a file it could not
+        # read as no accounts, so a trailing comma lifted the session's
+        # restriction (A2), in LONGHAUL_HOME's file or the default home's (F13).
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        default = self.os_home / ".longhaul"
+        default.mkdir()
+        cases = unreadable_accounts({"name": "main", "config_dir": None, "repositories": [str(self.tmp / "elsewhere")]})
+        for n, (home, (case, text)) in enumerate((home, case) for home in (self.home, default) for case in cases.items()):
+            with self.subTest(home=home.name, case=case):
+                (home / "accounts.json").write_text(text)
+                data = self.call(prompt=f"p{n}")
+                data["cwd"] = str(repo)
+                self.assertIn("this repository", self.denied(data, "repository"))
+                self.assertEqual(self.trace()[-1]["kind"], "hard")
+                (home / "accounts.json").unlink()
+        self.assertEqual(self.state(), {}, "nothing counted")
+        self.assertIn("accounts.json is not readable: ", self.log())
+        # No file in either home: unrestricted, as before.
+        data = self.call(prompt="p-missing")
+        data["cwd"] = str(repo)
+        self.admitted(data)
 
     def test_a_home_that_is_relative_or_inside_the_repository_is_untrusted(self):
         # F13: a repository's own settings could point LONGHAUL_HOME at files
