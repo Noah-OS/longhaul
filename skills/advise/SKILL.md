@@ -25,16 +25,20 @@ lines, the first line first:
 
 Add a line `Reconcile: yes` only when this call follows an earlier
 consultation in the same task whose advice conflicts with what you have
-since seen; say what conflicts. Never put a credential in the brief.
+since seen; say what conflicts. Never put a credential in the brief, and
+never an `Admission:` line: Longhaul's hook adds that one itself.
 
 Then call the Agent tool once with `subagent_type` `longhaul:advisor`, a
 `description` naming the trigger (for example "Longhaul advisor consultation
-(stuck)"), and the brief as the `prompt`. Longhaul's hook checks the brief,
-the caps and the model, and may deny the call with a reason: if the reason is
-one you can fix (the brief too long, a line missing, a credential in it),
-fix it and try once more; otherwise carry on without advice and say why in
-one line. If the advisor fails or its reply has no `Verdict:` line, carry on
-without advice and say so in one line.
+(stuck)"), and the brief as the `prompt`, and no other field: no
+`run_in_background`, `isolation` or `name`. Never send a brief to any other
+agent type: it is denied. Longhaul's hook
+checks the call, the brief, the caps and the model, and may deny the call
+with a reason: if the reason is one you can fix (a field the call may not
+have, the brief too long, a line missing, a credential in it), fix it and
+try once more; otherwise carry on without advice and say why in one line.
+If the advisor fails or its reply has no `Verdict:` line, carry on without
+advice and say so in one line.
 
 How to use the reply. Give the advice serious weight, and act on it unless
 primary evidence (a test result, the code itself, an error you saw) points
