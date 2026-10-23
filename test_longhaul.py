@@ -8,6 +8,7 @@ import collections
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -7854,6 +7855,140 @@ class Trial(unittest.TestCase):
     def log(self):
         path = self.home / "longhaul.log"
         return path.read_text() if path.exists() else ""
+
+    def arm_of(self, root, seed=SEED):
+        """The plan's rule, apart from Longhaul's code: habit when sha256(seed + root)'s first byte is even."""
+        return "habit" if hashlib.sha256((seed + root).encode()).digest()[0] % 2 == 0 else "usual"
+
+    def ids(self, arm, n, prefix="s"):
+        """`n` session ids whose own arm is `arm`."""
+        found, i = [], 0
+        while len(found) < n:
+            sid, i = f"{prefix}{i}", i + 1
+            if self.arm_of(sid) == arm:
+                found.append(sid)
+        return found
+
+    def link(self, child, parent, at=None):
+        """The record a /clear's carry writes beside the checkpoints: `child` was started by `parent`'s checkpoint."""
+        path = self.home / "checkpoints" / f"{child}.from.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"session_id": child, "carried_from": parent,
+                                    "carried_at": time.time() if at is None else at}))
+
+    def stamp(self, epoch):
+        return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def session(self, sid, start, requests=6, read=100_000, write=2_000, out=500, model="claude-opus-5-5",
+                compactions=0, reminders=(), minutes=30, folder="-code-app", cwd=None):
+        """A main transcript as Claude Code writes it, `start` seconds from now: a
+        prompt holding S, then `requests` responses over `minutes`, with
+        `compactions` among them and a reminder's line (as the engine records a
+        hook's additionalContext) at each minute in `reminders`."""
+        t0 = time.time() + start
+        step = minutes * 60 / max(requests, 1)
+        lines = [(t0, {"type": "user", "cwd": cwd or str(self.work), "sessionId": sid,
+                       "message": {"role": "user", "content": f"fix the parser {self.S}"}})]
+        for i in range(requests):
+            self.n += 1
+            usage = {"input_tokens": 3, "cache_creation_input_tokens": write, "cache_read_input_tokens": read,
+                     "output_tokens": out}
+            lines.append((t0 + (i + 1) * step, {"type": "assistant", "message": {
+                "id": f"msg_{self.n}", "model": model, "role": "assistant",
+                "content": [{"type": "text", "text": f"done {self.S}"}], "usage": usage}}))
+        for i in range(compactions):
+            lines.append((t0 + (i + 1.5) * step, {"type": "system", "subtype": "compact_boundary", "compactMetadata": {
+                "trigger": "auto", "preTokens": 900_000, "postTokens": 20_000}}))
+        for minute in reminders:
+            context = f"longhaul guard (advice; the call went ahead): {self.S}\n" + Reminder.MODEL.format(205)
+            lines.append((t0 + minute * 60, {"type": "attachment", "isSidechain": False, "attachment": {
+                "type": "hook_additional_context", "content": [context], "hookName": "PreToolUse:Bash",
+                "toolUseID": "t1", "hookEvent": "PreToolUse"}}))
+        path = self.claude / "projects" / folder / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps({**line, "timestamp": self.stamp(t)}) + "\n"
+                                for t, line in sorted(lines, key=lambda tl: tl[0])))
+        return path
+
+    def test_an_arm_comes_from_the_seed_and_the_id_half_and_half_and_stays(self):
+        ids = [f"{i:04d}-session" for i in range(200)]
+        self.assertIsNone(longhaul.trial_arm(ids[0]), "no trial")
+        self.trial()
+        arms = [longhaul.trial_arm(sid) for sid in ids]
+        self.assertEqual(arms, [self.arm_of(sid) for sid in ids])
+        self.assertTrue(80 <= arms.count("habit") <= 120, arms.count("habit"))
+        self.assertEqual([longhaul.trial_arm(sid) for sid in ids], arms, "the same id, the same arm")
+        self.trial(seed="fedcba9876543210")
+        self.assertNotEqual([longhaul.trial_arm(sid) for sid in ids], arms, "another trial, another draw")
+        # Only while a trial is on; nothing for an id that is not a plain one.
+        for state in ({"started": -15}, {"started": 1}, {"started": -3, "stopped_at": time.time() - 60}):
+            self.trial(**state)
+            self.assertIsNone(longhaul.trial_arm(ids[0]), state)
+        self.trial()
+        for sid in (None, "", "a/b", "x" * 101, 7):
+            self.assertIsNone(longhaul.trial_arm(sid), repr(sid))
+
+    def test_a_session_a_clear_carried_into_keeps_its_roots_arm_across_two_carries(self):
+        self.trial()
+        root = self.ids("habit", 1, "root")[0]
+        second, third = self.ids("usual", 2, "next")
+        state = json.dumps({"goal": f"the parser {self.S}", "next_action": f"its tests {self.S}"})
+
+        def clear(sid):
+            return longhaul.checkpoint_check({"session_id": sid, "hook_event_name": "SessionStart", "source": "clear",
+                                              "cwd": str(self.work), "transcript_path": "/t/x.jsonl"})
+
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.checkpoint_save(root, state, str(self.work), None), 0)
+            self.assertIn(self.S, clear(second)["hookSpecificOutput"]["additionalContext"], "the carry, as before")
+            self.assertEqual(longhaul.checkpoint_save(second, state, str(self.work), None), 0)
+            self.assertIn(self.S, clear(third)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual([longhaul.trial_arm(sid) for sid in (root, second, third)], ["habit"] * 3)
+        self.assertEqual([longhaul.trial_root(sid) for sid in (root, second, third)], [root] * 3)
+        # Each carry names the new session in the carried record and the old
+        # one in the new session's link: ids and times, 0600.
+        folder = self.home / "checkpoints"
+        self.assertEqual(json.loads((folder / f"{root}.carried.json").read_text())["carried_into"], second)
+        for child, parent in ((second, root), (third, second)):
+            path = folder / f"{child}.from.json"
+            record = json.loads(path.read_text())
+            self.assertEqual(set(record), {"session_id", "carried_from", "carried_at"})
+            self.assertEqual((record["session_id"], record["carried_from"]), (child, parent))
+            self.assertEqual(oct(path.stat().st_mode & 0o777), oct(0o600))
+            self.assertNotIn(self.S, path.read_text())
+        # The root resumed and saved again: its carried record goes, the
+        # chain's links stay.
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.checkpoint_save(root, state, str(self.work), None), 0)
+        self.assertFalse((folder / f"{root}.carried.json").exists())
+        self.assertEqual(longhaul.trial_arm(third), "habit")
+        # A link that is not whole, or a loop, ends the walk where it is.
+        (folder / "x1.from.json").write_text(json.dumps({"session_id": "x2", "carried_from": root, "carried_at": 1}))
+        (folder / "x3.from.json").write_text("{")
+        (folder / "x4.from.json").write_text(json.dumps({"session_id": "x4", "carried_from": "../x", "carried_at": 1}))
+        for sid in ("x1", "x3", "x4"):
+            self.assertEqual(longhaul.trial_root(sid), sid)
+        self.link("y1", "y2")
+        self.link("y2", "y1")
+        self.assertIn(longhaul.trial_root("y1"), ("y1", "y2"))
+
+    def test_status_counts_the_trials_sessions_and_chains_per_arm(self):
+        self.trial(started=-10)
+        habit, usual = self.ids("habit", 3, "h"), self.ids("usual", 2, "u")
+        child = self.ids("usual", 1, "c")[0]
+        self.session(habit[0], -5 * self.DAY)
+        self.session(child, -5 * self.DAY + 3600)
+        self.link(child, habit[0])
+        self.session(habit[1], -2 * self.DAY)
+        self.session(usual[0], -1 * self.DAY)
+        self.session(habit[2], -11 * self.DAY)  # before the trial began
+        self.session(usual[1], -1 * self.DAY, folder="-private-var-folders-x")  # a temporary folder's
+        self.session("agent-a1", -1 * self.DAY, folder=f"-code-app/{usual[0]}/subagents")  # not a main transcript
+        code, out, err = self.cli("status")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("habit: 3 sessions in 2 chains", out.splitlines())
+        self.assertIn("usual: 1 session in 1 chain", out.splitlines())
+        self.assertNotIn(self.S, out)
 
     def test_start_writes_the_trial_file_and_refuses_while_one_is_on(self):
         before = time.time()

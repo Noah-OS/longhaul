@@ -3627,8 +3627,9 @@ def guard(_opts) -> int:
 # nothing under it; it carries over, once, the newest checkpoint saved in
 # the new session's folder within LONGHAUL_CHECKPOINT_CARRY_HOURS (6),
 # by the record the save writes beside it, <session>.carry.json (the
-# owner's plan of 2026-10-23: save, /clear, go on fresh). The file holds
-# the model's text on purpose. It is
+# owner's plan of 2026-10-23: save, /clear, go on fresh); the carry
+# writes the new session's <session>.from.json, its link to the old one,
+# for the trial's chains. The file holds the model's text on purpose. It is
 # read by the hook alone; the log, inspect and every line a person or the
 # model reads name it by session, size, field and reason, never by its
 # content. Like the guard, the hook prints nothing and exits 0 whatever
@@ -3736,6 +3737,15 @@ def checkpoint_carry_path(sid: str, carried: bool = False) -> Path:
     <session>.carry.json, renamed <session>.carried.json once carried. A
     session id holds no dot, so neither is ever a checkpoint's name."""
     return LONGHAUL_HOME / "checkpoints" / f"{sid}.{'carried' if carried else 'carry'}.json"
+
+
+def checkpoint_from_path(sid: str) -> Path:
+    """The link a /clear's carry writes for the session it started,
+    <session>.from.json beside the checkpoints: the session it was
+    carried from and when. Written once, at that session's start, and
+    never removed by a save, so a chain of carries can be walked back
+    (trial_root())."""
+    return LONGHAUL_HOME / "checkpoints" / f"{sid}.from.json"
 
 
 def checkpoint_record_folder(sid: str, at: float, cwd: str) -> bool:
@@ -3991,6 +4001,13 @@ def checkpoint_carry(data: dict, now: float):
                                  "carried_into": sid, "carried_at": now})
         except OSError:  # the rename has marked it already; the names are a courtesy
             pass
+        try:
+            # The new session's link to the old one, for the trial's chains
+            # (trial_root()): the carried record above goes when the old
+            # session saves again, and a second carry of it replaces it.
+            write_json(checkpoint_from_path(sid), {"session_id": sid, "carried_from": old, "carried_at": now})
+        except OSError as e:
+            log(f"checkpoint for {old}: the link from {sid} was not written: {e.strerror or e}")
         log(f"checkpoint for {old} carried into {sid} after clear ({len(raw)} bytes, "
             f"written {max(0, int(now - at))} s earlier)")
         return {"systemMessage": f"Longhaul restored your checkpoint from before /clear ({age} old).",
@@ -5689,6 +5706,119 @@ def trial_current(now: float | None = None):
     return trial if trial and trial["started_at"] <= now < trial_end(trial) else None
 
 
+def trial_root(sid: str) -> str:
+    """The root of the session's chain: the session itself, or, for one a
+    /clear's carry started, the root of the one it was carried from, by
+    the links the carry writes (checkpoint_from_path()). A link that is
+    not whole, or not the session's own, ends the walk there, as a loop
+    does."""
+    seen = [sid]
+    while len(seen) <= 1_000:
+        record = read_json(checkpoint_from_path(sid))
+        parent = record.get("carried_from") if isinstance(record, dict) and record.get("session_id") == sid else None
+        if not isinstance(parent, str) or not re.fullmatch(GUARD_ID, parent) or parent in seen:
+            break
+        sid = parent
+        seen.append(sid)
+    return sid
+
+
+def trial_arm_of(trial: dict, root: str) -> str:
+    """A chain's arm in this trial: habit when sha256(seed + root id)'s
+    first byte is even, else usual (the plan's half and half)."""
+    import hashlib  # here, not at the top: see index_key()
+    return "habit" if hashlib.sha256((trial["seed"] + root).encode()).digest()[0] % 2 == 0 else "usual"
+
+
+def trial_arm(session_id, now: float | None = None):
+    """The one place a session's arm is decided: habit or usual while a
+    trial is on, from its chain's root; None with no trial on, or for
+    anything but a plain session id."""
+    if not isinstance(session_id, str) or not re.fullmatch(GUARD_ID, session_id):
+        return None
+    trial = trial_current(now)
+    return trial_arm_of(trial, trial_root(session_id)) if trial else None
+
+
+TRIAL_SKIP = ("scratchpad", "-tmp-", "-private-", "-var-")  # project folders that are no real work: the baseline's
+
+
+def trial_scan(path: Path):
+    """One main transcript's times, folder and reminders, read line by
+    line without keeping any text: its first and last timestamps, the
+    cwd its first line names, and the times the reminder's line reached
+    the model (an attachment of a hook's additionalContext that holds
+    REMINDER_MODEL's start). None for a file with no timestamp."""
+    first = last = cwd = None
+    reminders = []
+    stamp = re.compile(rb'"timestamp":\s*"([^"]{1,64})"')
+    start = REMINDER_MODEL.split("{")[0].encode()
+    try:
+        with path.open("rb") as f:
+            for raw in f:
+                found = stamp.search(raw)
+                when = parse_ts(found.group(1).decode(errors="replace")) if found else 0.0
+                if when:
+                    first = when if first is None else first
+                    last = when
+                if cwd is None and b'"cwd"' in raw:
+                    try:
+                        line = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        line = None
+                    if isinstance(line, dict) and isinstance(line.get("cwd"), str) and os.path.isabs(line["cwd"]):
+                        cwd = line["cwd"]
+                if b'"hook_additional_context"' in raw and start in raw and when:
+                    try:
+                        line = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    att = dict_at(line, "attachment")
+                    texts = att.get("content") if isinstance(att.get("content"), list) else []
+                    if line.get("type") == "attachment" and not line.get("isSidechain") \
+                            and att.get("type") == "hook_additional_context" \
+                            and any(isinstance(t, str) and any(part.startswith(start.decode()) for part in t.split("\n"))
+                                    for t in texts):
+                        reminders.append(when)
+            size = f.tell()
+    except OSError:
+        return None
+    if first is None:
+        return None
+    return {"first": first, "last": last, "cwd": cwd, "reminders": reminders, "bytes": size}
+
+
+def trial_sessions(trial: dict) -> list:
+    """The trial's sessions: the main transcripts under the projects folder
+    (none of the scratch, temporary or system folders the baseline leaves
+    out) whose first timestamp is inside the trial's window, each with
+    trial_scan()'s figures and its chain's root."""
+    start, end, found = trial["started_at"], trial_end(trial), {}
+    for path in sorted(files_of((DEFAULT_CONFIG / "projects").glob("*/*.jsonl"))):
+        if any(skip in path.parent.name for skip in TRIAL_SKIP) or not re.fullmatch(GUARD_ID, path.stem) \
+                or path.stem in found:
+            continue
+        scan = trial_scan(path)
+        if scan and start <= scan["first"] < end:
+            found[path.stem] = {"session": path.stem, "path": path, "folder": path.parent.name, **scan,
+                                "root": trial_root(path.stem)}
+    return sorted(found.values(), key=lambda s: s["first"])
+
+
+def trial_chains(trial: dict, sessions: list) -> list:
+    """The trial's sessions by chain, the oldest chain first: its root,
+    arm and sessions in order."""
+    chains: dict = {}
+    for s in sessions:
+        chains.setdefault(s["root"], []).append(s)
+    return [{"chain": root, "arm": trial_arm_of(trial, root), "sessions": members}
+            for root, members in sorted(chains.items(), key=lambda kv: kv[1][0]["first"])]
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def trial_day(epoch: float) -> str:
     return dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
 
@@ -5743,6 +5873,10 @@ def trial_status(now: float) -> int:
         state = f"ended {trial_day(trial['ends_at'])}"
     print(f"Trial: {TRIAL_NAME}, {state}")
     print(f"Started {trial_day(trial['started_at'])}")
+    chains = trial_chains(trial, trial_sessions(trial))
+    for arm in TRIAL_ARMS:
+        mine = [c for c in chains if c["arm"] == arm]
+        print(f"{arm}: {plural(sum(len(c['sessions']) for c in mine), 'session')} in {plural(len(mine), 'chain')}")
     return 0
 
 
