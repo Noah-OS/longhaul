@@ -2,6 +2,24 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.1 - 2026-10-23
+
+Setup that does the work for you, and accounts kept to their own folders.
+
+### Added
+
+- **A guided `longhaul add`.** With no arguments, in a terminal, it asks for each part of an account and explains it. Then it shows a summary to confirm, opens the browser sign-in, and asks whether to add another. The one-line form is unchanged.
+  - The parts: the name, the email, where its sign-in lives (a new folder is offered when the default already exists), and the folders it may be used in.
+  - With two accounts or more, it asks once whether to switch accounts by itself at a usage limit, and keeps the answer in `~/.longhaul/config.json`. The terminal and the VS Code panel both read it. `--switch`, `LONGHAUL_SWITCH` and `vscode.json` still override it.
+  - It offers to set up VS Code's Claude panel too.
+- **`longhaul vscode [on|off]`.** Points VS Code's Claude panel at Longhaul's accounts, or back to its own sign-in. It edits VS Code's user settings itself, as VS Code writes them: comments and trailing commas are kept, one line is added or removed, a copy of the old file is kept, and nothing changes without a yes.
+- **`longhaul status` says where each account may be used:** "only in …" or "anywhere". It adds a line for the current folder naming the accounts it may use, or saying that none may.
+
+### Changed
+
+- **A folder an account is limited to is reserved for it.** Only the accounts whose lists name a repository, or a folder above it, are used there; an account allowed anywhere is not. A work account's folders therefore never use personal tokens, and at its limit Longhaul waits for its reset instead of moving the work. Elsewhere, the accounts allowed anywhere are used, as before.
+- **The context reminder also has the model tell you, in one line, when it saves the checkpoint.** The VS Code panel does not show the reminder's own message.
+
 ## 0.2.0 - 2026-10-23
 
 Measure first, then act: tokens by model, a reminder that keeps sessions short without losing the thread, a trial that tests whether it saves anything on real work, and the Advisor experiment, built and off.
