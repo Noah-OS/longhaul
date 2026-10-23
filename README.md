@@ -84,7 +84,7 @@ You need Claude Code and `python3` on your PATH: Python 3.10 or later, nothing p
 ## Know before you use it
 
 - **The hooks run in every session** of every project once the plugin is enabled, and add 87–94 ms to every `Read` and `Bash` call (measured warm on one Mac). They let the call run whatever goes wrong, except the Advisor's check of a consultation. [Hooks](https://github.com/Noah-OS/longhaul/wiki/Hooks)
-- **A checkpoint is not a backup.** It is the model's own summary, at most 8,000 bytes, put back after a compaction or a resume and not after `/clear`. [Checkpoints](https://github.com/Noah-OS/longhaul/wiki/Checkpoints)
+- **A checkpoint is not a backup.** It is the model's own summary, at most 8,000 bytes, put back after a compaction or a resume, and once after `/clear` when it was saved in the same folder within the last 6 hours. [Checkpoints](https://github.com/Noah-OS/longhaul/wiki/Checkpoints)
 - **Off unless you turn them on:** building a code index, the Advisor experiment, and switching accounts, which is experimental. [Architecture](https://github.com/Noah-OS/longhaul/wiki/Architecture)
 - **Local only.** Longhaul keeps its records under `~/.longhaul`: numbers, ids and file paths, never message text or tool output, except the checkpoint, which is the model's own summary on purpose. It has no telemetry. [Privacy and security](https://github.com/Noah-OS/longhaul/wiki/Privacy-and-Security)
 - Everything not covered or not yet checked: [Limitations](https://github.com/Noah-OS/longhaul/wiki/Limitations).
