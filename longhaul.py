@@ -6063,8 +6063,65 @@ def trial_report(opts) -> int:
 
 
 
+def trial_size(n: int) -> str:
+    return f"{n / 2**20:,.1f} MB" if n >= 2**20 else f"{max(1, round(n / 1024)):,} KB"
+
+
+def trial_duration(seconds: float) -> str:
+    minutes = max(0, round(seconds / 60))
+    return f"{minutes // 60} h {minutes % 60} min" if minutes >= 60 else f"{minutes} min"
+
+
+def trial_rate(chain, rating, now: float) -> int:
+    """`longhaul trial rate`: the trial's finished chains (last line more
+    than TRIAL_FINISHED ago) that have no rating yet, by short id, start,
+    folder, duration and size, and never their arm: the rating is blind.
+    `trial rate CHAIN N` records N, 1 to 5, for the one chain whose root
+    id starts with CHAIN, in trial-ratings.json (0600)."""
+    trial, problem = trial_read()
+    if trial is None:
+        why = f" ({home_path(str(trial_path()))} is not a trial file: {problem})" if problem else ""
+        print(f"longhaul trial: no trial to rate{why}", file=sys.stderr)
+        return 2
+    if chain is not None and (rating is None or not re.fullmatch(r"[1-5]", rating)):
+        print("longhaul trial: a rating is a whole number from 1 to 5: `longhaul trial rate CHAIN N`", file=sys.stderr)
+        return 2
+    chains = trial_chains(trial, trial_sessions(trial))
+    if chain is None:
+        rated = trial_ratings()
+        waiting = [c for c in chains if c["chain"] not in rated
+                   and now - max(s["last"] for s in c["sessions"]) > TRIAL_FINISHED]
+        if not waiting:
+            print("No finished chain is waiting for a rating.")
+            return 0
+        print("Finished chains not yet rated, oldest first; how did the work go, 1 (badly) to 5 (well)? "
+              "`longhaul trial rate CHAIN N`")
+        for c in waiting:
+            first = c["sessions"][0]
+            folder = os.path.basename(first["cwd"]) if first["cwd"] else first["folder"]
+            took = trial_duration(max(s["last"] for s in c["sessions"]) - first["first"])
+            size = trial_size(sum(s["bytes"] for s in c["sessions"]))
+            print(f"  {c['chain'][:8]}  {trial_day(first['first'])}  {shown(folder, 40)}  {took}  "
+                  f"{plural(len(c['sessions']), 'session')}, {size}")
+        return 0
+    hits = [c["chain"] for c in chains if c["chain"].startswith(chain)]
+    if len(hits) != 1:
+        given = shown(chain, 100)
+        print(f"longhaul trial: {len(hits)} chains start with {given}; give more of the id" if hits
+              else f"longhaul trial: no chain of this trial starts with {given}", file=sys.stderr)
+        return 2
+    path = LONGHAUL_HOME / "trial-ratings.json"
+    with locked("trial"):
+        ratings = dict_at(read_json(path), "ratings")
+        ratings[hits[0]] = {"rating": int(rating), "rated_at": now}
+        write_json(path, {"schema": 1, "ratings": ratings})
+    log("trial: a chain rated")
+    print(f"longhaul trial: chain {hits[0][:8]} rated {rating}")
+    return 0
+
+
 def trial(opts) -> int:
-    """`longhaul trial start [--days N] | stop | status`."""
+    """`longhaul trial start [--days N] | stop | status | report [--json] | rate [CHAIN N]`."""
     now = time.time()
     if opts.action == "start":
         return trial_start(opts.days, now)
@@ -6072,6 +6129,8 @@ def trial(opts) -> int:
         return trial_stop(now)
     if opts.action == "report":
         return trial_report(opts)
+    if opts.action == "rate":
+        return trial_rate(opts.chain, opts.rating, now)
     return trial_status(now)
 
 
@@ -7285,10 +7344,13 @@ def main(argv: list[str]) -> int:
             p.add_argument("--json", action="store_true",
                            help="one record per number: metric, value, unit, source, confidence")
         if cmd == "trial":
-            p.add_argument("action", choices=["start", "stop", "status", "report"],
+            p.add_argument("action", choices=["start", "stop", "status", "report", "rate"],
                            help="start: a trial of the checkpoint habit, from now; stop: end it early, keeping "
                                 "its record; status: whether one is on, the days left and its sessions per arm; "
-                                "report: each arm's numbers per chain and the plan's rule")
+                                "report: each arm's numbers per chain and the plan's rule; rate: the finished "
+                                "chains to rate, blind, or with CHAIN N, a rating from 1 to 5")
+            p.add_argument("chain", nargs="?", metavar="CHAIN", help="rate: a chain's id, or the start of it")
+            p.add_argument("rating", nargs="?", metavar="N", help="rate: 1 (badly) to 5 (well)")
             p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
             p.add_argument("--json", action="store_true", help="report: the chains' records and the decision, as JSON")
         if cmd == "add":

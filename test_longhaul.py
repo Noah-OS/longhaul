@@ -8172,6 +8172,55 @@ class Trial(unittest.TestCase):
         self.assertEqual((code, out), (2, ""))
         self.assertIn("no trial", err)
 
+    def test_rate_lists_the_finished_unrated_chains_blind_and_records_a_rating(self):
+        self.trial(started=-10)
+        (first, waiting), second, rated = self.ids("habit", 2, "rh"), self.ids("usual", 1, "solo")[0], self.ids("usual", 1, "ru")[0]
+        child = self.ids("usual", 1, "rc")[0]
+        self.session(first, -3 * self.DAY, minutes=30)
+        self.session(child, -3 * self.DAY + 3600, minutes=30)
+        self.link(child, first)
+        self.session(second, -2 * self.DAY, minutes=45, cwd=str(self.tmp / "api"))
+        self.session(waiting, -20 * 60, minutes=10)  # its last line 10 minutes ago: not finished
+        self.session(rated, -4 * self.DAY)
+        self.ratings(**{rated: 3})
+        code, out, err = self.cli("rate")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertIn("longhaul trial rate CHAIN N", lines[0])
+        self.assertEqual(len(lines), 3, "a line per finished, unrated chain")
+        self.assertTrue(lines[1].split()[0] == first and " work " in lines[1] and "1 h 30 min" in lines[1]
+                        and "2 sessions" in lines[1], lines[1])
+        self.assertTrue(lines[2].split()[0] == second and " api " in lines[2] and "45 min" in lines[2]
+                        and "1 session," in lines[2], lines[2])
+        for word in ("habit", "usual", "arm"):
+            self.assertNotIn(word, out.lower(), "the rating is blind")
+        # Recorded, 0600: the chain leaves the list and the report has it.
+        code, out, err = self.cli("rate", first, "4")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"chain {first} rated 4", out)
+        path = self.home / "trial-ratings.json"
+        self.assertEqual(oct(path.stat().st_mode & 0o777), oct(0o600))
+        kept = json.loads(path.read_text())
+        self.assertEqual((kept["schema"], set(kept["ratings"]), kept["ratings"][first]["rating"]), (1, {first, rated}, 4))
+        self.assertEqual(len(self.cli("rate")[1].splitlines()), 2)
+        self.assertEqual({c["chain"]: c["rating"] for c in self.report()["chains"]},
+                         {first: 4, second: None, waiting: None, rated: 3})
+        # A short id one chain starts with is enough; a rating again replaces the first.
+        self.assertEqual(self.cli("rate", "sol", "5")[0], 0)
+        self.assertEqual(json.loads(path.read_text())["ratings"][second]["rating"], 5)
+        self.assertEqual(self.cli("rate")[1], "No finished chain is waiting for a rating.\n")
+        before = path.read_text()
+        for args, said in (((first, "6"), "1 to 5"), ((first, "0"), "1 to 5"), ((first, "x"), "1 to 5"),
+                           ((first,), "1 to 5"), (("nope", "3"), "no chain of this trial"), (("r", "3"), "chains start with"),
+                           ((child, "3"), "no chain of this trial")):
+            code, out, err = self.cli("rate", *args)
+            self.assertEqual((code, out), (2, ""), args)
+            self.assertIn(said, err, args)
+        self.assertEqual(path.read_text(), before, "a refusal writes nothing")
+        self.assertEqual(self.log().count("trial: a chain rated"), 2)
+        for sid in (first, second):
+            self.assertNotIn(sid, self.log(), "the log holds kinds and counts")
+
     def test_start_writes_the_trial_file_and_refuses_while_one_is_on(self):
         before = time.time()
         code, out, err = self.cli("start")
