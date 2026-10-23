@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "See where your Claude Code sessions' tokens go, and stop the waste; keeps long sessions running across your own subscriptions, opt-in.",
   "author": {
     "name": "Amr Adel",

@@ -2,6 +2,22 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.2 - 2026-10-23
+
+The code index builds itself, and subagents' models can be chosen per agent type.
+
+### Added
+
+- **Auto Model for subagents.** `longhaul models TYPE MODEL` keeps a table of agent type to model in `~/.longhaul/config.json`, and Longhaul applies it to every subagent call, in VS Code and the terminal.
+  - **It only lowers a model.** The model a call would run on is its own, else its agent definition's, else `CLAUDE_CODE_SUBAGENT_MODEL`, else the main conversation's. The table's model is used when it is cheaper.
+  - **It never touches** an Advisor consultation, a forced model, or an unknown one.
+  - **Where it applies:** `longhaul models trial`, the default, means only in a models trial's "routed" arm; `on` means everywhere; `off` means nowhere.
+- **A trial of the models table.** `longhaul trial start --kind models` runs "routed" against "usual" with the same rule as the checkpoint trial.
+
+### Changed
+
+- **The code index is on by default.** At a new session's start, in a git work tree with no map, Longhaul starts `codegraph init` and `trail init` in the background, where they are installed. Trail's init also writes a hook into the repository's `.claude/settings.json`. `LONGHAUL_INDEX=off` turns this off. Whether the index saves tokens is not yet measured.
+
 ## 0.2.1 - 2026-10-23
 
 Setup that does the work for you, and accounts kept to their own folders.
