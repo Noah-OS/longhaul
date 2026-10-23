@@ -8267,7 +8267,7 @@ class Trial(unittest.TestCase):
             if name != f"checkpoints/{root}.json":  # the checkpoint holds the model's text on purpose
                 self.assertNotIn(self.S.encode(), raw, name)
         self.assertEqual(set(json.loads(files["trial.json"])),
-                         {"schema", "name", "started_at", "ends_at", "seed", "stopped_at"})
+                         {"schema", "name", "kind", "started_at", "ends_at", "seed", "stopped_at"})
         ratings = json.loads(files["trial-ratings.json"])
         self.assertEqual(ratings, {"schema": 1, "ratings": {root: {"rating": 4, "rated_at": ratings["ratings"][root]["rated_at"]}}})
         self.assertEqual(set(json.loads(files[f"checkpoints/{child}.from.json"])), {"session_id", "carried_from", "carried_at"})
@@ -8295,7 +8295,7 @@ class Trial(unittest.TestCase):
         code, out, err = self.cli("start")
         self.assertEqual((code, err), (0, ""))
         record = self.trial_file()
-        self.assertEqual(set(record), {"schema", "name", "started_at", "ends_at", "seed"})
+        self.assertEqual(set(record), {"schema", "name", "kind", "started_at", "ends_at", "seed"})
         self.assertEqual((record["schema"], record["name"]), (1, "checkpoint-habit"))
         self.assertTrue(before <= record["started_at"] <= time.time())
         self.assertAlmostEqual(record["ends_at"] - record["started_at"], 14 * self.DAY, places=3, msg="14 days by default")
@@ -10482,6 +10482,182 @@ class PipePieces(unittest.TestCase):
         with mock.patch.dict(os.environ, elsewhere):
             env = longhaul.no_git_env(self.ACCOUNT)
         self.assertEqual(sorted(set(elsewhere) & set(env)), [])
+
+
+class Models(unittest.TestCase):
+    """Auto Model for subagents (the owner, 2026-10-23): a table of agent type
+    -> model in config.json, applied by the PreToolUse hook, lowered only."""
+
+    S = "SENTINEL-OKAPI-7731"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.transcript = self.tmp / "t.jsonl"
+        self.main("claude-opus-5-5")
+        for patch in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                      mock.patch.object(longhaul, "CONFIG", self.home / "config.json"),
+                      mock.patch.object(longhaul, "HOME", self.tmp / "user"),
+                      mock.patch.dict(os.environ, {})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        for name in ("CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "LONGHAUL_ADVISOR"):
+            os.environ.pop(name, None)
+
+    def main(self, model):
+        self.transcript.write_text(json.dumps({"type": "assistant", "message": {"model": model, "content": []}}) + "\n")
+
+    def config(self, **values):
+        (self.home / "config.json").write_text(json.dumps(values))
+
+    def call(self, kind="implementer", session="5e0c1a2b-0000-4000-8000-000000000001", **extra):
+        return {"session_id": session, "transcript_path": str(self.transcript), "cwd": str(self.repo),
+                "hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_use_id": "toolu_m1",
+                "tool_input": {"description": "Run it", "prompt": "do the task", "subagent_type": kind, **extra}}
+
+    def routed(self, data):
+        out = longhaul.advisor_check(data, time.time())
+        return out["hookSpecificOutput"]["updatedInput"].get("model") if out else None
+
+    def define(self, kind, front, where=None):
+        folder = (where or self.repo) / ".claude" / "agents"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{kind}.md").write_text(f"---\nname: {kind}\n{front}---\nThe body, {self.S}.\n")
+
+    def test_the_table_lowers_a_type_to_its_model_and_keeps_every_other_field(self):
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        data = self.call(run_in_background=True, isolation="worktree")
+        out = longhaul.advisor_check(data, time.time())["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertEqual(out["updatedInput"], {**data["tool_input"], "model": "sonnet"}, "every other field as it was")
+        self.assertIn("models: implementer opus -> sonnet in 5e0c1a2b", (self.home / "longhaul.log").read_text())
+
+    def test_it_only_lowers_from_the_model_the_call_would_run_on(self):
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        self.assertIsNone(self.routed(self.call(model="haiku")), "never raised")
+        self.assertIsNone(self.routed(self.call(model="sonnet")))
+        self.assertEqual(self.routed(self.call(model="opus")), "sonnet", "the call's own model first")
+        self.main("claude-sonnet-5-5")
+        self.assertIsNone(self.routed(self.call()), "a Sonnet session's subagent is not raised")
+        self.main("claude-fable-5-1")
+        self.assertEqual(self.routed(self.call()), "sonnet")
+        self.transcript.unlink()
+        self.assertIsNone(self.routed(self.call()), "the model it would run on unknown: no change")
+
+    def test_an_agent_definitions_model_is_read_and_its_body_never_is(self):
+        self.config(subagents={"implementer": "sonnet", "planner": "sonnet"}, models="on")
+        self.define("implementer", "model: haiku\n")
+        self.assertIsNone(self.routed(self.call()), "the definition's haiku is cheaper already")
+        self.define("implementer", "model: inherit\n")
+        self.assertEqual(self.routed(self.call()), "sonnet", "inherit: the main model, opus")
+        self.define("implementer", "description: no model\n")
+        self.assertEqual(self.routed(self.call()), "sonnet", "no model named: the main model")
+        self.define("planner", "model: sonnet\n", where=self.tmp / "user")
+        self.assertIsNone(self.routed(self.call("planner")), "~/.claude/agents too")
+        os.environ["CLAUDE_CODE_SUBAGENT_MODEL"] = "haiku"
+        self.define("implementer", "description: no model\n")
+        self.assertIsNone(self.routed(self.call()), "Claude Code's default, when nothing else names one")
+        for path in self.home.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.S, path.read_text(errors="replace"), path)
+
+    def test_nothing_changes_for_an_untabled_type_keep_a_forced_model_or_a_consultation(self):
+        self.config(subagents={"implementer": "sonnet", "reviewer": "keep"}, models="on")
+        self.assertIsNone(self.routed(self.call("planner")))
+        self.assertIsNone(self.routed(self.call("reviewer")))
+        os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
+        self.assertIsNone(self.routed(self.call()), "Claude Code ignores the call's model then")
+        del os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
+        self.config(subagents={"implementer": "sonnet", "longhaul:advisor": "haiku", "advisor": "haiku"}, models="on")
+        out = longhaul.advisor_check(self.call("longhaul:advisor"), time.time())["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny", "the Advisor's own answer (off), never the table's")
+        with mock.patch.object(longhaul, "advisor_tail", side_effect=RuntimeError("boom")):
+            self.assertIsNone(self.routed(self.call()), "a failure leaves the call as it was")
+
+    def test_where_it_applies_off_on_or_a_models_trials_routed_arm(self):
+        self.config(subagents={"implementer": "sonnet"}, models="off")
+        self.assertIsNone(self.routed(self.call()))
+        self.config(subagents={"implementer": "sonnet"})  # trial, the default: no trial on, so nowhere
+        self.assertIsNone(self.routed(self.call()))
+        now = time.time()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.trial_start(14, now - 1, "models"), 0)
+        arms = {}
+        for n in range(64):
+            sid = f"5e0c1a2b-0000-4000-8000-{n:012d}"
+            arms.setdefault(longhaul.trial_arm(sid), sid)
+        self.assertEqual(self.routed(self.call(session=arms["habit"])), "sonnet", "the routed arm")
+        self.assertIsNone(self.routed(self.call(session=arms["usual"])), "the usual arm")
+        record = json.loads((self.home / "trial.json").read_text())
+        self.assertEqual((record["kind"], record["name"]), ("models", "subagent-models"))
+
+    def test_a_models_trial_needs_a_table_and_the_trial_mode_and_names_its_arm_routed(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(longhaul.trial_start(14, time.time(), "models"), 2)
+        self.assertIn("no table of subagent models", err.getvalue())
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(longhaul.trial_start(14, time.time(), "models"), 2)
+        self.assertIn("`longhaul models trial`", err.getvalue())
+        self.config(subagents={"implementer": "sonnet"}, models="trial")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(longhaul.trial_start(14, time.time() - 1, "models"), 0)
+        self.assertIn("routed or usual", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            longhaul.trial_status(time.time())
+        self.assertIn("Trial: subagent-models", out.getvalue())
+        self.assertIn("routed:", out.getvalue())
+
+    def test_a_trial_file_written_before_kinds_is_a_checkpoint_trial(self):
+        now = time.time()
+        (self.home / "trial.json").write_text(json.dumps({"schema": 1, "name": "checkpoint-habit", "started_at": now - 10,
+                                                           "ends_at": now + 10, "seed": "0123456789abcdef"}))
+        trial = longhaul.trial_current(now)
+        self.assertEqual((longhaul.trial_kind(trial), longhaul.trial_label(trial)), ("checkpoint", "habit"))
+        (self.home / "trial.json").write_text(json.dumps({"schema": 1, "name": "checkpoint-habit", "kind": "models",
+                                                           "started_at": now - 10, "ends_at": now + 10,
+                                                           "seed": "0123456789abcdef"}))
+        self.assertIsNone(longhaul.trial_current(now), "a kind and a name that disagree: no trial")
+
+    def test_longhaul_models_shows_and_sets_the_table_and_where_it_applies(self):
+        def run(*args):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = longhaul.models(longhaul.argparse.Namespace(args=list(args)))
+            return code, out.getvalue()
+        code, out = run()
+        self.assertEqual(code, 0)
+        self.assertIn("`longhaul models implementer sonnet`", out, "the owner's starting table, suggested")
+        self.assertEqual(run("implementer", "Sonnet")[0], 0)
+        self.assertEqual(run("reviewer", "keep")[0], 0)
+        self.assertEqual(run("on")[0], 0)
+        self.assertEqual(json.loads((self.home / "config.json").read_text()),
+                         {"subagents": {"implementer": "sonnet", "reviewer": "keep"}, "models": "on"})
+        code, out = run()
+        self.assertRegex(out, r"implementer\s+sonnet")
+        self.assertIn("Where it applies: on (every session)", out)
+        self.assertEqual(run("implementer", "gpt-5")[0], 2)
+        self.assertEqual(run("one", "two", "three")[0], 2)
+
+    def test_the_hook_as_registered_lowers_the_model_and_the_shim_refuses_the_command(self):
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        env.update(LONGHAUL_HOME=str(self.home), HOME=str(self.tmp / "user"), LONGHAUL_NO_NOTIFY="1")
+        cmd = registered_hook("PreToolUse", "advisor-hook")
+        out = subprocess.run(cmd, input=json.dumps(self.call()), capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
+        shim = subprocess.run([str(HERE / "bin" / "longhaul"), "models", "on"], capture_output=True, text=True,
+                              env={**env, "CLAUDECODE": "1"}, timeout=30)
+        self.assertNotEqual(shim.returncode, 0)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "on", "unchanged")
 
 
 class Accounts(unittest.TestCase):

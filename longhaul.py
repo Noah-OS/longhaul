@@ -72,6 +72,9 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
+  longhaul models [on|off|trial | TYPE MODEL]
+                          subagents' models by agent type, lowered only: the
+                          table, and where it applies (trial by default)
   longhaul vscode [on|off]      VS Code's Claude panel uses your Longhaul accounts
                           (on), or its own sign-in again (off); it edits VS
                           Code's settings for you, a copy kept
@@ -4817,7 +4820,11 @@ def advisor_check(data, now: float):
         return advisor_refuse(data, "follow-up", now)
     if advisor_stand_in(data):
         return advisor_refuse(data, "stand-in", now)
-    return None
+    try:  # Auto Model: it only lowers a model, so a failure leaves the call as it was
+        return models_rule(data)
+    except Exception as e:
+        log(f"models: no change ({type(e).__name__})")
+        return None
 
 
 def advisor_refuse(data: dict, reason: str, now: float) -> dict:
@@ -5627,8 +5634,9 @@ def reminder_due(data: dict):
     crossed = size // at * at
     if not crossed and not junk:
         return None
-    if trial_arm(data.get("session_id")) == "usual":  # the checkpoint A/B's usual arm hears none (the trial section)
-        return None
+    trial = trial_current()
+    if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
+        return None  # the checkpoint A/B's usual arm hears none (the trial section); a models trial's does
     with locked("guard"):  # the guard's record, written by its hook at the same moments
         kept = read_json(record)
         kept = kept if isinstance(kept, dict) else {}
@@ -5713,6 +5721,13 @@ def reminder(_opts) -> int:
 # the shim refuses them from inside a session.
 
 TRIAL_NAME = "checkpoint-habit"
+# A trial's kind: its name, what its treatment arm is called, and its plan.
+# The arms stay habit and usual inside (trial_arm()); only the kind decides
+# what the treatment arm gets: the reminder (checkpoint), or the subagent
+# models' table (models; the owner, 2026-10-23: its own trial, after the
+# checkpoint one).
+TRIAL_KINDS = {"checkpoint": ("checkpoint-habit", "habit", "docs/plans/2026-10-23-checkpoint-ab-plan.md"),
+               "models": ("subagent-models", "routed", "docs/plans/2026-10-23-auto-model-design.md")}
 TRIAL_DAYS = 14
 TRIAL_ARMS = ("habit", "usual")
 # The plan's rule, written before looking: at least TRIAL_CHAINS chains per
@@ -5757,7 +5772,9 @@ def trial_read():
         record = json.loads(raw[:4096])
     except (ValueError, RecursionError):
         return None, "not JSON"
-    if not isinstance(record, dict) or record.get("schema") != 1 or record.get("name") != TRIAL_NAME:
+    kind = record.get("kind", "checkpoint") if isinstance(record, dict) else None
+    if not isinstance(record, dict) or record.get("schema") != 1 or kind not in TRIAL_KINDS \
+            or record.get("name") != TRIAL_KINDS[kind][0]:
         return None, "not schema 1 of this trial"
     if not isinstance(record.get("seed"), str) or not re.fullmatch(r"[0-9a-f]{16}", record["seed"]):
         return None, "its seed is not 16 hex digits"
@@ -5766,6 +5783,16 @@ def trial_read():
         if value is None or not math.isfinite(value):
             return None, f"its {key} is not a time"
     return record, None
+
+
+def trial_kind(trial: dict) -> str:
+    """A trial record's kind: checkpoint for one written before kinds."""
+    return trial.get("kind", "checkpoint")
+
+
+def trial_label(trial: dict) -> str:
+    """What the trial's treatment arm is called: habit, or routed."""
+    return TRIAL_KINDS[trial_kind(trial)][1]
 
 
 def trial_end(trial: dict) -> float:
@@ -5917,22 +5944,32 @@ def trial_day(epoch: float) -> str:
     return dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
 
 
-def trial_start(days: float, now: float) -> int:
+def trial_start(days: float, now: float, kind: str = "checkpoint") -> int:
     if not math.isfinite(days) or days <= 0:
         print("longhaul trial: --days must be a number of days above zero", file=sys.stderr)
         return 2
+    if kind == "models":
+        table, mode = models_settings()
+        why = ("there is no table of subagent models to route by: set one with `longhaul models TYPE MODEL`"
+               if not any(m != "keep" for m in table.values()) else
+               f"`longhaul models` is {mode}, so no session would be left usual or routed: set it back with "
+               "`longhaul models trial`" if mode != "trial" else None)
+        if why:
+            print(f"longhaul trial: not started, because {why}", file=sys.stderr)
+            return 2
+    name, label = TRIAL_KINDS[kind][:2]
     with locked("trial"):
         on = trial_current(now)
         if on:
             print(f"longhaul trial: a trial is on already (since {trial_day(on['started_at'])}, until "
                   f"{trial_day(on['ends_at'])}); stop it first with `longhaul trial stop`", file=sys.stderr)
             return 2
-        record = {"schema": 1, "name": TRIAL_NAME, "started_at": now, "ends_at": now + days * 86_400,
+        record = {"schema": 1, "name": name, "kind": kind, "started_at": now, "ends_at": now + days * 86_400,
                   "seed": os.urandom(8).hex()}
         write_json(trial_path(), record)
     log(f"trial: started, {days:g} days")
-    print(f"longhaul trial: {TRIAL_NAME} started; it ends {trial_day(record['ends_at'])} ({days:g} days). Each new "
-          f"session gets an arm, habit or usual, by its id; a session a /clear's carry starts keeps its chain's.")
+    print(f"longhaul trial: {name} started; it ends {trial_day(record['ends_at'])} ({days:g} days). Each new "
+          f"session gets an arm, {label} or usual, by its id; a session a /clear's carry starts keeps its chain's.")
     return 0
 
 
@@ -5944,7 +5981,7 @@ def trial_stop(now: float) -> int:
             return 2
         write_json(trial_path(), {**on, "stopped_at": now})
     log("trial: stopped")
-    print(f"longhaul trial: {TRIAL_NAME} stopped; its record is kept for `longhaul trial report`")
+    print(f"longhaul trial: {on['name']} stopped; its record is kept for `longhaul trial report`")
     return 0
 
 
@@ -5965,12 +6002,13 @@ def trial_status(now: float) -> int:
         state = f"stopped {trial_day(trial['stopped_at'])}"
     else:
         state = f"ended {trial_day(trial['ends_at'])}"
-    print(f"Trial: {TRIAL_NAME}, {state}")
+    print(f"Trial: {trial['name']}, {state}")
     print(f"Started {trial_day(trial['started_at'])}")
     chains = trial_chains(trial, trial_sessions(trial))
     for arm in TRIAL_ARMS:
         mine = [c for c in chains if c["arm"] == arm]
-        print(f"{arm}: {plural(sum(len(c['sessions']) for c in mine), 'session')} in {plural(len(mine), 'chain')}")
+        shown = trial_label(trial) if arm == "habit" else arm
+        print(f"{shown}: {plural(sum(len(c['sessions']) for c in mine), 'session')} in {plural(len(mine), 'chain')}")
     return 0
 
 
@@ -6064,13 +6102,15 @@ def trial_report_lines(trial: dict, decided: dict) -> list:
     end = trial_end(trial)
     state = "on" if time.time() < end else "stopped" if end < trial["ends_at"] else "ended"
 
+    t = trial_label(trial)  # habit, or routed: the treatment arm's name in this trial's kind
+
     def row(name, habit, usual):
         return f"  {name:<36}{habit:>14}{usual:>14}"
 
-    lines = [f"Trial {TRIAL_NAME}: {trial_day(trial['started_at'])} to {trial_day(end)} ({state})",
-             f"Chains kept: habit {h['chains']}, usual {u['chains']}; dropped (under {TRIAL_REQUESTS} requests): "
-             f"habit {h['dropped']}, usual {u['dropped']}",
-             row("Per chain, median", "habit", "usual"),
+    lines = [f"Trial {trial['name']}: {trial_day(trial['started_at'])} to {trial_day(end)} ({state})",
+             f"Chains kept: {t} {h['chains']}, usual {u['chains']}; dropped (under {TRIAL_REQUESTS} requests): "
+             f"{t} {h['dropped']}, usual {u['dropped']}",
+             row("Per chain, median", t, "usual"),
              row("API-price equivalent", trial_number(h["price_usd_median"], True),
                  trial_number(u["price_usd_median"], True))]
     for k, _ in TOKEN_KINDS:
@@ -6091,15 +6131,15 @@ def trial_report_lines(trial: dict, decided: dict) -> list:
         return {True: "met", False: "not met"}[checks[check]]
 
     saving = decided["saving"]
-    lines += ["The rule (docs/plans/2026-10-23-checkpoint-ab-plan.md):",
-              f"  at least {TRIAL_CHAINS} chains per arm: habit {h['chains']}, usual {u['chains']}: {met('chains')}",
-              f"  habit's median price at least {TRIAL_SAVING:.0%} below usual's: "
+    lines += [f"The rule ({TRIAL_KINDS[trial_kind(trial)][2]}):",
+              f"  at least {TRIAL_CHAINS} chains per arm: {t} {h['chains']}, usual {u['chains']}: {met('chains')}",
+              f"  {t}'s median price at least {TRIAL_SAVING:.0%} below usual's: "
               f"{'-' if saving is None else f'{saving:.1%} below'}: {met('price')}",
-              f"  median compactions not higher: habit {trial_number(h['compactions_median'])}, "
+              f"  median compactions not higher: {t} {trial_number(h['compactions_median'])}, "
               f"usual {trial_number(u['compactions_median'])}: {met('compactions')}",
               "  median rating not lower: " + (
-                  f"not counted (rated chains: habit {h['rated']}, usual {u['rated']}; {TRIAL_RATED} each needed)"
-                  if checks["rating"] is None else f"habit {trial_number(h['rating_median'])}, "
+                  f"not counted (rated chains: {t} {h['rated']}, usual {u['rated']}; {TRIAL_RATED} each needed)"
+                  if checks["rating"] is None else f"{t} {trial_number(h['rating_median'])}, "
                                                    f"usual {trial_number(u['rating_median'])}: {met('rating')}"),
               decided["verdict"]]
     return lines
@@ -6189,7 +6229,7 @@ def trial(opts) -> int:
         print(f"longhaul trial: {opts.action} takes no CHAIN or N; those are rate's", file=sys.stderr)
         return 2
     if opts.action == "start":
-        return trial_start(opts.days, now)
+        return trial_start(opts.days, now, opts.kind)
     if opts.action == "stop":
         return trial_stop(now)
     if opts.action == "report":
@@ -6197,6 +6237,131 @@ def trial(opts) -> int:
     if opts.action == "rate":
         return trial_rate(opts.chain, opts.rating, now)
     return trial_status(now)
+
+
+# ------------------------------------------------------------- models
+#
+# Auto Model for subagents (the owner, 2026-10-23; the design in
+# docs/plans/2026-10-23-auto-model-design.md): a table of agent type ->
+# model in config.json ("subagents"), applied by the PreToolUse hook on
+# Agent and Task. It only lowers: a call on the table's model or a cheaper
+# one is left as it is. "models" in config.json says where it applies: off,
+# on (every session), or trial (the default: only in a models trial's
+# routed arm). Logged by type and model, never text.
+
+MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
+MODELS_MODES = ("off", "on", "trial")
+MODELS_START = {"implementer": "sonnet", "security-auditor": "sonnet", "qa-engineer": "sonnet"}  # the owner's first
+
+
+def models_settings() -> tuple:
+    """(the table of agent type -> model alias or keep, the mode). Junk in
+    the table is no entry; a mode that is not one of the three is trial."""
+    found = read_json(CONFIG)
+    found = found if isinstance(found, dict) else {}
+    table = found.get("subagents")
+    table = {k: v for k, v in table.items() if isinstance(k, str) and isinstance(v, str)
+             and (v in MODEL_RANK or v == "keep")} if isinstance(table, dict) else {}
+    mode = found.get("models")
+    return table, mode if mode in MODELS_MODES else "trial"
+
+
+def models_applies(session_id, mode: str) -> bool:
+    if mode != "trial":
+        return mode == "on"
+    trial = trial_current()
+    return bool(trial and trial_kind(trial) == "models" and trial_arm(session_id) == "habit")
+
+
+def agent_definition_model(cwd, agent_type):
+    """The `model:` an agent definition names, read from its front matter
+    only: the repository's .claude/agents/<type>.md, then ~/.claude's;
+    "none" for a definition that names none; None for no definition (or a
+    plugin's type, which this does not read)."""
+    if not isinstance(agent_type, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", agent_type):
+        return None
+    bases = ([Path(repository_of(cwd))] if isinstance(cwd, str) and os.path.isabs(cwd) else []) + [HOME]
+    for base in bases:
+        try:
+            head = (base / ".claude" / "agents" / f"{agent_type}.md").read_text(errors="replace")[:4096]
+        except OSError:
+            continue
+        if not head.startswith("---"):
+            return "none"
+        end = head.find("\n---", 3)
+        found = re.search(r"(?m)^model:\s*['\"]?([A-Za-z0-9._-]+)", head[3:end if end > 0 else len(head)])
+        return found.group(1).lower() if found else "none"
+    return None
+
+
+def models_rule(data: dict):
+    """The table's answer to a subagent call, or None to leave it as it is:
+    the call's model lowered to the table's for its type. The model it
+    would run on: the call's own, else its definition's, else
+    CLAUDE_CODE_SUBAGENT_MODEL, else the main conversation's (the order
+    Claude Code's docs give). Unknown, or not above the table's: no change."""
+    if data.get("tool_name") not in ("Agent", "Task") or os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE"):
+        return None
+    given = data.get("tool_input")
+    kind = given.get("subagent_type") if isinstance(given, dict) else None
+    if not isinstance(kind, str):
+        return None
+    table, mode = models_settings()
+    want = table.get(kind)
+    if want in (None, "keep") or not models_applies(data.get("session_id"), mode):
+        return None
+    model, defined = given.get("model"), None
+    if not (isinstance(model, str) and model.strip()):
+        defined = agent_definition_model(data.get("cwd"), kind)
+        model = defined if defined not in (None, "none", "inherit") else os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+    have = (advisor_family(model) if isinstance(model, str) and model.strip() and model != "inherit"
+            else advisor_executor(advisor_tail(data.get("transcript_path"))))
+    if have not in MODEL_RANK or MODEL_RANK[want] >= MODEL_RANK[have]:
+        return None
+    log(f"models: {kind} {have} -> {want} in {str(data.get('session_id'))[:8]}")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                   "permissionDecisionReason": f"longhaul models: {kind} on {want} (was {have})",
+                                   "updatedInput": {**given, "model": want}}}
+
+
+def models(opts) -> int:
+    """`longhaul models [on|off|trial | TYPE MODEL]`: the table and where it
+    applies, or one change to either."""
+    args = opts.args or []
+    found = read_json(CONFIG)
+    found = found if isinstance(found, dict) else {}
+    if len(args) == 1 and args[0] in MODELS_MODES:
+        write_json(CONFIG, {**found, "models": args[0]})
+        say(f"subagent models: {args[0]} ({MODELS_SAID[args[0]]})")
+        return 0
+    if len(args) == 2:
+        kind, model = args[0], args[1].lower()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", kind) or not (model in MODEL_RANK or model == "keep"):
+            say("longhaul models TYPE MODEL: TYPE is an agent type (implementer, reviewer...), MODEL one of "
+                "haiku, sonnet, opus, fable or keep")
+            return 2
+        table = found.get("subagents") if isinstance(found.get("subagents"), dict) else {}
+        write_json(CONFIG, {**found, "subagents": {**table, kind: model}})
+        say(f"{kind}: {model}" + ("" if model == "keep" else ", or the model it would run on when that is cheaper"))
+        return 0
+    if args:
+        say("longhaul models [on|off|trial | TYPE MODEL]")
+        return 2
+    table, mode = models_settings()
+    if table:
+        say("Subagent models (lowered only, never raised):")
+        for kind, model in table.items():
+            print(f"  {kind:<24} {model}")
+    else:
+        say("No table yet. The one decided on 2026-10-23: "
+            + "; ".join(f"`longhaul models {k} {v}`" for k, v in MODELS_START.items()))
+    trial = trial_current()
+    on = f" A {trial['name']} trial is on." if trial else ""
+    say(f"Where it applies: {mode} ({MODELS_SAID[mode]}).{on}")
+    return 0
+
+
+MODELS_SAID = {"off": "nowhere", "on": "every session", "trial": "only in a models trial's routed arm"}
 
 
 # ------------------------------------------------------------- VS Code
@@ -7718,7 +7883,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "trial", "vscode"):
+                            "trial", "vscode", "models"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -7751,6 +7916,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("chain", nargs="?", metavar="CHAIN", help="rate: a chain's id, or the start of it")
             p.add_argument("rating", nargs="?", metavar="N", help="rate: 1 (badly) to 5 (well)")
             p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
+            p.add_argument("--kind", choices=sorted(TRIAL_KINDS), default="checkpoint",
+                           help="start: checkpoint (the reminder's A/B, the default) or models (the subagent models' table)")
             p.add_argument("--json", action="store_true", help="report: the chains' records and the decision, as JSON")
         if cmd == "add":
             p.add_argument("name", nargs="?", help="what to call it (Max, Pro, Team...); with neither name nor "
@@ -7762,6 +7929,10 @@ def main(argv: list[str]) -> int:
                                 "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "models":
+            p.add_argument("args", nargs="*", metavar="on|off|trial | TYPE MODEL",
+                           help="nothing: the table and where it applies; on, off or trial: where it applies; "
+                                "TYPE MODEL: an agent type's model (haiku, sonnet, opus, fable or keep)")
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
@@ -7770,7 +7941,7 @@ def main(argv: list[str]) -> int:
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
-                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode,
+                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "trial": trial}[cmd](opts)
 
