@@ -699,9 +699,20 @@ def account_allowed(acct: dict, top: str) -> bool:
     return any(real == entry or inside(real, entry) for entry in map(os.path.realpath, allowed))
 
 
+def covers(acct: dict, top: str) -> bool:
+    """Whether `acct`'s own list names `top`, or a parent of it."""
+    return bool(repositories_of(acct)) and account_allowed(acct, top)
+
+
 def eligible(accounts: list[dict], top: str) -> list[str]:
-    """The names of the accounts that may be used in `top`, in the file's order."""
-    return [a["name"] for a in accounts if account_allowed(a, top)]
+    """The names of the accounts that may be used in `top`, in the file's
+    order. A repository an account's list names is reserved: only the
+    accounts that name it, or a parent of it, may be used there, so an
+    account allowed anywhere is not (the owner, 2026-10-23: ~/zain only
+    ever uses zain-work, and its limit never moves work onto personal
+    tokens). Elsewhere, the accounts allowed anywhere."""
+    reserved = [a["name"] for a in accounts if covers(a, top)]
+    return reserved or [a["name"] for a in accounts if account_allowed(a, top)]
 
 
 def denied_in(accounts: list[dict], top: str) -> set[str]:
@@ -829,7 +840,7 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
         log(f"{who}: no record of where {resumed[:8]} last ran; picking an account")
         return None
     idx = [a["name"] for a in accounts].index(last)
-    if top is not None and not account_allowed(accounts[idx], top):
+    if top is not None and accounts[idx]["name"] not in eligible(accounts, top):
         why = f"may not be used in {home_path(top)}"
     elif last in unmanaged:
         why = "is not managed"
@@ -4758,7 +4769,12 @@ def advisor_repository(data: dict) -> bool:
     if not (isinstance(cwd, str) and os.path.isabs(cwd)):
         return all(repositories_of(acct) == [] for acct in accts)
     top = repository_of(cwd)
-    return all(account_allowed(acct, top) for acct in accts)
+    for home, acct in zip(homes, accts):  # a folder another account reserves is not this one's either
+        listed = read_accounts_file(home)[0] or []
+        names = [a["name"] for a in listed]
+        if acct["name"] not in eligible(listed if acct["name"] in names else listed + [acct], top):
+            return False
+    return True
 
 
 def advisor_fields_problem(tool: dict):
@@ -7399,7 +7415,8 @@ def guided_entry(accounts: list):
                 say(f"{home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
             repos.append(r)
         if repos:
-            say("A folder no account covers has no account: Longhaul will refuse to start there.")
+            say("These folders become this account's alone: no other account is used in them. "
+                "A folder no account may use makes Longhaul refuse to start there.")
     where = f"only in {', '.join(home_path(os.path.expanduser(r)) for r in repos)}" if repos else "anywhere"
     if not yes(f"Add {name} ({email}), sign-in in {folder}, {where}?", default=True):
         say("Not added.")
@@ -7629,6 +7646,7 @@ def status(_opts) -> int:
     accounts, problem = load_accounts()
     if problem:  # said, no stand-in shown in the accounts' place, and the rest shown; exit 2
         print(unreadable_text(problem))
+    accounts_listed = bool(read_accounts_file()[0])  # the stand-in for no file has no rule to show
     for acct in accounts or []:
         a = auth_status(acct)
         until = state["limited_until"].get(acct["name"], 0)
@@ -7644,10 +7662,17 @@ def status(_opts) -> int:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
         elif allowed:
             print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
+        elif accounts_listed:
+            print("       anywhere")
         if acct.get("config_dir"):
             broken = [i for i in SHARED if (DEFAULT_CONFIG / i).exists() and not (config_of(acct) / i).is_symlink()]
             if broken:
                 print(f"       not linked: {', '.join(broken)} (longhaul links them again at the next launch)")
+    if accounts_listed:  # the owner, 2026-10-23: which accounts this folder can use, at a glance
+        top = repository_of(os.getcwd())
+        here = eligible(accounts, top)
+        print(f"Here, in {home_path(top)}: " + (f"{', '.join(here)} may be used" if here else
+                                               "no account may be used, so longhaul refuses to start here"))
     version = claude_version()
     print(f"Claude Code {'.'.join(map(str, version)) if version else '(version unknown)'}: "
           f"{version_note(version) or 'checked with longhaul'}")
@@ -7656,14 +7681,15 @@ def status(_opts) -> int:
     except ValueError as e:  # for scripts that read this: the mode is always the second word
         print(f"Switching: invalid. {e}")
         return 2
-    source = "set by LONGHAUL_SWITCH" if os.environ.get("LONGHAUL_SWITCH") else "the default"
-    panel = vscode_config()
-    if panel["switch_mid_session"] is not True:
-        tail = "The VS Code panel never moves a chat (switch_mid_session is off)."
+    source = ("set by LONGHAUL_SWITCH" if os.environ.get("LONGHAUL_SWITCH")
+              else f"saved in {home_path(str(CONFIG))}" if config_switch() else "the default")
+    if not panel_mid_session():
+        tail = "The VS Code panel never moves a chat (switching mid-chat is off)."
     else:
-        # From the file only: this terminal's LONGHAUL_SWITCH may not be the panel's.
-        key = panel.get("switch")
+        # From the files only: this terminal's LONGHAUL_SWITCH may not be the panel's.
+        key = vscode_config().get("switch")
         shown = (f"{key} (from vscode.json)" if isinstance(key, str) and key in SWITCH_MODES
+                 else f"{config_switch()} (saved in {home_path(str(CONFIG))})" if not key and config_switch()
                  else "ask (the default)" if not key else f"never ({key!r} in vscode.json is not a mode)")
         tail = (f"The VS Code panel moves a chat at a limit only in auto; it is {shown}, "
                 "unless VS Code was started with LONGHAUL_SWITCH set.")

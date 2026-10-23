@@ -327,13 +327,20 @@ class Loop(unittest.TestCase):
         last = out.stdout.splitlines()[-1]
         self.assertEqual(last.split()[:2], ["Switching:", "ask"])
         self.assertIn("longhaul pipe moves a session only when its driver passes --swap and the mode there is auto", last)
-        self.assertIn("The VS Code panel never moves a chat (switch_mid_session is off)", last)
+        self.assertIn("The VS Code panel never moves a chat (switching mid-chat is off)", last)
         # Sprint 5, D3d: a resume by id is a move too.
         self.assertIn("A conversation resumed by id starts on the account it last ran on in ask and never", last)
         (self.home / "vscode.json").write_text(json.dumps({"switch_mid_session": True, "switch": "never"}))
         out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
         self.assertIn("The VS Code panel moves a chat at a limit only in auto; it is never (from vscode.json)",
                       out.stdout.splitlines()[-1])
+        # The guided add's saved answer (the owner, 2026-10-23): named as such,
+        # not as the default, and the panel's too when vscode.json says nothing.
+        (self.home / "vscode.json").unlink()
+        (self.home / "config.json").write_text(json.dumps({"switch": "auto"}))
+        out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
+        self.assertIn("Switching: auto (saved in ", out.stdout)
+        self.assertIn("it is auto (saved in ", out.stdout.splitlines()[-1])
 
     def test_longhaul_status_with_an_unknown_switch_mode_says_so_and_fails(self):
         out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="sometimes")
@@ -819,8 +826,10 @@ class Loop(unittest.TestCase):
         self.assertTrue(calls[1]["args"][-1].startswith(
             "The Max account hit its session limit while every account allowed here was at its limit, "
             "so longhaul waited for the Max account to reset"), calls[1]["args"][-1])
-        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], cwd=work)
-        self.assertEqual([c["config"] for c in calls[-2:]], [None, str(self.pro)], "in work it moves to Pro")
+        # Work is Pro's alone (the owner, 2026-10-23): a session there starts on
+        # Pro, and a limit there never moves it onto Max.
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=work)
+        self.assertEqual([c["config"] for c in calls][2:], [str(self.pro)], "in work only Pro (the log holds the run before's two)")
 
     def test_a_nearly_full_idle_session_never_moves_early_to_an_account_not_allowed_here(self):
         work, personal = self.repositories()
@@ -909,8 +918,10 @@ class Loop(unittest.TestCase):
         out, calls = self.run_longhaul(["exit"], runs=1, FAKE_EMAIL_MAX="stranger@example.com",
                                        FAKE_EMAIL_PRO="stranger@example.com", cwd=work)
         self.assertEqual((out.returncode, calls), (1, []), out.stdout)
-        self.assertIn("No account is signed in as expected. Run `longhaul status`, then `longhaul setup`.",
-                      out.stdout, "nothing denied in work: as before")
+        # Work is reserved for Pro (the owner, 2026-10-23): Max is denied there
+        # too now, so the line says the accounts allowed here.
+        self.assertIn("No account allowed here is signed in as expected. Run `longhaul status`, then `longhaul setup`.",
+                      out.stdout, "Max denied in work too")
 
     def test_a_session_started_through_a_symlink_to_an_allowed_repository_is_allowed(self):
         work, _ = self.repositories()
@@ -5335,16 +5346,20 @@ class Advisor(unittest.TestCase):
         self.reading(five=40, name="Max")
         self.reading(five=99, name="Pro")
         self.denied(self.call(), "near-full", CLAUDE_CONFIG_DIR=str(pro))
+        # Pro's list names this folder, so it is Pro's alone (the owner,
+        # 2026-10-23): Max, allowed anywhere, is not allowed here.
+        self.denied(self.call(), "repository")
+        # Pro may be used elsewhere only: this folder is no one's, Max's again.
+        accounts[1]["repositories"] = [str(self.tmp / "elsewhere")]
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
         data = self.call()
         out = self.admitted(data)  # no CLAUDE_CONFIG_DIR: ~/.claude, Max's folder
         given = out["updatedInput"]
         self.assertEqual({**given, "prompt": given["prompt"].split("\n", 1)[1]}, {**data["tool_input"], "model": "opus"},
                          "the model and the admission line (F1), nothing else")
         self.assertEqual(set(out), {"hookEventName", "permissionDecision", "permissionDecisionReason", "updatedInput"})
-        # Pro may be used elsewhere only. Before F9 the hook let this session
-        # consult on it all the same; now it checks A2 again, and fails closed.
-        accounts[1]["repositories"] = [str(self.tmp / "elsewhere")]
-        (self.home / "accounts.json").write_text(json.dumps(accounts))
+        # Before F9 the hook let a Pro session here consult all the same; now
+        # it checks A2 again, and fails closed.
         before = (self.home / "accounts.json").read_bytes()
         self.reading(five=40, name="Pro")
         self.denied(self.call(), "repository", CLAUDE_CONFIG_DIR=str(pro))
@@ -9034,11 +9049,13 @@ class Pieces(unittest.TestCase):
         work, personal = str(tmp / "work"), str(tmp / "personal")
         accounts = [{"name": "Team", "repositories": [personal]}, {"name": "Max"},
                     {"name": "Pro", "repositories": [work]}, {"name": "Odd", "repositories": "junk"}]
-        self.assertEqual(longhaul.eligible(accounts, work), ["Max", "Pro"])
-        self.assertEqual(longhaul.eligible(accounts, personal), ["Team", "Max"])
+        # A folder a list names is reserved for the accounts that name it (the
+        # owner, 2026-10-23); Max, allowed anywhere, is used where no list does.
+        self.assertEqual(longhaul.eligible(accounts, work), ["Pro"])
+        self.assertEqual(longhaul.eligible(accounts, personal), ["Team"])
         self.assertEqual(longhaul.eligible(accounts, str(tmp)), ["Max"])
         with mock.patch.object(longhaul, "LONGHAUL_HOME", tmp / "relay"):
-            self.assertEqual(longhaul.denied_in(accounts, work), {"Team", "Odd"})
+            self.assertEqual(longhaul.denied_in(accounts, work), {"Team", "Max", "Odd"})
             log = (tmp / "relay" / "longhaul.log").read_text()
         self.assertEqual(log.count("\n"), 1, log)
         self.assertIn(f"Odd in {longhaul.home_path(str(tmp / 'relay' / 'accounts.json'))}: {longhaul.REPOSITORIES_JUNK}; "
@@ -10555,7 +10572,7 @@ class Accounts(unittest.TestCase):
         self.assertIn("is already the account Max", out.stdout)
         self.assertIn("is not an absolute path", out.stdout)
         self.assertIn("does not exist yet; kept for when it does", out.stdout)
-        self.assertIn("A folder no account covers has no account", out.stdout)
+        self.assertIn("These folders become this account's alone: no other account is used in them.", out.stdout)
         self.assertEqual(self.accounts()[-1]["repositories"], [str(self.tmp / "orbit"), str(self.tmp / "zain")])
         self.assertEqual(out.stdout.count("does not exist yet"), 1, "said once, not again at the sign-in")
 
@@ -10658,6 +10675,49 @@ class Accounts(unittest.TestCase):
             config.write_text('{"switch": "sometimes"}')
             vscode.unlink()
             self.assertEqual((longhaul.switch_mode(), longhaul.panel_mid_session()), ("ask", False), "junk is no answer")
+
+    def test_status_says_where_each_account_may_be_used_and_which_this_folder_can_use(self):
+        # The owner, 2026-10-23: "how can I see how many accounts are connected on which repo".
+        work, other = self.tmp / "work", self.tmp / "other"
+        work.mkdir()
+        other.mkdir()
+        (self.relay / "accounts.json").write_text(json.dumps([
+            {"name": "Max", "config_dir": str(self.max), "email": "first@example.com"},
+            {"name": "Work", "config_dir": str(self.tmp / "w"), "email": "w@example.com", "repositories": [str(work)]}]))
+        def status(cwd):
+            self.longhaul("status")  # the helper's records, for the same environment
+            env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                       LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                       LONGHAUL_NO_NOTIFY="1", FAKE_EMAILS=json.dumps(self.emails))
+            return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "status"], env=env, cwd=cwd,
+                                  capture_output=True, text=True, timeout=60).stdout
+        out = status(work)
+        self.assertIn("only in: ~/work", out)
+        self.assertIn("       anywhere", out)
+        self.assertRegex(out, r"Here, in \S*/work: Work may be used")  # reserved: Max, allowed anywhere, is not
+        self.assertRegex(status(other), r"Here, in \S*/other: Max may be used")
+        accounts = self.accounts()
+        accounts[0]["repositories"] = [str(self.tmp / "personal")]
+        (self.relay / "accounts.json").write_text(json.dumps(accounts))
+        self.assertRegex(status(other), r"Here, in \S*/other: no account may be used, so longhaul refuses to start here")
+
+    def test_a_folder_an_account_names_is_reserved_for_the_accounts_that_name_it(self):
+        # The owner, 2026-10-23: "~/zain only ever uses zain-work"; its limit
+        # never moves work onto personal tokens. Elsewhere, unchanged.
+        zain, code = self.tmp / "zain", self.tmp / "code"
+        for d in (zain / "app", code):
+            d.mkdir(parents=True)
+        accounts = [{"name": "personal-1"}, {"name": "personal-2"},
+                    {"name": "zain-work", "repositories": [str(zain)]}]
+        self.assertEqual(longhaul.eligible(accounts, str(zain)), ["zain-work"])
+        self.assertEqual(longhaul.eligible(accounts, str(zain / "app")), ["zain-work"], "inside it too")
+        self.assertEqual(longhaul.eligible(accounts, str(code)), ["personal-1", "personal-2"])
+        self.assertEqual(longhaul.denied_in(accounts, str(zain)), {"personal-1", "personal-2"})
+        both = accounts + [{"name": "zain-2", "repositories": [str(zain / "app")]}]
+        self.assertEqual(longhaul.eligible(both, str(zain / "app")), ["zain-work", "zain-2"], "each that names it")
+        self.assertEqual(longhaul.eligible(both, str(zain)), ["zain-work"])
+        only = [{"name": "w", "repositories": [str(zain)]}, {"name": "p", "repositories": [str(code)]}]
+        self.assertEqual(longhaul.eligible(only, str(self.tmp)), [], "a folder no list names, with every account limited")
 
     def test_add_without_arguments_and_no_terminal_says_how(self):
         out = self.longhaul("add")
