@@ -10508,6 +10508,85 @@ class Accounts(unittest.TestCase):
         self.assertIn("team@example.com", login["args"], "the browser opens with the email filled in")
         self.assertTrue((team / "projects").is_symlink(), "linked to the shared history")
 
+    def guided(self, answers, **extra_env):
+        """`longhaul add` with no arguments, as in a terminal (LONGHAUL_TEST_TTY
+        stands in for one), each line of `answers` typed at a prompt."""
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   LONGHAUL_NO_NOTIFY="1", FAKE_EMAILS=json.dumps(self.emails), FAKE_REQUIRE_LOGIN="1", LONGHAUL_TEST_TTY="1")
+        env.pop("LONGHAUL_SWITCH", None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "add"], env=env, capture_output=True,
+                              text=True, timeout=60, input="".join(f"{a}\n" for a in answers))
+
+    def test_guided_add_asks_each_part_signs_in_and_lists_the_accounts(self):
+        # The owner's design (2026-10-23): name, email, folder, limits, a
+        # summary to confirm, the browser sign-in, another account or not.
+        self.emails[str(self.tmp / ".claude-team")] = "team@example.com"
+        out = self.guided(["Team", "team@example.com", "", "n", "", "n"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[-1], {"name": "Team", "config_dir": "~/.claude-team", "email": "team@example.com"})
+        for said in ("What should this account be called?", "Only this email will be accepted for it.",
+                     "[~/.claude-team]", "leave it open to use it anywhere", "Add Team (team@example.com), sign-in in "
+                     "~/.claude-team, anywhere? [Y/n]", "A browser window opens: sign in as team@example.com.",
+                     "Add another account? [y/N]", "Your accounts:", "export LONGHAUL_SWITCH=auto"):
+            self.assertIn(said, out.stdout, said)
+        self.assertRegex(out.stdout, r"Team\s+team@example\.com\s+~/\.claude-team\s+anywhere")
+        quiet = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_SWITCH="auto")
+        self.assertNotIn("export LONGHAUL_SWITCH=auto", quiet.stdout, "the tip only while the switch is unset")
+
+    def test_guided_add_asks_again_for_a_bad_or_taken_name_or_email_and_takes_folder_limits(self):
+        (self.tmp / "orbit").mkdir()
+        work = self.tmp / ".claude-work"
+        self.emails[str(work)] = "work@example.com"
+        out = self.guided(["bad name!", "max", "Work", "not-an-email", "FIRST@example.com", "work@example.com", "",
+                           "y", str(self.tmp / "orbit"), "relative/path", str(self.tmp / "zain"), "", "", "n"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("a name is letters and digits", out.stdout)
+        self.assertIn("there is already an account called max", out.stdout.lower())
+        self.assertIn("does not look like an email", out.stdout)
+        self.assertIn("is already the account Max", out.stdout)
+        self.assertIn("is not an absolute path", out.stdout)
+        self.assertIn("does not exist yet; kept for when it does", out.stdout)
+        self.assertIn("A folder no account covers has no account", out.stdout)
+        self.assertEqual(self.accounts()[-1]["repositories"], [str(self.tmp / "orbit"), str(self.tmp / "zain")])
+        self.assertEqual(out.stdout.count("does not exist yet"), 1, "said once, not again at the sign-in")
+
+    def test_guided_add_offers_a_new_folder_when_the_default_exists_and_refuses_dot_claude(self):
+        (self.tmp / ".claude-team").mkdir()
+        self.emails[str(self.tmp / ".claude-lh-team")] = "team@example.com"
+        out = self.guided(["Team", "team@example.com", "~/.claude", str(self.max), "", "n", "", "n"],
+                          LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / ".claude"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("already exists (perhaps from another setup)", out.stdout)
+        self.assertIn("[~/.claude-lh-team]", out.stdout)
+        self.assertIn("~/.claude is what the VS Code panel signs in to", out.stdout)
+        self.assertIn("is already the folder of Max", out.stdout)
+        self.assertEqual(self.accounts()[-1]["config_dir"], "~/.claude-lh-team")
+
+    def test_guided_add_writes_nothing_without_a_yes_or_when_stopped_and_takes_two_rounds(self):
+        before = self.accounts()
+        out = self.guided(["Team", "team@example.com", "", "n", "n", "n"])
+        self.assertIn("Not added.", out.stdout)
+        self.assertEqual(self.accounts(), before, "a no at the summary writes nothing")
+        out = self.guided(["Team", "team@example.com"])  # the input ends: as Ctrl-D, or a closed terminal
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Stopped: nothing more was added.", out.stdout)
+        self.assertEqual(self.accounts(), before)
+        for name in ("team", "pro"):
+            self.emails[str(self.tmp / f".claude-{name}")] = f"{name}@example.com"
+        out = self.guided(["Team", "team@example.com", "", "n", "", "y", "Pro", "pro@example.com", "", "n", "", "n"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual([a["name"] for a in self.accounts()], ["Max", "Team", "Pro"])
+
+    def test_add_without_arguments_and_no_terminal_says_how(self):
+        out = self.longhaul("add")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("with no arguments, in a terminal, it asks for each part", out.stdout)
+        out = self.longhaul("add", "Team")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("a NAME and an EMAIL, or neither", out.stdout)
+
     def test_longhaul_add_refuses_a_name_email_or_folder_already_in_use(self):
         for argv in (("add", "max", "new@example.com", "--dir", str(self.tmp / "x")),
                      ("add", "New", "FIRST@example.com", "--dir", str(self.tmp / "y")),

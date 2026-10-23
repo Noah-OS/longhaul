@@ -65,10 +65,12 @@ Usage:
                           limit, and early when one is nearly full; never:
                           wait for the reset (or set LONGHAUL_SWITCH)
   longhaul -- --model opus      anything after -- goes to claude on every launch
+  longhaul add                  a new account, guided: it asks for each part and
+                          explains it, then signs it in (in a terminal)
   longhaul add NAME EMAIL [--repo PATH]...
-                          a new account: its own folder, one browser sign-in;
-                          with --repo, used only in those repositories and
-                          those inside them (repeat it for more)
+                          the same in one line: its own folder, one browser
+                          sign-in; with --repo, used only in those
+                          repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
   longhaul setup [NAME]         sign each account in to its own folder (a browser
                           sign-in); only the emails in accounts.json count
@@ -7212,7 +7214,16 @@ def add(opts) -> int:
     folder, signed in once in the browser. Only that email is accepted for
     it from then on. With --repo it is used only in those repositories (and
     those inside them); without, anywhere, and its entry has no
-    "repositories" at all."""
+    "repositories" at all. With neither NAME nor EMAIL, in a terminal, it
+    asks for each part (add_guided())."""
+    if opts.name is None and opts.email is None:
+        if terminal():
+            return add_guided()
+        say("longhaul add NAME EMAIL [--dir FOLDER] [--repo PATH]...; with no arguments, in a terminal, it asks for each part")
+        return 2
+    if opts.name is None or opts.email is None:
+        say("longhaul add takes a NAME and an EMAIL, or neither (then, in a terminal, it asks for each part)")
+        return 2
     name, email = opts.name.strip(), opts.email.strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,30}", name):
         say("a name is letters and digits (and - or _), up to 31 of them")
@@ -7225,8 +7236,8 @@ def add(opts) -> int:
         if not os.path.isabs(os.path.expanduser(r)):
             say(f"--repo {shown(r)} is not an absolute path; give the repository's full path, like ~/work/repo")
             return 2
-    for r in repos:  # the clone may come later
-        if not os.path.exists(os.path.expanduser(r)):
+    for r in repos:  # the clone may come later; the guided form has said so already
+        if not os.path.exists(os.path.expanduser(r)) and not getattr(opts, "noted", False):
             say(f"--repo {home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
     folder = opts.dir or f"~/.claude-{name.lower()}"
     path = Path(os.path.expanduser(folder)).resolve()
@@ -7259,6 +7270,129 @@ def add(opts) -> int:
     if code != 0:
         say(f"{name} is on the list but not signed in, so longhaul will not use it yet: run `longhaul setup {name}`")
     return code
+
+
+def terminal() -> bool:
+    """Whether a person is at the keyboard: stdin and stdout both a terminal
+    (LONGHAUL_TEST_TTY=1 stands in for one in the tests)."""
+    return os.environ.get("LONGHAUL_TEST_TTY") == "1" or (sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def ask(question: str, default: str = "") -> str:
+    """One answer typed at the terminal, stripped; the default for an empty one."""
+    answer = input(f"{question}{f' [{default}]' if default else ''} ").strip()
+    return answer or default
+
+
+def yes(question: str, default: bool = False) -> bool:
+    answer = ask(f"{question} [{'Y/n' if default else 'y/N'}]").lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def add_guided() -> int:
+    """`longhaul add` with no arguments, in a terminal (the owner's design,
+    2026-10-23): a name, the email, where its sign-in lives and where it may
+    be used, each explained, then a summary to confirm, the browser sign-in
+    and another account or the list. Each account is written and signed in
+    by add() itself, so the two forms keep one set of rules. Ctrl-C or the
+    input's end stops it, and nothing unconfirmed is written."""
+    say("Adding an account: its name, its email, where its sign-in lives and where it may be used.")
+    failed = False
+    try:
+        while True:
+            accounts, problem = read_accounts_file()
+            if problem:
+                say(unreadable_text(problem))
+                return 2
+            entry = guided_entry(accounts)
+            if entry is None:
+                if yes("Start this account again?"):
+                    continue
+                break
+            say(f"A browser window opens: sign in as {entry.email}.")
+            failed = add(entry) != 0 or failed
+            if not yes("Add another account?"):
+                break
+    except (KeyboardInterrupt, EOFError) as e:
+        print()
+        say("Stopped: nothing more was added.")
+        return 130 if isinstance(e, KeyboardInterrupt) else 1
+    guided_list()
+    return 1 if failed else 0
+
+
+def guided_entry(accounts: list):
+    """One account's parts, asked for until each is valid by add()'s rules,
+    as add()'s arguments; None when the summary is not confirmed."""
+    while True:
+        name = ask("What should this account be called? (for example Personal, Work, Personal-2)")
+        taken = next((a["name"] for a in accounts if a["name"].lower() == name.lower()), None)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,30}", name):
+            say("a name is letters and digits (and - or _), up to 31 of them")
+        elif taken:
+            say(f"there is already an account called {taken}")
+        else:
+            break
+    while True:
+        email = ask("Which email does it sign in with? Only this email will be accepted for it.")
+        taken = next((a["name"] for a in accounts if (a.get("email") or "").lower() == email.lower()), None)
+        if "@" not in email:
+            say(f"{email or 'that'} does not look like an email")
+        elif taken:
+            say(f"{email} is already the account {taken}")
+        else:
+            break
+    default = f"~/.claude-{name.lower()}"
+    if Path(os.path.expanduser(default)).exists():
+        say(f"{default} already exists (perhaps from another setup), so a new folder is offered instead")
+        default = f"~/.claude-lh-{name.lower()}"
+    while True:
+        folder = ask("Where should it keep its sign-in? Each account has its own; your history and settings stay shared.",
+                     default)
+        path = Path(os.path.expanduser(folder)).resolve()
+        owner = next((a["name"] for a in accounts if a.get("config_dir") and config_of(a).resolve() == path), None)
+        if path in (DEFAULT_CONFIG.resolve(), (HOME / ".claude").resolve()):
+            say("each account needs its own folder: ~/.claude is what the VS Code panel signs in to")
+        elif owner:
+            say(f"{folder} is already the folder of {owner}")
+        else:
+            break
+    repos = []
+    if yes("Use this account only in certain folders? Work accounts usually are; leave it open to use it anywhere."):
+        while True:
+            r = ask("Folder (an absolute path; a folder covers everything inside it; Enter when done):")
+            if not r:
+                break
+            if not os.path.isabs(os.path.expanduser(r)):
+                say(f"{shown(r)} is not an absolute path; give its full path, like ~/work/repo")
+                continue
+            if not os.path.exists(os.path.expanduser(r)):
+                say(f"{home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
+            repos.append(r)
+        if repos:
+            say("A folder no account covers has no account: Longhaul will refuse to start there.")
+    where = f"only in {', '.join(home_path(os.path.expanduser(r)) for r in repos)}" if repos else "anywhere"
+    if not yes(f"Add {name} ({email}), sign-in in {folder}, {where}?", default=True):
+        say("Not added.")
+        return None
+    return argparse.Namespace(name=name, email=email, dir=folder, repo=repos or None, noted=True)
+
+
+def guided_list() -> None:
+    """The accounts as the guided form leaves them, and the switching tip
+    while LONGHAUL_SWITCH is unset."""
+    accounts, problem = read_accounts_file()
+    if problem or not accounts:
+        return
+    say("Your accounts:")
+    rows = [(a["name"], a.get("email") or "?", a.get("config_dir") or "~/.claude",
+             ", ".join(home_path(os.path.expanduser(r)) for r in a["repositories"])
+             if isinstance(a.get("repositories"), list) and a["repositories"] else "anywhere") for a in accounts]
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    for row in rows:
+        print("  " + "  ".join(cell.ljust(w) for cell, w in zip(row, widths)) + "  " + row[3])
+    if not os.environ.get("LONGHAUL_SWITCH"):
+        say("To switch accounts by itself at a usage limit, add `export LONGHAUL_SWITCH=auto` to your shell profile.")
 
 
 def remove(opts) -> int:
@@ -7382,8 +7516,9 @@ def main(argv: list[str]) -> int:
             p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
             p.add_argument("--json", action="store_true", help="report: the chains' records and the decision, as JSON")
         if cmd == "add":
-            p.add_argument("name", help="what to call it (Max, Pro, Team...)")
-            p.add_argument("email", help="the only email longhaul will accept for it")
+            p.add_argument("name", nargs="?", help="what to call it (Max, Pro, Team...); with neither name nor "
+                           "email, in a terminal, it asks for each part")
+            p.add_argument("email", nargs="?", help="the only email longhaul will accept for it")
             p.add_argument("--dir", help="its folder (default: ~/.claude-<name>)")
             p.add_argument("--repo", action="append", metavar="PATH",
                            help="a repository it may be used in, and those inside it; repeat for more "
