@@ -5558,9 +5558,13 @@ REMINDER_AT = 200_000  # tokens: the default threshold
 REMINDER_USER = ("Longhaul: this conversation's context is about {k}k tokens, and every request carries all of it "
                  "again. To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint "
                  "comes back.")
+# The model tells the user too: the VS Code panel shows no hook message, so
+# the user line above reaches only the terminal (seen 2026-10-23: the owner
+# saw neither the reminder nor the model's save in VS Code).
 REMINDER_MODEL = ("Longhaul: the context is about {k}k tokens. At your next natural stopping point (not in the middle "
-                  "of an edit or a test run), save a checkpoint with /longhaul:checkpoint, then continue the work. "
-                  "After a compaction or a /clear it comes back.")
+                  "of an edit or a test run), save a checkpoint with /longhaul:checkpoint, then tell the user in one "
+                  "line: \"Saved a checkpoint (the context is about {k}k tokens). Type /clear to start fresh; it comes "
+                  "back.\" Then continue the work. After a compaction or a /clear it comes back.")
 
 
 def reminder_threshold() -> tuple:

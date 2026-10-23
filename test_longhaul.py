@@ -7381,9 +7381,10 @@ class Reminder(unittest.TestCase):
     S = "SENTINEL-IBEX-5190"
     USER = ("Longhaul: this conversation's context is about {}k tokens, and every request carries all of it again. "
             "To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint comes back.")
-    MODEL = ("Longhaul: the context is about {}k tokens. At your next natural stopping point (not in the middle of an "
-             "edit or a test run), save a checkpoint with /longhaul:checkpoint, then continue the work. After a "
-             "compaction or a /clear it comes back.")
+    MODEL = ("Longhaul: the context is about {0}k tokens. At your next natural stopping point (not in the middle of an "
+             "edit or a test run), save a checkpoint with /longhaul:checkpoint, then tell the user in one line: \"Saved "
+             "a checkpoint (the context is about {0}k tokens). Type /clear to start fresh; it comes back.\" Then "
+             "continue the work. After a compaction or a /clear it comes back.")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
