@@ -7143,17 +7143,18 @@ class Shim(unittest.TestCase):
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
 
-    def test_the_shim_runs_checkpoint_save_which_writes_one_file_under_the_home(self):
+    def test_the_shim_runs_checkpoint_save_which_writes_the_checkpoint_and_its_record_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
-        # saves its own state through the shim; that file is the one thing a
-        # session may write through it.
+        # saves its own state through the shim; that file, and the record
+        # of its folder that a /clear's lookup goes by (Sprint 8), are the
+        # one thing a session may write through it.
         state = {"goal": "finish the parser", "next_action": "run the tests"}
         out = self.shim("checkpoint", "save", "s1", input=json.dumps(state))
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("longhaul checkpoint: saved for s1 (", out.stdout)
         home = self.tmp / "home"
         written = {p.relative_to(home).as_posix() for p in home.rglob("*") if p.is_file()}
-        self.assertEqual(written - {"longhaul.log"}, {"checkpoints/s1.json"})
+        self.assertEqual(written - {"longhaul.log"}, {"checkpoints/s1.json", "checkpoints/s1.carry.json"})
         out = self.shim("checkpoint", "save", "s1", input="{not json")
         self.assertEqual(out.returncode, 2, "the refusal's own exit code")
         self.assertIn("longhaul checkpoint: not saved", out.stderr)
