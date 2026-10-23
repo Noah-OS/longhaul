@@ -10523,24 +10523,31 @@ class Accounts(unittest.TestCase):
         # The owner's design (2026-10-23): name, email, folder, limits, a
         # summary to confirm, the browser sign-in, another account or not.
         self.emails[str(self.tmp / ".claude-team")] = "team@example.com"
-        out = self.guided(["Team", "team@example.com", "", "n", "", "n"])
+        out = self.guided(["Team", "team@example.com", "", "n", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(self.accounts()[-1], {"name": "Team", "config_dir": "~/.claude-team", "email": "team@example.com"})
         for said in ("What should this account be called?", "Only this email will be accepted for it.",
                      "[~/.claude-team]", "leave it open to use it anywhere", "Add Team (team@example.com), sign-in in "
                      "~/.claude-team, anywhere? [Y/n]", "A browser window opens: sign in as team@example.com.",
-                     "Add another account? [y/N]", "Your accounts:", "export LONGHAUL_SWITCH=auto"):
+                     "Add another account? [y/N]", "Your accounts:",
+                     "move the conversation to another allowed account by itself? [Y/n]", "Saved: it moves by itself (auto)"):
             self.assertIn(said, out.stdout, said)
         self.assertRegex(out.stdout, r"Team\s+team@example\.com\s+~/\.claude-team\s+anywhere")
-        quiet = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_SWITCH="auto")
-        self.assertNotIn("export LONGHAUL_SWITCH=auto", quiet.stdout, "the tip only while the switch is unset")
+        # The owner, 2026-10-23: Longhaul keeps the answer itself, no shell profile to edit.
+        self.assertEqual(json.loads((self.relay / "config.json").read_text()), {"switch": "auto"})
+        self.assertNotIn("export LONGHAUL_SWITCH", out.stdout)
+        quiet = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_SWITCH="never")
+        self.assertIn("Switching at a usage limit: never, from LONGHAUL_SWITCH in this shell.", quiet.stdout)
+        self.assertNotIn("[Y/n]\n", quiet.stdout.split("Your accounts:")[-1], "not asked when the shell says")
+        again = self.guided(["Max2", "max2@example.com", "", "n", "", "n"])
+        self.assertIn("Switching at a usage limit: auto (in ", again.stdout, "asked once, then said")
 
     def test_guided_add_asks_again_for_a_bad_or_taken_name_or_email_and_takes_folder_limits(self):
         (self.tmp / "orbit").mkdir()
         work = self.tmp / ".claude-work"
         self.emails[str(work)] = "work@example.com"
         out = self.guided(["bad name!", "max", "Work", "not-an-email", "FIRST@example.com", "work@example.com", "",
-                           "y", str(self.tmp / "orbit"), "relative/path", str(self.tmp / "zain"), "", "", "n"])
+                           "y", str(self.tmp / "orbit"), "relative/path", str(self.tmp / "zain"), "", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("a name is letters and digits", out.stdout)
         self.assertIn("there is already an account called max", out.stdout.lower())
@@ -10555,7 +10562,7 @@ class Accounts(unittest.TestCase):
     def test_guided_add_offers_a_new_folder_when_the_default_exists_and_refuses_dot_claude(self):
         (self.tmp / ".claude-team").mkdir()
         self.emails[str(self.tmp / ".claude-lh-team")] = "team@example.com"
-        out = self.guided(["Team", "team@example.com", "~/.claude", str(self.max), "", "n", "", "n"],
+        out = self.guided(["Team", "team@example.com", "~/.claude", str(self.max), "", "n", "", "n", ""],
                           LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / ".claude"))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("already exists (perhaps from another setup)", out.stdout)
@@ -10575,9 +10582,64 @@ class Accounts(unittest.TestCase):
         self.assertEqual(self.accounts(), before)
         for name in ("team", "pro"):
             self.emails[str(self.tmp / f".claude-{name}")] = f"{name}@example.com"
-        out = self.guided(["Team", "team@example.com", "", "n", "", "y", "Pro", "pro@example.com", "", "n", "", "n"])
+        out = self.guided(["Team", "team@example.com", "", "n", "", "y", "Pro", "pro@example.com", "", "n", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual([a["name"] for a in self.accounts()], ["Max", "Team", "Pro"])
+
+    def test_guided_add_points_vs_codes_panel_at_the_wrapper_only_when_it_can_safely(self):
+        # The owner, 2026-10-23: "ask and do it". Plain JSON with the key unset:
+        # one line added, a copy kept. Anything else: the line to paste.
+        self.emails[str(self.tmp / ".claude-team")] = "team@example.com"
+        settings = self.tmp / "vscode" / "settings.json"
+        settings.parent.mkdir()
+        wrapper = str((HERE / "longhaul-vscode").resolve())
+        answers = ["Team", "team@example.com", "", "n", "", "n", "", ""]
+        settings.write_text('{\n    "editor.fontSize": 13\n}\n')
+        out = self.guided(answers, LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Use these accounts in the VS Code panel too?", out.stdout)
+        self.assertEqual(json.loads(settings.read_text()), {"editor.fontSize": 13, "claudeCode.claudeProcessWrapper": wrapper})
+        [backup] = settings.parent.glob("settings.json.before-longhaul-*")
+        self.assertEqual(json.loads(backup.read_text()), {"editor.fontSize": 13})
+        self.assertIn("Restart VS Code", out.stdout)
+        out = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertIn("already uses these accounts", out.stdout)
+        for text, why in (('{\n  // mine\n  "a": 1\n}\n', "comments or another shape"),
+                          ('{"claudeCode.claudeProcessWrapper": "/other/wrapper"}', "already names another program")):
+            settings.write_text(text)
+            name = f"N{len(why)}"
+            self.emails[str(self.tmp / f".claude-{name.lower()}")] = f"{name.lower()}@example.com"
+            out = self.guided([name, f"{name.lower()}@example.com", "", "n", "", "n", ""],
+                              LONGHAUL_VSCODE_SETTINGS=str(settings))
+            self.assertIn(why, out.stdout)
+            self.assertIn(f'"claudeCode.claudeProcessWrapper": "{wrapper}"', out.stdout, "the line to paste")
+            self.assertEqual(settings.read_text(), text, "never edited")
+        settings.write_text("{}")
+        self.emails[str(self.tmp / ".claude-last")] = "last@example.com"
+        out = self.guided(["Last", "last@example.com", "", "n", "", "n", "n"], LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertIn("Not changed. To do it later", out.stdout)
+        self.assertEqual(settings.read_text(), "{}")
+
+    def test_the_saved_switching_answer_is_read_by_the_terminal_and_the_panel_under_the_flag_and_the_environment(self):
+        config = self.relay / "config.json"
+        vscode = self.relay / "vscode.json"
+        with mock.patch.object(longhaul, "CONFIG", config), mock.patch.object(longhaul, "VSCODE_CONFIG", vscode), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LONGHAUL_SWITCH", None)
+            self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode(), longhaul.panel_mid_session()),
+                             ("ask", "ask", False))
+            config.write_text('{"switch": "auto"}')
+            self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode(), longhaul.panel_mid_session()),
+                             ("auto", "auto", True))
+            self.assertEqual(longhaul.switch_mode("never"), "never", "the flag first")
+            with mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": "ask"}):
+                self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode()), ("ask", "ask"))
+            vscode.write_text('{"switch": "never", "switch_mid_session": false}')
+            self.assertEqual((longhaul.panel_switch_mode(), longhaul.panel_mid_session()), ("never", False),
+                             "vscode.json, when it says, before the shared answer")
+            config.write_text('{"switch": "sometimes"}')
+            vscode.unlink()
+            self.assertEqual((longhaul.switch_mode(), longhaul.panel_mid_session()), ("ask", False), "junk is no answer")
 
     def test_add_without_arguments_and_no_terminal_says_how(self):
         out = self.longhaul("add")

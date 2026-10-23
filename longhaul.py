@@ -1154,9 +1154,21 @@ def decide_move(mode: str, consent: bool, can_ask: bool) -> str:
     return "ask" if can_ask else "stay"
 
 
+CONFIG = LONGHAUL_HOME / "config.json"
+
+
+def config_switch():
+    """The switching mode the guided `longhaul add` saved in config.json
+    (one answer for the terminal and the panel), or None."""
+    found = read_json(CONFIG)
+    mode = found.get("switch") if isinstance(found, dict) else None
+    return mode if isinstance(mode, str) and mode in SWITCH_MODES else None
+
+
 def switch_mode(flag: str | None = None) -> str:
-    """--switch, then LONGHAUL_SWITCH, then "ask". ValueError for anything else."""
-    mode = flag or os.environ.get("LONGHAUL_SWITCH") or "ask"
+    """--switch, then LONGHAUL_SWITCH, then config.json's "switch", then "ask".
+    ValueError for anything else."""
+    mode = flag or os.environ.get("LONGHAUL_SWITCH") or config_switch() or "ask"
     if mode not in SWITCH_MODES:
         raise ValueError(f"LONGHAUL_SWITCH is {mode!r}, which is not a switching mode. "
                          "Set it to ask, auto or never, or unset it; longhaul has not started Claude.")
@@ -6247,11 +6259,23 @@ def vscode_config() -> dict:
     return {"switch_mid_session": False, **(found if isinstance(found, dict) else {})}
 
 
+def panel_mid_session() -> bool:
+    """Whether the wrapper stays in a panel chat to move it at a limit:
+    vscode.json's switch_mid_session when it says, only the JSON true being
+    on; else on when config.json's switching is auto, the one answer the
+    guided `longhaul add` gives for both front ends."""
+    found = read_json(VSCODE_CONFIG)
+    if isinstance(found, dict) and "switch_mid_session" in found:
+        return found["switch_mid_session"] is True
+    return config_switch() == "auto"
+
+
 def panel_switch_mode() -> str:
     """The panel's switching: LONGHAUL_SWITCH in the wrapper's environment, then
-    "switch" in vscode.json, then "ask". An unknown value never stops a
-    chat: it runs and never moves, and the log says why (ADR-0002)."""
-    value = os.environ.get("LONGHAUL_SWITCH") or vscode_config().get("switch") or "ask"
+    "switch" in vscode.json, then config.json's, then "ask". An unknown
+    value never stops a chat: it runs and never moves, and the log says why
+    (ADR-0002)."""
+    value = os.environ.get("LONGHAUL_SWITCH") or vscode_config().get("switch") or config_switch() or "ask"
     if isinstance(value, str) and value in SWITCH_MODES:
         return value
     where = "LONGHAUL_SWITCH" if os.environ.get("LONGHAUL_SWITCH") else f'"switch" in {VSCODE_CONFIG}'
@@ -6449,7 +6473,7 @@ def wrap(argv: list[str]) -> int:
             # the next reopen (review, Sprint 5). A new chat's id is not known
             # before the exec: the status line or the relay records it.
             note_session_account(resumed, acct["name"])
-        if not chat or vscode_config()["switch_mid_session"] is not True:  # "false" in the file is not on
+        if not chat or not panel_mid_session():  # "false" in vscode.json is not on
             os.execve(binary, [binary] + args, wrapper_env(acct))
         relay = Relay(binary, args, accounts, idx, mode=mode)
         relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
@@ -7313,11 +7337,13 @@ def add_guided() -> int:
             failed = add(entry) != 0 or failed
             if not yes("Add another account?"):
                 break
+        guided_list()
+        guided_switching()
+        guided_vscode()
     except (KeyboardInterrupt, EOFError) as e:
         print()
         say("Stopped: nothing more was added.")
         return 130 if isinstance(e, KeyboardInterrupt) else 1
-    guided_list()
     return 1 if failed else 0
 
 
@@ -7391,8 +7417,74 @@ def guided_list() -> None:
     widths = [max(len(row[i]) for row in rows) for i in range(3)]
     for row in rows:
         print("  " + "  ".join(cell.ljust(w) for cell, w in zip(row, widths)) + "  " + row[3])
-    if not os.environ.get("LONGHAUL_SWITCH"):
-        say("To switch accounts by itself at a usage limit, add `export LONGHAUL_SWITCH=auto` to your shell profile.")
+
+
+def guided_switching() -> None:
+    """Asks once whether to move a conversation to another allowed account by
+    itself at a usage limit, and keeps the answer in config.json, read by the
+    terminal and the panel alike (the owner, 2026-10-23: Longhaul does it,
+    not a shell profile to edit). --switch and LONGHAUL_SWITCH still win."""
+    accounts, problem = read_accounts_file()
+    if problem or len(accounts or []) < 2:
+        return
+    if os.environ.get("LONGHAUL_SWITCH"):
+        say(f"Switching at a usage limit: {os.environ['LONGHAUL_SWITCH']}, from LONGHAUL_SWITCH in this shell.")
+        return
+    if config_switch():
+        say(f"Switching at a usage limit: {config_switch()} (in {home_path(str(CONFIG))}).")
+        return
+    auto = yes("When an account reaches its usage limit, move the conversation to another allowed account by itself?",
+               default=True)
+    found = read_json(CONFIG)
+    write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": "auto" if auto else "ask"})
+    say(("Saved: it moves by itself (auto)" if auto else "Saved: it asks first in the terminal, and stays put in the panel (ask)")
+        + f", for the terminal and the VS Code panel, in {home_path(str(CONFIG))}. --switch or LONGHAUL_SWITCH override it.")
+
+
+VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
+    HOME / "Library" / "Application Support" / "Code" / "User" / "settings.json" if sys.platform == "darwin"
+    else HOME / ".config" / "Code" / "User" / "settings.json"))
+VSCODE_WRAPPER_KEY = "claudeCode.claudeProcessWrapper"
+
+
+def guided_vscode() -> None:
+    """Offers to point VS Code's Claude panel at longhaul-vscode, so that its
+    chats use these accounts too. The owner's yes, 2026-10-23: "ask and do
+    it". It edits VS Code's user settings only when the file is plain JSON
+    and the key is unset, keeping a copy first; otherwise it shows the line
+    to paste. Nothing when VS Code's settings are not on this machine."""
+    wrapper = Path(__file__).resolve().parent / "longhaul-vscode"
+    if not VSCODE_SETTINGS.is_file() or not wrapper.is_file():
+        return
+    line = f'{json.dumps(VSCODE_WRAPPER_KEY)}: {json.dumps(str(wrapper))}'
+    text = VSCODE_SETTINGS.read_text(errors="replace")
+    try:
+        found = json.loads(text)
+    except (ValueError, RecursionError):
+        found = None
+    if isinstance(found, dict) and found.get(VSCODE_WRAPPER_KEY) == str(wrapper):
+        say("VS Code's Claude panel already uses these accounts.")
+        return
+    if not yes("Use these accounts in the VS Code panel too? Longhaul adds one line to VS Code's settings "
+               "(a copy of them is kept).", default=True):
+        say(f"Not changed. To do it later, add this line to VS Code's user settings: {line}")
+        return
+    if not isinstance(found, dict) or VSCODE_WRAPPER_KEY in found:
+        why = ("the setting already names another program" if isinstance(found, dict)
+               else "the file has comments or another shape Longhaul does not edit")
+        say(f"Not changed, because {why}. Add or set this line in VS Code's user settings yourself: {line}")
+        return
+    end = text.rindex("}")
+    before = text[:end].rstrip()
+    joined = (before + "\n    " if before.endswith("{") else before + ",\n    ") + line + "\n" + text[end:]
+    if json.loads(joined).get(VSCODE_WRAPPER_KEY) != str(wrapper):  # never a file that would not read back
+        say(f"Not changed. Add this line to VS Code's user settings yourself: {line}")
+        return
+    backup = VSCODE_SETTINGS.with_name(f"settings.json.before-longhaul-{time.strftime('%Y%m%d-%H%M%S')}")
+    backup.write_text(text)
+    VSCODE_SETTINGS.write_text(joined)
+    say(f"VS Code's Claude panel now uses these accounts (a copy of its old settings is {home_path(str(backup))}). "
+        "Restart VS Code, or reload its window, to apply.")
 
 
 def remove(opts) -> int:
