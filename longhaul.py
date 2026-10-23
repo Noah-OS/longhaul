@@ -5576,8 +5576,8 @@ def reminder_due(data: dict):
     above the highest this session was told of, which is recorded; else
     None. A subagent's input is never reminded: its context is not the
     conversation's, and neither is a session in the trial's usual arm
-    (trial_arm()), which records nothing either. A threshold that is neither a number nor off is
-    logged once per session and kind."""
+    (trial_arm()), which records nothing either. A threshold that is
+    neither a number nor off is logged once per session and kind."""
     at, junk = reminder_threshold()
     if at is None or data.get("agent_id") is not None:
         return None
@@ -6006,7 +6006,8 @@ def trial_decide(records: list) -> dict:
               "compactions": h["chains"] > 0 and u["chains"] > 0 and h["compactions_median"] <= u["compactions_median"],
               "rating": h["rating_median"] >= u["rating_median"]
               if h["rated"] >= TRIAL_RATED and u["rated"] >= TRIAL_RATED else None}
-    return {"arms": arms, "checks": checks, "saving": 1 - h["price_usd_median"] / u["price_usd_median"] if priced else None,
+    return {"arms": arms, "checks": checks,
+            "saving": 1 - h["price_usd_median"] / u["price_usd_median"] if priced else None,
             "verdict": "saving shown" if False not in checks.values() else "no saving shown"}
 
 
