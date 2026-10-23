@@ -10668,6 +10668,56 @@ class Models(unittest.TestCase):
         self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "on", "unchanged")
 
 
+class Display(unittest.TestCase):
+    """Longhaul's display inside Claude Code (the owner, 2026-10-23): a hooks
+    module the plugin lists beside its command hooks, which shows the account,
+    allowance and context on the status line and a pop-up per event. The VS
+    Code panel shows no status line and no hook message; the module does."""
+
+    SOURCE = (HERE / "hooks" / "display.ts").read_text()
+
+    def test_the_plugin_lists_the_module_beside_its_command_hooks(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
+        self.assertEqual(hooks["modules"], ["./display.ts"])
+        self.assertTrue((HERE / "hooks" / "display.ts").is_file())
+        self.assertIn("!hooks/display.ts", (HERE / ".gitignore").read_text().splitlines(), "shipped, not ignored")
+
+    def test_it_only_reads_longhauls_files_and_sends_nothing(self):
+        # Read-only on ~/.longhaul: no write, no network, and the one program
+        # it runs is tail on the log.
+        for banned in ("$.fs.write", "fetch(", "$.http", "XMLHttpRequest", "$.model", "$.tool.call"):
+            self.assertNotIn(banned, self.SOURCE, banned)
+        self.assertEqual(re.findall(r"\$\.process\.run\(\[([^\]]*)\]", self.SOURCE),
+                         ["'tail', '-c', String(take), path"])
+        self.assertIn("longhaul.log", self.SOURCE)
+        for name in ("accounts.json", "usage/"):
+            self.assertIn(name, self.SOURCE)
+
+    def test_its_pop_ups_match_the_log_lines_longhaul_writes(self):
+        # Each pop-up's pattern against the line the Python side logs, so a
+        # changed log line cannot silently end a pop-up.
+        lines = {
+            "saved": "checkpoint for fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 saved (4,214 bytes)",
+            "carried": "checkpoint for aaaa carried into fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 after clear (2,708 bytes, "
+                       "saved 3 minutes ago)",
+            "reminded": "reminder: fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 reminded at 800,000 tokens (the context is 880,332)",
+            "moved": "personal-1 hit its 5-hour limit (resets 19:40); the panel chat carries on with personal-2.",
+            "index": "index: started codegraph init in ~/project (pid 4242)"}
+        patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
+        self.assertEqual(len(patterns), 5)
+        for pattern, (kind, line) in zip(patterns, lines.items()):
+            js = pattern.replace("\\/", "/")
+            self.assertRegex(line, js, kind)
+        # The same shapes in longhaul.py's own log calls.
+        source = (HERE / "longhaul.py").read_text()
+        for written in ('log(f"checkpoint for {sid} saved ({size:,} bytes)")',
+                        'log(f"checkpoint for {old} carried into {sid} after clear (',
+                        'log(f"reminder: {record.stem} reminded at {crossed:,} tokens (the context is {size:,})")',
+                        'f"the panel chat carries on with {new}."',
+                        'log(f"index: started {program} init in {home_path(top)} (pid {pid})")'):
+            self.assertIn(written, source, written)
+
+
 class Accounts(unittest.TestCase):
     """longhaul add and longhaul remove, against the stand-in claude (fake_stream.py)."""
 

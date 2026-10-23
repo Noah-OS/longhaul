@@ -2,6 +2,17 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.3 - 2026-10-24
+
+Longhaul shows itself inside Claude Code, the VS Code panel included.
+
+### Added
+
+- **The Longhaul display.** A small module the plugin loads beside its hooks, `hooks/display.ts`. VS Code's Claude panel shows no status line and no hook message, so until now nothing Longhaul did was visible there.
+  - **A status entry:** the account the chat runs on, its 5-hour and weekly allowance when a fresh reading exists, and the context size after each turn, as `personal-1 · 5h 62% · week 71% · context 180k`.
+  - **A pop-up for each event:** a checkpoint saved, a checkpoint brought back after `/clear`, the context reminder, a move to another account at a usage limit, and a code index starting to build.
+  - **It only reads** `~/.longhaul` (`accounts.json`, `usage/`, and the new lines of `longhaul.log`) and sends nothing anywhere. Any failure shows nothing.
+
 ## 0.2.2 - 2026-10-23
 
 The code index builds itself, and subagents' models can be chosen per agent type.

@@ -18,6 +18,7 @@
 !.claude-plugin/marketplace.json
 !hooks/
 !hooks/hooks.json
+!hooks/display.ts
 !bin/
 !bin/longhaul
 !skills/

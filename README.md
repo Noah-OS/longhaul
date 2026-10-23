@@ -20,7 +20,7 @@
   <a href="#releases"><b>Releases</b></a>
 </p>
 
-**Longhaul** shows where a Claude Code conversation's tokens went, flags the tool calls that put a big file into the context whole or a file the context already holds, and puts the model's own checkpoint back after a compaction or a resume. It is a Claude Code plugin and a terminal command in one Python file (plus a two-file VS Code launcher), standard library only, and what it keeps stays on your machine. The detail is in the [wiki](https://github.com/Noah-OS/longhaul/wiki).
+**Longhaul** shows where a Claude Code conversation's tokens went, flags the tool calls that put a big file into the context whole or a file the context already holds, and puts the model's own checkpoint back after a compaction or a resume. It is a Claude Code plugin and a terminal command in one Python file (plus a two-file VS Code launcher and a read-only display module for Claude Code's own status line and pop-ups), standard library only, and what it keeps stays on your machine. The detail is in the [wiki](https://github.com/Noah-OS/longhaul/wiki).
 
 ## Why it exists
 
@@ -36,6 +36,7 @@ Longhaul was built from those patterns as they show up in real use: in one perso
 | **[Context guard](https://github.com/Noah-OS/longhaul/wiki/Context-Guard)**<br><sub>On, advice only</sub> | Flags a file read again unchanged, and a whole `Read` or bare `cat` of a file over 20,000 bytes. Advice by default; denial is opt-in. |
 | **[Checkpoint](https://github.com/Noah-OS/longhaul/wiki/Checkpoints)**<br>`/longhaul:checkpoint`<br><sub>In the plugin</sub> | The model saves its goal, next action, decisions and changed files; Longhaul puts them back after a compaction or a resume. |
 | **[Status line and ledger](https://github.com/Noah-OS/longhaul/wiki/Usage-Report)**<br>`longhaul statusline`<br><sub>Terminal command, set by you</sub> | The account and its 5-hour and 7-day allowance with the reset times; each reading kept for `inspect` and `longhaul usage`. |
+| **Display**<br><sub>In the plugin</sub> | Inside Claude Code, the VS Code panel included: a status entry with the account, its allowance and the context size, and a pop-up when a checkpoint is saved or brought back, the context reminder fires, the account changes at a limit, or a code index starts. |
 | **[Code index](https://github.com/Noah-OS/longhaul/wiki/Code-Index)**<br><sub>On; `LONGHAUL_INDEX=off` turns it off</sub> | Tells the model when it finds a CodeGraph index, and builds a CodeGraph or Trail-Code map in the background where the program is installed and the repository has none (Trail's init also writes a hook into the repository's `.claude/settings.json`). |
 | **[Advisor](https://github.com/Noah-OS/longhaul/wiki/Advisor-Experiment)**<br>`/longhaul:advise`<br><sub>Experiment, off</sub> | A stronger model reviews the work at four decision points: read-only, capped and traced. |
 | **[Across subscriptions](https://github.com/Noah-OS/longhaul/wiki/Account-Switching)**<br>`longhaul`<br><sub>Advanced, experimental, off</sub> | Runs `claude` in your terminal and, at a usage limit, asks before moving the conversation to another of your own subscriptions, or waits for the reset. |
@@ -99,7 +100,7 @@ The [wiki](https://github.com/Noah-OS/longhaul/wiki) holds the detail:
 
 ## Releases
 
-**0.2.2** (2026-10-23), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2) · [changelog](CHANGELOG.md). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
+**0.2.3** (2026-10-24), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.3) · [changelog](CHANGELOG.md). **0.2.2** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
 
 ## Development
 
