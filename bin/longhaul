@@ -38,6 +38,12 @@ case "$1" in
     [ "$2" = save ] && exec python3 "$here/longhaul.py" "$@"
     printf '%s\n' "longhaul: from here only \`checkpoint save\` runs; \`longhaul checkpoint\` with no action is the SessionStart hook, which the engine runs by itself." >&2
     exit 2 ;;
+  trial)
+    # The checkpoint A/B (2026-10-23): its start, stop, ratings and report
+    # are the user's, and its status counts the arms, which a session is
+    # not told; none of it runs from here.
+    printf '%s\n' "longhaul: \`trial\` does not run from inside a session: the checkpoint trial (its start, stop, status, ratings and report) is the user's, and a session is not told its arm. Ask the user to run it in a terminal." >&2
+    exit 2 ;;
   *)
     printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, advisor status, checkpoint save and -h run. Ask the user to run it in a terminal." >&2
     exit 2 ;;

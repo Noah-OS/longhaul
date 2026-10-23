@@ -124,7 +124,19 @@ Usage:
                           off turns it off), and again at each multiple, says to
                           save a checkpoint and start fresh; the guard's PreToolUse
                           hook says it too, whatever LONGHAUL_GUARD is, and each
-                          multiple is said once
+                          multiple is said once; never in a trial's usual arm
+  longhaul trial start [--days N] | stop | status
+                          the checkpoint habit's A/B (14 days unless set): while
+                          it is on, each session's chain gets an arm by its id,
+                          habit (the reminder) or usual (none); a session a
+                          /clear's carry starts keeps its chain's
+  longhaul trial report [--json]
+                          per chain, numbers only: tokens, API-price equivalent,
+                          compactions, reminders, rating; then the plan's rule:
+                          "saving shown" or "no saving shown"
+  longhaul trial rate [CHAIN N]
+                          the finished chains to rate, without their arms; with
+                          CHAIN N, records a rating from 1 to 5
   longhaul clear                forget the recorded limits
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
@@ -6053,7 +6065,7 @@ def trial_report(opts) -> int:
     ratings = trial_ratings()
     records = [trial_figures(c, ratings) for c in trial_chains(trial, trial_sessions(trial))]
     decided = trial_decide(records)
-    log(f"trial: report, {len(records)} chains")
+    log(f"trial: report, {plural(len(records), 'chain')}")
     if opts.json:
         print(json.dumps({"trial": {k: trial.get(k) for k in ("name", "started_at", "ends_at", "stopped_at")},
                           "chains": records, **decided}, indent=1))

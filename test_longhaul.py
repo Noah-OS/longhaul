@@ -8221,6 +8221,53 @@ class Trial(unittest.TestCase):
         for sid in (first, second):
             self.assertNotIn(sid, self.log(), "the log holds kinds and counts")
 
+    def test_a_prompts_text_is_written_nowhere_and_the_trials_files_hold_ids_times_and_ratings(self):
+        # S is in every prompt, reply and checkpoint below, and in a reminder's line.
+        self.assertEqual(self.cli("start")[0], 0)
+        record = self.trial_file()
+        record["started_at"] -= 5 * self.DAY
+        (self.home / "trial.json").write_text(json.dumps(record))
+        root, child = self.ids("habit", 1, "p")[0], self.ids("usual", 1, "q")[0]
+        state = json.dumps({"goal": f"the parser {self.S}", "next_action": f"its tests {self.S}"})
+        self.session(root, -4 * self.DAY, reminders=[10])
+        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.checkpoint_save(root, state, str(self.work), None), 0)
+            longhaul.checkpoint_check({"session_id": child, "hook_event_name": "SessionStart", "source": "clear",
+                                       "cwd": str(self.work), "transcript_path": "/t/x.jsonl"})
+        self.session(child, -4 * self.DAY + 3600)
+        outs = [self.cli(*args) for args in (("status",), ("report",), ("report", "--json"), ("rate",),
+                                             ("rate", root, "4"), ("stop",), ("report",))]
+        self.assertEqual([code for code, _, _ in outs], [0] * len(outs))
+        for _, out, err in outs:
+            self.assertNotIn(self.S, out + err)
+        files = {path.relative_to(self.home).as_posix(): path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
+        for name, raw in files.items():
+            if name != f"checkpoints/{root}.json":  # the checkpoint holds the model's text on purpose
+                self.assertNotIn(self.S.encode(), raw, name)
+        self.assertEqual(set(json.loads(files["trial.json"])),
+                         {"schema", "name", "started_at", "ends_at", "seed", "stopped_at"})
+        ratings = json.loads(files["trial-ratings.json"])
+        self.assertEqual(ratings, {"schema": 1, "ratings": {root: {"rating": 4, "rated_at": ratings["ratings"][root]["rated_at"]}}})
+        self.assertEqual(set(json.loads(files[f"checkpoints/{child}.from.json"])), {"session_id", "carried_from", "carried_at"})
+        trial_lines = [line for line in self.log().splitlines() if "trial:" in line]
+        self.assertEqual(len(trial_lines), 6, trial_lines)
+        for line in trial_lines:
+            self.assertNotIn(root, line)
+            self.assertNotIn(child, line)
+
+    def test_the_shim_refuses_every_trial_command_from_inside_a_session(self):
+        shim = Shim()
+        shim.tmp, shim.env = self.tmp, self.env
+        for args in (("trial",), ("trial", "start"), ("trial", "start", "--days", "3"), ("trial", "stop"),
+                     ("trial", "status"), ("trial", "report", "--json"), ("trial", "rate"), ("trial", "rate", "x", "4"),
+                     ("trial", "-h")):
+            out = shim.shim(*args)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("run it in a terminal", out.stderr, args)
+            self.assertIn("the checkpoint trial (its start, stop, status, ratings and report) is the user's", out.stderr, args)
+        self.assertFalse((self.home / "trial.json").exists())
+        self.assertEqual(list(self.home.iterdir()), [], "nothing was written")
+
     def test_start_writes_the_trial_file_and_refuses_while_one_is_on(self):
         before = time.time()
         code, out, err = self.cli("start")
