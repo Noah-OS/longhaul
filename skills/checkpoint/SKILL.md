@@ -2,7 +2,7 @@
 name: checkpoint
 description: "Save this conversation's state as a checkpoint: the goal, the next action, the decisions, what is done, in progress and blocked, the files changed and how to verify. Longhaul puts it back after a compaction or a resume, with its age and what changed since. Use it when the state is worth keeping: before a compaction, at the end of a step, before stopping. The user can ask for it too."
 argument-hint: "[a note to fold into the state]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint *)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint *) Edit(~/.longhaul/checkpoints/*.state.json)
 ---
 
 Write this conversation's state as one JSON object with these eight keys

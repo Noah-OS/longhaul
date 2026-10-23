@@ -7305,7 +7305,17 @@ class CheckpointSkill(unittest.TestCase):
         # substitution; the save command passes no id, as ${CLAUDE_SESSION_ID}
         # is a substitution in a skill's text, not a variable the Bash tool
         # has, so the save takes the session's id from the environment (A13).
-        self.assertIn("allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint *)", head)
+        # The model saves by itself, unattended runs included (the owner,
+        # Sprint 8), so the Write of the state file must not ask: a second
+        # rule allows it in Longhaul's default folder and nowhere else. It
+        # is an Edit rule: Claude Code accepts a Write(path) rule and never
+        # matches it (permissions docs, "Write(path) ... rules never
+        # match"); Edit rules cover the Write tool, ~/ is the home folder,
+        # and * stays within the one folder. Not yet seen live.
+        [tools] = [line for line in head.splitlines() if line.startswith("allowed-tools:")]
+        self.assertEqual(tools, "allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint *) "
+                                "Edit(~/.longhaul/checkpoints/*.state.json)")
+        self.assertNotIn("Write(", head)
         # The step runs `echo`: a `!` command that is not in Claude Code's
         # documented read-only set (ls, cat, echo, pwd, head, tail, grep,
         # find, wc, which, diff, stat, du, cd) stops the skill with no
