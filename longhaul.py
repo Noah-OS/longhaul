@@ -5625,6 +5625,137 @@ def reminder(_opts) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- trial
+#
+# The checkpoint A/B (docs/plans/2026-10-23-checkpoint-ab-plan.md; the
+# owner, 2026-10-23: "History baseline + 2-week A/B", "Per session, by
+# Longhaul"). `longhaul trial start` writes LONGHAUL_HOME/trial.json
+# (0600): its name, window and a random seed. While it is on, a session's
+# arm comes from a hash of the seed and its chain's root id: a session a
+# /clear's carry started belongs to the chain of the one it was carried
+# from (the carry's <session>.from.json), so a chain never mixes arms.
+# Habit hears the reminder as before; usual never does. The carry works
+# alike in both. `trial report` reads the trial's transcripts, numbers
+# only, and applies the rule the plan wrote before looking; `trial rate`
+# records the owner's blind rating of a finished chain, 1 to 5, in
+# trial-ratings.json (0600). The trial's files hold ids, times, arms,
+# ratings and folder paths, never a message's text, and the log holds
+# kinds and counts alone. Every command is the owner's, in a terminal:
+# the shim refuses them from inside a session.
+
+TRIAL_NAME = "checkpoint-habit"
+TRIAL_DAYS = 14
+TRIAL_ARMS = ("habit", "usual")
+
+
+def trial_path() -> Path:
+    return LONGHAUL_HOME / "trial.json"
+
+
+def trial_read():
+    """The trial file: (its record, None), (None, None) when there is
+    none, or (None, why it is not a trial file)."""
+    try:
+        raw = trial_path().read_bytes()
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, e.strerror or str(e)
+    try:
+        record = json.loads(raw[:4096])
+    except (ValueError, RecursionError):
+        return None, "not JSON"
+    if not isinstance(record, dict) or record.get("schema") != 1 or record.get("name") != TRIAL_NAME:
+        return None, "not schema 1 of this trial"
+    if not isinstance(record.get("seed"), str) or not re.fullmatch(r"[0-9a-f]{16}", record["seed"]):
+        return None, "its seed is not 16 hex digits"
+    for key in ("started_at", "ends_at") + (("stopped_at",) if "stopped_at" in record else ()):
+        value = as_number(record.get(key))
+        if value is None or not math.isfinite(value):
+            return None, f"its {key} is not a time"
+    return record, None
+
+
+def trial_end(trial: dict) -> float:
+    """When the trial's window closes: its end, or its stop when sooner."""
+    return min(trial["ends_at"], as_number(trial.get("stopped_at")) or math.inf)
+
+
+def trial_current(now: float | None = None):
+    """The trial that is on now (between its start and its end, not
+    stopped), or None."""
+    trial, _ = trial_read()
+    now = time.time() if now is None else now
+    return trial if trial and trial["started_at"] <= now < trial_end(trial) else None
+
+
+def trial_day(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
+def trial_start(days: float, now: float) -> int:
+    if not math.isfinite(days) or days <= 0:
+        print("longhaul trial: --days must be a number of days above zero", file=sys.stderr)
+        return 2
+    with locked("trial"):
+        on = trial_current(now)
+        if on:
+            print(f"longhaul trial: a trial is on already (since {trial_day(on['started_at'])}, until "
+                  f"{trial_day(on['ends_at'])}); stop it first with `longhaul trial stop`", file=sys.stderr)
+            return 2
+        record = {"schema": 1, "name": TRIAL_NAME, "started_at": now, "ends_at": now + days * 86_400,
+                  "seed": os.urandom(8).hex()}
+        write_json(trial_path(), record)
+    log(f"trial: started, {days:g} days")
+    print(f"longhaul trial: {TRIAL_NAME} started; it ends {trial_day(record['ends_at'])} ({days:g} days). Each new "
+          f"session gets an arm, habit or usual, by its id; a session a /clear's carry starts keeps its chain's.")
+    return 0
+
+
+def trial_stop(now: float) -> int:
+    with locked("trial"):
+        on = trial_current(now)
+        if not on:
+            print("longhaul trial: no trial is on", file=sys.stderr)
+            return 2
+        write_json(trial_path(), {**on, "stopped_at": now})
+    log("trial: stopped")
+    print(f"longhaul trial: {TRIAL_NAME} stopped; its record is kept for `longhaul trial report`")
+    return 0
+
+
+def trial_status(now: float) -> int:
+    trial, problem = trial_read()
+    if problem:
+        print(f"longhaul trial: {home_path(str(trial_path()))} is not a trial file ({problem})", file=sys.stderr)
+        return 2
+    if trial is None:
+        print("Trial: none")
+        return 0
+    end = trial_end(trial)
+    if now < trial["started_at"]:
+        state = f"not started yet (starts {trial_day(trial['started_at'])})"
+    elif now < end:
+        state = f"on, {(end - now) / 86_400:.1f} days left (ends {trial_day(end)})"
+    elif "stopped_at" in trial and trial["stopped_at"] < trial["ends_at"]:
+        state = f"stopped {trial_day(trial['stopped_at'])}"
+    else:
+        state = f"ended {trial_day(trial['ends_at'])}"
+    print(f"Trial: {TRIAL_NAME}, {state}")
+    print(f"Started {trial_day(trial['started_at'])}")
+    return 0
+
+
+def trial(opts) -> int:
+    """`longhaul trial start [--days N] | stop | status`."""
+    now = time.time()
+    if opts.action == "start":
+        return trial_start(opts.days, now)
+    if opts.action == "stop":
+        return trial_stop(now)
+    return trial_status(now)
+
+
 # ------------------------------------------------------------- VS Code
 #
 # The Claude Code VS Code extension (2.1.300, 2.1.301) runs the program in
@@ -6809,7 +6940,8 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder"):
+                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
+                            "trial"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -6833,6 +6965,11 @@ def main(argv: list[str]) -> int:
                            help="a conversation (default: the latest one in the ledger)")
             p.add_argument("--json", action="store_true",
                            help="one record per number: metric, value, unit, source, confidence")
+        if cmd == "trial":
+            p.add_argument("action", choices=["start", "stop", "status"],
+                           help="start: a trial of the checkpoint habit, from now; stop: end it early, keeping "
+                                "its record; status: whether one is on, the days left and its sessions per arm")
+            p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
         if cmd == "add":
             p.add_argument("name", help="what to call it (Max, Pro, Team...)")
             p.add_argument("email", help="the only email longhaul will accept for it")
@@ -6849,7 +6986,7 @@ def main(argv: list[str]) -> int:
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
-                "advisor-note": advisor_note, "reminder": reminder}[cmd](opts)
+                "advisor-note": advisor_note, "reminder": reminder, "trial": trial}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

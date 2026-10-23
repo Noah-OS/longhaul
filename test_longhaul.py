@@ -7796,6 +7796,134 @@ class Reminder(unittest.TestCase):
                 self.assertNotIn(self.S.encode(), path.read_bytes(), path)
 
 
+class Trial(unittest.TestCase):
+    """`longhaul trial` (docs/plans/2026-10-23-checkpoint-ab-plan.md; the
+    owner, 2026-10-23: "Per session, by Longhaul"): a two-week A/B of the
+    checkpoint habit on real work. While a trial is on, each session's
+    arm comes from a hash of its chain's root id and the trial's seed:
+    habit hears the reminder, usual never does. The report reads the
+    trial's transcripts, numbers only, and applies the rule the plan
+    wrote before looking; the owner rates finished chains blind."""
+
+    # A prompt's text: it is in the transcripts and nowhere Longhaul writes.
+    S = "SENTINEL-OKAPI-4417"
+    SEED = "0123456789abcdef"
+    DAY = 86_400
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home, self.claude = self.tmp / "home", self.tmp / "claude"
+        self.home.mkdir()
+        self.work = self.tmp / "work"
+        self.work.mkdir()
+        self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "USAGE_DIR", "LEDGER", "DEFAULT_CONFIG")}
+        longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR, longhaul.LEDGER = self.home, self.home / "usage", self.home / "ledger.jsonl"
+        longhaul.DEFAULT_CONFIG = self.claude
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+        self.n = 0
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(longhaul, k, v)
+
+    def cli(self, *args, **env):
+        """`longhaul trial ARGS` in this process, in a terminal's environment: (exit code, stdout, stderr)."""
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                code = longhaul.main(["trial", *args])
+            except SystemExit as e:  # argparse's own refusals
+                code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def trial_file(self):
+        path = self.home / "trial.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def trial(self, started=-10, days=14, seed=SEED, **extra):
+        """A trial file as `trial start` writes it, started `started` days from now."""
+        now = time.time()
+        record = {"schema": 1, "name": "checkpoint-habit", "started_at": now + started * self.DAY,
+                  "ends_at": now + (started + days) * self.DAY, "seed": seed, **extra}
+        (self.home / "trial.json").write_text(json.dumps(record))
+        return record
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_start_writes_the_trial_file_and_refuses_while_one_is_on(self):
+        before = time.time()
+        code, out, err = self.cli("start")
+        self.assertEqual((code, err), (0, ""))
+        record = self.trial_file()
+        self.assertEqual(set(record), {"schema", "name", "started_at", "ends_at", "seed"})
+        self.assertEqual((record["schema"], record["name"]), (1, "checkpoint-habit"))
+        self.assertTrue(before <= record["started_at"] <= time.time())
+        self.assertAlmostEqual(record["ends_at"] - record["started_at"], 14 * self.DAY, places=3, msg="14 days by default")
+        self.assertRegex(record["seed"], r"\A[0-9a-f]{16}\Z")
+        self.assertEqual(oct((self.home / "trial.json").stat().st_mode & 0o777), oct(0o600))
+        self.assertIn("checkpoint-habit started", out)
+        self.assertIn("14 days", out)
+        # While it is on, a second start is refused and changes nothing.
+        code, out, err = self.cli("start", "--days", "3")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("a trial is on already", err)
+        self.assertEqual(self.trial_file(), record)
+        # Stopped, it is kept, with the time it stopped; a new one may start.
+        code, out, err = self.cli("stop")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("stopped", out)
+        stopped = self.trial_file()
+        self.assertEqual({k: v for k, v in stopped.items() if k != "stopped_at"}, record)
+        self.assertTrue(record["started_at"] <= stopped["stopped_at"] <= time.time())
+        self.assertEqual(oct((self.home / "trial.json").stat().st_mode & 0o777), oct(0o600))
+        code, out, err = self.cli("stop")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no trial is on", err)
+        code, out, err = self.cli("start", "--days", "3")
+        self.assertEqual((code, err), (0, ""))
+        again = self.trial_file()
+        self.assertAlmostEqual(again["ends_at"] - again["started_at"], 3 * self.DAY, places=3)
+        self.assertNotEqual(again["seed"], record["seed"], "a new seed for a new trial")
+        self.assertNotIn("stopped_at", again)
+        # A trial past its end is not on: a new one may start over it.
+        self.trial(started=-15)
+        self.assertEqual(self.cli("start")[0], 0)
+        for days in ("0", "-2", "x", "nan"):
+            self.trial(started=-15)
+            code, out, err = self.cli("start", "--days", days)
+            self.assertEqual((code, out), (2, ""), days)
+            self.assertEqual(self.trial_file()["started_at"] < time.time() - 14 * self.DAY, True, days)
+        self.assertEqual(self.log().count("trial: started"), 3)
+        self.assertIn("trial: stopped", self.log())
+
+    def test_status_says_whether_a_trial_is_on_and_the_days_left(self):
+        code, out, err = self.cli("status")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, "Trial: none\n")
+        self.trial(started=-10, days=14)
+        code, out, err = self.cli("status")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("Trial: checkpoint-habit, on, 4.0 days left (ends "), lines[0])
+        self.trial(started=-15, days=14)
+        self.assertTrue(self.cli("status")[1].startswith("Trial: checkpoint-habit, ended "))
+        self.trial(started=-3, days=14, stopped_at=time.time() - self.DAY)
+        self.assertTrue(self.cli("status")[1].startswith("Trial: checkpoint-habit, stopped "))
+        self.trial(started=2, days=14)
+        self.assertTrue(self.cli("status")[1].startswith("Trial: checkpoint-habit, not started yet "))
+        for junk in ("{", "[]", json.dumps({"schema": 2}), json.dumps({"schema": 1, "seed": "xyz"})):
+            (self.home / "trial.json").write_text(junk)
+            code, out, err = self.cli("status")
+            self.assertEqual(code, 2, junk)
+            self.assertIn("trial.json is not a trial file", err, junk)
+            self.assertIsNone(longhaul.trial_current(), junk)
+
+
 OLD_NAME = "c" + "w"  # spelled in pieces, so this file passes its own check
 OLD_FOLDER = "claude-" + "relay"  # the owner's former private folder, in pieces for the same reason
 
