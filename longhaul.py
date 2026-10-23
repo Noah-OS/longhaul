@@ -5666,6 +5666,29 @@ def reminder(_opts) -> int:
 TRIAL_NAME = "checkpoint-habit"
 TRIAL_DAYS = 14
 TRIAL_ARMS = ("habit", "usual")
+# The plan's rule, written before looking: at least TRIAL_CHAINS chains per
+# arm; the habit's median API-price equivalent per chain TRIAL_SAVING below
+# usual's or more; its median compactions not higher; its median rating
+# not lower, counted when both arms have TRIAL_RATED rated chains. A chain
+# under TRIAL_REQUESTS requests (a one-question chat) is dropped from both.
+TRIAL_CHAINS, TRIAL_SAVING, TRIAL_RATED, TRIAL_REQUESTS = 15, 0.15, 8, 5
+TRIAL_FINISHED = 3600  # seconds since a chain's last line before it is offered for a rating
+# Dollars per million tokens, by model family and token kind: the fit
+# docs/live/s0/price_table.py makes of Claude Code's own costUSD over the
+# SDK result lines on the owner's Mac (run 2026-10-23, R² 0.9999 or more),
+# per family from the model with the most result lines: claude-opus-5-5
+# (164), claude-fable-5-1 (115), claude-sonnet-5-5 (105) and
+# claude-haiku-4-5 (140). A price the fit put below zero (input, for opus
+# and sonnet: under 0.1% of their tokens) is the cache write's over 1.25,
+# the published ratio of a cache write to input. Any other model is priced
+# as opus. The report compares the arms' medians, so the weights between
+# the kinds matter more than the level.
+PRICES = {
+    "opus": {"input": 4.824, "cache_write": 6.03, "cache_read": 0.23, "output": 11.368},
+    "fable": {"input": 12.849, "cache_write": 17.642, "cache_read": 0.381, "output": 27.144},
+    "sonnet": {"input": 1.423, "cache_write": 1.779, "cache_read": 0.204, "output": 13.556},
+    "haiku": {"input": 1.466, "cache_write": 0.372, "cache_read": 0.158, "output": 5.669},
+}
 
 
 def trial_path() -> Path:
@@ -5709,17 +5732,27 @@ def trial_current(now: float | None = None):
     return trial if trial and trial["started_at"] <= now < trial_end(trial) else None
 
 
+def trial_link(sid: str) -> tuple:
+    """The session a /clear's carry started this one from, and when, by
+    the link the carry wrote (checkpoint_from_path()); (None, None) for
+    none, or for a link that is not whole or not this session's."""
+    record = read_json(checkpoint_from_path(sid))
+    if not isinstance(record, dict) or record.get("session_id") != sid:
+        return None, None
+    parent = record.get("carried_from")
+    if not isinstance(parent, str) or not re.fullmatch(GUARD_ID, parent):
+        return None, None
+    return parent, as_number(record.get("carried_at"))
+
+
 def trial_root(sid: str) -> str:
     """The root of the session's chain: the session itself, or, for one a
-    /clear's carry started, the root of the one it was carried from, by
-    the links the carry writes (checkpoint_from_path()). A link that is
-    not whole, or not the session's own, ends the walk there, as a loop
-    does."""
+    /clear's carry started, the root of the one it was carried from
+    (trial_link()). A loop ends the walk where it closes."""
     seen = [sid]
     while len(seen) <= 1_000:
-        record = read_json(checkpoint_from_path(sid))
-        parent = record.get("carried_from") if isinstance(record, dict) and record.get("session_id") == sid else None
-        if not isinstance(parent, str) or not re.fullmatch(GUARD_ID, parent) or parent in seen:
+        parent, _ = trial_link(sid)
+        if parent is None or parent in seen:
             break
         sid = parent
         seen.append(sid)
@@ -5803,8 +5836,9 @@ def trial_sessions(trial: dict) -> list:
             continue
         scan = trial_scan(path)
         if scan and start <= scan["first"] < end:
+            parent, carried_at = trial_link(path.stem)
             found[path.stem] = {"session": path.stem, "path": path, "folder": path.parent.name, **scan,
-                                "root": trial_root(path.stem)}
+                                "root": trial_root(path.stem), "parent": parent, "carried_at": carried_at}
     return sorted(found.values(), key=lambda s: s["first"])
 
 
@@ -5883,6 +5917,152 @@ def trial_status(now: float) -> int:
     return 0
 
 
+def trial_ratings() -> dict:
+    """The owner's ratings, chain root -> 1 to 5, from trial-ratings.json."""
+    kept = dict_at(read_json(LONGHAUL_HOME / "trial-ratings.json"), "ratings")
+    return {chain: entry["rating"] for chain, entry in kept.items()
+            if isinstance(entry, dict) and entry.get("rating") in (1, 2, 3, 4, 5) and type(entry["rating"]) is int}
+
+
+def trial_figures(chain: dict, ratings: dict) -> dict:
+    """One chain's record, numbers only: inspect's figures for each of its
+    sessions (main and subagents) summed, priced by PRICES, with the
+    reminders shown and the ones followed (a carry from a session after a
+    reminder in it), the owner's rating, and whether the drop rule takes
+    it."""
+    tokens = {k: 0 for k, _ in TOKEN_KINDS}
+    price, requests, compactions, peak = 0.0, 0, 0, 0
+    by_id = {s["session"]: s for s in chain["sessions"]}
+    for s in chain["sessions"]:
+        r = inspect_transcript(s["path"])
+        for row in r["model_tokens"]:
+            rates = PRICES.get(advisor_family(row["model"]), PRICES["opus"])
+            for k, _ in TOKEN_KINDS:
+                tokens[k] += row[k]
+                price += row[k] * rates[k] / 1e6
+        requests += sum(r["requests"].values())
+        compactions += len(r["compactions"])
+        peak = max(peak, (r["context"] or {}).get("peak", 0))
+    followed = sum(1 for s in chain["sessions"] if s["parent"] in by_id and s["carried_at"] is not None
+                   and any(t <= s["carried_at"] for t in by_id[s["parent"]]["reminders"]))
+    first, last = chain["sessions"][0]["first"], max(s["last"] for s in chain["sessions"])
+    return {"chain": chain["chain"], "arm": chain["arm"], "sessions": len(chain["sessions"]), "started_at": first,
+            "seconds": round(last - first, 3), "requests": requests, "tokens": tokens, "price_usd": round(price, 6),
+            "compactions": compactions, "context_peak": peak,
+            "reminders_shown": sum(len(s["reminders"]) for s in chain["sessions"]), "reminders_followed": followed,
+            "rating": ratings.get(chain["chain"]), "dropped": requests < TRIAL_REQUESTS}
+
+
+def trial_decide(records: list) -> dict:
+    """Each arm's medians over its kept chains, the plan's four checks
+    (True, False, or None for the rating while it is not counted) and the
+    verdict: "saving shown" only when no check fails."""
+    import statistics  # here, not at the top: the hooks import this module
+
+    def median(values):
+        return statistics.median(values) if values else None
+
+    arms = {}
+    for arm in TRIAL_ARMS:
+        mine = [r for r in records if r["arm"] == arm and not r["dropped"]]
+        rated = [r["rating"] for r in mine if r["rating"] is not None]
+        arms[arm] = {"chains": len(mine), "dropped": sum(1 for r in records if r["arm"] == arm and r["dropped"]),
+                     "sessions": sum(r["sessions"] for r in mine), "rated": len(rated),
+                     "price_usd_median": median([r["price_usd"] for r in mine]),
+                     **{f"{k}_tokens_median": median([r["tokens"][k] for r in mine]) for k, _ in TOKEN_KINDS},
+                     **{f"{k}_median": median([r[k] for r in mine])
+                        for k in ("requests", "compactions", "context_peak", "seconds")},
+                     "rating_median": median(rated),
+                     "reminders_shown": sum(r["reminders_shown"] for r in mine),
+                     "reminders_followed": sum(r["reminders_followed"] for r in mine)}
+    h, u = arms["habit"], arms["usual"]
+    priced = h["price_usd_median"] is not None and bool(u["price_usd_median"])
+    checks = {"chains": h["chains"] >= TRIAL_CHAINS and u["chains"] >= TRIAL_CHAINS,
+              "price": priced and h["price_usd_median"] <= (1 - TRIAL_SAVING) * u["price_usd_median"],
+              "compactions": h["chains"] > 0 and u["chains"] > 0 and h["compactions_median"] <= u["compactions_median"],
+              "rating": h["rating_median"] >= u["rating_median"]
+              if h["rated"] >= TRIAL_RATED and u["rated"] >= TRIAL_RATED else None}
+    return {"arms": arms, "checks": checks, "saving": 1 - h["price_usd_median"] / u["price_usd_median"] if priced else None,
+            "verdict": "saving shown" if False not in checks.values() else "no saving shown"}
+
+
+def trial_number(value, money: bool = False) -> str:
+    if value is None:
+        return "-"
+    if money:
+        return f"${value:,.2f}"
+    return f"{value:,}" if float(value).is_integer() else f"{value:,.1f}"
+
+
+def trial_report_lines(trial: dict, decided: dict) -> list:
+    """The report as text: the window, each arm's medians, the rule's
+    checks one per line, the verdict last."""
+    arms, checks = decided["arms"], decided["checks"]
+    h, u = arms["habit"], arms["usual"]
+    end = trial_end(trial)
+    state = "on" if time.time() < end else "stopped" if end < trial["ends_at"] else "ended"
+
+    def row(name, habit, usual):
+        return f"  {name:<36}{habit:>14}{usual:>14}"
+
+    lines = [f"Trial {TRIAL_NAME}: {trial_day(trial['started_at'])} to {trial_day(end)} ({state})",
+             f"Chains kept: habit {h['chains']}, usual {u['chains']}; dropped (under {TRIAL_REQUESTS} requests): "
+             f"habit {h['dropped']}, usual {u['dropped']}",
+             row("Per chain, median", "habit", "usual"),
+             row("API-price equivalent", trial_number(h["price_usd_median"], True),
+                 trial_number(u["price_usd_median"], True))]
+    for k, _ in TOKEN_KINDS:
+        lines.append(row(f"{k.replace('_', ' ')} tokens", trial_number(h[f"{k}_tokens_median"]),
+                         trial_number(u[f"{k}_tokens_median"])))
+    for name, key in (("requests", "requests_median"), ("compactions", "compactions_median"),
+                      ("peak context, tokens", "context_peak_median")):
+        lines.append(row(name, trial_number(h[key]), trial_number(u[key])))
+    lines.append(row("wall time, minutes", *(trial_number(None if a["seconds_median"] is None
+                                                          else round(a["seconds_median"] / 60, 1)) for a in (h, u))))
+    lines.append(row("rating (rated chains)", *(f"{trial_number(a['rating_median'])} ({a['rated']})" for a in (h, u))))
+    lines.append("  In all")
+    lines.append(row("sessions", str(h["sessions"]), str(u["sessions"])))
+    lines.append(row("reminders shown / followed", *(f"{a['reminders_shown']} / {a['reminders_followed']}"
+                                                     for a in (h, u))))
+
+    def met(check):
+        return {True: "met", False: "not met"}[checks[check]]
+
+    saving = decided["saving"]
+    lines += ["The rule (docs/plans/2026-10-23-checkpoint-ab-plan.md):",
+              f"  at least {TRIAL_CHAINS} chains per arm: habit {h['chains']}, usual {u['chains']}: {met('chains')}",
+              f"  habit's median price at least {TRIAL_SAVING:.0%} below usual's: "
+              f"{'-' if saving is None else f'{saving:.1%} below'}: {met('price')}",
+              f"  median compactions not higher: habit {trial_number(h['compactions_median'])}, "
+              f"usual {trial_number(u['compactions_median'])}: {met('compactions')}",
+              "  median rating not lower: " + (
+                  f"not counted (rated chains: habit {h['rated']}, usual {u['rated']}; {TRIAL_RATED} each needed)"
+                  if checks["rating"] is None else f"habit {trial_number(h['rating_median'])}, "
+                                                   f"usual {trial_number(u['rating_median'])}: {met('rating')}"),
+              decided["verdict"]]
+    return lines
+
+
+def trial_report(opts) -> int:
+    trial, problem = trial_read()
+    if trial is None:
+        print(f"longhaul trial: no trial to report on"
+              f"{f' ({home_path(str(trial_path()))} is not a trial file: {problem})' if problem else ''}; "
+              f"start one with `longhaul trial start`", file=sys.stderr)
+        return 2
+    ratings = trial_ratings()
+    records = [trial_figures(c, ratings) for c in trial_chains(trial, trial_sessions(trial))]
+    decided = trial_decide(records)
+    log(f"trial: report, {len(records)} chains")
+    if opts.json:
+        print(json.dumps({"trial": {k: trial.get(k) for k in ("name", "started_at", "ends_at", "stopped_at")},
+                          "chains": records, **decided}, indent=1))
+    else:
+        print("\n".join(trial_report_lines(trial, decided)))
+    return 0
+
+
+
 def trial(opts) -> int:
     """`longhaul trial start [--days N] | stop | status`."""
     now = time.time()
@@ -5890,6 +6070,8 @@ def trial(opts) -> int:
         return trial_start(opts.days, now)
     if opts.action == "stop":
         return trial_stop(now)
+    if opts.action == "report":
+        return trial_report(opts)
     return trial_status(now)
 
 
@@ -7103,10 +7285,12 @@ def main(argv: list[str]) -> int:
             p.add_argument("--json", action="store_true",
                            help="one record per number: metric, value, unit, source, confidence")
         if cmd == "trial":
-            p.add_argument("action", choices=["start", "stop", "status"],
+            p.add_argument("action", choices=["start", "stop", "status", "report"],
                            help="start: a trial of the checkpoint habit, from now; stop: end it early, keeping "
-                                "its record; status: whether one is on, the days left and its sessions per arm")
+                                "its record; status: whether one is on, the days left and its sessions per arm; "
+                                "report: each arm's numbers per chain and the plan's rule")
             p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
+            p.add_argument("--json", action="store_true", help="report: the chains' records and the decision, as JSON")
         if cmd == "add":
             p.add_argument("name", help="what to call it (Max, Pro, Team...)")
             p.add_argument("email", help="the only email longhaul will accept for it")

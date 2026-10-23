@@ -8036,6 +8036,142 @@ class Trial(unittest.TestCase):
         self.assertIn("usual: 1 session in 1 chain", out.splitlines())
         self.assertNotIn(self.S, out)
 
+    def ratings(self, **by_chain):
+        """The ratings file as `trial rate` writes it."""
+        (self.home / "trial-ratings.json").write_text(json.dumps({"schema": 1, "ratings": {
+            chain: {"rating": n, "rated_at": time.time()} for chain, n in by_chain.items()}}))
+
+    def report(self):
+        code, out, err = self.cli("report", "--json")
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn(self.S, out)
+        return json.loads(out)
+
+    def price(self, model, inp, write, read, out):
+        rates = longhaul.PRICES[model]
+        return (inp * rates["input"] + write * rates["cache_write"] + read * rates["cache_read"]
+                + out * rates["output"]) / 1e6
+
+    def test_prices_are_per_family_and_token_kind(self):
+        self.assertEqual(set(longhaul.PRICES), {"opus", "fable", "sonnet", "haiku"})
+        for family, rates in longhaul.PRICES.items():
+            self.assertEqual(set(rates), {k for k, _ in longhaul.TOKEN_KINDS}, family)
+            self.assertTrue(all(v > 0 for v in rates.values()), family)
+            self.assertLess(rates["cache_read"], rates["cache_write"], "a cache read at its lower price")
+
+    def test_the_report_reads_each_chains_numbers_from_its_transcripts(self):
+        self.trial(started=-10)
+        root, (child, short, edge, early) = self.ids("habit", 1, "r")[0], self.ids("usual", 4, "x")
+        t0 = -9 * self.DAY
+        self.session(root, t0, requests=6, read=100_000, reminders=[10], minutes=30)
+        sub = self.claude / "projects" / "-code-app" / root / "subagents" / "agent-a1.jsonl"
+        sub.parent.mkdir(parents=True)
+        sub.write_text("".join(json.dumps({"type": "assistant", "isSidechain": True, "timestamp": self.stamp(time.time() + t0 + 60),
+                                           "message": {"id": f"sub_{i}", "model": "claude-haiku-4-5", "role": "assistant",
+                                                       "content": [], "usage": {"input_tokens": 50, "output_tokens": 70,
+                                                                                "cache_read_input_tokens": 1_000}}}) + "\n"
+                               for i in range(2)))
+        self.link(child, root, at=time.time() + t0 + 40 * 60)  # after the reminder at minute 10: followed
+        self.session(child, t0 + 3600, requests=6, read=150_000, compactions=1, minutes=60)
+        self.session(short, t0 + 2 * 3600, requests=4)  # under 5 requests: dropped
+        self.session(edge, t0 + 3 * 3600, requests=5)  # 5: kept
+        self.session(early, -11 * self.DAY)  # before the trial began
+        r = self.report()
+        self.assertEqual(r["trial"]["name"], "checkpoint-habit")
+        chains = {c["chain"]: c for c in r["chains"]}
+        self.assertEqual(set(chains), {root, short, edge}, "a carried session is its root's chain's")
+        c = chains[root]
+        self.assertEqual((c["arm"], c["sessions"], c["requests"], c["compactions"]), ("habit", 2, 14, 1))
+        self.assertEqual(c["tokens"], {"input": 12 * 3 + 100, "cache_write": 12 * 2_000,
+                                       "cache_read": 6 * 100_000 + 6 * 150_000 + 2_000, "output": 12 * 500 + 140})
+        self.assertAlmostEqual(c["price_usd"], 6 * self.price("opus", 3, 2_000, 100_000, 500)
+                               + 6 * self.price("opus", 3, 2_000, 150_000, 500) + 2 * self.price("haiku", 50, 0, 1_000, 70),
+                               places=6)
+        self.assertEqual(c["context_peak"], 3 + 2_000 + 150_000)
+        self.assertEqual((c["reminders_shown"], c["reminders_followed"]), (1, 1))
+        self.assertAlmostEqual(c["seconds"], 3600 + 60 * 60, delta=1)
+        self.assertIsNone(c["rating"])
+        self.assertFalse(c["dropped"])
+        self.assertEqual((chains[short]["arm"], chains[short]["dropped"], chains[edge]["dropped"]), ("usual", True, False))
+        self.assertEqual((chains[short]["reminders_shown"], chains[short]["reminders_followed"]), (0, 0))
+        self.assertEqual((r["arms"]["habit"]["chains"], r["arms"]["usual"]["chains"]), (1, 1))
+        self.assertEqual((r["arms"]["habit"]["dropped"], r["arms"]["usual"]["dropped"]), (0, 1))
+        self.assertEqual(r["verdict"], "no saving shown")
+        # A carry with no reminder before it is not one followed.
+        self.link(child, root, at=time.time() + t0 + 5 * 60)
+        self.assertEqual(self.report()["chains"][0]["reminders_followed"], 0)
+        # The text: numbers, the rule, the verdict last.
+        code, out, err = self.cli("report")
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn(self.S, out)
+        self.assertIn("at least 15 chains per arm: habit 1, usual 1: not met", out)
+        self.assertEqual(out.splitlines()[-1], "no saving shown")
+
+    def arms(self, habit=15, usual=15, habit_read=80_000, usual_read=100_000, habit_compactions=0,
+             usual_compactions=0, short=0):
+        """Chains of one session each, `habit` and `usual` of them, tokens
+        almost all cache reads, so that the price follows the reads; and
+        `short` more in each arm, under 5 requests, at ten times the price."""
+        shutil.rmtree(self.claude / "projects", ignore_errors=True)
+        (self.home / "trial-ratings.json").unlink(missing_ok=True)
+        made = {}
+        for arm, n, read, compactions in (("habit", habit, habit_read, habit_compactions),
+                                          ("usual", usual, usual_read, usual_compactions)):
+            made[arm] = self.ids(arm, n + short, arm[0])
+            for i, sid in enumerate(made[arm]):
+                dropped = i >= n
+                self.session(sid, -9 * self.DAY + i * 3600, requests=4 if dropped else 6, write=0, out=0,
+                             read=read * (10 if dropped else 1), compactions=compactions)
+        return made
+
+    def test_the_report_applies_the_plans_rule_to_the_chains_kept(self):
+        self.trial(started=-10)
+        made = self.arms()
+        r = self.report()
+        self.assertEqual(r["verdict"], "saving shown", "15 a side, 20% below, no more compactions, too few ratings")
+        self.assertEqual(r["checks"], {"chains": True, "price": True, "compactions": True, "rating": None})
+        h, u = r["arms"]["habit"], r["arms"]["usual"]
+        self.assertAlmostEqual(h["price_usd_median"] / u["price_usd_median"], 0.8, delta=0.001)
+        code, out, err = self.cli("report")
+        self.assertIn("median rating not lower: not counted (rated chains: habit 0, usual 0; 8 each needed)", out)
+        self.assertEqual(out.splitlines()[-1], "saving shown")
+        cases = [
+            ("14 habit chains", dict(habit=14), "chains"),
+            ("10% below", dict(habit_read=90_000), "price"),
+            ("more compactions", dict(habit_compactions=1), "compactions"),
+            ("14 kept, with short ones dropped", dict(habit=14, short=3), "chains"),
+        ]
+        for name, kwargs, failed in cases:
+            with self.subTest(name):
+                self.arms(**kwargs)
+                r = self.report()
+                self.assertEqual(r["verdict"], "no saving shown")
+                self.assertEqual([k for k, v in r["checks"].items() if v is False], [failed])
+        # Dropped by the same rule in both arms: chains under 5 requests at
+        # ten times the price change nothing.
+        self.arms(short=3)
+        r = self.report()
+        self.assertEqual((r["verdict"], r["arms"]["habit"]["chains"], r["arms"]["habit"]["dropped"]), ("saving shown", 15, 3))
+        self.assertEqual((r["arms"]["usual"]["chains"], r["arms"]["usual"]["dropped"]), (15, 3))
+        # The rating counts once both arms have 8 rated chains: lower fails, the same passes.
+        for habit_ratings, usual_ratings, verdict in (([3] * 8, [4] * 8, "no saving shown"),
+                                                       ([4] * 8, [4, 4, 4, 4, 5, 3, 4, 4], "saving shown"),
+                                                       ([2] * 7, [5] * 8, "saving shown")):
+            with self.subTest(habit=habit_ratings, usual=usual_ratings):
+                made = self.arms()
+                self.ratings(**dict(zip(made["habit"], habit_ratings)), **dict(zip(made["usual"], usual_ratings)))
+                r = self.report()
+                self.assertEqual(r["verdict"], verdict)
+                counted = len(habit_ratings) >= 8
+                self.assertEqual(r["checks"]["rating"], None if not counted else verdict == "saving shown")
+                self.assertEqual((r["arms"]["habit"]["rated"], r["arms"]["usual"]["rated"]),
+                                 (len(habit_ratings), len(usual_ratings)))
+        # With no trial file there is nothing to report.
+        (self.home / "trial.json").unlink()
+        code, out, err = self.cli("report")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no trial", err)
+
     def test_start_writes_the_trial_file_and_refuses_while_one_is_on(self):
         before = time.time()
         code, out, err = self.cli("start")
