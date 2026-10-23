@@ -94,10 +94,10 @@ Usage:
                           CodeGraph index it names the index at the twentieth.
                           SessionStart: names the index at startup; at compact and
                           clear forgets the reads. LONGHAUL_GUARD=off does nothing.
-                          With LONGHAUL_INDEX=on, at startup in a git work tree with
-                          no code map, starts `codegraph init` or `trail init` in
-                          the background, once per project (the README says what
-                          each writes); off unless set
+                          At startup in a git work tree with no code map, starts
+                          `codegraph init` or `trail init` in the background, once
+                          per project (the README says what each writes);
+                          LONGHAUL_INDEX=off turns that off
   longhaul checkpoint save [ID] [--file PATH]
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
@@ -2924,8 +2924,8 @@ def inspect(opts) -> int:
 
 # ---------------------------------------------------------------- index
 #
-# Longhaul builds a repository's code map itself (Sprint 7, G4), when
-# asked to (LONGHAUL_INDEX=on; off otherwise): at a new session's start
+# Longhaul builds a repository's code map itself (Sprint 7, G4), unless
+# told not to (LONGHAUL_INDEX=off; on by default since 2026-10-23): at a new session's start
 # in a git work tree with no map, the guard's startup hook starts
 # `codegraph init -y`, or `trail init --yes --no-global --no-statusline
 # --no-agents`, or both, in the work tree's top level, detached, and
@@ -2978,11 +2978,12 @@ INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background for lat
 
 
 def index_mode() -> str:
-    """LONGHAUL_INDEX, read at call time as guard_mode() is: "on" is on,
-    anything else (unset included) is off. Opt-in (the owner's decision
-    after an outside review, 2026-10-21) until a benchmark shows the
-    index a consistent benefit."""
-    return "on" if os.environ.get("LONGHAUL_INDEX") == "on" else "off"
+    """LONGHAUL_INDEX, read at call time as guard_mode() is: "off" is off,
+    anything else (unset included) is on. On by default, CodeGraph's and
+    Trail's init both, since the owner's decision of 2026-10-23 ("on by
+    default for everyone", "both by default"), which ends the opt-in of
+    2026-10-21."""
+    return "off" if os.environ.get("LONGHAUL_INDEX") == "off" else "on"
 
 
 def index_top(cwd):

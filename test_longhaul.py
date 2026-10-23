@@ -29,6 +29,10 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The code index is on by default since 2026-10-23 (the owner): the suite
+# keeps it off, so that no test starts a real `codegraph init` or `trail
+# init` from the PATH; the index tests turn it on in their own environment.
+os.environ.setdefault("LONGHAUL_INDEX", "off")
 sys.path.insert(0, str(HERE))
 import longhaul  # noqa: E402
 
@@ -2339,7 +2343,8 @@ class Guard(unittest.TestCase):
         self.big.write_text("x" * 30_000)
         self.small = self.tmp / "small.py"
         self.small.write_text("y" * 300)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
+        self.env["LONGHAUL_INDEX"] = "off"  # no real init from the PATH (the index is on by default)
         # fake_stream.py as claude: the bad-size test runs status, which asks
         # it for auth status and the version (R3, Sprint 5: the real claude
         # answered here; Settings.test_the_suite_never_runs_the_real_claude).
@@ -2895,7 +2900,7 @@ class Index(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("CLAUDE_CODE_SESSION_ATTENDED", None)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
                         LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_INDEX="on")
@@ -3004,17 +3009,20 @@ class Index(unittest.TestCase):
     def test_nothing_starts_without_the_switch_on_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
         both = self.planned("codegraph", "trail")
         self.assertEqual(self.plan(self.start()), both, "the control: a work tree with no map, both programs found")
-        # Opt-in (the owner, 2026-10-21, after the outside review): "on" is
-        # on; unset, "off" or anything else is off.
+        # On by default (the owner, 2026-10-23: "on by default for everyone",
+        # "both by default"); "off" alone is off.
         self.assertEqual(longhaul.index_mode(), "on", "the fixture's environment")
-        for value in (None, "off", "", "1", "ON", "yes"):
+        for value in (None, "", "1", "ON", "yes"):
             with mock.patch.dict(os.environ):
                 if value is None:
                     os.environ.pop("LONGHAUL_INDEX")
                 else:
                     os.environ["LONGHAUL_INDEX"] = value
-                self.assertEqual(longhaul.index_mode(), "off", f"LONGHAUL_INDEX={value}")
-                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), [], f"LONGHAUL_INDEX={value}")
+                self.assertEqual(longhaul.index_mode(), "on", f"LONGHAUL_INDEX={value}")
+                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), both, f"LONGHAUL_INDEX={value}")
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX": "off"}):
+            self.assertEqual(longhaul.index_mode(), "off")
+            self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), [], "LONGHAUL_INDEX=off")
         self.assertEqual(self.plan(self.start(), index="off"), [], "the mode as passed down")
         # Never in the home folder, in a subfolder of it, or in a work tree
         # the home folder is inside (a dotfiles repository at ~ makes every
@@ -3047,13 +3055,13 @@ class Index(unittest.TestCase):
         (self.tmp / "wt" / ".git").write_text("gitdir: elsewhere\n")
         self.assertEqual(longhaul.index_top(str(self.tmp / "wt" / "src")), str(self.tmp / "wt"))
 
-    def test_the_switch_unset_or_off_starts_nothing_through_the_hook_or_guard_check(self):
+    def test_the_switch_off_starts_nothing_through_the_hook_or_guard_check(self):
         # Review, Sprint 7 (F11): the switch as the hook reads it from its
         # own environment, not only as index_plan() is handed it; both
         # programs on PATH and a work tree with no map, so with the switch
-        # on both would start (the tests above).
+        # on (the default since 2026-10-23) both would start (the tests above).
         self.assertIsNone(self.check(self.start(), index="off"))
-        for value in (None, "off"):
+        for value in ("off",):
             env = {k: v for k, v in self.env.items() if k != "LONGHAUL_INDEX"}
             if value is not None:
                 env["LONGHAUL_INDEX"] = value
@@ -4014,7 +4022,7 @@ class Advisor(unittest.TestCase):
         self.enable()
         self.reading()
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith("LONGHAUL_") and k not in self.VARS + Checkpoint.SESSION_VARS}
+                    if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in self.VARS + Checkpoint.SESSION_VARS}
         self.env.update(HOME=str(self.os_home), LONGHAUL_HOME=str(self.home),
                         LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude-config"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
@@ -6148,7 +6156,7 @@ class Settings(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         (self.tmp / "home").mkdir()
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         # fake_stream.py as claude: status asks it for auth status and the
         # version (review, Sprint 4: the real claude answered here, twelve times).
         self.env.update(LONGHAUL_HOME=str(self.tmp / "home"), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
@@ -6304,7 +6312,7 @@ class Checkpoint(unittest.TestCase):
         # The suite runs from inside a session too, whose variables would
         # name it: the save and the hook under test get a terminal's
         # environment unless a test says otherwise.
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
         # The carry window is read when the hook runs: the default unless a test sets it.
@@ -7103,7 +7111,7 @@ class Shim(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         # A terminal's environment (the suite runs from inside a session too).
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         # Every data path in scratch: `usage` and `inspect` read the config
         # folder, which must never be the real one (review, Sprint 3).
         self.env.update(LONGHAUL_HOME=str(self.tmp / "home"), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
@@ -7395,7 +7403,7 @@ class Reminder(unittest.TestCase):
         self.transcript = self.tmp / "s1.jsonl"
         self.transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}) + "\n")
         self.n = 0
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
 
@@ -7836,7 +7844,7 @@ class Trial(unittest.TestCase):
         self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "USAGE_DIR", "LEDGER", "DEFAULT_CONFIG")}
         longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR, longhaul.LEDGER = self.home, self.home / "usage", self.home / "ledger.jsonl"
         longhaul.DEFAULT_CONFIG = self.claude
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in Checkpoint.SESSION_VARS}
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
         self.n = 0
@@ -10648,7 +10656,7 @@ class Models(unittest.TestCase):
 
     def test_the_hook_as_registered_lowers_the_model_and_the_shim_refuses_the_command(self):
         self.config(subagents={"implementer": "sonnet"}, models="on")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         env.update(LONGHAUL_HOME=str(self.home), HOME=str(self.tmp / "user"), LONGHAUL_NO_NOTIFY="1")
         cmd = registered_hook("PreToolUse", "advisor-hook")
         out = subprocess.run(cmd, input=json.dumps(self.call()), capture_output=True, text=True, env=env, timeout=30)
