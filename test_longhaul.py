@@ -8030,6 +8030,8 @@ class Trial(unittest.TestCase):
         self.session(habit[2], -11 * self.DAY)  # before the trial began
         self.session(usual[1], -1 * self.DAY, folder="-private-var-folders-x")  # a temporary folder's
         self.session("agent-a1", -1 * self.DAY, folder=f"-code-app/{usual[0]}/subagents")  # not a main transcript
+        old = self.session(self.ids("usual", 1, "o")[0], -1 * self.DAY)
+        os.utime(old, (time.time() - 11 * self.DAY,) * 2)  # last written before the trial began: not even read
         code, out, err = self.cli("status")
         self.assertEqual((code, err), (0, ""))
         self.assertIn("habit: 3 sessions in 2 chains", out.splitlines())
@@ -8306,6 +8308,7 @@ class Trial(unittest.TestCase):
         # A trial past its end is not on: a new one may start over it.
         self.trial(started=-15)
         self.assertEqual(self.cli("start")[0], 0)
+        self.assertEqual(self.cli("status", "x")[0], 2, "CHAIN is rate's")
         for days in ("0", "-2", "x", "nan"):
             self.trial(started=-15)
             code, out, err = self.cli("start", "--days", days)

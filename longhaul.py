@@ -5791,22 +5791,25 @@ def trial_arm(session_id, now: float | None = None):
 TRIAL_SKIP = ("scratchpad", "-tmp-", "-private-", "-var-")  # project folders that are no real work: the baseline's
 
 
-def trial_scan(path: Path):
+def trial_scan(path: Path, start: float = -math.inf, end: float = math.inf):
     """One main transcript's times, folder and reminders, read line by
     line without keeping any text: its first and last timestamps, the
     cwd its first line names, and the times the reminder's line reached
     the model (an attachment of a hook's additionalContext that holds
-    REMINDER_MODEL's start). None for a file with no timestamp."""
+    REMINDER_MODEL's start). None for a file with no timestamp, or one
+    whose first is outside [start, end), which is read no further."""
     first = last = cwd = None
     reminders = []
     stamp = re.compile(rb'"timestamp":\s*"([^"]{1,64})"')
-    start = REMINDER_MODEL.split("{")[0].encode()
+    said = REMINDER_MODEL.split("{")[0]
     try:
         with path.open("rb") as f:
             for raw in f:
                 found = stamp.search(raw)
                 when = parse_ts(found.group(1).decode(errors="replace")) if found else 0.0
                 if when:
+                    if first is None and not start <= when < end:
+                        return None
                     first = when if first is None else first
                     last = when
                 if cwd is None and b'"cwd"' in raw:
@@ -5816,7 +5819,7 @@ def trial_scan(path: Path):
                         line = None
                     if isinstance(line, dict) and isinstance(line.get("cwd"), str) and os.path.isabs(line["cwd"]):
                         cwd = line["cwd"]
-                if b'"hook_additional_context"' in raw and start in raw and when:
+                if b'"hook_additional_context"' in raw and said.encode() in raw and when:
                     try:
                         line = json.loads(raw)
                     except (ValueError, RecursionError):
@@ -5825,7 +5828,7 @@ def trial_scan(path: Path):
                     texts = att.get("content") if isinstance(att.get("content"), list) else []
                     if line.get("type") == "attachment" and not line.get("isSidechain") \
                             and att.get("type") == "hook_additional_context" \
-                            and any(isinstance(t, str) and any(part.startswith(start.decode()) for part in t.split("\n"))
+                            and any(isinstance(t, str) and any(part.startswith(said) for part in t.split("\n"))
                                     for t in texts):
                         reminders.append(when)
             size = f.tell()
@@ -5846,8 +5849,13 @@ def trial_sessions(trial: dict) -> list:
         if any(skip in path.parent.name for skip in TRIAL_SKIP) or not re.fullmatch(GUARD_ID, path.stem) \
                 or path.stem in found:
             continue
-        scan = trial_scan(path)
-        if scan and start <= scan["first"] < end:
+        try:
+            if path.stat().st_mtime < start:  # last written before the trial began: it began before too
+                continue
+        except OSError:
+            continue
+        scan = trial_scan(path, start, end)
+        if scan:
             parent, carried_at = trial_link(path.stem)
             found[path.stem] = {"session": path.stem, "path": path, "folder": path.parent.name, **scan,
                                 "root": trial_root(path.stem), "parent": parent, "carried_at": carried_at}
@@ -5946,7 +5954,11 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
     price, requests, compactions, peak = 0.0, 0, 0, 0
     by_id = {s["session"]: s for s in chain["sessions"]}
     for s in chain["sessions"]:
-        r = inspect_transcript(s["path"])
+        try:
+            r = inspect_transcript(s["path"])
+        except OSError as e:  # gone, or no longer readable, since the scan: the chain goes without it
+            log(f"trial: a session's transcript was not read ({type(e).__name__})")
+            continue
         for row in r["model_tokens"]:
             rates = PRICES.get(advisor_family(row["model"]), PRICES["opus"])
             for k, _ in TOKEN_KINDS:
@@ -6135,6 +6147,9 @@ def trial_rate(chain, rating, now: float) -> int:
 def trial(opts) -> int:
     """`longhaul trial start [--days N] | stop | status | report [--json] | rate [CHAIN N]`."""
     now = time.time()
+    if opts.action != "rate" and opts.chain is not None:
+        print(f"longhaul trial: {opts.action} takes no CHAIN or N; those are rate's", file=sys.stderr)
+        return 2
     if opts.action == "start":
         return trial_start(opts.days, now)
     if opts.action == "stop":
