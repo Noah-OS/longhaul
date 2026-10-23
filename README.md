@@ -99,7 +99,7 @@ The [wiki](https://github.com/Noah-OS/longhaul/wiki) holds the detail:
 
 ## Releases
 
-**0.1.0** (2026-10-21) is the only release: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0) · [changelog](CHANGELOG.md). The default branch has moved on since and still reads 0.1.0; installing from the marketplace takes it as it stands. What has landed since: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
+**0.2.0** (2026-10-23), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0) · [changelog](CHANGELOG.md). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
 
 ## Development
 

@@ -2,6 +2,41 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.0 - 2026-10-23
+
+Measure first, then act: tokens by model, a reminder that keeps sessions short without losing the thread, a trial that tests whether it saves anything on real work, and the Advisor experiment, built and off.
+
+### Added
+
+- **Tokens by model in `inspect`.** Input, cache write, cache read and output per model, for the main conversation and the subagents apart, as `model_tokens` records in `--json`.
+- **The context reminder.** When a conversation's context passes 200,000 tokens, and each further 200,000, you see one line suggesting `/longhaul:checkpoint` then `/clear`, and the model is asked to save a checkpoint itself at its next natural stopping point. It is also delivered during unattended work, through the guard's hook on `Read` and `Bash`. It is said once per threshold per session. `LONGHAUL_CHECKPOINT_AT` sets the threshold, and `off` turns it off. This is a new `UserPromptSubmit` hook.
+- **The checkpoint comes back after `/clear`.** It comes back once, when it was saved in the same folder within the last 6 hours (`LONGHAUL_CHECKPOINT_CARRY_HOURS`; `0` or `off` turns this off), with a line saying where it came from. The save records the folder and time beside the checkpoint, never its text. The checkpoint skill may write its state file without a permission prompt.
+- **The trial.** `longhaul trial start`, `status`, `rate`, `report` and `stop` run a two-week A/B of the checkpoint habit on your own work. Each new session is assigned at random to "usual" (no reminder) or "habit", and a session continued after `/clear` keeps its arm. `report` applies a rule written in advance and says "saving shown" or "no saving shown". `rate` is a blind list for scoring finished tasks 1 to 5.
+- **Search and the code index.**
+  - `inspect` counts searches (calls, chains, big results) and says whether a CodeGraph or Trail-Code map was seen or used.
+  - The guard's startup note names a project's CodeGraph index, and a nudge at 20 searches points at it.
+  - With `LONGHAUL_INDEX=on`, Longhaul runs `codegraph init` or `trail init` in the background where the program is installed and the repository has no map. Opt-in, and never installed by Longhaul.
+- **Accounts restricted to repositories (advanced).** `longhaul add NAME EMAIL --repo PATH` (or `"repositories"` in `accounts.json`) uses an account only in those repositories. Outside them it is never started, resumed or moved there, and with no account allowed, Longhaul refuses to start, or the VS Code panel refuses the chat.
+- **The Advisor experiment, off.** A stronger model, read-only, reviews the work at four decision points through `/longhaul:advise`. It is off unless you turn it on with three steps: a capability probe recorded for your Claude Code version, `longhaul advisor enable` run in your own terminal, and `LONGHAUL_ADVISOR=experiment`. A hook checks every consultation and denies what it cannot check; it enforces caps per task and per session, by advisor model. `inspect` shows the consultations and their tokens. Two hooks on subagent calls, messages and workflows, and a note on each prompt while the experiment is on.
+
+### Changed
+
+- **The code index is looked for only from the session's folder up to its git work tree's top, never in the home folder or above.** CodeGraph's `~/.codegraph` and Trail's `~/.trail` no longer make every project look indexed.
+- **An `accounts.json` that cannot be read refuses instead of falling back to one unrestricted account.** `longhaul` and `pipe` exit 2 with the reason, the panel refuses the chat, and `status` shows it. A missing file works as before.
+- The hooks now number eight.
+
+### Known limits
+
+- **No token saving has been shown yet.** The guard's two controlled runs showed none; block mode cost 3.5 times the baseline on a task that needs whole files. The trial exists to measure the checkpoint habit on real work. Its cost figure uses per-model prices fitted from Claude Code's own estimates.
+- **The reminder** reaches the model on your prompts and on `Read` and `Bash` calls only.
+- **The checkpoint carry** uses the folder the save ran in, and its write permission is not yet seen in a live run.
+- **The Advisor:**
+  - it has been probed on Claude Code 2.1.307 only, and the VS Code extension's bundled 2.1.304 is refused;
+  - in the benchmark's automatic runs the executor never consulted on its own, and the note meant to change that is not yet retested;
+  - if its check cannot run at all, the call goes ahead, and the advisor's own refusal is the model following its instructions;
+  - an executor that sets out to get around it could.
+- **The advanced account switching** is still unproven at a real limit.
+
 ## 0.1.0 - 2026-10-21
 
 The first release: a Claude Code plugin and a terminal command, in one Python file (plus a two-file VS Code launcher) with no dependencies, that show where a session's tokens go and stop the waste. Account switching ships opt-in.
