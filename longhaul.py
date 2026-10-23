@@ -6016,7 +6016,7 @@ def trial_number(value, money: bool = False) -> str:
         return "-"
     if money:
         return f"${value:,.2f}"
-    return f"{value:,}" if float(value).is_integer() else f"{value:,.1f}"
+    return f"{int(value):,}" if float(value).is_integer() else f"{value:,.1f}"  # a median of two may be x.0
 
 
 def trial_report_lines(trial: dict, decided: dict) -> list:

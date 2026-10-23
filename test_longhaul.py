@@ -8137,6 +8137,10 @@ class Trial(unittest.TestCase):
         code, out, err = self.cli("report")
         self.assertIn("median rating not lower: not counted (rated chains: habit 0, usual 0; 8 each needed)", out)
         self.assertEqual(out.splitlines()[-1], "saving shown")
+        self.arms(habit=16)  # an even count: the median of two
+        out = self.cli("report")[1]
+        self.assertIn("80,003", out)
+        self.assertNotIn("80,003.0", out, "a whole number is shown whole")
         cases = [
             ("14 habit chains", dict(habit=14), "chains"),
             ("10% below", dict(habit_read=90_000), "price"),
