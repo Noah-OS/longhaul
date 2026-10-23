@@ -98,7 +98,9 @@ Usage:
                           there as <ID>.state.json, removed once read, saved or
                           refused
   longhaul checkpoint           the plugin's SessionStart hook: puts that state back
-                          after a compaction or a resume
+                          after a compaction or a resume, and once after a /clear
+                          in the folder it was saved in, within
+                          LONGHAUL_CHECKPOINT_CARRY_HOURS (6; 0 or off: never)
   longhaul advisor status       the Advisor experiment's gate: its switch
                           (LONGHAUL_ADVISOR, off unless experiment), the probe
                           record's Claude Code version, the running one, and
@@ -3621,10 +3623,12 @@ def guard(_opts) -> int:
 # of the files it names changed since. The engine's own summary is made
 # when the context is already full; this one is made when the model
 # knows what matters, and it survives a crash and a move to another
-# account. (A /clear gives the session a new id, so the hook, which also
-# answers a clear, finds nothing under it; until the live check says
-# otherwise no text promises a return after one.) The file holds the
-# model's text on purpose. It is
+# account. A /clear gives the conversation a new id, so the hook finds
+# nothing under it; it carries over, once, the newest checkpoint saved in
+# the new session's folder within LONGHAUL_CHECKPOINT_CARRY_HOURS (6),
+# by the record the save writes beside it, <session>.carry.json (the
+# owner's plan of 2026-10-23: save, /clear, go on fresh). The file holds
+# the model's text on purpose. It is
 # read by the hook alone; the log, inspect and every line a person or the
 # model reads name it by session, size, field and reason, never by its
 # content. Like the guard, the hook prints nothing and exits 0 whatever
@@ -3642,6 +3646,8 @@ CHECKPOINT_FILE_MAX = 4 * CHECKPOINT_BYTES_MAX  # what the hook will read of a f
 CHECKPOINT_SECRET_SHAPES = ("sk-ant-", "AKIA", "-----BEGIN", "ghp_")  # the start of a known kind of credential
 CHECKPOINT_CLI = ("schema_version", "session_id", "written_at", "cwd")  # set by the CLI, never by the model
 CHECKPOINT_SOURCES = ("compact", "clear", "resume")  # the session starts whose context is gone
+CHECKPOINT_CARRY_HOURS = 6.0  # how old a checkpoint a /clear carries over, by default
+CHECKPOINT_CARRY_RECORD_MAX = 4_096  # what the lookup reads of a carry record: a save writes a few hundred bytes
 
 
 def checkpoint_path(sid: str | None):
@@ -3766,6 +3772,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     sid = sid or here
     path = checkpoint_path(sid)
     state = problem = logged = None
+    recorded = False
     if path is None:
         problem = ("save needs the session id: pass it, or run from inside a Claude Code session (CLAUDE_CODE_SESSION_ID)"
                    if sid is None else "the session id must be letters, digits, - or _ (at most 100)")
@@ -3796,7 +3803,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
             except OSError as e:  # a full disk, a home that is not a writable folder
                 problem = f"could not write the file: {e.strerror or e}"
             else:
-                checkpoint_record_folder(sid, record["written_at"], cwd)
+                recorded = checkpoint_record_folder(sid, record["written_at"], cwd)
     removed = remove_state_file(state_file, sid) if state_file is not None else None
     if problem:
         if removed:
@@ -3806,7 +3813,9 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
             log(f"checkpoint for {sid} not saved: {logged or problem}")
         return 2
     log(f"checkpoint for {sid} saved ({size:,} bytes)")
+    hours = checkpoint_carry_hours() if recorded else 0  # the window as it is now; the hook reads it when it runs
     print(f"longhaul checkpoint: saved for {sid} ({size:,} bytes); it comes back after a compaction or a resume"
+          f"{f', and once after a /clear in this folder within {hours:g} h' if hours else ''}"
           f"{'; the state file could not be removed' if removed is False else ''}")
     return 0
 
@@ -3875,6 +3884,120 @@ def checkpoint_text(kept: dict, now: float) -> str:
     return "\n".join(lines)
 
 
+def checkpoint_carry_hours() -> float:
+    """LONGHAUL_CHECKPOINT_CARRY_HOURS, read at call time as guard_mode()
+    is: how old, in hours, a checkpoint a /clear carries over may be. 0
+    or off turns carrying off (0.0); unset, or anything but a positive
+    number, is the default, as setting() takes a typo."""
+    raw = (os.environ.get("LONGHAUL_CHECKPOINT_CARRY_HOURS") or "").strip()
+    if raw.lower() == "off":
+        return 0.0
+    try:
+        hours = float(raw)
+    except ValueError:
+        return CHECKPOINT_CARRY_HOURS
+    if hours == 0:
+        return 0.0
+    return hours if math.isfinite(hours) and hours > 0 else CHECKPOINT_CARRY_HOURS
+
+
+def checkpoint_carry_record(raw: bytes, sid: str):
+    """A carry record read back (checkpoint_record_folder): (its time and
+    folder, None), or (None, why not, for the log)."""
+    if len(raw) > CHECKPOINT_CARRY_RECORD_MAX:
+        return None, f"its record is over {CHECKPOINT_CARRY_RECORD_MAX:,} bytes"
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None, f"its record is not JSON ({len(raw)} bytes)"
+    if not isinstance(record, dict):
+        return None, "its record is not an object"
+    if record.get("session_id") != sid:
+        return None, "the session_id in its record is another session's"
+    at = as_number(record.get("written_at"))
+    if at is None:
+        return None, "its record's written_at is not a number"
+    folder = record.get("folder")
+    if not isinstance(folder, str) or not os.path.isabs(folder) or shown(folder, 1024) != folder:
+        return None, "its record's folder is not a plain absolute path"
+    return {"written_at": at, "folder": folder}, None
+
+
+def checkpoint_carry(data: dict, now: float):
+    """After a /clear, which gives the conversation a new id, so the new
+    session has no checkpoint of its own: the answer that carries over
+    the newest checkpoint saved in its folder (the two compared by real
+    path), within the carry window and never carried before, or None.
+    Carried once: the record is renamed <session>.carried.json, so of
+    two clears at one moment one takes it. A checkpoint without a record
+    (saved before the folder was recorded) is never carried, and one
+    from another folder never comes back. The text is the compaction's,
+    with one line first for the model, and the user's line says so by
+    age alone; the log names the sessions, never the text."""
+    hours = checkpoint_carry_hours()
+    cwd = data.get("cwd")
+    if not hours or not isinstance(cwd, str) or not os.path.isabs(cwd) or shown(cwd, 1024) != cwd:
+        return None
+    here, window, sid = os.path.realpath(cwd), hours * 3600, data["session_id"]
+    try:
+        entries = list(os.scandir(LONGHAUL_HOME / "checkpoints"))
+    except OSError:  # no folder: nothing was ever saved
+        return None
+    found = []
+    for entry in entries:
+        old = entry.name[:-len(".carry.json")]
+        if not entry.name.endswith(".carry.json") or old == sid or not re.fullmatch(GUARD_ID, old):
+            continue
+        try:
+            # A record last written before the window opened holds an
+            # older time still: it is not even read.
+            if entry.stat().st_mtime < now - window - 60:
+                continue
+            with open(entry.path, "rb") as f:
+                raw = f.read(CHECKPOINT_CARRY_RECORD_MAX + 1)
+        except OSError:
+            continue
+        record, problem = checkpoint_carry_record(raw, old)
+        if problem:
+            log(f"checkpoint for {old} not carried: {problem}")
+        elif os.path.realpath(record["folder"]) == here and now - record["written_at"] <= window:
+            found.append((record["written_at"], old, record))
+    for at, old, record in sorted(found, reverse=True):
+        try:
+            with checkpoint_path(old).open("rb") as f:
+                raw = f.read(CHECKPOINT_FILE_MAX + 1)
+        except OSError as e:
+            log(f"checkpoint for {old} not carried: {e.strerror or e}")
+            continue
+        kept, problem = checkpoint_load(raw, old, now)
+        if not problem and kept["written_at"] != at:
+            problem = "it was saved again without its folder being recorded"
+        if problem:
+            log(f"checkpoint for {old} not carried: {problem}")
+            continue
+        age = ago_text(now - at)[:-len(" ago")]
+        text = (f"Carried over from the session before /clear (saved {age} ago, in this folder). "
+                f"If the user has started something new, ignore it.\n" + checkpoint_text(kept, now))
+        carried = checkpoint_carry_path(old, carried=True)
+        try:
+            os.rename(checkpoint_carry_path(old), carried)
+        except FileNotFoundError:  # another clear took it a moment ago
+            continue
+        except OSError as e:
+            log(f"checkpoint for {old} not carried: its record could not be marked carried: {e.strerror or e}")
+            continue
+        try:
+            write_json(carried, {"session_id": old, "written_at": at, "folder": record["folder"],
+                                 "carried_into": sid, "carried_at": now})
+        except OSError:  # the rename has marked it already; the names are a courtesy
+            pass
+        log(f"checkpoint for {old} carried into {sid} after clear ({len(raw)} bytes, "
+            f"written {max(0, int(now - at))} s earlier)")
+        return {"systemMessage": f"Longhaul restored your checkpoint from before /clear ({age} old).",
+                "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+    return None
+
+
 def checkpoint_check(data, now: float | None = None):
     """The hook's answer for one input: the JSON that puts the session's
     checkpoint back, or None. Only a SessionStart for compact, clear or
@@ -3890,15 +4013,16 @@ def checkpoint_check(data, now: float | None = None):
     path = checkpoint_path(sid)
     if path is None:
         return None
+    now = time.time() if now is None else now
     try:
         with path.open("rb") as f:
             raw = f.read(CHECKPOINT_FILE_MAX + 1)  # a hand-made file can be any size; past the cap it is not read
     except FileNotFoundError:
-        return None
+        # None of its own: after a /clear, the one saved before it in this folder.
+        return checkpoint_carry(data, now) if data["source"] == "clear" else None
     except OSError as e:
         log(f"checkpoint for {sid} not put back: {e.strerror or e}")
         return None
-    now = time.time() if now is None else now
     kept, problem = checkpoint_load(raw, sid, now)
     if problem:
         log(f"checkpoint for {sid} not put back: {problem}")

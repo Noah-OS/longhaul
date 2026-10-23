@@ -6259,10 +6259,10 @@ class Settings(unittest.TestCase):
 class Checkpoint(unittest.TestCase):
     """`longhaul checkpoint` (Sprint 4, C1): the model's own structured
     state, saved by the skill through `checkpoint save` and put back by the
-    plugin's SessionStart hook after a compaction or a resume (a /clear
-    gives the session a new id, so until the live check says otherwise
-    nothing promises a return after one; the hook answers a clear with
-    the same id all the same)."""
+    plugin's SessionStart hook after a compaction or a resume, and once
+    after a /clear, which gives the conversation a new id, from the folder
+    the save ran in (Sprint 8; the hook answers a clear with the same id
+    as a compaction)."""
 
     # The model's text. It belongs in the file and in the hook's stdout, which
     # the engine hands to the model, and nowhere else: not in `save`'s lines,
@@ -6415,6 +6415,10 @@ class Checkpoint(unittest.TestCase):
         text = self.context(self.check(self.start(), now=at + 10))
         self.assertEqual(text.count(" (changed)"), 20)
         self.assertLess(len(text), 10_000, len(text))
+        # Carried over after a /clear, its line first: still under the cap.
+        text = self.context(self.check(self.start("clear", "s2", cwd=self.work), now=at + 10))
+        self.assertEqual(text.count(" (changed)"), 20)
+        self.assertLess(len(text), 10_000, len(text))
 
     def test_a_startup_or_a_subagent_gets_nothing_back(self):
         self.assertEqual(self.save(self.state(), "s1").returncode, 0)
@@ -6512,9 +6516,9 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(calls["matcher"], "Read|Bash")
         # The guard names the project's code index at startup (Sprint 6, G3)
         # and forgets its reads after a compaction or a clear; the
-        # checkpoint comes back after a compaction or a resume (the clear
-        # in its matcher is kept: it is harmless, and the live check will
-        # say whether a /clear keeps the id).
+        # checkpoint comes back after a compaction or a resume, and after a
+        # clear, which gives a new id, it is carried over from the folder
+        # (Sprint 8).
         self.assertEqual(set(starts), {"startup", "compact|clear", "compact|clear|resume"})
         handlers = {}
         for entry, command in ((calls, "guard"), (starts["startup"], "guard"), (starts["compact|clear"], "guard"),
@@ -6554,7 +6558,8 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         size = self.file().stat().st_size
         self.assertEqual(out.stdout, f"longhaul checkpoint: saved for s1 ({size:,} bytes); "
-                                     "it comes back after a compaction or a resume\n")
+                                     "it comes back after a compaction or a resume, "
+                                     "and once after a /clear in this folder within 6 h\n")
         self.assertEqual(out.stderr, "")
         self.assertEqual(oct(self.file().stat().st_mode & 0o777), oct(0o600))
         self.assertEqual(sorted(p.name for p in self.file().parent.iterdir()), ["s1.carry.json", "s1.json"],
@@ -6766,7 +6771,8 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         size = self.file().stat().st_size
         self.assertEqual(out.stdout, f"longhaul checkpoint: saved for s1 ({size:,} bytes); "
-                                     "it comes back after a compaction or a resume\n")
+                                     "it comes back after a compaction or a resume, "
+                                     "and once after a /clear in this folder within 6 h\n")
         self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
         self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"],
                          "the state file went, the checkpoint stays")
@@ -6860,6 +6866,217 @@ class Checkpoint(unittest.TestCase):
         self.assertNotIn(self.S, "\n".join(longhaul.inspect_lines(report)))
         self.assertNotIn(self.S, json.dumps(list(longhaul.inspect_records(report))))
         self.assertIn("checkpoint for s1", self.log(), "the log names the session")
+        self.assertNotIn(self.S, self.log())
+
+    # After a /clear (Sprint 8; the owner's plan of 2026-10-23: save a
+    # checkpoint when the context grows large, /clear, go on fresh). The
+    # clear gives the conversation a new id, so the hook finds nothing under
+    # it; it carries over, once, the newest checkpoint saved in the new
+    # session's folder within LONGHAUL_CHECKPOINT_CARRY_HOURS (6 by default).
+
+    CARRIED = ("Carried over from the session before /clear (saved {} ago, in this folder). "
+               "If the user has started something new, ignore it.")
+
+    def clear(self, session="s2", cwd=None, now=None):
+        return self.check(self.start("clear", session=session, cwd=cwd or self.work), now)
+
+    def carry(self, session="s1"):
+        return self.home / "checkpoints" / f"{session}.carry.json"
+
+    def saved_at(self, session="s1"):
+        return json.loads(self.file(session).read_text())["written_at"]
+
+    def test_after_a_clear_the_checkpoint_saved_in_this_folder_comes_back_once_with_its_age_and_what_changed_since(self):
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = self.saved_at()
+        (self.work / "b.py").write_text("b, again")
+        os.utime(self.work / "b.py", (at + 5, at + 5))
+        (self.work / "c.py").unlink()
+        answer = self.clear("s2", now=at + 125)
+        self.assertEqual(set(answer), {"systemMessage", "hookSpecificOutput"})
+        self.assertEqual(answer["systemMessage"], "Longhaul restored your checkpoint from before /clear (2 min old).")
+        self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        first, rest = self.context(answer).split("\n", 1)
+        self.assertEqual(first, self.CARRIED.format("2 min"), "one line first, for the model")
+        # The rest is what a compaction puts back, the files changed since among it.
+        self.assertEqual(rest, self.context(self.check(self.start("compact", "s1"), now=at + 125)))
+        self.assertIn(f"\ngoal: finish the parser {self.S}\n", rest)
+        self.assertTrue(rest.endswith("\nChanged since the checkpoint: b.py (changed), c.py (gone); "
+                                      "check them before trusting this."), rest)
+        # Once: a second clear, in that session or another, gets nothing.
+        # The checkpoint is still its own session's, after a resume.
+        for session in ("s2", "s3"):
+            self.assertIsNone(self.clear(session, now=at + 130), session)
+        self.assertIn(self.S, self.context(self.check(self.start("resume", "s1"), now=at + 130)))
+        # Recorded beside the checkpoint, 0600: the record is renamed, so
+        # two clears at one moment cannot both take it.
+        carried = self.home / "checkpoints" / "s1.carried.json"
+        self.assertFalse(self.carry().exists())
+        self.assertEqual(oct(carried.stat().st_mode & 0o777), oct(0o600))
+        record = json.loads(carried.read_text())
+        self.assertEqual((record["carried_into"], record["folder"], record["written_at"]), ("s2", str(self.work), at))
+        self.assertNotIn(self.S, carried.read_text())
+        # The log names the sessions and the size, never the text, and the
+        # user's line holds none of it.
+        self.assertIn("checkpoint for s1 carried into s2 after clear (", self.log())
+        self.assertNotIn(self.S, self.log())
+        self.assertNotIn(self.S, answer["systemMessage"])
+        # A new save is a new checkpoint: it is carried in its turn.
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = self.saved_at()
+        answer = self.clear("s3", now=at + 3 * 3600 + 10)
+        self.assertEqual(answer["systemMessage"], "Longhaul restored your checkpoint from before /clear (3 h old).")
+        self.assertTrue(self.context(answer).startswith(self.CARRIED.format("3 h") + "\nlonghaul checkpoint, written "))
+
+    def test_a_clear_in_another_folder_gets_nothing_and_a_symlinked_folder_matches_by_its_real_path(self):
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = self.saved_at()
+        (self.work / "sub").mkdir()
+        (self.tmp / "elsewhere").mkdir()
+        for cwd in (self.tmp / "elsewhere", self.work / "sub", self.tmp, self.tmp / "missing"):
+            self.assertIsNone(self.clear("s2", cwd=cwd, now=at + 60), cwd)
+        for cwd in ("work", "", None, ["x"], 7, str(self.work) + "\x00"):  # not a plain absolute path, or none at all
+            data = self.start("clear", "s2")
+            data["cwd"] = cwd
+            self.assertIsNone(self.check(data, at + 60), repr(cwd))
+        data.pop("cwd")
+        self.assertIsNone(self.check(data, at + 60), "no cwd")
+        self.assertTrue(self.carry().exists(), "a miss takes nothing")
+        link = self.tmp / "link"
+        link.symlink_to(self.work)
+        self.assertIn(self.S, self.context(self.clear("s2", cwd=link, now=at + 60)), "the link's real path is the folder")
+        # And the other way: saved through the link, cleared in the folder itself.
+        self.assertEqual(self.save(self.state(), "s1", cwd=link).returncode, 0)
+        self.assertIn(self.S, self.context(self.clear("s3", cwd=self.work, now=self.saved_at() + 60)))
+        self.assertNotIn(self.S, self.log())
+
+    def test_a_clear_carries_only_a_checkpoint_saved_within_the_carry_window(self):
+        def fresh():
+            self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+            return self.saved_at()
+
+        at = fresh()
+        self.assertIsNone(self.clear(now=at + 7 * 3600), "7 h old: past the default 6 h")
+        self.assertTrue(self.carry().exists())
+        answer = self.clear(now=at + 6 * 3600 - 60)
+        self.assertEqual(answer["systemMessage"], "Longhaul restored your checkpoint from before /clear (5 h old).")
+        # A positive number of hours; 0 or off turns carrying off; anything
+        # else is the default, as setting() takes a typo.
+        cases = [("8", 7 * 3600, True), ("0.5", 3600, False), ("0.5", 20 * 60, True), ("off", 60, False),
+                 ("OFF", 60, False), ("0", 60, False), ("abc", 5 * 3600, True), ("-1", 5 * 3600, True),
+                 ("-1", 7 * 3600, False), ("nan", 5 * 3600, True), ("", 7 * 3600, False)]
+        for value, age, carried in cases:
+            at = fresh()
+            with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_CARRY_HOURS": value}):
+                answer = self.clear(now=at + age)
+            self.assertEqual(answer is not None, carried, (value, age))
+            self.assertEqual(self.carry().exists(), not carried, (value, age))
+        # The save's line says what a /clear will do, by the window as it is
+        # at the save; the folder is recorded all the same, as the hook
+        # reads the window when it runs.
+        out = self.save(self.state(), "s1", env={"LONGHAUL_CHECKPOINT_CARRY_HOURS": "0.5"})
+        self.assertTrue(out.stdout.endswith("; it comes back after a compaction or a resume, "
+                                            "and once after a /clear in this folder within 0.5 h\n"), out.stdout)
+        out = self.save(self.state(), "s1", env={"LONGHAUL_CHECKPOINT_CARRY_HOURS": "off"})
+        self.assertTrue(out.stdout.endswith("; it comes back after a compaction or a resume\n"), out.stdout)
+        self.assertTrue(self.carry().exists())
+
+    def test_a_clear_never_carries_a_checkpoint_saved_without_its_folder_or_one_its_record_does_not_match(self):
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = self.saved_at()
+        record = json.loads(self.carry().read_text())
+        # A checkpoint saved before the folder was recorded, or by a
+        # Longhaul that does not record it, has no record: it stays its own
+        # session's.
+        self.carry().unlink()
+        self.assertIsNone(self.clear(now=at + 60), "no record of its folder")
+        self.assertIn(self.S, self.context(self.check(self.start("compact", "s1"), now=at + 60)), "it still loads")
+        cases = [
+            ("{not json", "not JSON"),
+            ("[]", "not an object"),
+            (json.dumps({**record, "written_at": at - 1}), "the checkpoint was saved again without it"),
+            (json.dumps({**record, "written_at": "now"}), "written_at is not a number"),
+            (json.dumps({**record, "session_id": "s9"}), "another session's"),
+            (json.dumps({k: v for k, v in record.items() if k != "folder"}), "no folder"),
+            (json.dumps({**record, "folder": 7}), "a folder that is not text"),
+            (json.dumps({**record, "folder": "work"}), "a relative folder"),
+            (json.dumps({**record, "folder": str(self.work) + "\x00"}), "a NUL"),
+            (json.dumps({**record, "pad": "x" * 100_000}), "far over any record's size"),
+        ]
+        for raw, reason in cases:
+            self.carry().write_text(raw)
+            self.assertIsNone(self.clear(now=at + 60), reason)
+        # The record whole, the checkpoint not: missing, cut short, another session's.
+        self.carry().write_text(json.dumps(record))
+        good = self.file().read_text()
+        for raw in ("{not json", json.dumps({**json.loads(good), "session_id": "s9"})):
+            self.file().write_text(raw)
+            self.assertIsNone(self.clear(now=at + 60), raw[:20])
+        self.file().unlink()
+        self.assertIsNone(self.clear(now=at + 60), "the checkpoint is gone")
+        self.assertIn("checkpoint for s1 not carried: ", self.log(), "a record that is not whole is one line")
+        self.assertNotIn(self.S, self.log())
+        # Whole again: it is carried.
+        self.file().write_text(good)
+        self.assertIn(self.S, self.context(self.clear(now=at + 60)))
+
+    def test_after_a_clear_the_new_sessions_own_checkpoint_comes_first_then_the_newest_in_the_folder(self):
+        self.assertEqual(self.save(self.state(goal=f"the second session's own {self.S}"), "s2").returncode, 0)
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)  # newer, in the same folder
+        at = self.saved_at("s1")
+        answer = self.clear("s2", now=at + 60)
+        self.assertEqual(set(answer), {"hookSpecificOutput"}, "its own, as after a compaction: no carry line")
+        self.assertIn("goal: the second session's own", self.context(answer))
+        self.assertFalse(self.context(answer).startswith("Carried over"))
+        self.assertTrue(self.carry("s1").exists() and self.carry("s2").exists(), "nothing was carried")
+        # A new session takes the newest; the next, the next newest.
+        self.assertIn("goal: finish the parser", self.context(self.clear("s3", now=at + 60)))
+        self.assertIn("goal: the second session's own", self.context(self.clear("s4", now=at + 60)))
+        self.assertIsNone(self.clear("s5", now=at + 60))
+        # A file of its own that is not whole is still its own: one line, nothing carried.
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        self.file("s6").write_text("{not json")
+        self.assertIsNone(self.clear("s6", now=self.saved_at() + 60))
+        self.assertIn("checkpoint for s6 not put back: not JSON", self.log())
+        self.assertTrue(self.carry("s1").exists())
+
+    def test_a_compaction_a_resume_a_startup_or_a_subagent_carries_nothing_over(self):
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = self.saved_at()
+        for source in ("compact", "resume", "startup"):
+            self.assertIsNone(self.check(self.start(source, "s2", cwd=self.work), now=at + 60), source)
+        self.assertIsNone(self.check(self.start("clear", "s2", agent="agent-1", cwd=self.work), now=at + 60))
+        self.assertTrue(self.carry().exists())
+        for source in ("compact", "resume"):
+            answer = self.check(self.start(source, "s1", cwd=self.work), now=at + 60)
+            self.assertEqual(set(answer), {"hookSpecificOutput"}, "its own session's, as before")
+            self.assertTrue(self.context(answer).startswith("longhaul checkpoint, written "), source)
+        self.assertTrue(self.carry().exists(), "putting it back in its own session does not carry it")
+
+    def test_the_hook_as_the_plugin_registers_it_carries_the_checkpoint_after_a_clear(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
+        [entry] = [e for e in hooks["hooks"]["SessionStart"] if "main(['checkpoint'])" in e["hooks"][0]["args"][2]]
+        self.assertIn("clear", entry["matcher"].split("|"))
+        [handler] = entry["hooks"]
+        command = [sys.executable] + [str(HERE) if arg == "${CLAUDE_PLUGIN_ROOT}" else arg for arg in handler["args"]]
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        raw = json.dumps(self.start("clear", "s2", cwd=self.work))
+
+        def run(env=None):
+            return subprocess.run(command, input=raw, cwd=self.work, env={**self.env, **(env or {})},
+                                  capture_output=True, text=True, timeout=handler["timeout"])
+
+        out = run({"LONGHAUL_CHECKPOINT_CARRY_HOURS": "off"})
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        out = run()
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        answer = json.loads(out.stdout)
+        self.assertRegex(answer["systemMessage"], r"^Longhaul restored your checkpoint from before /clear \(\d+ s old\)\.$")
+        text = answer["hookSpecificOutput"]["additionalContext"]
+        self.assertRegex(text.split("\n", 1)[0], r"^Carried over from the session before /clear \(saved \d+ s ago, in this folder\)\. "
+                                                 r"If the user has started something new, ignore it\.$")
+        self.assertIn(f"\ngoal: finish the parser {self.S}\n", text)
+        self.assertEqual((run().returncode, run().stdout), (0, ""), "once")
         self.assertNotIn(self.S, self.log())
 
 
