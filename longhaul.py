@@ -5563,7 +5563,8 @@ def reminder_due(data: dict):
     """The context's size when it has crossed a multiple of the threshold
     above the highest this session was told of, which is recorded; else
     None. A subagent's input is never reminded: its context is not the
-    conversation's. A threshold that is neither a number nor off is
+    conversation's, and neither is a session in the trial's usual arm
+    (trial_arm()), which records nothing either. A threshold that is neither a number nor off is
     logged once per session and kind."""
     at, junk = reminder_threshold()
     if at is None or data.get("agent_id") is not None:
@@ -5576,6 +5577,8 @@ def reminder_due(data: dict):
         return None
     crossed = size // at * at
     if not crossed and not junk:
+        return None
+    if trial_arm(data.get("session_id")) == "usual":  # the checkpoint A/B's usual arm hears none (the trial section)
         return None
     with locked("guard"):  # the guard's record, written by its hook at the same moments
         kept = read_json(record)

@@ -7972,6 +7972,52 @@ class Trial(unittest.TestCase):
         self.link("y2", "y1")
         self.assertIn(longhaul.trial_root("y1"), ("y1", "y2"))
 
+    def hook(self, command, data):
+        """A hook command's stdout for `data`, in this process, in a terminal's environment."""
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(longhaul.main([command]), 0)
+        return out.getvalue()
+
+    def test_the_reminder_is_silent_in_usual_and_said_in_habit_and_with_no_trial_on_both_paths(self):
+        transcript = self.tmp / "t.jsonl"
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 202_994,
+                 "output_tokens": 900}
+        transcript.write_text(json.dumps({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_1", "model": "claude-opus-5-5", "role": "assistant", "content": [], "usage": usage}}) + "\n")
+
+        def prompt(sid):
+            return self.hook("reminder", {"session_id": sid, "transcript_path": str(transcript), "cwd": str(self.work),
+                                          "hook_event_name": "UserPromptSubmit", "prompt": f"go on {self.S}"})
+
+        def tool(sid):
+            return self.hook("guard", {"session_id": sid, "transcript_path": str(transcript), "cwd": str(self.work),
+                                       "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                       "tool_input": {"command": "ls"}, "tool_use_id": "t1"})
+
+        def said(out, event):
+            answer = json.loads(out)
+            return (answer["systemMessage"], answer["hookSpecificOutput"]) == (
+                Reminder.USER.format(205), {"hookEventName": event, "additionalContext": Reminder.MODEL.format(205)})
+
+        self.trial()
+        usual, habit = self.ids("usual", 4, "u"), self.ids("habit", 3, "h")
+        for sid in usual[:2]:
+            self.assertEqual((prompt(sid), tool(sid)), ("", ""), "usual: neither path says it")
+        self.assertFalse((self.home / "guard" / f"{usual[0]}.json").exists(), "nor records it said it")
+        self.link(habit[2], usual[0])
+        self.assertEqual((prompt(habit[2]), tool(habit[2])), ("", ""), "a usual chain's carried session is usual")
+        self.assertTrue(said(prompt(habit[0]), "UserPromptSubmit"), "habit: the prompt's hook says it")
+        self.assertEqual(tool(habit[0]), "", "once")
+        self.assertTrue(said(tool(habit[1]), "PreToolUse"), "and the guard's")
+        # The trial stopped, or none at all: as before, on both paths.
+        self.trial(stopped_at=time.time() - 60)
+        self.assertTrue(said(tool(usual[0]), "PreToolUse"))
+        (self.home / "trial.json").unlink()
+        self.assertTrue(said(prompt(usual[1]), "UserPromptSubmit"))
+        self.assertTrue(said(tool(usual[2]), "PreToolUse"))
+        self.assertTrue(said(prompt(usual[3]), "UserPromptSubmit"))
+
     def test_status_counts_the_trials_sessions_and_chains_per_arm(self):
         self.trial(started=-10)
         habit, usual = self.ids("habit", 3, "h"), self.ids("usual", 2, "u")
