@@ -10586,39 +10586,57 @@ class Accounts(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual([a["name"] for a in self.accounts()], ["Max", "Team", "Pro"])
 
-    def test_guided_add_points_vs_codes_panel_at_the_wrapper_only_when_it_can_safely(self):
-        # The owner, 2026-10-23: "ask and do it". Plain JSON with the key unset:
-        # one line added, a copy kept. Anything else: the line to paste.
+    def test_guided_add_and_longhaul_vscode_point_the_panel_at_the_wrapper_as_vs_code_writes_its_settings(self):
+        # The owner, 2026-10-23: Longhaul does it for the user, on VS Code's own
+        # settings format (comments, trailing commas), a copy kept, after a yes.
         self.emails[str(self.tmp / ".claude-team")] = "team@example.com"
         settings = self.tmp / "vscode" / "settings.json"
         settings.parent.mkdir()
         wrapper = str((HERE / "longhaul-vscode").resolve())
-        answers = ["Team", "team@example.com", "", "n", "", "n", "", ""]
-        settings.write_text('{\n    "editor.fontSize": 13\n}\n')
-        out = self.guided(answers, LONGHAUL_VSCODE_SETTINGS=str(settings))
+        original = '{\n    // my font\n    "editor.fontSize": 13, /* why */\n    "url": "http://x//y",\n}\n'
+        settings.write_text(original)
+        out = self.guided(["Team", "team@example.com", "", "n", "", "n", "", ""], LONGHAUL_VSCODE_SETTINGS=str(settings))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn("Use these accounts in the VS Code panel too?", out.stdout)
-        self.assertEqual(json.loads(settings.read_text()), {"editor.fontSize": 13, "claudeCode.claudeProcessWrapper": wrapper})
+        self.assertIn("Use your Longhaul accounts in VS Code's Claude panel?", out.stdout)
+        self.assertIn("Developer: Reload Window", out.stdout)
+        after = settings.read_text()
+        self.assertEqual(longhaul.jsonc_load(after), {"editor.fontSize": 13, "url": "http://x//y",
+                                                      "claudeCode.claudeProcessWrapper": wrapper})
+        self.assertIn("// my font", after, "comments kept")
+        self.assertIn("/* why */", after)
         [backup] = settings.parent.glob("settings.json.before-longhaul-*")
-        self.assertEqual(json.loads(backup.read_text()), {"editor.fontSize": 13})
-        self.assertIn("Restart VS Code", out.stdout)
-        out = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_VSCODE_SETTINGS=str(settings))
-        self.assertIn("already uses these accounts", out.stdout)
-        for text, why in (('{\n  // mine\n  "a": 1\n}\n', "comments or another shape"),
-                          ('{"claudeCode.claudeProcessWrapper": "/other/wrapper"}', "already names another program")):
-            settings.write_text(text)
-            name = f"N{len(why)}"
-            self.emails[str(self.tmp / f".claude-{name.lower()}")] = f"{name.lower()}@example.com"
-            out = self.guided([name, f"{name.lower()}@example.com", "", "n", "", "n", ""],
-                              LONGHAUL_VSCODE_SETTINGS=str(settings))
-            self.assertIn(why, out.stdout)
-            self.assertIn(f'"claudeCode.claudeProcessWrapper": "{wrapper}"', out.stdout, "the line to paste")
-            self.assertEqual(settings.read_text(), text, "never edited")
-        settings.write_text("{}")
+        self.assertEqual(backup.read_text(), original)
+        on = self.longhaul("vscode", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertIn("already uses your Longhaul accounts", on.stdout)
+        off = self.longhaul("vscode", "off", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"editor.fontSize": 13, "url": "http://x//y"})
+        self.assertIn("uses its own sign-in again", off.stdout)
+        # Another program in the setting: replaced only on a yes; a file that
+        # is not one object: never edited, the line shown.
+        settings.write_text('{"claudeCode.claudeProcessWrapper": "/other/wrapper", "a": 1}')
+        self.emails[str(self.tmp / ".claude-pro")] = "pro@example.com"
+        out = self.guided(["Pro", "pro@example.com", "", "n", "", "n", ""], LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertIn("runs /other/wrapper now. Replace it with Longhaul's? [y/N]", out.stdout)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text())["claudeCode.claudeProcessWrapper"], "/other/wrapper",
+                         "Enter keeps the other program")
+        settings.write_text("[1, 2]")
         self.emails[str(self.tmp / ".claude-last")] = "last@example.com"
-        out = self.guided(["Last", "last@example.com", "", "n", "", "n", "n"], LONGHAUL_VSCODE_SETTINGS=str(settings))
-        self.assertIn("Not changed. To do it later", out.stdout)
-        self.assertEqual(settings.read_text(), "{}")
+        out = self.guided(["Last", "last@example.com", "", "n", "", "n", ""], LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertIn("not in a shape Longhaul edits safely", out.stdout)
+        self.assertIn(f'"claudeCode.claudeProcessWrapper": "{wrapper}"', out.stdout, "the line to add by hand")
+        self.assertEqual(settings.read_text(), "[1, 2]")
+
+    def test_the_settings_editor_keeps_what_vs_code_allows_and_refuses_what_it_cannot_read_back(self):
+        key, value = "claudeCode.claudeProcessWrapper", "/x/longhaul-vscode"
+        for text in ('{\n    "a": 1\n}\n', '{\n    "a": [1, 2,],\n}\n', '{"a": 1}', "{}", "{\n}\n",
+                     '{\n  "s": "a // not a comment",  // a comment\n  "b": 2 /* c */\n}'):
+            added = longhaul.jsonc_add(text, key, value)
+            self.assertIsNotNone(added, text)
+            self.assertEqual(longhaul.jsonc_load(added), {**longhaul.jsonc_load(text), key: value}, text)
+            self.assertEqual(longhaul.jsonc_load(longhaul.jsonc_drop(added, key)), longhaul.jsonc_load(text), text)
+        for text in ("[1]", "not json", '{"a": }', ""):
+            self.assertIsNone(longhaul.jsonc_add(text, key, value), text)
 
     def test_the_saved_switching_answer_is_read_by_the_terminal_and_the_panel_under_the_flag_and_the_environment(self):
         config = self.relay / "config.json"

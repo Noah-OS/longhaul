@@ -72,6 +72,9 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
+  longhaul vscode [on|off]      VS Code's Claude panel uses your Longhaul accounts
+                          (on), or its own sign-in again (off); it edits VS
+                          Code's settings for you, a copy kept
   longhaul setup [NAME]         sign each account in to its own folder (a browser
                           sign-in); only the emails in accounts.json count
   longhaul status               accounts, sign-ins, limits, links
@@ -7447,44 +7450,156 @@ VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
 VSCODE_WRAPPER_KEY = "claudeCode.claudeProcessWrapper"
 
 
-def guided_vscode() -> None:
-    """Offers to point VS Code's Claude panel at longhaul-vscode, so that its
-    chats use these accounts too. The owner's yes, 2026-10-23: "ask and do
-    it". It edits VS Code's user settings only when the file is plain JSON
-    and the key is unset, keeping a copy first; otherwise it shows the line
-    to paste. Nothing when VS Code's settings are not on this machine."""
-    wrapper = Path(__file__).resolve().parent / "longhaul-vscode"
-    if not VSCODE_SETTINGS.is_file() or not wrapper.is_file():
-        return
-    line = f'{json.dumps(VSCODE_WRAPPER_KEY)}: {json.dumps(str(wrapper))}'
-    text = VSCODE_SETTINGS.read_text(errors="replace")
+def jsonc_code(text: str):
+    """The positions in `text` outside comments, as VS Code's settings files
+    allow them (// and /* */), strings counted as code."""
+    i, n, in_str = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            yield i
+            if c == "\\" and i + 1 < n:
+                yield i + 1
+                i += 2
+                continue
+            in_str = c != '"'
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            in_str = c == '"'
+            yield i
+            i += 1
+
+
+def jsonc_load(text: str):
+    """VS Code's settings as data: comments and trailing commas allowed; None
+    when it does not read as JSON even so."""
+    code = "".join(text[i] for i in jsonc_code(text))
     try:
-        found = json.loads(text)
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", code))
     except (ValueError, RecursionError):
-        found = None
-    if isinstance(found, dict) and found.get(VSCODE_WRAPPER_KEY) == str(wrapper):
-        say("VS Code's Claude panel already uses these accounts.")
-        return
-    if not yes("Use these accounts in the VS Code panel too? Longhaul adds one line to VS Code's settings "
-               "(a copy of them is kept).", default=True):
-        say(f"Not changed. To do it later, add this line to VS Code's user settings: {line}")
-        return
-    if not isinstance(found, dict) or VSCODE_WRAPPER_KEY in found:
-        why = ("the setting already names another program" if isinstance(found, dict)
-               else "the file has comments or another shape Longhaul does not edit")
-        say(f"Not changed, because {why}. Add or set this line in VS Code's user settings yourself: {line}")
-        return
-    end = text.rindex("}")
-    before = text[:end].rstrip()
-    joined = (before + "\n    " if before.endswith("{") else before + ",\n    ") + line + "\n" + text[end:]
-    if json.loads(joined).get(VSCODE_WRAPPER_KEY) != str(wrapper):  # never a file that would not read back
-        say(f"Not changed. Add this line to VS Code's user settings yourself: {line}")
-        return
+        return None
+
+
+def jsonc_add(text: str, key: str, value: str):
+    """`text` with "key": value added as the top-level object's last member,
+    on its own line, everything else kept as it was (comments, commas, the
+    owner's spacing); None when the text is not one object, or the result
+    would not read back with the value."""
+    code = [i for i in jsonc_code(text) if not text[i].isspace()]
+    if not code or text[code[0]] != "{" or text[code[-1]] != "}":
+        return None
+    close, last = code[-1], code[-2] if len(code) > 1 else None
+    line = f"{json.dumps(key)}: {json.dumps(value)}"
+    start = text.rfind("\n", 0, close) + 1
+    if text[start:close].strip() == "" and last is not None and last < start:
+        joined = text[:start] + f"    {line}\n" + text[start:]
+    else:
+        joined = text[:close] + f"\n    {line}\n" + text[close:]
+    if last is not None and text[last] not in "{,":
+        joined = joined[:last + 1] + "," + joined[last + 1:]
+    found = jsonc_load(joined)
+    return joined if isinstance(found, dict) and found.get(key) == value else None
+
+
+def jsonc_drop(text: str, key: str):
+    """`text` without the line that holds only "key": ..., (a trailing comma
+    left behind is allowed in VS Code's settings); None when the key is not
+    on a line of its own, or the result would still hold it."""
+    lines = text.splitlines(keepends=True)
+    keep = [l for l in lines if not re.fullmatch(rf'\s*{re.escape(json.dumps(key))}\s*:\s*"(?:[^"\\]|\\.)*"\s*,?\s*', l)]
+    if len(keep) == len(lines):
+        return None
+    joined = "".join(keep)
+    found = jsonc_load(joined)
+    return joined if isinstance(found, dict) and key not in found else None
+
+
+VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
+    HOME / "Library" / "Application Support" / "Code" / "User" / "settings.json" if sys.platform == "darwin"
+    else HOME / ".config" / "Code" / "User" / "settings.json"))
+VSCODE_WRAPPER_KEY = "claudeCode.claudeProcessWrapper"
+VSCODE_RELOAD = "Reload VS Code to apply: Cmd+Shift+P, then Developer: Reload Window (or quit and reopen it)."
+
+
+def vscode_write(text: str) -> str:
+    """VS Code's settings replaced by `text`, a copy of the old kept beside
+    them; the copy's path, shown."""
     backup = VSCODE_SETTINGS.with_name(f"settings.json.before-longhaul-{time.strftime('%Y%m%d-%H%M%S')}")
-    backup.write_text(text)
-    VSCODE_SETTINGS.write_text(joined)
-    say(f"VS Code's Claude panel now uses these accounts (a copy of its old settings is {home_path(str(backup))}). "
-        "Restart VS Code, or reload its window, to apply.")
+    backup.write_text(VSCODE_SETTINGS.read_text(errors="replace"))
+    VSCODE_SETTINGS.write_text(text)
+    return home_path(str(backup))
+
+
+def vscode_on(asked: bool = False) -> int:
+    """Points VS Code's Claude panel at longhaul-vscode, so that its chats use
+    Longhaul's accounts (the owner, 2026-10-23: Longhaul does it for the
+    user). It edits VS Code's user settings as they are written, comments
+    and trailing commas kept, a copy saved first, and only after a yes;
+    when it cannot do so safely it says why and shows the line."""
+    wrapper = Path(__file__).resolve().parent / "longhaul-vscode"
+    if not VSCODE_SETTINGS.is_file():
+        if not asked:
+            say(f"VS Code's user settings are not at {home_path(str(VSCODE_SETTINGS))}: is VS Code installed and opened once?")
+        return 1
+    line = f"{json.dumps(VSCODE_WRAPPER_KEY)}: {json.dumps(str(wrapper))}"
+    text = VSCODE_SETTINGS.read_text(errors="replace")
+    found = jsonc_load(text)
+    current = found.get(VSCODE_WRAPPER_KEY) if isinstance(found, dict) else None
+    if current == str(wrapper):
+        say("VS Code's Claude panel already uses your Longhaul accounts.")
+        return 0
+    question = ("Use your Longhaul accounts in VS Code's Claude panel? Longhaul adds one line to VS Code's settings "
+                "(a copy of them is kept).")
+    if current:
+        question = f"VS Code's Claude panel runs {shown(current)} now. Replace it with Longhaul's?"
+    if not yes(question, default=not current):
+        say(f"Not changed. Run `longhaul vscode` to do it later.")
+        return 1
+    joined = jsonc_add(jsonc_drop(text, VSCODE_WRAPPER_KEY) or text if current else text, VSCODE_WRAPPER_KEY, str(wrapper))
+    if joined is None:
+        say(f"Not changed: VS Code's settings file is not in a shape Longhaul edits safely. Add this line to it yourself: {line}")
+        return 1
+    backup = vscode_write(joined)
+    say(f"Done: VS Code's Claude panel now uses your Longhaul accounts (the old settings are kept as {backup}). {VSCODE_RELOAD}")
+    return 0
+
+
+def vscode_off() -> int:
+    """`longhaul vscode off`: the panel back to its own sign-in, the line
+    Longhaul added taken out, a copy kept."""
+    if not VSCODE_SETTINGS.is_file():
+        say("VS Code's settings are not on this machine; nothing to change.")
+        return 0
+    text = VSCODE_SETTINGS.read_text(errors="replace")
+    found = jsonc_load(text)
+    if not (isinstance(found, dict) and VSCODE_WRAPPER_KEY in found):
+        say("VS Code's Claude panel does not use Longhaul's wrapper; nothing to change.")
+        return 0
+    joined = jsonc_drop(text, VSCODE_WRAPPER_KEY)
+    if joined is None:
+        say(f"Not changed: remove the {VSCODE_WRAPPER_KEY} line from VS Code's settings yourself.")
+        return 1
+    backup = vscode_write(joined)
+    say(f"Done: VS Code's Claude panel uses its own sign-in again (the old settings are kept as {backup}). {VSCODE_RELOAD}")
+    return 0
+
+
+def vscode(opts) -> int:
+    """`longhaul vscode [on|off]`."""
+    return vscode_off() if opts.action == "off" else vscode_on()
+
+
+def guided_vscode() -> None:
+    """The guided `longhaul add`'s last step: the same as `longhaul vscode`,
+    only when VS Code's settings are on this machine."""
+    if VSCODE_SETTINGS.is_file():
+        vscode_on(asked=True)
 
 
 def remove(opts) -> int:
@@ -7573,7 +7688,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "trial"):
+                            "trial", "vscode"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -7617,12 +7732,15 @@ def main(argv: list[str]) -> int:
                                 "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "vscode":
+            p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
+                           help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
         if cmd == "setup":
             p.add_argument("account", nargs="?", help="only this account (default: each one not signed in)")
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
-                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
+                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "trial": trial}[cmd](opts)
 
