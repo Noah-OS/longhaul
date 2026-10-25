@@ -111,6 +111,13 @@ async function popUps($: any, lines: string[]): Promise<void> {
       $.ui.toast(`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`, { timeoutMs: 8000 })
     else if ((m = body.match(/^account: refused a prompt in (\S+?): (.+?) is kept for (.+?); the chat runs on (.+)$/)) && m[1] === sid)
       $.ui.toast(`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`, { timeoutMs: 12000 })
+    // A newer Longhaul (said at a chat's start, once per version a day): a
+    // release names no chat, so any chat shows it; an install names the
+    // chat that runs the older version, and that chat alone shows it.
+    else if ((m = body.match(/^release: Longhaul (\S+) is out \(this is (\S+)\)$/)))
+      $.ui.toast(`Longhaul: ${m[1]} is out. To update: claude plugin marketplace update longhaul, then claude plugin update longhaul@longhaul, then /reload-plugins.`, { timeoutMs: 12000 })
+    else if ((m = body.match(/^release: Longhaul (\S+) is installed; (\S+) runs (\S+)$/)) && m[2] === sid)
+      $.ui.toast(`Longhaul: ${m[1]} is installed; this chat runs ${m[3]}. Type /reload-plugins to use it.`, { timeoutMs: 12000 })
   }
 }
 

@@ -97,7 +97,19 @@ Usage:
                           At startup in a git work tree with no code map, starts
                           `codegraph init` or `trail init` in the background, once
                           per project (the README says what each writes);
-                          LONGHAUL_INDEX=off turns that off
+                          LONGHAUL_INDEX=off turns that off. At startup, too,
+                          once a day, asks GitHub for the latest release in the
+                          background (LONGHAUL_UPDATE_CHECK=off turns it off),
+                          and says in one line when a newer Longhaul is out, or
+                          installed but not loaded in this chat (/reload-plugins)
+  longhaul update [status|on|off] [--yes]
+                          status (the default): the version this copy runs, the
+                          one Claude Code has installed, the latest release and
+                          when GitHub was asked, and whether Claude Code's own
+                          auto-update is on for Longhaul's marketplace; on or
+                          off sets it, in each account's list of marketplaces,
+                          after a yes in a terminal (--yes: without asking), a
+                          copy of the old file kept
   longhaul checkpoint save [ID] [--file PATH]
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
@@ -3649,7 +3661,9 @@ def guard_startup(data: dict, mode: str, index: str):
     still building: index_unfinished), then one sentence per init the
     auto-init started (INDEX_NOTE, with the index on; the two switches
     are independent); and for the user, a systemMessage of each init
-    started and each failure that stands (index_message); or None. A
+    started and each failure that stands (index_message), and of a newer
+    Longhaul installed or released (release_startup, which also starts the
+    day's release check in the background); or None. A
     subagent's start is not the session's, and without the index there
     is nothing to say of it: the install advice is the inspect report's,
     not every session's. What the index's part raises is logged and
@@ -3662,6 +3676,10 @@ def guard_startup(data: dict, mode: str, index: str):
         named = named and not index_unfinished(data["cwd"])
     except Exception as e:
         log(f"index: not started ({e!r})")
+    try:  # the release's part (release_startup): its one line goes last, on its own; what it raises costs the rest nothing
+        message = "\n".join(part for part in (message, release_startup(data)) if part)
+    except Exception as e:
+        log(f"release: nothing said at startup ({e!r})")
     notes = []
     if named:
         log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
@@ -6009,6 +6027,459 @@ def autocompact_note(opts) -> int:
     return 0
 
 
+# -------------------------------------------------------------- release
+#
+# Whether a newer Longhaul exists (the owner's decision of 2026-10-25,
+# "Both"). Claude Code's own plugin auto-update is off by default for a
+# marketplace like Longhaul's, and with it off nothing says a release is
+# out; a running chat keeps its version until /reload-plugins. So:
+# - once a day the startup hook starts a runner, detached, as the index's
+#   runner is started (release_spawn), and the hook never waits for it;
+#   the runner asks GitHub's API for the latest release of the repository
+#   this copy's manifest names (release_check). It is Longhaul's one
+#   request to GitHub: a GET carrying a User-Agent with Longhaul's version
+#   and an Accept header, nothing else (no id, no path, no account).
+#   LONGHAUL_UPDATE_CHECK=off and Claude Code's own
+#   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC each turn it off;
+# - what it found is LONGHAUL_HOME/release.json, read at a later start:
+#   the hook's systemMessage gets one line, a newer version installed than
+#   the chat runs first (Claude Code's installed_plugins.json; a local fact,
+#   said whatever the switch), else a newer release than the chat has, once
+#   per version a day. Each line said is one line in the log, which the
+#   display (hooks/display.ts) turns into a pop-up;
+# - `longhaul update` shows the versions, and turns Claude Code's
+#   auto-update on or off for Longhaul's marketplace (`autoUpdate` on its
+#   entry of known_marketplaces.json, as /plugin > Marketplaces writes
+#   it), after a yes, a copy of the file kept beside it.
+# The running version and the repository asked are the manifest's beside
+# the module, .claude-plugin/plugin.json, as this feature was specified
+# (2026-10-25); ADR-0001's decision 7 had kept the module off
+# .claude-plugin/, and this is the one place that reads it. The repository
+# comes from there and is not written here: the shipped code names no
+# owner's handle (the Name tests), and a fork asks its own. A copy without
+# a manifest runs "unknown" and asks nothing.
+
+RELEASE_RECORD = "release.json"  # under LONGHAUL_HOME: {checked_at, latest, error, said}
+RELEASE_EVERY = 86_400  # seconds between two asks of GitHub, whatever the last one answered
+RELEASE_GRACE = 60  # seconds a recorded ask may be ahead of the clock and still count as now
+RELEASE_TIMEOUT = 3  # seconds the request may take
+RELEASE_MAX = 1_000_000  # bytes of the answer read: a release's JSON is a few thousand
+RELEASE_PLUGIN = "longhaul@longhaul"  # Claude Code's name for the plugin installed from its marketplace
+RELEASE_MARKETPLACE = "longhaul"  # the marketplace's name (.claude-plugin/marketplace.json)
+# The runner, started by the hook as the index's is: an import, in its own process.
+RELEASE_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.release_run()"
+RELEASE_STEPS = ("run claude plugin marketplace update longhaul, then claude plugin update longhaul@longhaul, "
+                 "then /reload-plugins")
+RELEASE_OUT = "Longhaul {latest} is out (you have {have}): " + RELEASE_STEPS + "."
+RELEASE_INSTALLED = "Longhaul {installed} is installed; this chat runs {running}. Type /reload-plugins to use it."
+
+
+def release_version(text):
+    """(0, 2, 10) from "0.2.10", or from a tag's "v0.2.10"; None for
+    anything else, a pre-release's suffix included."""
+    m = re.fullmatch(r"v?(\d{1,6})\.(\d{1,6})\.(\d{1,6})", text) if isinstance(text, str) else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def release_newer(a, b) -> bool:
+    """Whether version a is newer than b, as numbers (0.2.10 > 0.2.9);
+    False when either is no version."""
+    va, vb = release_version(a), release_version(b)
+    return va is not None and vb is not None and va > vb
+
+
+def release_switch():
+    """Why the check is off, or None when it is on: LONGHAUL_UPDATE_CHECK
+    "off" in any case, or Claude Code's CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    set to anything; read at call time, as the other switches are."""
+    if (os.environ.get("LONGHAUL_UPDATE_CHECK") or "").lower() == "off":
+        return "LONGHAUL_UPDATE_CHECK=off"
+    if os.environ.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
+        return "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set"
+    return None
+
+
+def release_manifest() -> dict:
+    """This copy's own .claude-plugin/plugin.json, beside the module; {}
+    when it cannot be read (a copy without it)."""
+    found = read_json(Path(__file__).resolve().parent / ".claude-plugin" / "plugin.json")
+    return found if isinstance(found, dict) else {}
+
+
+def release_running(manifest: dict) -> str:
+    """The version this copy runs, its manifest's, or "unknown"."""
+    version = manifest.get("version")
+    return version if release_version(version) and not version.startswith("v") else "unknown"
+
+
+def release_url(manifest: dict):
+    """GitHub's API address for the latest release of the repository the
+    manifest names, https://github.com/OWNER/NAME; None for anything else,
+    so the check never asks anywhere but GitHub."""
+    repo = manifest.get("repository")
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9_][A-Za-z0-9._-]{0,99}?)"
+                     r"(?:\.git)?/?", repo) if isinstance(repo, str) else None
+    return f"https://api.github.com/repos/{m[1]}/{m[2]}/releases/latest" if m else None
+
+
+def release_path() -> Path:
+    return LONGHAUL_HOME / RELEASE_RECORD
+
+
+def release_record() -> dict:
+    """release.json, {} when missing or not an object: a fresh record, which
+    the next write replaces."""
+    kept = read_json(release_path())
+    return kept if isinstance(kept, dict) else {}
+
+
+def release_due(record: dict, now: float) -> bool:
+    """Whether GitHub is to be asked: never yet, or the last ask, answered
+    or not, RELEASE_EVERY or more ago, or so far ahead of the clock (it was
+    set back) that it says nothing of now."""
+    checked = as_number(record.get("checked_at"))
+    return checked is None or not -RELEASE_GRACE <= now - checked < RELEASE_EVERY
+
+
+def release_ask(url: str, running: str) -> tuple:
+    """One GET of `url`, within RELEASE_TIMEOUT, with the User-Agent GitHub
+    asks for and its Accept header and nothing else: (the latest release's
+    version, None), or (None, why): http-<code>, timeout, unreachable, or
+    unreadable for an answer that is no release."""
+    # Imported here, not at the top: the hooks import this module at every
+    # tool call, and urllib.request loads ssl (as index_key() says of hashlib).
+    import http.client
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(url, headers={"User-Agent": f"longhaul/{running}",
+                                                   "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(request, timeout=RELEASE_TIMEOUT) as answer:
+            body = answer.read(RELEASE_MAX + 1)
+    except urllib.error.HTTPError as e:
+        return None, f"http-{e.code}"
+    except urllib.error.URLError as e:
+        return None, "timeout" if isinstance(e.reason, (TimeoutError, socket.timeout)) else "unreachable"
+    except (TimeoutError, socket.timeout):
+        return None, "timeout"
+    except (OSError, http.client.HTTPException, ValueError):
+        return None, "unreachable"
+    try:
+        tag = json.loads(body).get("tag_name") if len(body) <= RELEASE_MAX else None
+    except (ValueError, AttributeError):
+        tag = None
+    found = release_version(tag)
+    return (".".join(map(str, found)), None) if found else (None, "unreadable")
+
+
+def release_check(now: float | None = None):
+    """The day's ask, in the runner (never in a hook): None, asking nothing,
+    when the check is off (release_switch), when the manifest names no
+    GitHub repository, or when it is not due (release_due); else the
+    record written. The ask is claimed first, its time written under the
+    release lock, so two runners never both ask and a runner that dies
+    still counts as the day's ask; the answer is written into the record
+    as it is then, what the startup wrote meanwhile kept: the latest
+    release on success (and no error), the error's kind on a failure (the
+    release known before kept). One log line, the version or the kind."""
+    if release_switch():
+        return None
+    manifest = release_manifest()
+    url, running = release_url(manifest), release_running(manifest)
+    if url is None:
+        return None
+    now = time.time() if now is None else now
+    with locked("release"):
+        record = release_record()
+        if not release_due(record, now):
+            return None
+        write_json(release_path(), {**record, "checked_at": now})
+    latest, error = release_ask(url, running)
+    with locked("release"):
+        record = {**release_record(), "checked_at": now}
+        if latest:
+            record["latest"] = latest
+            record.pop("error", None)
+        else:
+            record["error"] = error
+        write_json(release_path(), record)
+    log(f"release: asked GitHub: the latest release is {latest}" if latest else f"release: asked GitHub: no answer ({error})")
+    return record
+
+
+def release_run() -> None:
+    """The runner's whole work: release_check(), whatever it raises logged."""
+    try:
+        release_check()
+    except Exception as e:
+        log(f"release: the check stopped ({e!r})")
+
+
+def release_spawn() -> int:
+    """The runner, detached, as index_spawn() starts the index's: in its own
+    session, holding none of the hook's pipes, with `python3 -I`; its pid.
+    The hook never waits for it."""
+    here = str(Path(__file__).resolve().parent)
+    proc = subprocess.Popen([sys.executable, "-I", "-c", RELEASE_RUNNER, here], start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            close_fds=True)
+    pid = proc.pid
+    with warnings.catch_warnings():  # the handle is dropped with the runner still running: that is the point
+        warnings.simplefilter("ignore", ResourceWarning)
+        del proc
+    return pid
+
+
+def release_installed(cwd=None):
+    """The version Claude Code's installed_plugins.json, in the chat's config
+    folder's plugins/ (CLAUDE_CONFIG_DIR; unset is ~/.claude), records for
+    longhaul@longhaul: the newest of the installs that load at `cwd`, a
+    user's anywhere, a project's or a local one at its projectPath and
+    below; None without one (no file, junk, another way of installing)."""
+    found = read_json(Path(chat_config_dir()) / "plugins" / "installed_plugins.json")
+    entries = dict_at(found, "plugins").get(RELEASE_PLUGIN)
+    entries = [entries] if isinstance(entries, dict) else entries if isinstance(entries, list) else []
+    here = os.path.realpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    versions = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not release_version(entry.get("version")):
+            continue
+        if entry.get("scope") in ("project", "local"):
+            project = entry.get("projectPath")
+            if not (here and isinstance(project, str) and os.path.isabs(project)):
+                continue
+            project = os.path.realpath(project)
+            if not (here == project or inside(here, project)):
+                continue
+        versions.append(entry["version"])
+    return max(versions, key=release_version) if versions else None
+
+
+def release_marketplace(path: Path):
+    """Longhaul's entry in one known_marketplaces.json, or None."""
+    found = read_json(path)
+    entry = found.get(RELEASE_MARKETPLACE) if isinstance(found, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def release_auto_update(path: Path):
+    """Whether Claude Code's auto-update is on for Longhaul's marketplace in
+    that file: True only for autoUpdate true (off is the default for a
+    marketplace like Longhaul's); None when the file does not list it."""
+    entry = release_marketplace(path)
+    return None if entry is None else entry.get("autoUpdate") is True
+
+
+def release_status() -> dict:
+    """The release's state, for `longhaul doctor` (a contract: these keys
+    and no others): running, this copy's version or "unknown"; installed,
+    Claude Code's record for the cwd, or None; latest and checked (epoch
+    seconds), release.json's, or None; auto_update, for the chat's config
+    folder, None when unknown; check, "on" or "off". It reads and never
+    asks or writes."""
+    record = release_record()
+    latest, checked = record.get("latest"), as_number(record.get("checked_at"))
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = None
+    return {"running": release_running(release_manifest()), "installed": release_installed(cwd),
+            "latest": latest if release_version(latest) else None, "checked": None if checked is None else float(checked),
+            "auto_update": release_auto_update(Path(chat_config_dir()) / "plugins" / "known_marketplaces.json"),
+            "check": "off" if release_switch() else "on"}
+
+
+def release_startup(data: dict, now: float | None = None) -> str:
+    """The startup hook's part (guard_startup): the day's check started in
+    the background when it is due, and the one line for the user, "" for
+    none. Nothing for a subagent's start or a run nobody attends. First a
+    newer version installed than this chat runs, at each start; else,
+    with the check on, a newer release than both the installed and the
+    running version (those known), once per version a day, which the
+    record keeps as said. Each line said is logged, the installed one with
+    the session."""
+    if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+        return ""
+    now = time.time() if now is None else now
+    manifest = release_manifest()
+    running, off = release_running(manifest), release_switch()
+    if not off and release_url(manifest) and release_due(release_record(), now):
+        try:
+            release_spawn()
+        except Exception as e:
+            log(f"release: the check was not started ({getattr(e, 'strerror', None) or repr(e)})")
+    installed = release_installed(data.get("cwd"))
+    if release_newer(installed, running):
+        sid = data.get("session_id")
+        sid = sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) else "-"
+        log(f"release: Longhaul {installed} is installed; {sid} runs {running}")
+        return RELEASE_INSTALLED.format(installed=installed, running=running)
+    known = [v for v in (installed, running) if release_version(v)]
+    if off or not known:
+        return ""
+    with locked("release"):
+        record = release_record()
+        latest, said = record.get("latest"), dict_at(record, "said")
+        if not all(release_newer(latest, v) for v in known):
+            return ""
+        at = as_number(said.get("at"))
+        if said.get("latest") == latest and at is not None and 0 <= now - at < RELEASE_EVERY:
+            return ""
+        write_json(release_path(), {**record, "said": {"latest": latest, "at": now}})
+    log(f"release: Longhaul {latest} is out (this is {running})")
+    return RELEASE_OUT.format(latest=latest, have=installed or running)
+
+
+def release_files() -> list:
+    """Each known_marketplaces.json Claude Code keeps for a config folder
+    Longhaul knows, ~/.claude's, each account's and the chat's
+    (CLAUDE_CONFIG_DIR), once by its real path: an account's plugins/ is a
+    link into ~/.claude's (SHARED), and one file must be edited once. Only
+    the files there are, in that order."""
+    accounts, _problem = read_accounts_file()
+    folders = [DEFAULT_CONFIG]
+    folders += [config_of(a) for a in accounts or [] if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)]
+    folders.append(Path(chat_config_dir()))
+    seen, files = set(), []
+    for folder in folders:
+        real = os.path.realpath(folder / "plugins" / "known_marketplaces.json")
+        if real not in seen and os.path.isfile(real):
+            seen.add(real)
+            files.append(Path(real))
+    return files
+
+
+def release_set(path: Path, wanted: bool) -> str:
+    """autoUpdate set to `wanted` on Longhaul's entry of one
+    known_marketplaces.json, the file written whole as Claude Code writes
+    it (two spaces, its ending kept) with its mode kept, a copy of the old
+    beside it under a name of its own; the copy's path, shown. What it
+    cannot read or write is raised."""
+    text = path.read_text()
+    found = json.loads(text)
+    found[RELEASE_MARKETPLACE]["autoUpdate"] = wanted
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.before-longhaul-{stamp}")
+    n = 1
+    while backup.exists():  # two changes in one second: each copy kept
+        n += 1
+        backup = path.with_name(f"{path.name}.before-longhaul-{stamp}-{n}")
+    backup.write_text(text)
+    mode = path.stat().st_mode & 0o777
+    write_whole(path, json.dumps(found, indent=2) + ("\n" if text.endswith("\n") else ""))
+    os.chmod(path, mode)
+    return home_path(str(backup))
+
+
+def update_status_lines() -> list:
+    """`longhaul update status`: this copy's version, the installed one,
+    the latest release and when GitHub was asked, the check's switch, and
+    Claude Code's auto-update for Longhaul's marketplace in each file;
+    then what to do, when there is something to do. It reads and never
+    asks or writes."""
+    manifest, record, now = release_manifest(), release_record(), time.time()
+    running = release_running(manifest)
+    try:
+        installed = release_installed(os.getcwd())
+    except OSError:
+        installed = release_installed()
+    latest, checked, error = record.get("latest"), as_number(record.get("checked_at")), record.get("error")
+    latest = latest if release_version(latest) else None
+    lines = [f"Running here: {running} ({home_path(str(Path(__file__).resolve().parent))})",
+             f"Installed by Claude Code: {f'{installed} ({RELEASE_PLUGIN})' if installed else f'none recorded for {RELEASE_PLUGIN}'}"]
+    if checked is None:
+        lines.append("Latest release: not asked yet")
+    else:
+        failed = f"; that ask failed: {shown(error, 40)}" if isinstance(error, str) else ""
+        lines.append(f"Latest release: {latest or 'unknown'} (asked GitHub {ago_text(now - checked)}{failed})")
+    off = release_switch()
+    lines.append(f"Release check: off ({off})" if off else
+                 "Release check: on, once a day in the background; LONGHAUL_UPDATE_CHECK=off turns it off")
+    files = release_files()
+    if not files:
+        where = home_path(str(Path(chat_config_dir()) / "plugins" / "known_marketplaces.json"))
+        lines.append(f"Auto-update: unknown (no list of marketplaces at {where})")
+    for path in files:
+        on = release_auto_update(path)
+        lines.append(f"Auto-update: unknown (Longhaul's marketplace is not listed in {home_path(str(path))})" if on is None
+                     else f"Auto-update: on for Longhaul's marketplace in {home_path(str(path))}" if on
+                     else f"Auto-update: off for Longhaul's marketplace in {home_path(str(path))}; `longhaul update on` "
+                          "turns it on (or /plugin > Marketplaces > Enable auto-update)")
+    known = [v for v in (installed, running) if release_version(v)]
+    if latest and known and all(release_newer(latest, v) for v in known):
+        lines.append(f"Longhaul {latest} is out: {RELEASE_STEPS} in each chat.")
+    elif release_newer(installed, running):
+        lines.append(f"Longhaul {installed} is installed: a chat started before it loads it with /reload-plugins.")
+    return lines
+
+
+def update_switch(wanted: bool, assume_yes: bool) -> int:
+    """`longhaul update on|off`: autoUpdate on Longhaul's entry of each
+    known_marketplaces.json (release_files) that is not so already, after
+    a yes in a terminal; without a terminal only with --yes (exit 2
+    otherwise). A file it cannot read, or that does not list Longhaul's
+    marketplace, is said and left as it is (exit 1)."""
+    word = "on" if wanted else "off"
+    files = release_files()
+    if not files:
+        where = home_path(str(Path(chat_config_dir()) / "plugins" / "known_marketplaces.json"))
+        say(f"Claude Code's list of marketplaces is not at {where}: is Longhaul installed from its marketplace "
+            "(/plugin marketplace add, then /plugin install longhaul@longhaul)?")
+        return 1
+    todo, problems = [], 0
+    for path in files:
+        try:
+            found = json.loads(path.read_text())
+        except (OSError, ValueError):
+            found = None
+        entry = found.get(RELEASE_MARKETPLACE) if isinstance(found, dict) else None
+        if not isinstance(entry, dict):
+            problems += 1
+            say(f"Not changed: {home_path(str(path))} " + ("does not list Longhaul's marketplace."
+                                                           if isinstance(found, dict) else "could not be read as JSON."))
+        elif (entry.get("autoUpdate") is True) != wanted:
+            todo.append(path)
+    if not todo:
+        if len(files) > problems:
+            say(f"Claude Code's auto-update is already {word} for Longhaul's marketplace.")
+        return 1 if problems else 0
+    where = ", ".join(home_path(str(p)) for p in todo)
+    if not assume_yes:
+        if not terminal():
+            say(f"Not changed: `longhaul update {word}` asks first, in a terminal; run it in one, or add --yes "
+                f"to change {where} without asking.")
+            return 2
+        try:
+            agreed = yes(f"Turn {word} Claude Code's auto-update for Longhaul's marketplace? Longhaul sets autoUpdate "
+                         f"to {json.dumps(wanted)} in {where} (a copy is kept).", default=True)
+        except (EOFError, KeyboardInterrupt):
+            agreed = False
+        if not agreed:
+            say(f"Not changed. Run `longhaul update {word}` to do it later.")
+            return 1
+    for path in todo:
+        try:
+            backup = release_set(path, wanted)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            problems += 1
+            say(f"Not changed: {home_path(str(path))} could not be written ({getattr(e, 'strerror', None) or type(e).__name__}).")
+            continue
+        say(f"Done: Claude Code's auto-update is {word} for Longhaul's marketplace in {home_path(str(path))} "
+            f"(the old file is kept as {backup}).")
+    if wanted:
+        say("Claude Code updates Longhaul within about ten minutes of a session's first message and says "
+            "\"Plugin updated\"; a chat already running loads it with /reload-plugins.")
+    return 1 if problems else 0
+
+
+def update(opts) -> int:
+    """`longhaul update [status|on|off] [--yes]`."""
+    if opts.action == "status":
+        print("\n".join(update_status_lines()))
+        return 0
+    return update_switch(opts.action == "on", opts.yes)
+
+
 # ---------------------------------------------------------------- trial
 #
 # The checkpoint A/B (docs/plans/2026-10-23-checkpoint-ab-plan.md; the
@@ -8227,7 +8698,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "autocompact-note", "trial", "vscode", "models"):
+                            "account-check", "autocompact-note", "trial", "vscode", "models", "update"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -8280,6 +8751,12 @@ def main(argv: list[str]) -> int:
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
+        if cmd == "update":
+            p.add_argument("action", nargs="?", choices=["status", "on", "off"], default="status",
+                           help="status (the default): the running, installed and latest versions, and whether "
+                                "Claude Code's auto-update is on for Longhaul's marketplace; on, off: set it")
+            p.add_argument("--yes", action="store_true",
+                           help="on, off: change it without asking (needed without a terminal)")
         if cmd == "autocompact-note":
             p.add_argument("session", nargs="?", metavar="SID", help="the session compacted")
             p.add_argument("tokens", nargs="?", metavar="TOKENS", help="its context before, in tokens")
@@ -8293,7 +8770,7 @@ def main(argv: list[str]) -> int:
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "autocompact-note": autocompact_note,
-                "trial": trial}[cmd](opts)
+                "trial": trial, "update": update}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

@@ -17,6 +17,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ import threading
 import time
 import unittest
 from unittest import mock
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -33,6 +36,17 @@ HERE = Path(__file__).resolve().parent
 # keeps it off, so that no test starts a real `codegraph init` or `trail
 # init` from the PATH; the index tests turn it on in their own environment.
 os.environ.setdefault("LONGHAUL_INDEX", "off")
+# The release check (the owner, 2026-10-25) is Longhaul's one request to
+# GitHub: the suite keeps it off, and sets Claude Code's own switch for
+# nonessential traffic as well, which a child's environment keeps where it
+# drops the LONGHAUL_* variables, so no test's hook ever starts a real ask;
+# the Release tests turn it on with a fake urlopen. A run from inside a
+# chat would also hand every test that chat's CLAUDE_CONFIG_DIR, a real
+# config folder whose plugins/ the startup hook reads: CI has none, and
+# here neither.
+os.environ.setdefault("LONGHAUL_UPDATE_CHECK", "off")
+os.environ.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 sys.path.insert(0, str(HERE))
 import longhaul  # noqa: E402
 
@@ -7461,6 +7475,18 @@ class Shim(unittest.TestCase):
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
 
+    def test_the_shim_refuses_update_whose_on_and_off_edit_claude_codes_own_files(self):
+        # 2026-10-25: `longhaul update on|off` edits Claude Code's list of
+        # marketplaces; `update status` is read-only, but ADR-0001's decision 5
+        # lists what the shim admits, and each addition was the owner's, so it
+        # stays in a terminal until the owner adds it.
+        for args in (("update",), ("update", "status"), ("update", "on"), ("update", "on", "--yes"), ("update", "off")):
+            out = self.shim(*args)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("run it in a terminal", out.stderr, args)
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+        self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
+
     def test_the_shim_runs_checkpoint_save_which_writes_the_checkpoint_and_its_record_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
         # saves its own state through the shim; that file, and the record
@@ -11196,9 +11222,14 @@ class Display(unittest.TestCase):
             # is pinned against that line's exact format as given, and its
             # log call is not pinned below.
             "account": "account: refused a prompt in fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6: ~/code/client is kept for "
-                       "work and work-2; the chat runs on personal-1"}
+                       "work and work-2; the chat runs on personal-1",
+            # The release's two lines (the owner, 2026-10-25): a newer one is
+            # out, which names no session, and a newer one installed than a
+            # chat runs, which names that chat.
+            "out": "release: Longhaul 0.2.10 is out (this is 0.2.4)",
+            "installed": "release: Longhaul 0.2.5 is installed; fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 runs 0.2.4"}
         patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
-        self.assertEqual(len(patterns), 8)
+        self.assertEqual(len(patterns), 10)
         for pattern, (kind, line) in zip(patterns, lines.items()):
             js = pattern.replace("\\/", "/")
             self.assertRegex(line, js, kind)
@@ -11221,6 +11252,19 @@ class Display(unittest.TestCase):
                           "the decision names no pop-up for a refused repeat")
         self.assertEqual(re.match(account, lines["account"]).groups(),
                          (sid, "~/code/client", "work and work-2", "personal-1"))
+        # The release's: the versions, and the chat the installed line names,
+        # which alone shows it; the out line shows in any chat.
+        out, installed = (pattern.replace("\\/", "/") for pattern in patterns[8:10])
+        self.assertEqual(re.match(out, lines["out"]).groups(), ("0.2.10", "0.2.4"))
+        self.assertEqual(re.match(installed, lines["installed"]).groups(), ("0.2.5", sid, "0.2.4"))
+        self.assertIsNone(re.match(out, "release: asked GitHub: the latest release is 0.2.5"), "the check's own line")
+        self.assertIsNone(re.match(installed, "release: asked GitHub: the latest release is 0.2.5"))
+        self.assertIn("/^release: Longhaul (\\S+) is installed; (\\S+) runs (\\S+)$/)) && m[2] === sid)", self.SOURCE)
+        self.assertIn("/^release: Longhaul (\\S+) is out \\(this is (\\S+)\\)$/)))\n", self.SOURCE, "no session asked")
+        for toast in ("`Longhaul: ${m[1]} is installed; this chat runs ${m[3]}. Type /reload-plugins to use it.`",
+                      "`Longhaul: ${m[1]} is out. To update: claude plugin marketplace update longhaul, then claude "
+                      "plugin update longhaul@longhaul, then /reload-plugins.`"):
+            self.assertIn(toast, self.SOURCE)
         for toast in ("`Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps "
                       "the context small.`",
                       "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
@@ -11237,8 +11281,555 @@ class Display(unittest.TestCase):
                         'verb = "refused" if mode == "block" else "advised on"',
                         'who = " (a subagent)" if data.get("agent_id") is not None else ""',
                         'log(f"guard: {verb} a whole read of {shown} ({size:,} bytes) in {sid}{who}")',
-                        'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")'):
+                        'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")',
+                        'log(f"release: Longhaul {latest} is out (this is {running})")',
+                        'log(f"release: Longhaul {installed} is installed; {sid} runs {running}")'):
             self.assertIn(written, source, written)
+
+
+class Release(unittest.TestCase):
+    """Whether a newer Longhaul exists (the owner, 2026-10-25, "Both"):
+    Claude Code's plugin auto-update is off by default for Longhaul's
+    marketplace, and with it off nothing says a release is out. Once a day
+    the startup hook starts a runner, detached, that asks GitHub for the
+    latest release; a later start says a newer one is out, or first that a
+    newer one is installed than the chat runs; `longhaul update on` turns
+    Claude Code's auto-update on, after a yes. No test reaches the network:
+    urlopen is a fake (one that fails the test unless a test gives its
+    own), and the one test of the runner in its own process sends it to a
+    proxy on this machine."""
+
+    SID = "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"
+    UPDATE = ("run claude plugin marketplace update longhaul, then claude plugin update longhaul@longhaul, "
+              "then /reload-plugins")
+    # known_marketplaces.json as Claude Code writes it, Longhaul's entry and another.
+    MARKETS = {"claude-plugins-official": {"source": {"source": "github", "repo": "example/official"},
+                                           "installLocation": "/x/marketplaces/official",
+                                           "lastUpdated": "2026-10-24T17:02:01.569Z"},
+               "longhaul": {"source": {"source": "github", "repo": "example/longhaul"},
+                            "installLocation": "/x/marketplaces/longhaul", "lastUpdated": "2026-10-24T17:02:01.569Z"}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: the real paths the files are shown by
+        self.home, self.config = self.tmp / "home", self.tmp / "claude"
+        self.home.mkdir()
+        self.plugin = self.tmp / "plugin"  # this copy's own folder: its manifest is the running version
+        (self.plugin / ".claude-plugin").mkdir(parents=True)
+        self.manifest("0.2.4")
+        for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                        mock.patch.object(longhaul, "DEFAULT_CONFIG", self.config),
+                        mock.patch.object(longhaul, "__file__", str(self.plugin / "longhaul.py")),
+                        mock.patch.dict(os.environ, {"LONGHAUL_UPDATE_CHECK": "on"}),
+                        mock.patch("urllib.request.urlopen", self.unexpected)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ATTENDED"):
+            os.environ.pop(name, None)  # put back by the patch of the environment
+
+    def unexpected(self, *args, **kwargs):
+        raise AssertionError("a request to the network this test did not give an answer for")
+
+    def url(self):
+        return f"https://api.github.com/repos/{Name.HANDLE}/releases/latest"
+
+    def manifest(self, version, **fields):
+        data = {"name": "longhaul", "version": version, "repository": f"https://github.com/{Name.HANDLE}", **fields}
+        (self.plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps(data))
+
+    def installed(self, *rows, folder=None):
+        """installed_plugins.json as Claude Code writes it, with longhaul@longhaul's
+        installs: each row a version, or (version, scope, projectPath)."""
+        rows = [(row, "user", None) if isinstance(row, str) else row for row in rows]
+        path = (folder or self.config) / "plugins" / "installed_plugins.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 2, "plugins": {
+            "other@example": [{"scope": "user", "version": "9.9.9"}],
+            "longhaul@longhaul": [{"scope": scope, "installPath": f"/x/cache/longhaul/longhaul/{version}",
+                                   "version": version, **({"projectPath": project} if project else {})}
+                                  for version, scope, project in rows]}}, indent=2))
+
+    def markets(self, entries=None, folder=None) -> Path:
+        path = (folder or self.config) / "plugins" / "known_marketplaces.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.MARKETS if entries is None else entries, indent=2))  # no newline at the end
+        return path
+
+    def opener(self, *answers):
+        """A fake urlopen giving each answer in turn (a release's JSON as a
+        dict, bytes as they are, or an exception, raised), and its calls."""
+        calls, queue = [], list(answers)
+
+        def urlopen(request, *args, **kwargs):
+            calls.append((request, args, kwargs))
+            if not queue:
+                raise AssertionError("one request more than the test expected")
+            answer = queue.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return io.BytesIO(answer if isinstance(answer, bytes) else json.dumps(answer).encode())
+        return urlopen, calls
+
+    def check(self, now, *answers):
+        urlopen, calls = self.opener(*answers)
+        with mock.patch("urllib.request.urlopen", urlopen):
+            return longhaul.release_check(now=now), calls
+
+    def record(self):
+        return json.loads((self.home / "release.json").read_text())
+
+    def write(self, **record):
+        (self.home / "release.json").write_text(json.dumps(record))
+
+    def logged(self):
+        path = self.home / "longhaul.log"
+        lines = [line[20:] for line in path.read_text().splitlines()] if path.exists() else []
+        return [line for line in lines if line.startswith("release: ")]
+
+    def start(self, session=None, agent=None, cwd=None):
+        data = {"session_id": session or self.SID, "hook_event_name": "SessionStart", "source": "startup",
+                "cwd": str(cwd or self.tmp), "transcript_path": "/t/x.jsonl"}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "Explore"
+        return data
+
+    def said(self, data=None):
+        """The startup hook's systemMessage for a start, "" for none; the
+        runner is never started here, and the check never runs inline."""
+        with mock.patch.object(longhaul, "release_spawn"), \
+                mock.patch.object(longhaul, "release_check", side_effect=AssertionError("run inline")):
+            answer = longhaul.guard_check(data or self.start(), "warn", index="off")
+        return (answer or {}).get("systemMessage", "")
+
+    def out(self, latest, have):
+        return f"Longhaul {latest} is out (you have {have}): {self.UPDATE}."
+
+    def update(self, *args, terminal=False, answers=""):
+        """`longhaul update ARGS` from a terminal (LONGHAUL_TEST_TTY) or from a
+        script, `answers` typed at its question: the exit code and the output."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(answers)), \
+                mock.patch.dict(os.environ, {"LONGHAUL_TEST_TTY": "1" if terminal else "0"}):
+            code = longhaul.main(["update", *args])
+        return code, out.getvalue()
+
+    def test_the_check_asks_github_once_a_day_whatever_it_answered_and_keeps_what_it_found(self):
+        record, calls = self.check(1_000.0, {"tag_name": "v0.2.5", "name": "Longhaul 0.2.5", "body": "the notes"})
+        self.assertEqual(record, {"checked_at": 1_000.0, "latest": "0.2.5"})
+        self.assertEqual(self.record(), record)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(os.stat(self.home / "release.json").st_mode & 0o777, 0o600, "a file only you can read")
+        for later in (1_001.0, 1_000.0 + 86_399):
+            self.assertEqual(self.check(later), (None, []), "once a day")
+        # A day on it asks again. A failure is that day's ask too, and keeps
+        # the release it knew; a clock set back far is no reason to wait.
+        record, calls = self.check(87_400.0, TimeoutError("timed out"))
+        self.assertEqual((record, len(calls)), ({"checked_at": 87_400.0, "latest": "0.2.5", "error": "timeout"}, 1))
+        self.assertEqual(self.check(87_401.0), (None, []), "a failed ask waits a day as well: never a storm")
+        record, calls = self.check(10.0, {"tag_name": "v0.2.6"})
+        self.assertEqual((record, len(calls)), ({"checked_at": 10.0, "latest": "0.2.6"}, 1), "the error is gone")
+        self.assertEqual(self.logged(), ["release: asked GitHub: the latest release is 0.2.5",
+                                         "release: asked GitHub: no answer (timeout)",
+                                         "release: asked GitHub: the latest release is 0.2.6"])
+        # What another process wrote in the record meanwhile (the line said) is kept.
+        self.write(checked_at=0.0, latest="0.2.6", said={"latest": "0.2.6", "at": 5.0})
+        record, _ = self.check(200_000.0, {"tag_name": "v0.2.6"})
+        self.assertEqual(record["said"], {"latest": "0.2.6", "at": 5.0})
+        # A record that is not JSON is a fresh one: asked at once, written whole.
+        (self.home / "release.json").write_text("{not json")
+        record, calls = self.check(300_000.0, {"tag_name": "v0.2.7"})
+        self.assertEqual((record, len(calls)), ({"checked_at": 300_000.0, "latest": "0.2.7"}, 1))
+
+    def test_the_request_is_a_plain_get_that_carries_nothing_about_the_user(self):
+        _, [(request, args, kwargs)] = self.check(1_000.0, {"tag_name": "v0.2.5"})
+        self.assertEqual(request.full_url, self.url())
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIsNone(request.data, "no body")
+        self.assertEqual(dict(request.header_items()),
+                         {"User-agent": "longhaul/0.2.4", "Accept": "application/vnd.github+json"}, "no id, no path")
+        self.assertEqual((args, kwargs), ((), {"timeout": 3}))
+        # The repository asked is the one this copy's manifest names: the
+        # shipped manifest's is Longhaul's own.
+        shipped = json.loads((HERE / ".claude-plugin" / "plugin.json").read_text())
+        self.assertEqual(longhaul.release_url(shipped), self.url())
+        for repository in ("https://example.com/a/b", "ssh://github.com/a/b.git", "http://github.com/a/b", "", None, 5,
+                           "https://github.com/a/b/../../c", "https://github.com/a"):
+            self.assertIsNone(longhaul.release_url({"repository": repository}), repository)
+        self.assertEqual(longhaul.release_url({"repository": "https://github.com/a-b/c.d_e.git"}),
+                         "https://api.github.com/repos/a-b/c.d_e/releases/latest")
+        self.manifest("0.2.4", repository="https://example.com/a/b")
+        self.assertIsNone(longhaul.release_check(now=1e9), "no GitHub repository, no ask")  # urlopen is the unexpected one
+
+    def test_a_tag_is_read_as_a_version_and_versions_compare_as_numbers(self):
+        self.assertEqual(longhaul.release_version("v0.2.5"), (0, 2, 5))
+        self.assertEqual(longhaul.release_version("0.2.10"), (0, 2, 10))
+        for junk in ("", None, 5, "v0.2", "0.2.5-beta", "latest", " 0.2.5", "0.2.5\n"):
+            self.assertIsNone(longhaul.release_version(junk), junk)
+        self.assertTrue(longhaul.release_newer("0.2.10", "0.2.9"), "not as text")
+        self.assertTrue(longhaul.release_newer("1.0.0", "0.9.99"))
+        for a, b in (("0.2.9", "0.2.10"), ("0.2.5", "0.2.5"), ("0.2.5", None), (None, "0.2.5"), ("0.2.5", "unknown")):
+            self.assertFalse(longhaul.release_newer(a, b), (a, b))
+        # What GitHub may answer, and what is kept of it.
+        notfound = urllib.error.HTTPError(self.url(), 404, "Not Found", {}, None)
+        for n, (answer, kept) in enumerate(((notfound, ("error", "http-404")),
+                                            (TimeoutError("timed out"), ("error", "timeout")),
+                                            (socket.timeout("timed out"), ("error", "timeout")),
+                                            (urllib.error.URLError(socket.timeout("timed out")), ("error", "timeout")),
+                                            (urllib.error.URLError(OSError(65, "No route to host")), ("error", "unreachable")),
+                                            (ConnectionResetError(54, "reset"), ("error", "unreachable")),
+                                            (b"<html>rate limited</html>", ("error", "unreadable")),
+                                            (b"[]", ("error", "unreadable")),
+                                            ({"tag_name": 5}, ("error", "unreadable")),
+                                            ({"tag_name": "nightly"}, ("error", "unreadable")),
+                                            (b"x" * 2_000_001, ("error", "unreadable")),
+                                            ({"tag_name": "v0.2.10"}, ("latest", "0.2.10")))):
+            with self.subTest(answer=repr(answer)[:60]):
+                record, calls = self.check(1_000_000.0 * (n + 1), answer)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(record[kept[0]], kept[1])
+        self.assertNotIn("error", self.record())
+
+    def test_the_switches_turn_the_check_off_and_the_hook_starts_nothing(self):
+        for env in ({"LONGHAUL_UPDATE_CHECK": "off"}, {"LONGHAUL_UPDATE_CHECK": "OFF"}, {"LONGHAUL_UPDATE_CHECK": "Off"},
+                    {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(longhaul, "release_spawn") as spawn:
+                self.assertIsNone(longhaul.release_check(now=1_000.0))  # urlopen is the unexpected one
+                self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
+                spawn.assert_not_called()
+                self.assertEqual(longhaul.release_status()["check"], "off")
+        self.assertEqual(list(self.home.iterdir()), [], "nothing written")
+        self.assertEqual(longhaul.release_status()["check"], "on")
+        with mock.patch.object(longhaul, "release_spawn") as spawn:
+            self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
+        spawn.assert_called_once_with()
+
+    def test_the_startup_hook_starts_the_days_check_detached_and_never_runs_it_inline(self):
+        started = []
+
+        class Runner:
+            pid = 4242
+
+        def popen(args, **kwargs):
+            started.append((args, kwargs))
+            return Runner()
+
+        with mock.patch.object(longhaul.subprocess, "Popen", popen), \
+                mock.patch.object(longhaul, "release_check", side_effect=AssertionError("run inline")):
+            self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
+            [(args, kwargs)] = started
+            self.assertEqual(args, [sys.executable, "-I", "-c", longhaul.RELEASE_RUNNER, str(self.plugin)])
+            self.assertEqual(kwargs, {"start_new_session": True, "stdin": subprocess.DEVNULL,
+                                      "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True})
+            # A subagent's start, a run nobody attends: none.
+            longhaul.guard_check(self.start(agent="a1"), "warn", index="off")
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "0"}):
+                longhaul.guard_check(self.start(), "warn", index="off")
+            self.assertEqual(len(started), 1)
+            # Asked within the day: none; a day ago: one more, in any guard mode.
+            self.write(checked_at=time.time() - 3_600, latest="0.2.4")
+            longhaul.guard_check(self.start(), "warn", index="off")
+            self.assertEqual(len(started), 1)
+            self.write(checked_at=time.time() - 86_401, latest="0.2.4")
+            longhaul.guard_check(self.start(), "off", index="off")
+            self.assertEqual(len(started), 2)
+        self.assertIn("longhaul.release_run()", longhaul.RELEASE_RUNNER)
+        # A runner that cannot be started costs the start nothing but a log line.
+        with mock.patch.object(longhaul.subprocess, "Popen", side_effect=OSError(2, "No such file or directory")):
+            self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
+        self.assertIn("release: the check was not started (No such file or directory)", self.logged())
+
+    def test_the_hook_returns_while_its_runner_asks_and_the_runner_reaches_only_the_proxy_it_is_given(self):
+        # The runner in its own process, as the startup hook starts it: the
+        # network is a proxy on this machine, which holds the runner's ask
+        # until the test lets it answer.
+        asked, answer = [], threading.Event()
+        server = socket.socket()
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(30)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(30)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                asked.append(data.decode("latin-1"))
+                answer.wait(30)
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+
+        threading.Thread(target=serve, daemon=True).start()
+        proxy = f"http://127.0.0.1:{server.getsockname()[1]}"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and not k.lower().endswith("_proxy")
+               and k not in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ATTENDED")}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.config),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_INDEX="off", LONGHAUL_UPDATE_CHECK="on", https_proxy=proxy, HTTPS_PROXY=proxy)
+        # First, that this Python sends the address to that proxy and never past it.
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(urllib.request.getproxies().get("https"), proxy)
+            self.assertFalse(urllib.request.proxy_bypass("api.github.com"))
+        out = subprocess.run(Guard.HOOK, input=json.dumps(self.start()), env=env, cwd=str(self.tmp),
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), "nothing known yet, nothing said")
+        deadline = time.monotonic() + 30
+        while not asked and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(len(asked), 1, "one ask")
+        self.assertRegex(asked[0].split("\r\n")[0], r"^CONNECT api\.github\.com:443 HTTP/1\.[01]$")
+        # The hook is done and the runner still waits on its answer: the day's
+        # ask is claimed, nothing is known yet.
+        self.assertEqual(self.record(), {"checked_at": self.record()["checked_at"]})
+        answer.set()
+        while "error" not in self.record() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.record().get("error"), "unreachable")
+        self.assertNotIn("latest", self.record())
+
+    def test_at_a_start_a_newer_installed_version_comes_first_then_a_newer_release_once_a_day(self):
+        now = time.time()
+        self.assertEqual(self.said(), "", "nothing known")
+        self.installed("0.2.4")
+        self.write(checked_at=now, latest="0.2.4")
+        self.assertEqual(self.said(), "", "the same release")
+        self.write(checked_at=now, latest="0.2.5")
+        self.assertEqual(self.said(), self.out("0.2.5", "0.2.4"))
+        self.assertEqual(self.said(), "", "once per version a day")
+        self.assertEqual(self.said(self.start(session="another")), "", "in any chat")
+        self.assertEqual(self.record()["said"]["latest"], "0.2.5")
+        # A day on, once more; a newer release the same day, at once.
+        record = self.record()
+        record["said"]["at"] -= 86_400
+        self.write(**record)
+        self.assertEqual(self.said(), self.out("0.2.5", "0.2.4"))
+        self.write(**{**self.record(), "latest": "0.2.10"})
+        self.assertEqual(self.said(), self.out("0.2.10", "0.2.4"))
+        # A newer version installed than this chat runs: said first, at each
+        # start of a chat that runs the older, and the release waits.
+        self.installed("0.2.5")
+        installed = "Longhaul 0.2.5 is installed; this chat runs 0.2.4. Type /reload-plugins to use it."
+        self.assertEqual(self.said(), installed)
+        self.assertEqual(self.said(), installed)
+        self.assertEqual(self.logged(), ["release: Longhaul 0.2.5 is out (this is 0.2.4)",
+                                         "release: Longhaul 0.2.5 is out (this is 0.2.4)",
+                                         "release: Longhaul 0.2.10 is out (this is 0.2.4)",
+                                         f"release: Longhaul 0.2.5 is installed; {self.SID} runs 0.2.4",
+                                         f"release: Longhaul 0.2.5 is installed; {self.SID} runs 0.2.4"])
+        # The line goes last in the message, on its own line, after the index's.
+        with mock.patch.object(longhaul, "index_start", return_value=([], [])), \
+                mock.patch.object(longhaul, "index_message", return_value="longhaul: the index's sentence."):
+            self.assertEqual(self.said(), "longhaul: the index's sentence.\n" + installed)
+
+    def test_a_start_says_nothing_of_an_older_release_or_where_nobody_reads_it(self):
+        now = time.time()
+        self.manifest("0.2.10")
+        self.installed("0.2.10")
+        self.write(checked_at=now, latest="0.2.9")
+        self.assertEqual(self.said(), "", "0.2.9 is older than 0.2.10")
+        # This chat runs a newer copy than the one installed (a checkout of
+        # one's own): a release between the two is no news.
+        self.manifest("0.2.6")
+        self.installed("0.2.4")
+        self.write(checked_at=now, latest="0.2.5")
+        self.assertEqual(self.said(), "")
+        # Not installed from the marketplace at all: what this chat runs.
+        self.manifest("0.2.4")
+        (self.config / "plugins" / "installed_plugins.json").write_text("{not json")
+        self.assertEqual(self.said(self.start(agent="a1")), "", "a subagent's start is not the chat's")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ATTENDED": "0"}):
+            self.assertEqual(self.said(), "", "a run nobody attends")
+        self.assertEqual(self.said(), self.out("0.2.5", "0.2.4"))
+        # With the check off nothing of a release is said; the installed
+        # version is this machine's own news, said all the same.
+        self.write(checked_at=now, latest="0.2.6")
+        self.installed("0.2.5")
+        with mock.patch.dict(os.environ, {"LONGHAUL_UPDATE_CHECK": "off"}):
+            self.assertEqual(self.said(), "Longhaul 0.2.5 is installed; this chat runs 0.2.4. Type /reload-plugins to use it.")
+            self.installed("0.2.4")
+            self.assertEqual(self.said(), "")
+
+    def test_an_install_counts_where_its_scope_applies(self):
+        # A project's or a local install loads in its own folder and below;
+        # a user's install everywhere.
+        project = self.tmp / "project"
+        (project / "src").mkdir(parents=True)
+        self.installed("0.2.4", ("0.2.6", "project", str(self.tmp / "elsewhere")), ("0.2.7", "local", "/nowhere"))
+        self.assertEqual(longhaul.release_installed(str(project / "src")), "0.2.4")
+        self.installed("0.2.4", ("0.2.6", "project", str(project)))
+        self.assertEqual(longhaul.release_installed(str(project / "src")), "0.2.6")
+        self.assertEqual(longhaul.release_installed(str(project)), "0.2.6")
+        self.assertEqual(longhaul.release_installed(str(self.tmp)), "0.2.4")
+        self.assertEqual(self.said(self.start(cwd=project / "src")),
+                         "Longhaul 0.2.6 is installed; this chat runs 0.2.4. Type /reload-plugins to use it.")
+        # The chat's own config folder, CLAUDE_CONFIG_DIR (an account's), is the one read.
+        account = self.tmp / "account"
+        self.installed("0.2.3", folder=account)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(account)}):
+            self.assertEqual(longhaul.release_installed(str(self.tmp)), "0.2.3")
+        for junk in ("[]", '{"plugins": []}', '{"plugins": {"longhaul@longhaul": "0.2.9"}}',
+                     '{"plugins": {"longhaul@longhaul": [{"version": "v0.2"}, 5]}}'):
+            (self.config / "plugins" / "installed_plugins.json").write_text(junk)
+            self.assertIsNone(longhaul.release_installed(str(self.tmp)), junk)
+
+    def test_release_status_keeps_its_contract(self):
+        # Another region's `longhaul doctor` reads these keys.
+        self.assertEqual(longhaul.release_status(), {"running": "0.2.4", "installed": None, "latest": None,
+                                                     "checked": None, "auto_update": None, "check": "on"})
+        self.installed("0.2.4")
+        self.write(checked_at=1_000, latest="0.2.5", error="timeout")
+        self.markets()
+        status = longhaul.release_status()
+        self.assertEqual(status, {"running": "0.2.4", "installed": "0.2.4", "latest": "0.2.5", "checked": 1_000.0,
+                                  "auto_update": False, "check": "on"})
+        self.assertIsInstance(status["checked"], float)
+        self.markets({**self.MARKETS, "longhaul": {**self.MARKETS["longhaul"], "autoUpdate": True}})
+        self.assertIs(longhaul.release_status()["auto_update"], True)
+        self.markets({"claude-plugins-official": self.MARKETS["claude-plugins-official"]})
+        self.assertIsNone(longhaul.release_status()["auto_update"], "Longhaul's marketplace is not listed: unknown")
+        (self.home / "release.json").write_text('{"checked_at": "yesterday", "latest": "newest"}')
+        (self.plugin / ".claude-plugin" / "plugin.json").unlink()
+        self.assertEqual(longhaul.release_status(), {"running": "unknown", "installed": "0.2.4", "latest": None,
+                                                     "checked": None, "auto_update": None, "check": "on"})
+        with mock.patch.dict(os.environ, {"LONGHAUL_UPDATE_CHECK": "off"}):
+            self.assertEqual(longhaul.release_status()["check"], "off")
+
+    def test_update_status_says_the_versions_when_github_was_asked_and_whether_auto_update_is_on(self):
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.splitlines()[:5], [
+            f"Running here: 0.2.4 ({longhaul.home_path(str(self.plugin))})",
+            "Installed by Claude Code: none recorded for longhaul@longhaul",
+            "Latest release: not asked yet",
+            "Release check: on, once a day in the background; LONGHAUL_UPDATE_CHECK=off turns it off",
+            f"Auto-update: unknown (no list of marketplaces at "
+            f"{longhaul.home_path(str(self.config / 'plugins' / 'known_marketplaces.json'))})"])
+        self.assertFalse((self.home / "release.json").exists(), "status asks nothing and writes nothing")
+        self.installed("0.2.4")
+        self.write(checked_at=time.time() - 7_300, latest="0.2.5")
+        path = self.markets()
+        code, out = self.update("status")
+        self.assertEqual(code, 0, out)
+        shown = longhaul.home_path(str(path))
+        self.assertEqual(out.splitlines()[1:], [
+            "Installed by Claude Code: 0.2.4 (longhaul@longhaul)",
+            "Latest release: 0.2.5 (asked GitHub 2 h ago)",
+            "Release check: on, once a day in the background; LONGHAUL_UPDATE_CHECK=off turns it off",
+            f"Auto-update: off for Longhaul's marketplace in {shown}; `longhaul update on` turns it on "
+            "(or /plugin > Marketplaces > Enable auto-update)",
+            f"Longhaul 0.2.5 is out: {self.UPDATE} in each chat."])
+        self.write(checked_at=time.time() - 7_300, latest="0.2.5", error="timeout")
+        self.installed("0.2.5")
+        self.markets({**self.MARKETS, "longhaul": {**self.MARKETS["longhaul"], "autoUpdate": True}})
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}):
+            code, out = self.update()
+        self.assertEqual(out.splitlines()[1:], [
+            "Installed by Claude Code: 0.2.5 (longhaul@longhaul)",
+            "Latest release: 0.2.5 (asked GitHub 2 h ago; that ask failed: timeout)",
+            "Release check: off (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set)",
+            f"Auto-update: on for Longhaul's marketplace in {shown}",
+            "Longhaul 0.2.5 is installed: a chat started before it loads it with /reload-plugins."])
+        with mock.patch.dict(os.environ, {"LONGHAUL_UPDATE_CHECK": "Off"}):
+            self.assertIn("Release check: off (LONGHAUL_UPDATE_CHECK=off)", self.update()[1].splitlines())
+
+    def test_update_on_and_off_set_auto_update_on_longhauls_entry_after_a_yes_with_a_copy_kept(self):
+        path = self.markets()
+        path.chmod(0o644)
+        original = path.read_text()
+        backups = lambda: sorted(path.parent.glob("known_marketplaces.json.before-longhaul-*"))
+        code, out = self.update("on", terminal=True, answers="n\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"Turn on Claude Code's auto-update for Longhaul's marketplace? Longhaul sets autoUpdate "
+                      f"to true in {longhaul.home_path(str(path))} (a copy is kept). [Y/n]", out)
+        self.assertIn("Not changed.", out)
+        self.assertEqual((path.read_text(), backups()), (original, []))
+        code, out = self.update("on", terminal=True, answers="\n")
+        self.assertEqual(code, 0, out)
+        after = json.loads(path.read_text())
+        self.assertEqual(after, {**self.MARKETS, "longhaul": {**self.MARKETS["longhaul"], "autoUpdate": True}},
+                         "Longhaul's entry alone, and its one key")
+        self.assertEqual(path.read_text(), json.dumps(after, indent=2), "as Claude Code writes it")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o644, "its mode kept")
+        [backup] = backups()
+        self.assertEqual(backup.read_text(), original)
+        self.assertIn(f"Done: Claude Code's auto-update is on for Longhaul's marketplace in "
+                      f"{longhaul.home_path(str(path))} (the old file is kept as {longhaul.home_path(str(backup))})", out)
+        self.assertIn("/reload-plugins", out)
+        self.assertIs(longhaul.release_status()["auto_update"], True)
+        code, out = self.update("on")
+        self.assertEqual(code, 0, out)
+        self.assertIn("already on", out)
+        self.assertEqual(len(backups()), 1, "nothing to change, nothing asked, no copy")
+        # Off from a script: refused without a terminal, unless --yes.
+        code, out = self.update("off")
+        self.assertEqual(code, 2, out)
+        self.assertIn("asks first, in a terminal", out)
+        self.assertIn("--yes", out)
+        self.assertIs(json.loads(path.read_text())["longhaul"]["autoUpdate"], True, "not changed")
+        code, out = self.update("off", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIs(json.loads(path.read_text())["longhaul"]["autoUpdate"], False)
+        self.assertEqual(len(backups()), 2, "a second copy, under its own name in the same second")
+        self.assertEqual(backups()[1].read_text(), path.read_text().replace('"autoUpdate": false', '"autoUpdate": true'))
+        self.assertIs(longhaul.release_status()["auto_update"], False)
+        self.assertEqual(self.update("off", "--yes")[0], 0)
+        self.assertEqual(len(backups()), 2, "already off")
+        # The input's end at the question is no yes.
+        code, out = self.update("on", terminal=True)
+        self.assertEqual(code, 1, out)
+        self.assertIs(json.loads(path.read_text())["longhaul"]["autoUpdate"], False)
+
+    def test_update_changes_nothing_it_cannot_read_or_that_does_not_list_longhaul(self):
+        code, out = self.update("on", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("Claude Code's list of marketplaces is not at", out)
+        self.assertFalse(self.config.exists(), "nothing made")
+        path = self.markets({"claude-plugins-official": self.MARKETS["claude-plugins-official"]})
+        for text in (path.read_text(), "{not json", "[]", '{"longhaul": "x"}'):
+            path.write_text(text)
+            code, out = self.update("on", "--yes")
+            self.assertEqual(code, 1, (text, out))
+            self.assertIn("Not changed", out)
+            self.assertEqual(path.read_text(), text)
+            self.assertEqual(list(path.parent.glob("*.before-longhaul-*")), [], text)
+
+    def test_update_edits_each_file_once_when_account_folders_link_their_plugins(self):
+        # Longhaul's accounts link plugins/ into ~/.claude (SHARED): one file
+        # for all of them; an account with a folder of its own has its own.
+        shared = self.markets()
+        own = self.markets(folder=self.tmp / "acct-own")
+        for name in ("acct-a", "acct-b"):
+            (self.tmp / name).mkdir()
+            (self.tmp / name / "plugins").symlink_to(self.config / "plugins")
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "A", "config_dir": str(self.tmp / "acct-a")}, {"name": "B", "config_dir": str(self.tmp / "acct-b")},
+            {"name": "Own", "config_dir": str(self.tmp / "acct-own")}, {"name": "Gone", "config_dir": str(self.tmp / "gone")},
+            {"name": "Junk", "config_dir": 5}]))
+        self.assertEqual(longhaul.release_files(), [shared, own])
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / "acct-a")}):
+            self.assertEqual(longhaul.release_files(), [shared, own], "the chat's folder is one of them")
+        code, out = self.update("on", "--yes")
+        self.assertEqual(code, 0, out)
+        for path in (shared, own):
+            self.assertIs(json.loads(path.read_text())["longhaul"]["autoUpdate"], True, path)
+            self.assertEqual(len(list(path.parent.glob("known_marketplaces.json.before-longhaul-*"))), 1, path)
+        code, out = self.update()
+        self.assertIn(f"Auto-update: on for Longhaul's marketplace in {longhaul.home_path(str(shared))}", out)
+        self.assertIn(f"Auto-update: on for Longhaul's marketplace in {longhaul.home_path(str(own))}", out)
+
+    def test_the_usage_text_and_the_readme_name_the_command_and_the_switch(self):
+        self.assertIn("longhaul update [status|on|off] [--yes]", longhaul.__doc__)
+        self.assertIn("LONGHAUL_UPDATE_CHECK=off", longhaul.__doc__)
+        readme = (HERE / "README.md").read_text()
+        for said in ("once a day", "LONGHAUL_UPDATE_CHECK=off", "`longhaul update on`", "Enable auto-update"):
+            self.assertIn(said, readme)
 
 
 class Autocompact(unittest.TestCase):
