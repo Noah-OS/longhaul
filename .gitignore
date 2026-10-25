@@ -19,6 +19,9 @@
 !hooks/
 !hooks/hooks.json
 !hooks/display.ts
+!hooks/index.ts
+!hooks/autocompact.ts
+!hooks/autocompact.test.ts
 !bin/
 !bin/longhaul
 !skills/
@@ -46,6 +49,7 @@ labels.json
 ledger.jsonl
 auth-cache.json
 vscode.json
+autocompact.json
 usage/
 sessions/
 guard/

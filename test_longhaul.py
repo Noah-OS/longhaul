@@ -11155,9 +11155,13 @@ class Display(unittest.TestCase):
     SOURCE = (HERE / "hooks" / "display.ts").read_text()
 
     def test_the_plugin_lists_the_module_beside_its_command_hooks(self):
+        # A plugin has one hooks module (Claude Code refuses a second entry
+        # under "modules", seen 2026-10-25): hooks/index.ts is that module,
+        # and it registers display.ts's hooks beside autocompact.ts's.
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        self.assertEqual(hooks["modules"], ["./display.ts"])
+        self.assertEqual(hooks["modules"], ["./index.ts"])
         self.assertTrue((HERE / "hooks" / "display.ts").is_file())
+        self.assertIn("import { register as display } from './display.ts'", (HERE / "hooks" / "index.ts").read_text())
         self.assertIn("!hooks/display.ts", (HERE / ".gitignore").read_text().splitlines(), "shipped, not ignored")
 
     def test_it_only_reads_longhauls_files_and_sends_nothing(self):
@@ -11233,6 +11237,157 @@ class Display(unittest.TestCase):
                         'log(f"guard: {verb} a whole read of {shown} ({size:,} bytes) in {sid}{who}")',
                         'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")'):
             self.assertIn(written, source, written)
+
+
+class Autocompact(unittest.TestCase):
+    """The compaction after a checkpoint (the owner, 2026-10-25: "Yes, probe
+    then build"). The reminder asks the model to save a checkpoint; it
+    saved, and nothing compacted: the owner's chat stayed at 600-840k
+    tokens for hours after each save. hooks/autocompact.ts runs /compact
+    once at the end of the turn in which this chat's save follows its
+    reminder, shows a pop-up and has Longhaul log it, through
+    `longhaul autocompact-note`, which also keeps the time: two
+    compactions of a chat are ten minutes apart at least, even across a
+    reload of the module. LONGHAUL_AUTO_COMPACT=off turns it off. What the
+    module does turn by turn is tested in hooks/autocompact.test.ts, under
+    `claude plugin test .`; here, what it may touch and the Python side."""
+
+    SID = "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"
+    TOAST = "Longhaul: compacted this chat after its checkpoint (${Math.round(size / 1000)}k tokens); " \
+            "the checkpoint comes back now."
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def source(self) -> str:
+        return (HERE / "hooks" / "autocompact.ts").read_text()
+
+    def log(self) -> str:
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def note(self, *args):
+        """`longhaul autocompact-note ARGS` in this process: its exit code and what it printed."""
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = longhaul.main(["autocompact-note", *args])
+        return code, out.getvalue() + err.getvalue()
+
+    def test_the_plugins_one_module_registers_it_before_display(self):
+        # One hooks module per plugin: index.ts registers autocompact.ts
+        # first, which nests its hooks outside display.ts's ("first
+        # outermost"), so the compaction comes after display's pop-ups and
+        # status for that turn, and its own pop-up is the last word.
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
+        self.assertEqual(hooks["modules"], ["./index.ts"])
+        index = (HERE / "hooks" / "index.ts").read_text()
+        self.assertIn("import { register as autocompact } from './autocompact.ts'", index)
+        self.assertIn("import { register as display } from './display.ts'", index)
+        self.assertLess(index.index("autocompact(on, options)"), index.index("display(on, options)"))
+        ignore = (HERE / ".gitignore").read_text().splitlines()
+        for path in ("hooks/index.ts", "hooks/autocompact.ts", "hooks/autocompact.test.ts"):
+            self.assertTrue((HERE / path).is_file(), path)
+            self.assertIn(f"!{path}", ignore, f"{path} is shipped, not ignored")
+
+    def test_it_writes_no_file_sends_nothing_and_runs_tail_and_the_note_alone(self):
+        source = self.source()
+        for banned in ("$.fs.write", "fetch(", "$.http", "XMLHttpRequest", "$.model", "$.tool", "$.agent",
+                       "$.prompt", "$.session.compact", "$.env.set"):
+            self.assertNotIn(banned, source, banned)
+        self.assertEqual(re.findall(r"\$\.process\.run\(\[([^\]]*)\]", source),
+                         ["'tail', '-c', String(take), path",
+                          "'python3', '-I', `${$.plugin.root}/longhaul.py`, 'autocompact-note', sid, String(size)"])
+        self.assertEqual(re.findall(r"\$\.command\.run\(([^)]*)\)", source), ["{ command: 'compact' }"])
+        self.assertIn("$.env.get('LONGHAUL_AUTO_COMPACT')", source)
+        self.assertIn("longhaul.log", source)
+        self.assertIn(f"/{longhaul.AUTOCOMPACT_RECORD}`", source, "it reads the record autocompact-note keeps")
+        self.assertRegex(source, r"\nconst GAP = 600 //", "ten minutes between two compactions of a chat")
+        # Its turn.complete hook hears answered turns alone, the main loop's.
+        self.assertIn("on('turn.complete', { reason: 'answer' }, async ($, e, next) => {", source)
+        self.assertIn("e.agentId !== undefined", source)
+
+    def test_its_pop_up_and_its_log_line_are_pinned(self):
+        self.assertIn(f"$.ui.toast(`{self.TOAST}`", self.source())
+        # The note as the module runs it: python3 -I on the plugin's longhaul.py.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        out = subprocess.run([sys.executable, "-I", str(HERE / "longhaul.py"), "autocompact-note", self.SID, "612345"],
+                             capture_output=True, text=True, env={**env, "LONGHAUL_HOME": str(self.home)}, timeout=30)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        (line,) = self.log().splitlines()
+        self.assertRegex(line, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
+        self.assertEqual(line[20:], f"autocompact: compacted {self.SID} after its checkpoint (the context was 612,345)")
+
+    def test_the_lines_it_acts_on_are_the_lines_longhaul_writes(self):
+        # The reminder and the save, written by longhaul.py's own code paths
+        # (reminder_due(), checkpoint_save()), against the module's patterns;
+        # a save that was refused is no save.
+        transcript = self.tmp / f"{self.SID}.jsonl"
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 610_339,
+                 "output_tokens": 900}
+        transcript.write_text(json.dumps({"type": "assistant", "isSidechain": False, "uuid": "u1", "message": {
+            "id": "msg_1", "model": "claude-opus-4-5", "role": "assistant", "content": [{"type": "text", "text": "ok"}],
+            "usage": usage}}) + "\n")
+        env = {k: v for k, v in os.environ.items() if k != "LONGHAUL_CHECKPOINT_AT"}
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(longhaul.reminder_due({"session_id": self.SID, "transcript_path": str(transcript)}), 612_345)
+            state = json.dumps({"goal": "finish the parser", "next_action": "run the tests"})
+            self.assertEqual(longhaul.checkpoint_save(self.SID, state, str(self.tmp), None), 0)
+            self.assertEqual(longhaul.checkpoint_save(self.SID, "{not json", str(self.tmp), None), 2)
+        reminded, saved, refused = [line[20:] for line in self.log().splitlines()]
+        patterns = [p.replace("\\/", "/") for p in re.findall(r"body\.match\(/(.+?)/\)", self.source())]
+        self.assertEqual(len(patterns), 2)
+        arms, makes_due = patterns
+        self.assertEqual(re.match(arms, reminded).group(1), self.SID, reminded)
+        self.assertEqual(re.match(makes_due, saved).group(1), self.SID, saved)
+        for pattern in patterns:
+            self.assertIsNone(re.match(pattern, refused), refused)
+        self.assertIsNone(re.match(arms, saved))
+        self.assertIsNone(re.match(makes_due, reminded))
+        # The module's own line is neither: a compaction never arms another.
+        self.note(self.SID, "612345")
+        mine = self.log().splitlines()[-1][20:]
+        self.assertTrue(mine.startswith("autocompact: "), mine)
+        for pattern in patterns:
+            self.assertIsNone(re.match(pattern, mine), mine)
+
+    def test_the_note_keeps_each_chats_last_compaction_for_a_day(self):
+        record = self.home / longhaul.AUTOCOMPACT_RECORD
+        self.home.mkdir()
+        now = time.time()
+        record.write_text(json.dumps({"old-chat": now - 90_000, "recent-chat": now - 3_600, "junk": "x"}))
+        self.assertEqual(self.note(self.SID, "0"), (0, ""))
+        kept = json.loads(record.read_text())
+        self.assertEqual(set(kept), {"recent-chat", self.SID}, "a day's records are kept, older ones and junk go")
+        self.assertAlmostEqual(kept[self.SID], now, delta=5)
+        self.assertIsInstance(kept[self.SID], int, "whole seconds")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600, "private, like the rest of the home")
+        self.assertIn(f"autocompact: compacted {self.SID} after its checkpoint (the context was 0)", self.log())
+
+    def test_the_note_with_bad_arguments_logs_nothing_and_exits_0(self):
+        for args in ((), (self.SID,), ("not an id", "5"), ("a/b", "5"), ("x" * 101, "5"), (self.SID, "-5"),
+                     (self.SID, "5.0"), (self.SID, "five"), (self.SID, "1,000"), (self.SID, ""),
+                     (self.SID, "9" * 13), (self.SID, "5", "extra")):
+            self.assertEqual(self.note(*args), (0, ""), args)
+        self.assertFalse(self.home.exists(), "no log, no record")
+
+    def test_the_usage_block_names_it_and_the_shim_still_refuses_it(self):
+        # The module runs longhaul.py itself; bin/longhaul, what the model may
+        # run, is the owner's boundary and stays as it was.
+        self.assertTrue("longhaul autocompact-note SID TOKENS" in longhaul.__doc__, "the Usage block names it")
+        self.assertNotIn("autocompact", (HERE / "bin" / "longhaul").read_text())
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+        out = subprocess.run([str(HERE / "bin" / "longhaul"), "autocompact-note", self.SID, "5"], capture_output=True,
+                             text=True, env=env, timeout=30)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertIn("run it in a terminal", out.stderr)
+        self.assertFalse(self.home.exists(), "nothing was written")
 
 
 class Accounts(unittest.TestCase):

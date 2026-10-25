@@ -140,6 +140,12 @@ Usage:
                           its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
                           is sent on the wrong one; whatever it cannot read lets
                           the prompt through
+  longhaul autocompact-note SID TOKENS
+                          what the plugin's hooks module runs once it has run
+                          /compact at the end of the turn in which a chat saved
+                          its checkpoint after the reminder: logs it and keeps the
+                          time, so a chat compacts at most once in ten minutes;
+                          LONGHAUL_AUTO_COMPACT=off turns the compaction off
   longhaul trial start [--days N] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -5957,6 +5963,52 @@ def reminder(_opts) -> int:
     return 0
 
 
+# ---------------------------------------------------------- autocompact
+#
+# The compaction after a checkpoint (the owner's decision of 2026-10-25,
+# "Yes, probe then build"): the reminder asks the model to save a
+# checkpoint, and the model saved, but nothing compacted (the owner's chat
+# stayed at 600-840k tokens for hours after each save). The plugin's hooks
+# module (hooks/autocompact.ts) reads the log: once this chat's reminder
+# and then its save are there, at the end of that turn it runs /compact
+# once, shows a pop-up and runs `autocompact-note`, which logs it and
+# keeps the time in AUTOCOMPACT_RECORD. The module reads that record
+# before a compaction and lets none come within ten minutes of the last,
+# so a reload of the module, which forgets its own count, cannot make two.
+# The SessionStart(compact) hook then puts the fresh checkpoint back.
+# LONGHAUL_AUTO_COMPACT=off turns it off, in the module. The note is the
+# module's alone: bin/longhaul does not run it, so the model cannot.
+
+AUTOCOMPACT_RECORD = "autocompact.json"  # under LONGHAUL_HOME: {session id: when it last compacted, epoch seconds}
+AUTOCOMPACT_KEEP = 86_400  # seconds a chat's time is kept; the module looks back ten minutes
+
+
+def autocompact_note(opts) -> int:
+    """`longhaul autocompact-note SID TOKENS`, run by the hooks module once
+    /compact has run for session SID, whose context was TOKENS: the log's
+    line and the time in AUTOCOMPACT_RECORD, a file only you can read (a
+    day's times kept, older ones dropped). SID must have the session-id
+    shape (GUARD_ID) and TOKENS be a whole number of at most 12 digits;
+    anything else (or more) does nothing. Exit 0 always: the module shows
+    nothing either way."""
+    sid, tokens = opts.session, opts.tokens
+    if opts.rest or not isinstance(sid, str) or not re.fullmatch(GUARD_ID, sid) \
+            or not isinstance(tokens, str) or not re.fullmatch(r"[0-9]{1,12}", tokens):
+        return 0
+    log(f"autocompact: compacted {sid} after its checkpoint (the context was {int(tokens):,})")
+    try:
+        now = time.time()
+        path = LONGHAUL_HOME / AUTOCOMPACT_RECORD
+        with locked("autocompact"):
+            kept = read_json(path)
+            kept = {k: v for k, v in kept.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and now - v < AUTOCOMPACT_KEEP} if isinstance(kept, dict) else {}
+            write_json(path, {**kept, sid: int(now)})
+    except OSError as e:
+        log(f"autocompact: the time of {sid}'s compaction was not kept: {e.strerror or e}")
+    return 0
+
+
 # ---------------------------------------------------------------- trial
 #
 # The checkpoint A/B (docs/plans/2026-10-23-checkpoint-ab-plan.md; the
@@ -8175,7 +8227,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "trial", "vscode", "models"):
+                            "account-check", "autocompact-note", "trial", "vscode", "models"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -8228,6 +8280,10 @@ def main(argv: list[str]) -> int:
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
+        if cmd == "autocompact-note":
+            p.add_argument("session", nargs="?", metavar="SID", help="the session compacted")
+            p.add_argument("tokens", nargs="?", metavar="TOKENS", help="its context before, in tokens")
+            p.add_argument("rest", nargs="*", help=argparse.SUPPRESS)  # more: nothing is noted
         if cmd == "setup":
             p.add_argument("account", nargs="?", help="only this account (default: each one not signed in)")
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
@@ -8236,6 +8292,7 @@ def main(argv: list[str]) -> int:
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
+                "autocompact-note": autocompact_note,
                 "trial": trial}[cmd](opts)
 
     extra: list[str] = []

@@ -1,5 +1,5 @@
 {
-  "modules": ["./display.ts"],
+  "modules": ["./index.ts"],
   "hooks": {
     "PreToolUse": [
       {
