@@ -4,8 +4,18 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## 0.2.5 - 2026-10-25
 
+Claude picks each subagent's model by how hard its job is, and Longhaul tells you more of what it does.
+
+### Changed
+
+- **Auto Model picks by the task, not by a table.** At each start, compaction, `/clear` and resume, Longhaul gives the main conversation a short guide: Haiku for lookups and small mechanical edits, Sonnet for ordinary implementation, tests and routine reviews, Opus for design, hard debugging, security review and work across many files; Sonnet when unsure. Claude then sets each subagent's model itself. Longhaul reads no task text. Every pick is logged (`models: TYPE picked MODEL (guided)`, or `(its own)` or `(inherited)`). `guide` is the new default mode; the per-type table stays as `longhaul models on`. `longhaul models cap MODEL` keeps every subagent at or below a model. A models trial now compares guided chats against unguided ones, with subagent cost by model and a redo count.
+- **`/longhaul:inspect` shows subagents by agent type and model**, with runs, requests, cache reads and the API-price equivalent, so you can see what ran where.
+
 ### Fixed
 
+- **The reload line after a compaction, a /clear or a resume too.** A long chat updated under it never starts again, so the line telling it to type `/reload-plugins` now also comes at those moments.
+- **An old checkpoint is said to you.** When Longhaul puts back a checkpoint six hours old or more, you are told its age, in the chat and as a pop-up, so a stale one is not followed unseen.
+- **The first chat's line counts its quick checks** ("7 of 8 quick checks pass"), so it is not read as the doctor's own count.
 - **Auto-compact after a reload.** When the plugin's module had just loaded (a chat's start, or `/reload-plugins`), its first turn only marked where Longhaul's log ended, so a reminder and the save in that same turn were missed and nothing compacted, as in the first live check. Its first turn now also reads the last fifteen minutes of the log; its own `autocompact:` line keeps a replay from compacting twice.
 
 ## 0.2.4 - 2026-10-25

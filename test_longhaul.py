@@ -6798,6 +6798,23 @@ class Checkpoint(unittest.TestCase):
         return subprocess.run(self.HOOK, input=raw, env={**self.env, **(env or {})}, capture_output=True, text=True,
                               timeout=10)
 
+    def test_an_old_checkpoint_put_back_tells_the_user_its_age(self):
+        # The owner's real work, 2026-10-24: a resume put back a 27-hour-old
+        # checkpoint and only the model knew its age (review issue 6). From
+        # CHECKPOINT_OLD on, the user is told too; a fresh one says nothing.
+        self.assertEqual(self.save(self.state(), "s1").returncode, 0)
+        at = json.loads(self.file().read_text())["written_at"]
+        fresh = self.check(self.start("resume"), now=at + 3_600)
+        self.assertIn("longhaul checkpoint, written", self.context(fresh))
+        self.assertNotIn("systemMessage", fresh)
+        old = self.check(self.start("resume"), now=at + 27 * 3_600)
+        self.assertIn("longhaul checkpoint, written", self.context(old), "Claude still gets it")
+        self.assertEqual(old["systemMessage"], longhaul.CHECKPOINT_OLD_SAID.format(ago="1 day ago"))
+        self.assertEqual(longhaul.CHECKPOINT_OLD_SAID, "Longhaul put back a checkpoint from {ago}: it may be out of "
+                         "date. If it is, ask Claude to save a fresh one with /longhaul:checkpoint.")
+        self.assertEqual(self.check(self.start("compact"), now=at + 6 * 3_600)["systemMessage"],
+                         longhaul.CHECKPOINT_OLD_SAID.format(ago="6 h ago"), "six hours is old")
+
     def test_a_compaction_a_clear_or_a_resume_puts_the_checkpoint_back_with_its_age_and_what_changed_since(self):
         self.assertEqual(self.save(self.state(), "s1").returncode, 0)
         at = json.loads(self.file().read_text())["written_at"]
@@ -11717,9 +11734,12 @@ class Display(unittest.TestCase):
             "out": "release: Longhaul 0.2.10 is out (this is 0.2.4)",
             "installed": "release: Longhaul 0.2.5 is installed; fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 runs 0.2.4",
             # The first chat after an install or an update (the doctor, 2026-10-25).
-            "setup": "setup: Longhaul 0.2.4 is on: 7 of 8 set up"}
+            "setup": "setup: Longhaul 0.2.4 is on: 7 of 8 set up",
+            # A checkpoint put back from long ago (review issue 6, 2026-10-25).
+            "put back": "checkpoint for fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 put back after resume (4214 bytes, written "
+                        "98444 s earlier)"}
         patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
-        self.assertEqual(len(patterns), 11)
+        self.assertEqual(len(patterns), 12)
         for pattern, (kind, line) in zip(patterns, lines.items()):
             js = pattern.replace("\\/", "/")
             self.assertRegex(line, js, kind)
@@ -11758,12 +11778,19 @@ class Display(unittest.TestCase):
         setup = patterns[10].replace("\\/", "/")
         self.assertEqual(re.match(setup, lines["setup"]).groups(), ("0.2.4", "7", "8"))
         self.assertIsNone(re.match(setup, "setup: Longhaul 0.2.4 is on: 7 of 8 set up, and more"), "the whole line")
+        old = patterns[11].replace("\\/", "/")
+        self.assertEqual(re.match(old, lines["put back"]).groups(), (sid, "resume", "4214", "98444"))
+        self.assertIn("/^checkpoint for (\\S+) put back after (\\S+) \\((\\d+) bytes, written (\\d+) s earlier\\)$/)) "
+                      "&& m[1] === sid && Number(m[4]) >= 21600)", self.SOURCE, "this chat's, six hours or more")
         for toast in ("`Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps "
                       "the context small.`",
                       "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
                       "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
                       "`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`",
-                      "`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} set up. Type /longhaul:doctor to see what's left.`"):
+                      "`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} quick checks pass. Type /longhaul:doctor for the full "
+                      "list and what's left.`",
+                      "`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out "
+                      "of date. /longhaul:checkpoint saves a fresh one.`"):
             self.assertIn(toast, self.SOURCE)
         # The same shapes in longhaul.py's own log calls.
         source = (HERE / "longhaul.py").read_text()
@@ -12097,6 +12124,20 @@ class Release(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(self.record().get("error"), "unreachable")
         self.assertNotIn("latest", self.record())
+
+    def test_a_compaction_a_clear_or_a_resume_also_says_a_newer_install(self):
+        # A long chat updated under it (the owner's long chat, 2026-10-25) never
+        # starts again, so the startup line never reaches it: the checkpoint's
+        # hook says it too, at a compaction, a clear or a resume.
+        self.installed("0.2.5")
+        line = "Longhaul 0.2.5 is installed; this chat runs 0.2.4. Type /reload-plugins to use it."
+        for source in ("compact", "clear", "resume"):
+            data = {**self.start(), "source": source}
+            self.assertEqual((longhaul.checkpoint_answer(data) or {}).get("systemMessage"), line, source)
+        self.assertIsNone(longhaul.checkpoint_answer({**self.start(agent="a1"), "source": "compact"}), "not a subagent's")
+        self.assertIn(f"release: Longhaul 0.2.5 is installed; {self.SID} runs 0.2.4", self.logged())
+        self.installed("0.2.4")
+        self.assertIsNone(longhaul.checkpoint_answer({**self.start(), "source": "compact"}), "the same: nothing")
 
     def test_at_a_start_a_newer_installed_version_comes_first_then_a_newer_release_once_a_day(self):
         now = time.time()
@@ -13716,7 +13757,8 @@ class Doctor(unittest.TestCase):
         os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
         n, m = longhaul.doctor_count(longhaul.doctor_checks(quick=True))
         self.assertEqual(m, 8, "the quick checks: no updates (network) and no process list")
-        line = f"Longhaul {self.VERSION} is on: {n} of {m} set up. Type /longhaul:doctor to see what's left."
+        line = (f"Longhaul {self.VERSION} is on: {n} of {m} quick checks pass. Type /longhaul:doctor for the full list "
+                "and what's left.")
         self.assertIsNone(longhaul.guard_check(self.start(agent="a1"), "warn"), "a subagent's start")
         os.environ["CLAUDE_CODE_SESSION_ATTENDED"] = "0"
         self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "a -p run: nobody would read it")
@@ -13740,7 +13782,7 @@ class Doctor(unittest.TestCase):
                 mock.patch.object(longhaul, "release_status", side_effect=boom), \
                 mock.patch.object(longhaul, "claude_version", side_effect=boom):
             answer = longhaul.guard_check(self.start(), "warn")
-        self.assertRegex(answer["systemMessage"], rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 set up\. ")
+        self.assertRegex(answer["systemMessage"], rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 quick checks pass\. ")
 
     def test_the_first_chat_line_through_the_hook_is_quick_and_joins_the_index_message(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
@@ -13753,7 +13795,7 @@ class Doctor(unittest.TestCase):
         took = time.time() - started
         self.assertEqual((out.returncode, out.stderr), (0, ""))
         self.assertRegex(json.loads(out.stdout)["systemMessage"],
-                         rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 set up\. Type /longhaul:doctor ")
+                         rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 quick checks pass\. Type /longhaul:doctor ")
         self.assertLess(took, 2.0, "well inside the hook's 5 s")
         out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
         # Once. Auto Model's guide joins every startup's answer since the

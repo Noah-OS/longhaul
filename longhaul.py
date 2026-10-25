@@ -4043,6 +4043,11 @@ CHECKPOINT_SECRET_SHAPES = ("sk-ant-", "AKIA", "-----BEGIN", "ghp_")  # the star
 CHECKPOINT_CLI = ("schema_version", "session_id", "written_at", "cwd")  # set by the CLI, never by the model
 CHECKPOINT_SOURCES = ("compact", "clear", "resume")  # the session starts whose context is gone
 CHECKPOINT_CARRY_HOURS = 6.0  # how old a checkpoint a /clear carries over, by default
+# From this age on a checkpoint put back is said to the user too, not only to
+# the model (review issue 6, 2026-10-25: a 27-hour-old one came back unseen).
+CHECKPOINT_OLD = 6 * 3600
+CHECKPOINT_OLD_SAID = ("Longhaul put back a checkpoint from {ago}: it may be out of date. If it is, ask Claude to save "
+                       "a fresh one with /longhaul:checkpoint.")
 CHECKPOINT_CARRY_RECORD_MAX = 4_096  # what the lookup reads of a carry record: a save writes a few hundred bytes
 
 
@@ -4440,9 +4445,33 @@ def checkpoint_check(data, now: float | None = None):
         log(f"checkpoint for {sid} not put back: {problem}")
         return None
     text = checkpoint_text(kept, now)  # before the log line: a text that fails leaves no "put back" behind
-    log(f"checkpoint for {sid} put back after {data['source']} ({len(raw)} bytes, "
-        f"written {max(0, int(now - kept['written_at']))} s earlier)")
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+    age = max(0, int(now - kept["written_at"]))
+    log(f"checkpoint for {sid} put back after {data['source']} ({len(raw)} bytes, written {age} s earlier)")
+    answer = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+    if age >= CHECKPOINT_OLD:
+        answer["systemMessage"] = CHECKPOINT_OLD_SAID.format(ago=ago_text(age))
+    return answer
+
+
+def checkpoint_answer(data):
+    """The checkpoint hook's whole answer: the checkpoint (checkpoint_check()),
+    Auto Model's guide after it (models_guide_join(); the guard's hook gives it
+    at a startup), and, for a chat that runs an older Longhaul than is
+    installed, the reload line (release_reload()): a long chat updated under it
+    never starts again, so a compaction, a clear or a resume says it too."""
+    answer = models_guide_join(data, checkpoint_check(data), CHECKPOINT_SOURCES)
+    if not isinstance(data, dict) or data.get("source") not in CHECKPOINT_SOURCES:
+        return answer
+    try:
+        line = release_reload(data)
+    except Exception as e:  # the release's part costs the checkpoint nothing
+        log(f"release: nothing said at {data.get('source')} ({type(e).__name__})")
+        line = ""
+    if not line:
+        return answer
+    answer = dict(answer or {})
+    answer["systemMessage"] = "\n".join(filter(None, (answer.get("systemMessage"), line)))
+    return answer
 
 
 def checkpoint(opts) -> int:
@@ -4486,9 +4515,7 @@ def checkpoint(opts) -> int:
                   f"not for {shown(sid, 100)}", file=sys.stderr)
             log(f"checkpoint for {shown(sid, 100)} not put back: run by hand from inside session {shown(here, 100)}")
             raise SystemExit(2)
-        # Auto Model's guide after the checkpoint, at a compaction, a clear
-        # or a resume (the guard's hook gives it at a startup).
-        return models_guide_join(data, checkpoint_check(data), CHECKPOINT_SOURCES)
+        return checkpoint_answer(data)
 
     return run_hook(check, "checkpoint")
 
@@ -6384,6 +6411,23 @@ def release_status() -> dict:
             "check": "off" if release_switch() else "on"}
 
 
+def release_reload(data: dict) -> str:
+    """The line for a chat that runs an older Longhaul than is installed, ""
+    otherwise or for a subagent's start or a run nobody attends; logged with
+    the session. Said at a startup (release_startup()) and at a compaction, a
+    clear or a resume (checkpoint_answer())."""
+    if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+        return ""
+    running = release_running(release_manifest())
+    installed = release_installed(data.get("cwd"))
+    if not release_newer(installed, running):
+        return ""
+    sid = data.get("session_id")
+    sid = sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) else "-"
+    log(f"release: Longhaul {installed} is installed; {sid} runs {running}")
+    return RELEASE_INSTALLED.format(installed=installed, running=running)
+
+
 def release_startup(data: dict, now: float | None = None) -> str:
     """The startup hook's part (guard_startup): the day's check started in
     the background when it is due, and the one line for the user, "" for
@@ -6403,12 +6447,10 @@ def release_startup(data: dict, now: float | None = None) -> str:
             release_spawn()
         except Exception as e:
             log(f"release: the check was not started ({getattr(e, 'strerror', None) or repr(e)})")
+    line = release_reload(data)
+    if line:
+        return line
     installed = release_installed(data.get("cwd"))
-    if release_newer(installed, running):
-        sid = data.get("session_id")
-        sid = sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) else "-"
-        log(f"release: Longhaul {installed} is installed; {sid} runs {running}")
-        return RELEASE_INSTALLED.format(installed=installed, running=running)
     known = [v for v in (installed, running) if release_version(v)]
     if off or not known:
         return ""
@@ -9002,7 +9044,8 @@ DOCTOR_JOBS = ("auth", "mcp", "plugin", "plugins", "update", "upgrade", "doctor"
                "migrate-installer", "--version", "-v", "-h", "--help")
 DOCTOR_PS_TIMEOUT = 10  # seconds each of ps and lsof may take
 SEEN = "seen.json"  # under LONGHAUL_HOME: {"version": the plugin version whose first chat was told, "at": epoch}
-SETUP_LINE = "Longhaul {version} is on: {n} of {m} set up. Type /longhaul:doctor to see what's left."
+SETUP_LINE = ("Longhaul {version} is on: {n} of {m} quick checks pass. Type /longhaul:doctor for the full list and "
+              "what's left.")  # the quick checks only: the doctor's own count has more lines
 SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"
 
 
