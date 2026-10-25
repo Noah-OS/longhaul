@@ -2,6 +2,19 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.8 - 2026-10-26
+
+Longhaul hears Claude Code's own word when a turn stops or a chat ends.
+
+### Added
+
+- **Claude Code's own signals that a turn stopped.** Two new hooks: StopFailure, which Claude Code runs when a turn ends on an API error, and its Notification for a wait at a claude.ai usage limit (2.1.234 and later). For the main conversation each logs one line and keeps the error's type or the wait's moment, and the time, in `~/.longhaul/stops.json`; never the error's text or the notification's message. Where you have to act, the display shows a pop-up: a rate or usage limit, a failed sign-in, a billing error, an account on hold, a limit that reset while the computer slept (press Enter to carry on), or Claude Code no longer waiting. `/longhaul:inspect` counts them under Failures. They decide nothing yet: the terminal still tells a limit stop from the transcript until a live test shows which of these signals a real limit fires.
+- **A normal end told from a crash by Claude Code's word.** A SessionEnd hook keeps why each session ended (`clear`, `resume`, `logout`, `prompt_input_exit` or `other`) and when, nothing else. The terminal `longhaul` no longer reopens a chat that exited with an error code after Claude Code recorded that you closed it at its prompt or signed out; any other non-zero exit is still a crash. The hook keeps within Claude Code's 1.5-second budget for SessionEnd.
+
+### Fixed
+
+- **The README said the code index is off until you turn it on.** It has been on by default since 0.2.2, where CodeGraph or Trail-Code is installed; `LONGHAUL_INDEX=off` turns it off.
+
 ## 0.2.7 - 2026-10-26
 
 Long subagent runs are told to wrap up.
