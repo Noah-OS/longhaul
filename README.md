@@ -100,7 +100,7 @@ The [wiki](https://github.com/Noah-OS/longhaul/wiki) holds the detail:
 
 ## Releases
 
-**0.2.3** (2026-10-24), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.3) · [changelog](CHANGELOG.md). **0.2.2** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
+**0.2.4** (2026-10-25), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.4) · [changelog](CHANGELOG.md). **0.2.3** (2026-10-24): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.3). **0.2.2** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
 
 ## Development
 

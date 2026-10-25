@@ -2920,7 +2920,8 @@ class Index(unittest.TestCase):
         """A program that records where and how it was called and what it
         saw of the environment, talks on both streams, makes its map, and
         is slow or fails when a marker file says so: slow before the map
-        is made (a run in progress has none yet), failing after it (a
+        is made (a run in progress has none yet), hanging (30 s, which only
+        a timeout ends) the same, failing after it (a
         failed init leaves a half-built map); with `.child`, it leaves a
         child of its own running first and records its pid. Its own PATH:
         sh has no mkdir or sleep of its own, and the test's PATH holds the
@@ -2934,6 +2935,7 @@ class Index(unittest.TestCase):
                         f"echo SECRET-OUTPUT-{name} >&2\n"
                         f"[ -e '{self.tmp}/{name}.child' ] && {{ sleep 30 & echo $! > '{self.tmp}/{name}.child.pid'; }}\n"
                         f"[ -e '{self.tmp}/{name}.slow' ] && sleep 3\n"
+                        f"[ -e '{self.tmp}/{name}.hang' ] && sleep 30\n"
                         f"mkdir -p {self.MAPS[name]}\n"
                         f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
                         "exit 0\n")
@@ -3334,26 +3336,29 @@ class Index(unittest.TestCase):
         self.assertTrue((self.repo / ".codegraph").is_dir())
 
     def test_a_run_over_the_timeout_is_killed_and_counts_as_a_failure(self):
-        (self.tmp / "codegraph.slow").touch()
+        # A 3 s timeout on a 30 s hang (2026-10-25): with 1 s on a 3 s run, a
+        # machine at a load average of 16 to 27 killed the fake before it
+        # started, or let it finish first.
+        (self.tmp / "codegraph.hang").touch()
         (self.bin / "trail").unlink()
-        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "1"}):  # the runner reads it at its import
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "3"}):  # the runner reads it at its import
             self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
         entry = self.wait("codegraph")
         self.assertEqual(entry["exit"], -1)
-        self.assertLess(entry["seconds"], 3, "killed at the timeout, not waited for")
+        self.assertLess(entry["seconds"], 10, "killed at the timeout, not waited for")
         self.assertFalse((self.repo / ".codegraph").exists())
         self.assertRegex((self.home / "longhaul.log").read_text(),
-                         r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 1 s timeout\)\n")
+                         r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 3 s timeout\)\n")
         self.assertEqual(entry["why"], "timeout")
-        self.assertEqual(entry["timeout"], 1, "the timeout it was killed at, recorded at the kill")
+        self.assertEqual(entry["timeout"], 3, "the timeout it was killed at, recorded at the kill")
         self.assertEqual(self.begin(self.start()), [], "a failure: left alone")
         # The user is told the timeout, not the time the run took (final
-        # review, Sprint 7, G3): a loaded machine's 2.7 s says 1 s still.
+        # review, Sprint 7, G3): a loaded machine's 4.7 s says 3 s still.
         state = self.state()
-        state["runs"]["codegraph"]["seconds"] = 2.7
+        state["runs"]["codegraph"]["seconds"] = 4.7
         longhaul.write_json(self.state_path(), state)
         answer = self.check(self.start())
-        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 1 s timeout"))
+        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 3 s timeout"))
         self.assertNotIn("hookSpecificOutput", answer, "nothing started, nothing for the model")
         del state["runs"]["codegraph"]["timeout"]  # an entry written before the timeout was recorded
         longhaul.write_json(self.state_path(), state)
@@ -3365,9 +3370,9 @@ class Index(unittest.TestCase):
         state["runs"]["codegraph"]["started"] -= 86_401
         longhaul.write_json(self.state_path(), state)
         self.assertEqual(self.begin(self.start()), [], "a day on, a timeout still")
-        self.assertEqual(len(self.calls("codegraph")), 1)
+        self.assertEqual(len(self.calls("codegraph")), 1, "never run again")
         self.state_path().unlink()
-        (self.tmp / "codegraph.slow").unlink()
+        (self.tmp / "codegraph.hang").unlink()
         self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))], "the state deleted: now")
         self.assertEqual(self.wait("codegraph")["exit"], 0)
         self.assertNotIn("why", self.state()["runs"]["codegraph"], "a clean exit has no why")
@@ -3375,10 +3380,10 @@ class Index(unittest.TestCase):
     def test_the_timeout_kills_the_programs_children_too(self):
         # Review, Sprint 7 (F6): the kill reached the program alone, and
         # what it had started ran on past the timeout, holding its log.
-        for marker in ("slow", "child"):
+        for marker in ("hang", "child"):  # 3 s on a 30 s hang, as above
             (self.tmp / f"codegraph.{marker}").touch()
         (self.bin / "trail").unlink()
-        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "1"}):
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "3"}):
             self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
         entry = self.wait("codegraph")
         self.assertEqual((entry["exit"], entry["why"]), (-1, "timeout"))
@@ -5899,7 +5904,10 @@ class Advisor(unittest.TestCase):
                  "enabled"),
                 ({"CLAUDE_CODE_SESSION_ID": "s2"}, "2.1.307 (from the path)", "enabled"),
                 ({"CLAUDE_CODE_SESSION_ID": "../s1"}, "2.1.307 (from the path)", "enabled"),
-                ({"CLAUDE_CODE_EXECPATH": str(exe)}, "2.1.307 (from --version)", "enabled"),
+                # 10 s for the fake to start: a loaded machine took past the 2 s
+                # default (2026-10-25, a load average of 16 to 27).
+                ({"CLAUDE_CODE_EXECPATH": str(exe), "LONGHAUL_ADVISOR_VERSION_TIMEOUT": "10"}, "2.1.307 (from --version)",
+                 "enabled"),
                 ({"CLAUDE_CODE_EXECPATH": None}, "unknown", "off: the running Claude Code version is unknown")):
             lines, said = self.status(**env)
             self.assertEqual((lines["Running Claude Code"], said), (running, last), env)
@@ -7383,7 +7391,7 @@ class Reminder(unittest.TestCase):
     context. The history baseline (98 sessions) found re-reads 1.3% of
     what was read, and long contexts and compactions the cost. The
     session's guard record keeps the highest multiple said, so each is
-    said once."""
+    said once, and forgets it after a compaction (the owner, 2026-10-25)."""
 
     # A prompt's text: it is in the hook's input and nowhere else.
     S = "SENTINEL-IBEX-5190"
@@ -7473,7 +7481,11 @@ class Reminder(unittest.TestCase):
         self.assertIsNone(self.record(), "nothing is written below it")
         self.assertFalse((self.home / "guard").exists())
 
-    def test_each_multiple_is_said_once_and_after_a_compaction_only_a_new_one_is(self):
+    def test_each_multiple_is_said_once_and_a_compaction_starts_the_count_again(self):
+        # The owner, 2026-10-25 ("Yes, fix it"): after a compaction the count
+        # starts again. Before, a multiple said once stayed said for good, and
+        # a real conversation of the owner's, told at 800k and compacted near 968k, grew
+        # from 49k to 967k again with no reminder.
         self.grow(150_000, 205_400)
         self.assertEqual(self.remind(), self.reminded(205), "in thousands, rounded down")
         self.assertEqual(self.record(), {"reminder": {"at": 200_000}}, "the highest multiple said, in tokens")
@@ -7482,20 +7494,56 @@ class Reminder(unittest.TestCase):
         self.assertEqual(self.remind(), "", "and the same size again")
         self.grow(401_999)
         self.assertEqual(self.remind(), self.reminded(401), "the second multiple")
-        # A compaction: the context drops; 200k and 400k were said already.
-        self.grow(self.compaction(402_000, 30_000), 30_000)
-        self.assertEqual(self.remind(), "")
+        # Less than a step below the highest said (Claude Code clearing old
+        # tool results, say) is no compaction: nothing is said again.
         self.grow(250_000)
-        self.assertEqual(self.remind(), "", "200k again, after the compaction")
+        self.assertEqual(self.remind(), "")
+        self.grow(405_000)
+        self.assertEqual(self.remind(), "", "400k was said, and the context never fell a step below it")
+        # A compaction: the context falls more than a step below; the count starts again.
+        self.grow(self.compaction(402_000, 30_000), 30_000)
+        self.assertEqual(self.remind(), "", "below the threshold: nothing to say")
+        self.assertEqual(self.record(), {"reminder": {}}, "but the highest said is forgotten")
+        self.grow(250_000)
+        self.assertEqual(self.remind(), self.reminded(250), "200k again, after the compaction")
         self.grow(420_000)
-        self.assertEqual(self.remind(), "", "400k again")
-        self.grow(600_000)
-        self.assertEqual(self.remind(), self.reminded(600), "a multiple above the highest said")
+        self.assertEqual(self.remind(), self.reminded(420), "and 400k")
         self.grow(1_250_000)
         self.assertEqual(self.remind(), self.reminded(1250), "past several multiples at once: one line")
         self.assertEqual(self.record(), {"reminder": {"at": 1_200_000}})
         self.assertEqual(self.remind(self.ask(session_id="s2")), self.reminded(1250), "each session has its own record")
         self.assertIn("reminder: s1 reminded at 200,000 tokens (the context is 205,400)", self.log())
+
+    def test_a_conversation_told_at_800k_is_told_again_after_its_compaction(self):
+        # The owner's case, as it ran on 2026-10-24: told at 800k, compacted at
+        # 967k to 49k, then past 200k again. A record written before the fix
+        # holds the same mark, so it is fixed in place.
+        self.grow(880_000)
+        self.assertEqual(self.remind(), self.reminded(880))
+        self.assertEqual(self.record(), {"reminder": {"at": 800_000}})
+        self.grow(967_000, self.compaction(967_000, 49_000), 49_000, 140_000)
+        self.assertEqual(self.remind(), "")
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205), "the first multiple of the new context")
+        # Seen only on its way to the next multiple: the drop still counts.
+        (self.home / "guard" / "s1.json").write_text(json.dumps({"reads": {}, "reminder": {"at": 800_000}}))
+        self.grow(410_000)
+        self.assertEqual(self.remind(), self.reminded(410), "410k is more than a step below 800k")
+        self.assertEqual(self.record(), {"reads": {}, "reminder": {"at": 400_000}}, "the guard's own keys are kept")
+
+    def test_told_at_the_first_multiple_it_is_told_again_after_a_compaction(self):
+        # A step below 200k is below nothing: a compaction there is the
+        # context falling under half the threshold, as it ran on 2026-10-25
+        # (told at 200k, then /compact).
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+        self.grow(150_000, 230_000)
+        self.assertEqual(self.remind(), "", "205k to 150k is no compaction: 200k stays said")
+        self.grow(self.compaction(230_000, 42_000), 42_000)
+        self.assertEqual(self.remind(), "")
+        self.assertEqual(self.record(), {"reminder": {}})
+        self.grow(201_000)
+        self.assertEqual(self.remind(), self.reminded(201), "200k of the new context")
 
     def test_the_threshold_is_longhaul_checkpoint_at_and_off_turns_it_off(self):
         self.grow(450_000)
@@ -10358,7 +10406,7 @@ class Pipe(StreamHarness):
         """The config folder a pipe session in `cwd` started on."""
         p = self.pipe(*flags, args=args, cwd=cwd)
         p.stdin.close()
-        self.assertEqual(p.wait(10), 0, self.log_text())
+        self.assertEqual(p.wait(30), 0, self.log_text())
         return self.calls()[-1]["config"]
 
     def test_pipe_picks_only_an_account_allowed_in_the_drivers_folder(self):

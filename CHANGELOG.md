@@ -2,6 +2,18 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.4 - 2026-10-25
+
+The context reminder keeps working through a long conversation.
+
+### Fixed
+
+- **The context reminder starts counting again after a compaction.** Before, each threshold was said once per conversation for good, so a conversation reminded at 800,000 tokens and compacted near 968,000 was never reminded again. Now, once the context falls more than one threshold below the last reminder, or under half the threshold (as after a compaction), it is reminded at 200,000, 400,000 and so on of the new context. A drop smaller than that, as when Claude Code clears old tool results, changes nothing.
+
+### Changed
+
+- **`LONGHAUL_ADVISOR_VERSION_TIMEOUT`** sets how long the Advisor's gate waits for `claude --version`: 2 seconds unless set, as before.
+
 ## 0.2.3 - 2026-10-24
 
 Longhaul shows itself inside Claude Code, the VS Code panel included.

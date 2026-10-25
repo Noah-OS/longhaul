@@ -132,7 +132,8 @@ Usage:
                           off turns it off), and again at each multiple, says to
                           save a checkpoint and start fresh; the guard's PreToolUse
                           hook says it too, whatever LONGHAUL_GUARD is, and each
-                          multiple is said once; never in a trial's usual arm
+                          multiple is said once, the count starting again after
+                          a compaction; never in a trial's usual arm
   longhaul trial start [--days N] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -4200,8 +4201,9 @@ ADVISOR_FORCED_MODEL_VARS = ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "CLAUDE_CODE_CO
 ADVISOR_VERSION = r"\d+\.\d+\.\d+"
 # Seconds `claude --version` may take when the transcript names no version
 # and the path names none, or not the record's (F7): well inside the
-# hook's timeout, past which Claude Code lets the call run.
-ADVISOR_VERSION_TIMEOUT = 2
+# hook's timeout, past which Claude Code lets the call run. A setting so
+# that a test's child process can wait longer on a loaded machine.
+ADVISOR_VERSION_TIMEOUT = setting("LONGHAUL_ADVISOR_VERSION_TIMEOUT", 2, float, 0.1)
 # Seconds the hooks wait for locked("advisor") before they give up: a
 # consultation is then denied (error). With the --version above and the
 # trace of the denial's own wait, the hook stays under 10 s (F3).
@@ -5552,8 +5554,10 @@ def advisor(opts) -> int:
 # input, cache write and cache read, as inspect's context figures count
 # it, from the transcript's tail. The session's guard record keeps the
 # highest multiple said, under the guard's lock, so each is said once;
-# after a compaction the context drops, and only a multiple above that
-# one is said. The guard's PreToolUse hook on Read and Bash says it too
+# after a compaction, when the context has fallen more than a step below
+# it or under half the threshold, it is forgotten and the count starts again (reminder_fell(), the
+# owner's decision of 2026-10-25: before, a conversation told at 800k and
+# compacted near 968k was never told again). The guard's PreToolUse hook on Read and Bash says it too
 # (reminder_join(), the owner's second decision of 2026-10-23), so an
 # unattended run with no prompts hears it as well; the one record serves
 # both, so a multiple is said once wherever it is crossed first. Of the
@@ -5616,13 +5620,24 @@ def reminder_size(tail: list):
     return None
 
 
+def reminder_fell(said: dict, size: int, at: int) -> bool:
+    """Whether the context is more than a step of the threshold below the
+    highest multiple this session was told of, or under half the threshold
+    (a step below the first multiple is below nothing): a compaction, after
+    which the count starts again (the owner, 2026-10-25). Less, as when
+    Claude Code clears old tool results, is not one."""
+    told = as_int(said.get("at"))
+    return bool(told) and size < max(told - at, at // 2)
+
+
 def reminder_due(data: dict):
     """The context's size when it has crossed a multiple of the threshold
-    above the highest this session was told of, which is recorded; else
-    None. A subagent's input is never reminded: its context is not the
-    conversation's, and neither is a session in the trial's usual arm
-    (trial_arm()), which records nothing either. A threshold that is
-    neither a number nor off is logged once per session and kind."""
+    above the highest this session was told of since its last compaction,
+    which is recorded; else None. A subagent's input is never reminded: its
+    context is not the conversation's, and neither is a session in the
+    trial's usual arm (trial_arm()), which records nothing either. A
+    threshold that is neither a number nor off is logged once per session
+    and kind."""
     at, junk = reminder_threshold()
     if at is None or data.get("agent_id") is not None:
         return None
@@ -5634,7 +5649,11 @@ def reminder_due(data: dict):
         return None
     crossed = size // at * at
     if not crossed and not junk:
-        return None
+        # Nothing to say; but after a compaction, forget the highest multiple
+        # told, so the next is said. Read without the lock, which only a write takes.
+        kept = read_json(record) if record.exists() else None
+        if not (isinstance(kept, dict) and reminder_fell(dict_at(kept, "reminder"), size, at)):
+            return None
     trial = trial_current()
     if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
         return None  # the checkpoint A/B's usual arm hears none (the trial section); a models trial's does
@@ -5648,6 +5667,8 @@ def reminder_due(data: dict):
             log(f"reminder: LONGHAUL_CHECKPOINT_AT is {junk}, so the default, {REMINDER_AT:,} tokens, is used "
                 f"({record.stem})")
             said["junk"] = [*logged, junk]
+        if reminder_fell(said, size, at):
+            said.pop("at")
         due = crossed > as_int(said.get("at"))
         if due:
             said["at"] = crossed
