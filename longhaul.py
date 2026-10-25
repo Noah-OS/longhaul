@@ -3081,6 +3081,10 @@ INDEX_FAILED = ("longhaul: `{command}` in {where} failed on {day} ({reason}); se
 # It names no folder to wait for: the map folder appears before the build ends (review, Sprint 7, F19).
 INDEX_NOTE = ("Longhaul started `{command}` in {where} in the background for later sessions; "
               "in this session search as you would without an index.")
+INDEX_GIT_TIMEOUT = 5  # seconds each git call of the local exclude may take: a local question, answered in milliseconds
+# The variables that would point git at another repository than the top's (as GIT_SIGN_IN_ENV says of the
+# pipe's): the runner has the session's environment, and a GIT_DIR there would put the rule in its exclude file.
+INDEX_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
 
 
 def index_mode() -> str:
@@ -3318,6 +3322,75 @@ def index_start(data: dict, index: str) -> tuple:
     return started, failed
 
 
+def index_git(git: str, top: str, *args) -> subprocess.CompletedProcess:
+    """One git call of index_exclude() in the top, within INDEX_GIT_TIMEOUT:
+    its stdout kept, nothing read from a terminal, its stderr dropped. It
+    answers for the top's own repository alone: none of INDEX_GIT_ENV, and
+    the top's parent as GIT_CEILING_DIRECTORIES, so a `.git` that is no
+    repository (an empty folder) is git's error, never the repository
+    above it."""
+    env = {k: v for k, v in os.environ.items() if k not in INDEX_GIT_ENV}
+    env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(os.path.realpath(top))
+    return subprocess.run([git, "-C", top, *args], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=INDEX_GIT_TIMEOUT)
+
+
+def index_exclude(program: str, top: str) -> None:
+    """Keeps the program's map folder out of `git status` in the top (the
+    owner's decision of 2026-10-25, "Ignore it locally": in two of their
+    repositories the new .codegraph/ was untracked, and a `git add -A`
+    would have committed it). The runner's, before the program runs, so
+    the folder is ignored before it appears. A folder the repository's
+    rules ignore already (`git check-ignore`) is left as it is: asked
+    with its slash, as `.codegraph/`, since the usual rule ".codegraph/"
+    matches only a name git knows to be a folder, and this one is not
+    made yet; by the rules alone (--no-index), so no index is read, a big
+    repository's or one an fsmonitor hook watches. Otherwise two lines,
+    `# Longhaul: <program> code map, local only` and `/<folder>/`, go at
+    the end of the local exclude file git names (`rev-parse --git-path
+    info/exclude`: in a linked worktree, the main repository's, which
+    every worktree reads), after a newline when its last line has none,
+    and one log line says so. Never the .gitignore; nothing staged or
+    committed. A `/<folder>/` line there already is not added again, though
+    git does not obey it (a "!" of the .gitignore outranks the file). The
+    file is locked while it is read and added to: the two runners of a
+    repository add theirs at the same moment. Whatever fails (no git on
+    PATH, no repository, a timeout, a write refused) is one log line with
+    a short reason, never git's output, and the init goes on. Never raises."""
+    folder = INDEX_MAPS[program]
+    rule, reason = f"/{folder}/", None
+    try:
+        git = index_program("git", top)  # by an absolute PATH entry, and never a git the repository ships
+        if git is None:
+            reason = "git not found"
+        else:
+            asked = index_git(git, top, "check-ignore", "-q", "--no-index", folder + "/")
+            if asked.returncode == 0:
+                return  # its rules ignore it already
+            if asked.returncode == 1:  # not ignored; any other exit is git's failure
+                asked = index_git(git, top, "rev-parse", "--git-path", "info/exclude")
+            if asked.returncode != 0 or not asked.stdout.strip():
+                reason = f"git exit {asked.returncode}"
+            else:
+                path = os.path.join(top, os.fsdecode(asked.stdout.rstrip(b"\n")))  # the top's, unless absolute
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "a+b") as f:
+                    with contextlib.suppress(OSError):  # a disk with no locks: the race costs a blank line at most
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                    f.seek(0)
+                    kept = f.read()
+                    if rule.encode() in kept.splitlines():
+                        return
+                    f.write((b"\n" if kept and not kept.endswith(b"\n") else b"")
+                            + f"# Longhaul: {program} code map, local only\n{rule}\n".encode())
+    except Exception as e:  # a timeout, a write refused, a git that cannot be run
+        reason = type(e).__name__
+    if reason is None:
+        log(f"index: {program} map folder ignored locally in {home_path(top)} (.git/info/exclude)")
+    else:
+        log(f"index: could not add {rule} to the local exclude in {home_path(top)} ({reason})")
+
+
 def index_run(program: str, top: str, found: str) -> None:
     """The detached runner, one per program: the init in the top level,
     run by `found`, the absolute path the hook found the program at
@@ -3334,12 +3407,14 @@ def index_run(program: str, top: str, found: str) -> None:
     started with it (review, Sprint 7, F6), and it counts as exit -1, why
     "timeout"; one that could not be run, and any failure of the
     runner's own, as exit -1, why "error": every run ends in an exit and
-    a line (index_finish)."""
+    a line (index_finish). Before the program runs, its map folder is
+    kept out of `git status` (index_exclude), whatever comes of that."""
     started, why = time.time(), "error"
     try:
         if not os.path.isabs(found) or inside(os.path.realpath(found), os.path.realpath(top)):
             code, said = -1, " (could not run: not the program found)"
         else:
+            index_exclude(program, top)
             out = index_log(program, top)
             out.parent.mkdir(parents=True, exist_ok=True)
             with os.fdopen(os.open(out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "ab") as f:

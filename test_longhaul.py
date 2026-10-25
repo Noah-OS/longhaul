@@ -4021,6 +4021,234 @@ class Index(unittest.TestCase):
         self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
         self.assertFalse((self.home / "index").exists(), "nothing written")
 
+    # The local exclude (the owner's decision of 2026-10-25, "Ignore it
+    # locally"): a map folder the repository does not ignore goes into its
+    # local exclude file, never its .gitignore. setUp's .git/ is an empty
+    # folder, no repository to git, and the fakes alone are on PATH, so
+    # these tests make a real repository and put the real git beside them.
+    GIT = shutil.which("git")  # looked up on the suite's own PATH, before setUp narrows it to the fakes
+
+    def use_git(self):
+        """The real git on the fakes' PATH (bin/git runs it), and git's
+        configuration the scratch tree's alone, in this process and in the
+        runner: a ~/.gitconfig, a global ignore file or a system file of
+        the user's would say what is ignored here. setUp's patch of
+        os.environ undoes the variables."""
+        if self.GIT is None:
+            self.skipTest("git is not installed")
+        config = self.tmp / "gitconfig"
+        config.write_text("[user]\n\tname = Longhaul Test\n\temail = test@example.com\n"
+                          "[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n")
+        os.environ.update(GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM="1", XDG_CONFIG_HOME=str(self.tmp / "xdg"))
+        (self.bin / "git").write_text(f"#!/bin/sh\nexec '{self.GIT}' \"$@\"\n")
+        (self.bin / "git").chmod(0o755)
+
+    def real_repo(self, top=None) -> Path:
+        """A real repository in `top` (repo/ by default), with use_git();
+        its exclude file, as `git init` leaves it."""
+        self.use_git()
+        top = self.repo if top is None else top
+        self.git("init", "-q", top=top)
+        exclude = top / ".git" / "info" / "exclude"
+        if not exclude.exists():  # a git built with no templates
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text("# git ls-files --others --exclude-from=.git/info/exclude\n")
+        return exclude
+
+    def git(self, *args, top=None) -> str:
+        """The real git in `top` (repo/ by default): its output; a failure raises."""
+        return subprocess.run([self.GIT, "-C", str(self.repo if top is None else top), *args], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10, check=True).stdout
+
+    def untracked(self, top=None) -> list:
+        """What `git status` lists as untracked in `top`."""
+        return [line[3:] for line in self.git("status", "--porcelain", top=top).splitlines() if line.startswith("?? ")]
+
+    def fill(self, top=None, programs=None):
+        """A file in each program's map folder: the fakes make an empty
+        folder, which git never lists, and a real map holds files."""
+        for program in programs or self.MAPS:
+            (Path(top or self.repo) / self.MAPS[program] / "map.db").write_text("x")
+
+    def rule(self, program) -> str:
+        """The two lines Longhaul adds for a program."""
+        return f"# Longhaul: {program} code map, local only\n/{self.MAPS[program]}/\n"
+
+    def ignored_said(self, program, top=None) -> str:
+        where = longhaul.home_path(str(self.repo if top is None else top))
+        return f"index: {program} map folder ignored locally in {where} (.git/info/exclude)\n"
+
+    def not_added_said(self, program, reason, top=None) -> str:
+        where = longhaul.home_path(str(self.repo if top is None else top))
+        return f"index: could not add /{self.MAPS[program]}/ to the local exclude in {where} ({reason})\n"
+
+    def build(self, *programs, top=None):
+        """Both inits (or `programs`) started in `top` and ended with exit 0."""
+        top = str(self.repo if top is None else top)
+        self.assertEqual(self.begin(self.start(cwd=top)), [(program, top) for program in programs or self.MAPS])
+        for program in programs or self.MAPS:
+            self.assertEqual(self.wait(program, top)["exit"], 0, program)
+
+    def test_a_map_folder_the_repository_does_not_ignore_goes_into_its_local_exclude_and_is_said(self):
+        # Seen in two of the owner's repositories (2026-10-25): the new
+        # .codegraph/ untracked in `git status`, where a `git add -A` would
+        # have committed it. Both programs, so trail's /.trail/ too; the
+        # user's own last line has no newline, which is added first. The
+        # two runners append one after the other, in either order.
+        exclude = self.real_repo()
+        exclude.write_text("# the user's own\n*.log")
+        self.build()
+        mine = "# the user's own\n*.log\n"
+        self.assertIn(exclude.read_text(), {mine + self.rule("codegraph") + self.rule("trail"),
+                                            mine + self.rule("trail") + self.rule("codegraph")})
+        log = (self.home / "longhaul.log").read_text()
+        for program in self.MAPS:
+            self.assertEqual(log.count(self.ignored_said(program)), 1, program)
+        self.assertNotIn("could not add", log)
+        self.fill()
+        self.assertEqual(self.untracked(), [], "neither map folder in git status")
+        exclude.write_text(mine)  # the control: without the two lines each, both are listed
+        self.assertEqual(self.untracked(), [".codegraph/", ".trail/"])
+        # Local only: no .gitignore, nothing staged, nothing committed.
+        self.assertFalse((self.repo / ".gitignore").exists())
+        self.assertEqual(self.git("ls-files"), "", "nothing staged")
+        self.assertEqual(self.git("rev-list", "--all"), "", "nothing committed")
+
+    def test_trail_alone_gets_its_own_rule_and_codegraphs_is_not_written(self):
+        exclude = self.real_repo()
+        before = exclude.read_text()
+        (self.bin / "codegraph").unlink()
+        self.build("trail")
+        self.assertEqual(exclude.read_text(), before + self.rule("trail"))
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn(self.ignored_said("trail"), log)
+        self.assertNotIn(self.ignored_said("codegraph"), log)
+        self.fill(programs=["trail"])
+        self.assertEqual(self.untracked(), [])
+
+    def test_a_map_folder_the_repositorys_gitignore_ignores_is_left_alone(self):
+        # ".codegraph/", the usual form, matches a name git knows to be a
+        # folder: git asked of `.codegraph` before the program has made it
+        # says "not ignored", and the rule would have been added for nothing.
+        exclude = self.real_repo()
+        before = exclude.read_bytes()
+        (self.repo / ".gitignore").write_text(".codegraph/\n.trail\n")
+        self.build()
+        self.assertEqual(exclude.read_bytes(), before, "the exclude file unchanged")
+        self.assertEqual((self.repo / ".gitignore").read_text(), ".codegraph/\n.trail\n", "the .gitignore unchanged")
+        log = (self.home / "longhaul.log").read_text()
+        self.assertNotIn("ignored locally", log)
+        self.assertNotIn("could not add", log)
+        self.fill()
+        self.assertEqual(self.untracked(), [".gitignore"])
+
+    def test_a_map_folder_the_local_exclude_ignores_already_is_left_alone(self):
+        exclude = self.real_repo()
+        exclude.write_text(exclude.read_text() + ".codegraph\n/.trail/\n")
+        before = exclude.read_bytes()
+        self.build()
+        self.assertEqual(exclude.read_bytes(), before, "the exclude file unchanged")
+        log = (self.home / "longhaul.log").read_text()
+        self.assertNotIn("ignored locally", log)
+        self.assertNotIn("could not add", log)
+        self.fill()
+        self.assertEqual(self.untracked(), [])
+
+    def test_a_second_init_in_the_repository_adds_nothing_more(self):
+        exclude = self.real_repo()
+        self.build()
+        after = exclude.read_bytes()
+        self.assertEqual(self.begin(self.start()), [], "the maps there: nothing started")
+        for folder in self.MAPS.values():  # gone (a user's rm): both built again, and the rules are there
+            shutil.rmtree(self.repo / folder)
+        self.build()
+        self.assertEqual([len(self.calls(program)) for program in self.MAPS], [2, 2])
+        self.assertEqual(exclude.read_bytes(), after, "nothing added")
+        log = (self.home / "longhaul.log").read_text()
+        for program in self.MAPS:
+            self.assertEqual(log.count(self.ignored_said(program)), 1, program)
+        # A rule that git does not obey, as a "!" of the .gitignore outranks
+        # the exclude file, is not added again either: git says "not
+        # ignored" at every init.
+        (self.repo / ".gitignore").write_text("!/.codegraph/\n")
+        longhaul.index_exclude("codegraph", str(self.repo))
+        self.assertEqual(exclude.read_bytes(), after, "the line there already")
+        self.assertEqual((self.home / "longhaul.log").read_text(), log, "and nothing said")
+
+    def test_a_linked_worktree_gets_the_rule_in_the_exclude_file_git_names_for_it(self):
+        # A linked worktree's .git is a file, with no info/ beside it to
+        # write in. git names the exclude file it reads there: the main
+        # repository's, which every worktree of it shares.
+        exclude = self.real_repo()
+        before = exclude.read_text()
+        self.git("commit", "-q", "--allow-empty", "-m", "first")
+        wt = self.tmp / "wt"
+        self.git("worktree", "add", "-q", str(wt))
+        self.assertTrue((wt / ".git").is_file(), "the control: a linked worktree")
+        named = self.git("rev-parse", "--git-path", "info/exclude", top=wt).rstrip("\n")
+        self.assertEqual(os.path.realpath(named), os.path.realpath(exclude), "the exclude file git names for it")
+        self.build(top=wt)
+        self.assertIn(exclude.read_text(), {before + self.rule("codegraph") + self.rule("trail"),
+                                            before + self.rule("trail") + self.rule("codegraph")})
+        self.assertTrue((wt / ".git").is_file(), "its .git still a file")
+        log = (self.home / "longhaul.log").read_text()
+        for program in self.MAPS:
+            self.assertIn(self.ignored_said(program, wt), log)
+        self.assertNotIn("could not add", log)
+        self.fill(wt)
+        self.assertEqual(self.untracked(wt), [])
+
+    def test_a_git_that_cannot_answer_or_a_write_refused_is_said_and_the_init_starts_all_the_same(self):
+        (self.bin / "trail").unlink()
+        log = self.home / "longhaul.log"
+        self.build("codegraph")  # setUp's PATH: the fakes alone
+        self.assertIn(self.not_added_said("codegraph", "git not found"), log.read_text())
+        self.use_git()
+        shutil.rmtree(self.repo / ".codegraph")
+        self.build("codegraph")  # setUp's .git/, an empty folder: no repository to git
+        self.assertIn(self.not_added_said("codegraph", "git exit 128"), log.read_text())
+        self.assertFalse((self.repo / ".git" / "info").exists(), "nothing written in it")
+        # A write refused: info/ is a file.
+        other = self.tmp / "other"
+        other.mkdir()
+        exclude = self.real_repo(other)
+        shutil.rmtree(exclude.parent)
+        exclude.parent.write_text("not a folder")
+        self.build("codegraph", top=other)
+        self.assertIn(self.not_added_said("codegraph", "FileExistsError", other), log.read_text())
+        self.assertEqual(exclude.parent.read_text(), "not a folder")
+        # A git that takes too long, in the runner itself, which goes on to the init.
+        third = self.tmp / "third"
+        third.mkdir()
+        exclude = self.real_repo(third)
+        before = exclude.read_bytes()
+        with mock.patch.object(longhaul.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            longhaul.index_run("codegraph", str(third), str(self.bin / "codegraph"))
+        self.assertIn(self.not_added_said("codegraph", "TimeoutExpired", third), log.read_text())
+        self.assertEqual(self.state(str(third))["runs"]["codegraph"]["exit"], 0, "the init ran")
+        self.assertEqual(exclude.read_bytes(), before)
+        self.assertEqual(len(self.calls("codegraph")), 4, "every init ran")
+        self.assertNotIn("ignored locally", log.read_text())
+
+    def test_git_answers_for_the_tops_own_repository_never_one_above_it_or_one_the_environment_names(self):
+        # setUp's repo/.git is an empty folder, and the scratch tree above
+        # it a repository: git, asked in repo/, would answer for the one
+        # above, and the rule would land in its exclude file. The same for a
+        # GIT_DIR in the session's environment, which the runner inherits.
+        (self.bin / "trail").unlink()
+        outer = self.real_repo(self.tmp)
+        before = outer.read_bytes()
+        self.build("codegraph")
+        self.assertIn(self.not_added_said("codegraph", "git exit 128"), (self.home / "longhaul.log").read_text())
+        self.assertEqual(outer.read_bytes(), before, "the repository above untouched")
+        shutil.rmtree(self.repo / ".codegraph")
+        inner = self.real_repo()
+        inner_before = inner.read_text()
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.tmp / ".git"), "GIT_WORK_TREE": str(self.tmp)}):
+            self.build("codegraph")
+        self.assertEqual(outer.read_bytes(), before, "the repository GIT_DIR names untouched")
+        self.assertEqual(inner.read_text(), inner_before + self.rule("codegraph"), "the top's own")
+
 
 class Advisor(unittest.TestCase):
     """The Advisor experiment's hooks (Sprint 8, region B; the decision
