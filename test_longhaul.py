@@ -500,6 +500,57 @@ class Loop(unittest.TestCase):
         self.assertIn("Max ended: crashed (session sid-1, exit -9)", (self.home / "longhaul.log").read_text())
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
+    def ended(self) -> list:
+        """The log's lines for each launch's end, without their time stamps."""
+        return [line[20:] for line in (self.home / "longhaul.log").read_text().splitlines() if " ended: " in line]
+
+    def test_a_claude_the_user_closed_or_signed_out_of_is_not_reopened_whatever_its_exit_code(self):
+        # Sprint 10, L2: a non-zero exit was a crash, and the conversation
+        # was reopened, even when the user had closed it or signed out. The
+        # plugin's SessionEnd hook records why the session ended; a reason
+        # recorded during this launch for this session, prompt_input_exit or
+        # logout, makes it a normal end, and the log says which.
+        for reason, code in (("prompt_input_exit", 1), ("logout", 1), ("prompt_input_exit", 0)):
+            with self.subTest(reason=reason, code=code):
+                for old in ("calls.jsonl", "longhaul.log"):
+                    (self.home / old).unlink(missing_ok=True)
+                shutil.rmtree(self.home / "guard", ignore_errors=True)
+                out, calls = self.run_longhaul([f"session_end:{reason}:{code}", "exit"], runs=0)
+                self.assertEqual(len(calls), 1, out.stdout + out.stderr)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn("closed normally", out.stdout)
+                self.assertEqual(self.ended(), [f"Max ended: completed (session sid-1, SessionEnd: {reason}, exit {code})"])
+                record = json.loads((self.home / "guard" / "sid-1.json").read_text())
+                self.assertEqual(record["session_end"]["reason"], reason)
+
+    def test_a_claude_that_ended_for_another_reason_with_a_non_zero_code_is_still_reopened(self):
+        # "other" (and clear, resume) says nothing of a crash or not: the
+        # exit code decides, as before.
+        out, calls = self.run_longhaul(["session_end:other:1", "session_end:resume:1", "exit"], runs=0)
+        self.assertEqual(len(calls), 3, out.stdout + out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertEqual(self.ended(), ["Max ended: crashed (session sid-1, SessionEnd: other, exit 1)",
+                                        "Max ended: crashed (session sid-1, SessionEnd: resume, exit 1)",
+                                        "Max ended: completed (session sid-1, exit 0)"])
+
+    def test_a_record_from_before_the_launch_does_not_make_a_crash_a_normal_end(self):
+        guard = self.home / "guard"
+        guard.mkdir()
+        (guard / "sid-1.json").write_text(json.dumps({"session_end": {"reason": "prompt_input_exit",
+                                                                      "at": round(time.time() - 60, 3)}}))
+        out, calls = self.run_longhaul(["crash", "exit"], runs=0)
+        self.assertEqual(len(calls), 2, out.stdout + out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertEqual(self.ended(), ["Max ended: crashed (session sid-1, exit 1)",
+                                        "Max ended: completed (session sid-1, exit 0)"], "as with no record")
+
+    def test_another_sessions_record_does_not_make_a_crash_a_normal_end(self):
+        out, calls = self.run_longhaul(["session_end:prompt_input_exit:1:sid-9", "exit"], runs=0)
+        self.assertEqual(len(calls), 2, out.stdout + out.stderr)
+        self.assertEqual(json.loads((self.home / "guard" / "sid-9.json").read_text())["session_end"]["reason"],
+                         "prompt_input_exit", "the hook ran, for sid-9")
+        self.assertEqual(self.ended()[0], "Max ended: crashed (session sid-1, exit 1)")
+
     def test_a_conversation_another_longhaul_supervises_is_refused(self):
         held = longhaul_lock(self.home, "sid-held")
         out, calls = self.run_longhaul(["exit"], "-r", "sid-held", runs=1)
@@ -6463,8 +6514,9 @@ class Advisor(unittest.TestCase):
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 11,
-                         "the plugin's seventh hook, the reminder's, the account check's and the stops' two (Sprint 10)")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 12,
+                         "the plugin's seventh hook, the reminder's, the account check's, the stops' two and "
+                         "SessionEnd's (Sprint 10)")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -7029,9 +7081,10 @@ class Checkpoint(unittest.TestCase):
 
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        # StopFailure and Notification (Sprint 10) are pinned in Stops.
+        # StopFailure and Notification (Sprint 10) are pinned in Stops, SessionEnd's (L2) in SessionEnd.
         self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse", "UserPromptSubmit",
-                                               "StopFailure", "Notification"}, "these six events and nothing else")
+                                               "StopFailure", "Notification", "SessionEnd"},
+                         "these seven events and nothing else")
         # The Advisor's two entries on Agent, Task, SendMessage and Workflow
         # (Sprint 8) and its note on UserPromptSubmit are pinned in Advisor.
         self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]],
@@ -8193,8 +8246,9 @@ class Reminder(unittest.TestCase):
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]),
                          (5, "Checking the context's size (longhaul checkpoint)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 11,
-                         "the plugin's eighth hook, the account check's (2026-10-25) and the stops' two (Sprint 10)")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 12,
+                         "the plugin's eighth hook, the account check's (2026-10-25), the stops' two and "
+                         "SessionEnd's (Sprint 10)")
         # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
         # does, BaseException included, the wrapper exits 0.
         wrapper = handler["args"][2]
@@ -8687,6 +8741,243 @@ class Reminder(unittest.TestCase):
         self.assertTrue("LONGHAUL_SUBAGENT_AT tokens (150000 unless set; off turns it off)" in usage, "the usage text")
         readme = (HERE / "README.md").read_text()
         self.assertTrue("`LONGHAUL_SUBAGENT_AT`" in readme, "the README")
+
+
+class SessionEnd(unittest.TestCase):
+    """`longhaul session-end`, the plugin's SessionEnd hook (Sprint 10, L2):
+    as a session ends, Claude Code says why, one of clear, resume, logout,
+    prompt_input_exit and other (bypass_permissions_disabled was one until
+    2.1.234). The hook keeps the reason and the time in the session's guard
+    record, nothing more, so that the terminal supervisor takes a non-zero
+    exit after the user closed the chat (prompt_input_exit) or signed out
+    (logout) for a normal end, not a crash to reopen (Loop plays those)."""
+
+    # Text a session's end may carry beside the reason: never kept, never logged.
+    S = "SENTINEL-TAPIR-6043"
+    SID = "7e8f9a0b-1c2d-4e3f-8a9b-0c1d2e3f4a5b"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.transcript = self.tmp / f"{self.SID}.jsonl"
+        self.transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": self.S}}) + "\n")
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")
+                    and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def ending(self, reason="prompt_input_exit", **fields):
+        """A SessionEnd input as Claude Code sends it."""
+        return {"session_id": self.SID, "transcript_path": str(self.transcript), "cwd": str(self.tmp),
+                "permission_mode": "default", "hook_event_name": "SessionEnd", "reason": reason, **fields}
+
+    def end(self, data=None):
+        """`longhaul session-end`'s output for `data` (an input, or its raw
+        text; default: ending()), in this process, in a terminal's environment."""
+        data = self.ending() if data is None else data
+        raw = data if isinstance(data, str) else json.dumps(data)
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["session-end"])
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def path(self, sid=None):
+        return self.home / "guard" / f"{sid or self.SID}.json"
+
+    def record(self, sid=None):
+        path = self.path(sid)
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def logged(self):
+        """The hook's log lines, without their time stamps."""
+        return [line[20:] for line in self.log().splitlines() if line[20:].startswith("session end: ")]
+
+    def test_each_documented_reason_is_kept_with_the_time_and_logged(self):
+        self.assertEqual(longhaul.SESSION_END_REASONS, ("clear", "resume", "logout", "prompt_input_exit", "other"))
+        for reason in longhaul.SESSION_END_REASONS:
+            before = time.time()
+            self.assertEqual(self.end(self.ending(reason)), "", reason)
+            end = self.record()["session_end"]
+            self.assertEqual(set(end), {"reason", "at"}, reason)
+            self.assertEqual(end["reason"], reason)
+            self.assertTrue(before - 0.001 <= end["at"] <= time.time() + 0.001, (before, end))
+            self.assertEqual(end["at"], round(end["at"], 3), "to the millisecond")
+        self.assertEqual(self.logged(), [f"session end: {self.SID} ended ({reason})"
+                                         for reason in longhaul.SESSION_END_REASONS])
+        self.assertEqual(self.path().stat().st_mode & 0o777, 0o600, "only you can read it")
+
+    def test_a_reason_it_does_not_know_is_kept_as_other(self):
+        # A reason a later Claude Code adds is "other" until the hook knows
+        # it, as the one 2.1.234 dropped is now.
+        junk = ["bypass_permissions_disabled", "", "CLEAR", " logout", self.S, None, 7, True, ["logout"],
+                {"reason": "logout"}]
+        for value in junk:
+            self.assertEqual(self.end(self.ending(value)), "", value)
+            self.assertEqual(self.record()["session_end"]["reason"], "other", value)
+        self.end({k: v for k, v in self.ending().items() if k != "reason"})
+        self.assertEqual(self.record()["session_end"]["reason"], "other", "no reason")
+        self.assertEqual(self.logged(), [f"session end: {self.SID} ended (other)"] * (len(junk) + 1))
+        self.assertNotIn(self.S, self.log())
+
+    def test_a_subagents_end_and_input_that_is_no_sessions_end_are_passed_over(self):
+        cases = ["", "not json {", "[1]", "null", "7", '"SessionEnd"',
+                 json.dumps(self.ending(agent_id="a1b2c3d4", agent_type="Explore")),
+                 json.dumps({**self.ending(), "hook_event_name": "SessionStart"}),
+                 json.dumps({k: v for k, v in self.ending().items() if k != "hook_event_name"}),
+                 json.dumps({**self.ending(), "session_id": "../s1"}),
+                 json.dumps({**self.ending(), "session_id": "s1+a1"}),
+                 json.dumps({**self.ending(), "session_id": None}),
+                 json.dumps({k: v for k, v in self.ending().items() if k != "session_id"})]
+        for raw in cases:
+            self.assertEqual(self.end(raw), "", raw[:40])
+        guard = self.home / "guard"
+        self.assertEqual(sorted(guard.iterdir()) if guard.exists() else [], [], "nothing recorded")
+        self.assertEqual(self.logged(), [])
+
+    def test_only_the_reason_and_the_time_are_kept_beside_the_rest_of_the_record(self):
+        self.path().parent.mkdir()
+        kept = {"reminder": {"at": 200_000}, "subagent_reminder": {"at": 150_000},
+                "reads": {"/p/x.py": {"size": 3, "mtime_ns": 1, "at": 1.0}}, "fired": {"repeat": 1, "big": 0, "cat": 0},
+                "bytes": {"repeat": 3, "big": 0, "cat": 0}, "searches": 4, "nudged": False}
+        self.path().write_text(json.dumps(kept))
+        data = self.ending(prompt=self.S, message=self.S, last_assistant_message=self.S, tool_response=self.S,
+                           error={"text": self.S}, agent_type=self.S)
+        self.assertEqual(self.end(data), "")
+        record = self.record()
+        self.assertEqual(record, {**kept, "session_end": {"reason": "prompt_input_exit", "at": record["session_end"]["at"]}})
+        self.assertNotIn(self.S, self.path().read_text())
+        self.assertNotIn(self.S, self.log())
+        # A record that cannot be read is started again, as the guard starts it.
+        self.path().write_text("not json {")
+        self.assertEqual(self.end(self.ending("logout")), "")
+        self.assertEqual(set(self.record()), {"session_end"})
+        self.assertEqual(self.record()["session_end"]["reason"], "logout")
+
+    def test_the_guards_rewrites_and_a_compaction_keep_the_reason(self):
+        self.assertIn("session_end", longhaul.GUARD_KEPT)
+        self.end(self.ending("clear"))
+        self.assertIsNone(longhaul.guard_counts(self.SID), "the reason alone is no record of the guard's")
+        small = self.tmp / "small.py"
+        small.write_text("y" * 300)
+        read = {"session_id": self.SID, "hook_event_name": "PreToolUse", "tool_name": "Read",
+                "tool_input": {"file_path": str(small)}, "tool_use_id": "t1", "cwd": str(self.tmp),
+                "transcript_path": str(self.transcript)}
+        longhaul.guard_check(read, "warn")
+        record = self.record()
+        self.assertIn(str(small), record["reads"])
+        self.assertEqual(record["session_end"]["reason"], "clear", "the guard's rewrite keeps it")
+        self.assertIsNotNone(longhaul.guard_counts(self.SID))
+        longhaul.guard_check({"session_id": self.SID, "hook_event_name": "SessionStart", "source": "compact",
+                              "cwd": str(self.tmp), "transcript_path": str(self.transcript)}, "warn")
+        record = self.record()
+        self.assertEqual(record["reads"], {}, "the compaction forgot the reads")
+        self.assertEqual(record["session_end"]["reason"], "clear", "and kept the reason")
+
+    def test_a_held_lock_costs_the_note_and_never_the_close(self):
+        # Claude Code gives SessionEnd's hooks 1.5 s in all: the write waits
+        # half a second for the guard's lock at most, then gives up, logged.
+        with longhaul.locked("guard"):
+            started = time.time()
+            self.assertEqual(self.end(), "")
+            took = time.time() - started
+        self.assertLess(took, 1.0)
+        self.assertIsNone(self.record())
+        self.assertEqual(self.logged(), [])
+        self.assertIn("session-end hook: no answer (TimeoutError", self.log())
+
+    def test_the_supervisor_takes_the_reason_of_this_launch_and_this_session_alone(self):
+        self.assertEqual(longhaul.SESSION_END_DONE, ("prompt_input_exit", "logout"))
+        self.end(self.ending("logout"))
+        at = self.record()["session_end"]["at"]
+        self.assertEqual(longhaul.session_end_reason(self.SID, at - 1), "logout")
+        self.assertEqual(longhaul.session_end_reason(self.SID, at), "logout", "at the launch's very moment")
+        self.assertIsNone(longhaul.session_end_reason(self.SID, at + 1), "written before the launch")
+        self.assertIsNone(longhaul.session_end_reason("another-session", 0))
+        self.assertIsNone(longhaul.session_end_reason(None, 0), "no session seen")
+        self.assertIsNone(longhaul.session_end_reason("../x", 0))
+        for junk in ({"reason": "bypass_permissions_disabled", "at": at}, {"reason": "logout"},
+                     {"reason": "logout", "at": "1"}, {"reason": "logout", "at": True}, {"reason": ["logout"], "at": at},
+                     {"at": at}, "logout", ["logout"], None):
+            self.path().write_text(json.dumps({"session_end": junk}))
+            self.assertIsNone(longhaul.session_end_reason(self.SID, 0), junk)
+        self.path().write_text('{"session_end": {"reason": "logout", "at": NaN}}')
+        self.assertIsNone(longhaul.session_end_reason(self.SID, 0), "NaN is no time")
+        self.path().write_text("not json {")
+        self.assertIsNone(longhaul.session_end_reason(self.SID, 0))
+
+    def test_the_usage_text_names_the_hook(self):
+        self.assertIn("longhaul session-end", longhaul.__doc__)
+
+    def hook(self, root=None):
+        """The hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook("SessionEnd", "session-end")
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def run_hook(self, cmd, data):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.run(cmd, input=raw, env=self.env, cwd=self.tmp, capture_output=True, text=True, timeout=30)
+
+    def test_the_plugin_registers_the_hook_on_session_end(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        [entry] = hooks["SessionEnd"]
+        self.assertNotIn("matcher", entry, "every reason: the hook sorts them")
+        [handler] = entry["hooks"]
+        self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+        self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+        # Claude Code gives SessionEnd's hooks 1.5 s in all, and a plugin's
+        # timeout does not raise it; 2 s is no more than that budget. The
+        # import takes 0.07 s warm on 3.14 and 0.22-0.81 s on 3.9 (measured
+        # by the lead, Sprint 10), and the lock waits half a second at most.
+        self.assertEqual((handler["timeout"], handler["statusMessage"]),
+                         (2, "Noting why this session ended (longhaul supervisor)"))
+        # The reminder's wrapper, with this command: whatever longhaul does,
+        # BaseException included, the wrapper exits 0 and the close goes on.
+        [reminder] = [e for e in hooks["UserPromptSubmit"] if "main(['reminder'])" in e["hooks"][0]["args"][2]]
+        wrapper = handler["args"][2]
+        self.assertEqual(wrapper, reminder["hooks"][0]["args"][2].replace("'reminder'", "'session-end'"))
+        self.assertIn("except BaseException:", wrapper)
+        self.assertTrue(wrapper.endswith("\nsys.exit(0)"), wrapper)
+        self.assertEqual(self.hook()[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+        took = []
+        for reason in ("prompt_input_exit", "logout", "clear", "resume", "other"):
+            started = time.time()
+            out = self.run_hook(self.hook(), self.ending(reason, prompt=self.S))
+            took.append(time.time() - started)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), reason)
+            self.assertEqual(self.record()["session_end"]["reason"], reason)
+        self.assertLess(sorted(took)[len(took) // 2], 0.5, f"median of {[round(t, 3) for t in took]}")
+        self.assertNotIn(self.S, self.path().read_text() + self.log())
+
+    def test_the_hook_exits_0_and_prints_nothing_whatever_its_longhaul_does(self):
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n", "returns": "def main(argv):\n    return 2\n",
+                 "interrupted": "def main(argv):\n    raise KeyboardInterrupt\n", "empty": None, "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / "roots" / name
+            if name != "missing":
+                root.mkdir(parents=True)
+            if source:
+                (root / "longhaul.py").write_text(source)
+            out = self.run_hook(self.hook(root), self.ending())
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
+        self.assertIsNone(self.record())
+        for raw in ("", "not json {", "[1]", json.dumps(self.ending(agent_id="a1b2c3d4"))):
+            out = self.run_hook(self.hook(), raw)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw[:20])
+        self.assertIsNone(self.record())
+        self.assertIsNone(self.record(f"{self.SID}+a1b2c3d4"))
 
 
 class Trial(unittest.TestCase):

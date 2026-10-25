@@ -24,9 +24,10 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   which connects it again (Claude Code reconnects short drops itself; this
   is for the ones it gives up on, after a VPN change or a long outage). A
   link lost again and again is left to Claude after a few reopens;
-- Claude closed normally (/exit): longhaul stops too. Claude crashed: longhaul reopens
-  the conversation after a countdown that grows with each crash, and stops
-  after a few.
+- Claude closed normally (/exit, exit code 0, or any code after the plugin's
+  SessionEnd hook recorded that you closed the chat or signed out): longhaul
+  stops too. Claude crashed: longhaul reopens the conversation after a
+  countdown that grows with each crash, and stops after a few.
 
 How it sees what Claude is doing. Claude Code documents no API for any of
 it, so longhaul reads the files Claude Code itself writes (checked on 2.1.295 to
@@ -170,6 +171,11 @@ Usage:
                           its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
                           is sent on the wrong one; whatever it cannot read lets
                           the prompt through
+  longhaul session-end          the plugin's SessionEnd hook: keeps why the session
+                          ended (clear, resume, logout, prompt_input_exit or
+                          other) and when, nothing else, so that a non-zero exit
+                          after you closed the chat or signed out is no crash
+                          to reopen
   longhaul autocompact-note SID TOKENS
                           what the plugin's hooks module runs once it has run
                           /compact at the end of the turn in which a chat saved
@@ -1840,11 +1846,17 @@ def run(opts) -> int:
             show(msg)
         untold.clear()
         runs += 1
+        ended = None
         if why == "exit":
             # 0 is how Claude Code ends on /exit and on Ctrl+C twice
-            # (2.1.304); anything else, a signal included, is a crash.
-            why = "completed" if proc.returncode == 0 else "crashed"
-        log(f"{acct['name']} ended: {why} (session {w.sid}, exit {proc.returncode})")
+            # (2.1.304); anything else, a signal included, is a crash,
+            # unless the plugin's SessionEnd hook recorded, during this
+            # launch, that the user closed this session or signed out
+            # (Sprint 10, L2). "other" never makes a crash a normal end.
+            ended = session_end_reason(w.sid, started)
+            why = "completed" if proc.returncode == 0 or ended in SESSION_END_DONE else "crashed"
+        noted = f", SessionEnd: {ended}" if ended else ""
+        log(f"{acct['name']} ended: {why} (session {w.sid}{noted}, exit {proc.returncode})")
         log(f"state: running -> {why}")
         if w.sid:  # where it ran, for a later `longhaul -r` in ask or never
             note_session_account(w.sid, acct["name"])
@@ -3709,7 +3721,9 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
-GUARD_KEPT = ("reminder", "subagent_reminder")  # a record's keys that are the reminders': every rewrite keeps them
+# A record's keys that are not the guard's (the reminders', and why the session
+# ended: session_end_check()): every rewrite of the guard's keeps them.
+GUARD_KEPT = ("reminder", "subagent_reminder", "session_end")
 
 
 def guard_mode() -> str:
@@ -3991,7 +4005,7 @@ def guard_counts(sid: str):
     found = False
     for file in guard_records(sid):
         kept = read_json(file) if file.is_file() else None
-        if not isinstance(kept, dict) or set(kept) <= set(GUARD_KEPT):  # the reminder's alone: no record of the guard's
+        if not isinstance(kept, dict) or set(kept) <= set(GUARD_KEPT):  # the kept keys alone: no record of the guard's
             continue
         found = True
         for k in GUARD_RULES:
@@ -4024,6 +4038,62 @@ def guard(_opts) -> int:
     hook gives it at the other starts), whatever the guard's mode."""
     return run_hook(lambda data: reminder_join(data, models_guide_join(
         data, guard_check(data, guard_mode(), index=index_mode()), ("startup",))), "guard")
+
+
+# ---------------------------------------------------------- session end
+#
+# `longhaul session-end`: the plugin's SessionEnd hook (Sprint 10, L2). As
+# a session ends, Claude Code names the reason: one of SESSION_END_REASONS
+# (bypass_permissions_disabled was one until 2.1.234; anything it does not
+# document is "other"). The hook keeps the reason and the time in the
+# session's guard record and nothing else of its input, so that the
+# terminal supervisor (run()) takes a non-zero exit after the user closed
+# the chat or signed out for a normal end, not a crash to reopen. Claude
+# Code gives SessionEnd's hooks 1.5 s in all, so the lock is waited for
+# half a second at most.
+
+SESSION_END_REASONS = ("clear", "resume", "logout", "prompt_input_exit", "other")
+SESSION_END_DONE = ("prompt_input_exit", "logout")  # the user ended it: never a crash, whatever the exit code
+
+
+def session_end_check(data) -> None:
+    """Record why a session ended, for a SessionEnd input naming a plain
+    session (a subagent's is passed over), and log it: the reason (one of
+    SESSION_END_REASONS, else "other") and the time, under the record's
+    "session_end", beside what the record holds. Never an answer."""
+    if not isinstance(data, dict) or data.get("hook_event_name") != "SessionEnd" or data.get("agent_id") is not None:
+        return None
+    record = guard_record_path(data)
+    if record is None:
+        return None
+    reason = data.get("reason")
+    reason = reason if isinstance(reason, str) and reason in SESSION_END_REASONS else "other"
+    with locked("guard", wait=0.5):  # the guard's record, written by its hook too
+        kept = read_json(record)
+        kept = kept if isinstance(kept, dict) else {}  # corrupt or missing: a fresh record
+        write_json(record, {**kept, "session_end": {"reason": reason, "at": round(time.time(), 3)}})
+    log(f"session end: {record.stem} ended ({reason})")
+    return None
+
+
+def session_end(_opts) -> int:
+    """The SessionEnd hook command: stdin in, nothing out, exit 0 always."""
+    return run_hook(session_end_check, "session-end")
+
+
+def session_end_reason(sid, since: float):
+    """Why conversation `sid` ended, as the SessionEnd hook recorded it at
+    or after `since` (a launch's start), or None: no record, one written
+    before the launch (an earlier launch's), or a reason it does not
+    document."""
+    record = guard_record_path({"session_id": sid})
+    if record is None:
+        return None
+    end = dict_at(read_json(record), "session_end")
+    at, reason = as_number(end.get("at")), end.get("reason")
+    if at is None or at < since or not isinstance(reason, str) or reason not in SESSION_END_REASONS:
+        return None
+    return reason
 
 
 # ----------------------------------------------------------- checkpoint
@@ -10048,8 +10118,8 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "autocompact-note", "stop-failure", "quota-note", "trial", "vscode",
-                            "models", "update", "doctor"):
+                            "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
+                            "vscode", "models", "update", "doctor"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -10122,7 +10192,8 @@ def main(argv: list[str]) -> int:
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
-                "autocompact-note": autocompact_note, "stop-failure": stop_failure, "quota-note": quota_note,
+                "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
+                "quota-note": quota_note,
                 "trial": trial, "update": update, "doctor": doctor}[cmd](opts)
 
     extra: list[str] = []

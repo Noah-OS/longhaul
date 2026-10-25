@@ -6,17 +6,22 @@ network or a terminal.
 
 Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
 rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
-exit_after_signin_change | clear_then_crash | stay
+exit_after_signin_change | clear_then_crash | stay |
+session_end:<reason>:<code>[:<sid>]
 
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
 2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
-sees as -9. `--version` prints FAKE_VERSION.
+sees as -9. `session_end` runs the SessionEnd hooks hooks/hooks.json
+registers, as Claude Code does as it closes, with that reason and this
+session's id (or <sid>, another session's), then ends with <code>.
+`--version` prints FAKE_VERSION.
 """
 
 import datetime as dt
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -118,6 +123,24 @@ elif step == "crash":
     session(status="idle")
     time.sleep(0.2)
     sys.exit(1)
+elif step.startswith("session_end:"):
+    # Claude Code runs SessionEnd's hooks as it closes, with CLAUDE_PLUGIN_ROOT
+    # set and the event's fields on stdin; what a hook prints is not shown.
+    _, reason, code, *named = step.split(":", 3)
+    session(status="idle")
+    time.sleep(0.2)  # the watcher sees the session's id first
+    root = str(Path(__file__).resolve().parent)
+    event = {"session_id": named[0] if named else sid, "transcript_path": str(transcript), "cwd": os.getcwd(),
+             "hook_event_name": "SessionEnd", "reason": reason}
+    for entry in json.loads((Path(root) / "hooks" / "hooks.json").read_text())["hooks"].get("SessionEnd", []):
+        for hook in entry["hooks"]:
+            try:  # one past its timeout is ended, and the close goes on
+                subprocess.run([hook["command"], *(a.replace("${CLAUDE_PLUGIN_ROOT}", root) for a in hook["args"])],
+                               input=json.dumps(event), env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root),
+                               capture_output=True, text=True, timeout=hook.get("timeout", 60))
+            except subprocess.TimeoutExpired:
+                pass
+    sys.exit(int(code))
 elif step == "killed":
     # What the Sprint 6 live check does to a real claude (`kill -9`): no exit
     # code of its own, so the parent sees -9, not 1.
