@@ -6146,7 +6146,11 @@ def subagent_due(data: dict):
         return None
     crossed = size // at * at
     if not crossed and not junk:
-        return None
+        # Nothing to say; but after the subagent's own compaction, forget the
+        # highest multiple told, as the main reminder does (reminder_fell()).
+        kept = read_json(record) if record.exists() else None
+        if not (isinstance(kept, dict) and reminder_fell(dict_at(kept, "subagent_reminder"), size, at)):
+            return None
     trial = trial_current()
     if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
         return None  # the checkpoint A/B's usual arm hears no reminder, a subagent's included
@@ -6160,6 +6164,8 @@ def subagent_due(data: dict):
             log(f"reminder: LONGHAUL_SUBAGENT_AT is {junk}, so the default, {SUBAGENT_AT:,} tokens, is used "
                 f"({record.stem})")
             said["junk"] = [*logged, junk]
+        if reminder_fell(said, size, at):
+            said.pop("at")
         due = crossed > as_int(said.get("at"))
         if due:
             said["at"] = crossed

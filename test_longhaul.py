@@ -8392,6 +8392,20 @@ class Reminder(unittest.TestCase):
     def sub_logged(self):
         return [entry.split(" ", 2)[2] for entry in self.log().splitlines() if " subagent " in entry]
 
+    def test_a_subagents_count_starts_again_after_its_own_compaction(self):
+        # As the main reminder (the owner, 2026-10-25): a subagent told at 150k
+        # that compacts, on a 200k-window model, would never be told again.
+        self.sub_grow(160_500)
+        self.assertEqual(self.sub_ls(), self.sub_told(160))
+        self.sub_grow(120_000)
+        self.assertIsNone(self.sub_ls(), "less than a step below: no compaction, nothing said")
+        self.sub_grow(155_000)
+        self.assertIsNone(self.sub_ls(), "150k was said")
+        self.sub_grow(30_000)  # its compaction
+        self.assertIsNone(self.sub_ls(), "below the threshold: nothing to say, the mark forgotten")
+        self.sub_grow(151_000)
+        self.assertEqual(self.sub_ls(), self.sub_told(151), "150k of the new context")
+
     def test_a_subagent_is_told_to_report_back_once_per_multiple_of_its_own_context(self):
         self.grow(50_000)
         self.sub_grow(100_000)

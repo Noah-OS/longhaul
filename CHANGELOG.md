@@ -2,6 +2,14 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.7 - 2026-10-26
+
+Long subagent runs are told to wrap up.
+
+### Added
+
+- **A reminder for long subagent runs.** Subagents were most of the cost on the owner's real work, and the costly runs were long ones: each request re-reads the subagent's whole, growing context (one run made 355 requests at 466k tokens each). When a subagent's own context passes `LONGHAUL_SUBAGENT_AT` (150,000 tokens unless set; `off` turns it off), Longhaul tells that subagent, at its next file read or shell command, to finish the step it is on and report back what is done, what is left and what the next agent needs, so the main conversation can hand the rest to a fresh one. Once per multiple per run, and the count starts again after the subagent's own compaction. Logged with the agent type and size; `longhaul doctor` shows the setting and `/longhaul:inspect` how many subagents were told.
+
 ## 0.2.6 - 2026-10-25
 
 ### Fixed
