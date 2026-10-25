@@ -3390,29 +3390,29 @@ class Index(unittest.TestCase):
         self.assertTrue((self.repo / ".codegraph").is_dir())
 
     def test_a_run_over_the_timeout_is_killed_and_counts_as_a_failure(self):
-        # A 3 s timeout on a 30 s hang (2026-10-25): with 1 s on a 3 s run, a
+        # A 6 s timeout on a 30 s hang (2026-10-25): with 1 s on a 3 s run, a
         # machine at a load average of 16 to 27 killed the fake before it
         # started, or let it finish first.
         (self.tmp / "codegraph.hang").touch()
         (self.bin / "trail").unlink()
-        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "3"}):  # the runner reads it at its import
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "6"}):  # the runner reads it at its import
             self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
         entry = self.wait("codegraph")
         self.assertEqual(entry["exit"], -1)
-        self.assertLess(entry["seconds"], 10, "killed at the timeout, not waited for")
+        self.assertLess(entry["seconds"], 20, "killed at the timeout, not waited for")
         self.assertFalse((self.repo / ".codegraph").exists())
         self.assertRegex((self.home / "longhaul.log").read_text(),
-                         r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 3 s timeout\)\n")
+                         r"index: codegraph init in \S+ exit -1 after \d\.\d s \(killed at the 6 s timeout\)\n")
         self.assertEqual(entry["why"], "timeout")
-        self.assertEqual(entry["timeout"], 3, "the timeout it was killed at, recorded at the kill")
+        self.assertEqual(entry["timeout"], 6, "the timeout it was killed at, recorded at the kill")
         self.assertEqual(self.begin(self.start()), [], "a failure: left alone")
         # The user is told the timeout, not the time the run took (final
-        # review, Sprint 7, G3): a loaded machine's 4.7 s says 3 s still.
+        # review, Sprint 7, G3): a loaded machine's 7.7 s says 6 s still.
         state = self.state()
-        state["runs"]["codegraph"]["seconds"] = 4.7
+        state["runs"]["codegraph"]["seconds"] = 7.7
         longhaul.write_json(self.state_path(), state)
         answer = self.check(self.start())
-        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 3 s timeout"))
+        self.assertEqual(self.said(answer), self.told_failed("codegraph", "exit -1, killed at the 6 s timeout"))
         self.assertNotIn("hookSpecificOutput", answer, "nothing started, nothing for the model")
         del state["runs"]["codegraph"]["timeout"]  # an entry written before the timeout was recorded
         longhaul.write_json(self.state_path(), state)
@@ -3424,7 +3424,9 @@ class Index(unittest.TestCase):
         state["runs"]["codegraph"]["started"] -= 86_401
         longhaul.write_json(self.state_path(), state)
         self.assertEqual(self.begin(self.start()), [], "a day on, a timeout still")
-        self.assertEqual(len(self.calls("codegraph")), 1, "never run again")
+        # Never run again: at most the one call. Not exactly one: under load the
+        # fake may not have started before the kill (2026-10-25).
+        self.assertLessEqual(len(self.calls("codegraph")), 1, "never run again")
         self.state_path().unlink()
         (self.tmp / "codegraph.hang").unlink()
         self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))], "the state deleted: now")

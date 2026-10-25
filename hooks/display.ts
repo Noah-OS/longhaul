@@ -125,8 +125,16 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     try {
+      // The live window, as the status line has it: a turn's usage sums all its
+      // requests, so on a turn of several it overstated the context (2026-10-25).
+      let live: number | undefined
+      try {
+        const { context: now } = await $.session.usage()
+        if (typeof now?.tokens === 'number') live = now.tokens
+      } catch {}
       const u: any = (e as any).usage
-      if (u && typeof u.input_tokens === 'number')
+      if (live !== undefined) context = live
+      else if (u && typeof u.input_tokens === 'number')
         context = u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)
       await popUps($, await newLines($))
     } catch {}

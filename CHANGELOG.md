@@ -4,9 +4,11 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## 0.2.4 - 2026-10-25
 
-The context reminder keeps working through a long conversation, work folders stay on the work account, and the guard shows what it does.
+The context reminder keeps working through a long conversation and now compacts it, work folders stay on the work account, and the guard shows what it does.
 
 ### Added
+
+- **Auto-compact after a reminder's save.** When the context reminder has fired and Claude has saved its checkpoint, Longhaul runs `/compact` once at the end of that turn, so the conversation goes on from a small context and the checkpoint comes back right after. It is logged, shown as a pop-up, and done at most once per reminder and once in ten minutes. `LONGHAUL_AUTO_COMPACT=off` turns it off. It works through Claude Code's plugin modules: a headless run showed it compacting; the terminal and the VS Code panel are checked live.
 
 - **A chat on the wrong account is stopped in a folder kept for another one.** A new prompt hook, `longhaul account-check`, refuses each prompt in a folder that `accounts.json` keeps for some accounts (their `repositories`) when the chat runs on any other account, by its `CLAUDE_CONFIG_DIR`. Nothing is sent, and the line says how to fix it: close the chat and open it again, so it starts on the right account. It is logged, and the Longhaul display shows it. This catches a chat whose process began before Longhaul was set up, as two VS Code chats in a work folder did. Whatever the hook cannot read lets the prompt through.
 - **The guard shows what it does.** Each read it flags, advised on or refused, is one line in `~/.longhaul/longhaul.log` with the file's path and size, never its content, and the Longhaul display shows a pop-up for this chat's flags. It still advises only Claude by default.
@@ -18,6 +20,7 @@ The context reminder keeps working through a long conversation, work folders sta
 
 ### Fixed
 
+- **The display's context size.** The status entry's "context Nk" added up every request of a turn, so a turn of several requests showed several times the real context. It now shows the live window, as Claude Code's own status line does.
 - **The context reminder starts counting again after a compaction.** Before, each threshold was said once per conversation for good, so a conversation reminded at 800,000 tokens and compacted near 968,000 was never reminded again. Now, once the context falls more than one threshold below the last reminder, or under half the threshold (as after a compaction), it is reminded at 200,000, 400,000 and so on of the new context. A drop smaller than that, as when Claude Code clears old tool results, changes nothing.
 
 ### Changed
