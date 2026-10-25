@@ -18,6 +18,7 @@ import type { Register } from 'claude-code'
 // so it can only miss a compaction, never add one. Any failure shows nothing.
 
 const TAIL = 65536 // bytes of the log read at most per turn
+const RECENT = 15 * 60 * 1000 // ms of the log a first read takes into account
 const GAP = 600 // seconds: never two compactions of one chat closer than this
 let seen = -1 // the log's size when last read: a reload starts afresh
 let armed: string | undefined // the chat whose reminder was heard, until it compacts
@@ -33,13 +34,23 @@ async function newLines($: any): Promise<string[]> {
   try {
     const path = `${await home($)}/longhaul.log`
     const { size } = await $.fs.stat(path)
-    if (seen < 0 || size < seen) { seen = size; return [] }
-    if (size === seen) return []
-    const take = Math.min(size - seen, TAIL)
+    // A first read (the module just loaded, by a start or a /reload-plugins) takes
+    // the last RECENT of the log too: a reminder and its save in the turn that
+    // loaded it were missed before (2026-10-25, the first live check).
+    const first = seen < 0 || size < seen
+    if (!first && size === seen) return []
+    const take = first ? Math.min(size, TAIL) : Math.min(size - seen, TAIL)
     seen = size
+    if (!take) return []
     const ran = await $.process.run(['tail', '-c', String(take), path])
     const text = typeof ran?.stdout === 'string' ? ran.stdout : ''
-    return text.split('\n').filter(Boolean)
+    const lines = text.split('\n').filter(Boolean)
+    if (!first) return lines
+    const since = (await $.clock.now()) - RECENT
+    return lines.filter(line => {
+      const m = line.match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) /)
+      return !!m && new Date(`${m[1]}T${m[2]}`).getTime() >= since
+    })
   } catch { return [] }
 }
 
@@ -50,6 +61,8 @@ function hear(lines: string[], sid: string): void {
     let m: RegExpMatchArray | null
     if ((m = body.match(/^reminder: (\S+) reminded at [\d,]+ tokens/)) && m[1] === sid) { armed = sid; due = undefined }
     else if ((m = body.match(/^checkpoint for (\S+) saved \([\d,]+ bytes\)/)) && m[1] === sid && armed === sid) due = sid
+    // Its own compaction disarms, so a first read's replay never compacts twice.
+    else if ((m = body.match(/^autocompact: compacted (\S+) after its checkpoint/)) && m[1] === sid) { armed = undefined; due = undefined }
   }
 }
 

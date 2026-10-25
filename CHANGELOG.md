@@ -2,6 +2,12 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.5 - 2026-10-25
+
+### Fixed
+
+- **Auto-compact after a reload.** When the plugin's module had just loaded (a chat's start, or `/reload-plugins`), its first turn only marked where Longhaul's log ended, so a reminder and the save in that same turn were missed and nothing compacted, as in the first live check. Its first turn now also reads the last fifteen minutes of the log; its own `autocompact:` line keeps a replay from compacting twice.
+
 ## 0.2.4 - 2026-10-25
 
 The context reminder keeps working through a long conversation and now compacts it, work folders stay on the work account, and the guard shows what it does.

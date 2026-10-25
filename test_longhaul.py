@@ -11988,20 +11988,24 @@ class Autocompact(unittest.TestCase):
             self.assertEqual(longhaul.checkpoint_save(self.SID, "{not json", str(self.tmp), None), 2)
         reminded, saved, refused = [line[20:] for line in self.log().splitlines()]
         patterns = [p.replace("\\/", "/") for p in re.findall(r"body\.match\(/(.+?)/\)", self.source())]
-        self.assertEqual(len(patterns), 2)
-        arms, makes_due = patterns
+        self.assertEqual(len(patterns), 3)
+        arms, makes_due, disarms = patterns
         self.assertEqual(re.match(arms, reminded).group(1), self.SID, reminded)
         self.assertEqual(re.match(makes_due, saved).group(1), self.SID, saved)
         for pattern in patterns:
             self.assertIsNone(re.match(pattern, refused), refused)
         self.assertIsNone(re.match(arms, saved))
         self.assertIsNone(re.match(makes_due, reminded))
-        # The module's own line is neither: a compaction never arms another.
+        for line in (reminded, saved):
+            self.assertIsNone(re.match(disarms, line), line)
+        # The module's own line neither arms nor makes due: it disarms, so a first
+        # read's replay of the last fifteen minutes never compacts twice (0.2.5).
         self.note(self.SID, "612345")
         mine = self.log().splitlines()[-1][20:]
         self.assertTrue(mine.startswith("autocompact: "), mine)
-        for pattern in patterns:
-            self.assertIsNone(re.match(pattern, mine), mine)
+        self.assertIsNone(re.match(arms, mine), mine)
+        self.assertIsNone(re.match(makes_due, mine), mine)
+        self.assertEqual(re.match(disarms, mine).group(1), self.SID, mine)
 
     def test_the_note_keeps_each_chats_last_compaction_for_a_day(self):
         record = self.home / longhaul.AUTOCOMPACT_RECORD

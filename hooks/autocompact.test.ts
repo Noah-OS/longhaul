@@ -231,3 +231,39 @@ test('without the live window\'s figure the turn\'s own usage counts', async ($,
   expect(compacted(w)).toEqual(['Longhaul: compacted this chat after its checkpoint (602k tokens); the checkpoint comes back now.'])
   expect(w.notes[0]!.slice(-1)).toEqual(['602006'])
 })
+
+// A first read after a load (a start, or /reload-plugins) takes the last
+// fifteen minutes of the log too (2026-10-25, the first live check: the
+// reminder and the save came in the very turn /reload-plugins had loaded it).
+function stamped(w: World, minutesAgo: number, text: string) {
+  const d = new Date(NOW - minutesAgo * 60_000)
+  const two = (n: number) => String(n).padStart(2, '0')
+  const at = `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
+  w.log += `${at} ${text}\n`
+}
+
+test('a reminder and its save just before the module loaded compact at its first turn', async ($, on) => {
+  const w = world(on)
+  stamped(w, 6, reminded())
+  stamped(w, 4, saved())
+  await turn($) // the module's first turn
+  expect(w.commands).toEqual(['compact'])
+  expect(compacted(w)).toEqual([TOAST])
+})
+
+test('lines older than fifteen minutes at the first turn do nothing', async ($, on) => {
+  const w = world(on)
+  stamped(w, 30, reminded())
+  stamped(w, 20, saved())
+  await turn($)
+  expect(w.commands).toEqual([])
+})
+
+test('a recent save the module already compacted after does nothing at a first turn', async ($, on) => {
+  const w = world(on)
+  stamped(w, 9, reminded())
+  stamped(w, 8, saved())
+  stamped(w, 7, `autocompact: compacted ${SID} after its checkpoint (the context was 612,345)`)
+  await turn($)
+  expect(w.commands).toEqual([])
+})
