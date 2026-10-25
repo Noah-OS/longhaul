@@ -50,6 +50,7 @@ ledger.jsonl
 auth-cache.json
 vscode.json
 autocompact.json
+seen.json
 usage/
 sessions/
 guard/

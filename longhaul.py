@@ -81,6 +81,11 @@ Usage:
   longhaul setup [NAME]         sign each account in to its own folder (a browser
                           sign-in); only the emails in accounts.json count
   longhaul status               accounts, sign-ins, limits, links
+  longhaul doctor               what is set up and what to do next, one line each:
+                          the plugin, the terminal command, Claude Code, updates,
+                          the status line, the VS Code panel, the accounts, the
+                          chats running now, the code maps and the features; it
+                          only reads (/longhaul:doctor runs it in a chat)
   longhaul usage [--days N]     each account's allowance; work per task and account
   longhaul inspect [ID|PATH] [--json]
                           where one conversation's usage went (numbers only;
@@ -3661,21 +3666,27 @@ def guard_startup(data: dict, mode: str, index: str):
     still building: index_unfinished), then one sentence per init the
     auto-init started (INDEX_NOTE, with the index on; the two switches
     are independent); and for the user, a systemMessage of each init
-    started and each failure that stands (index_message), and of a newer
-    Longhaul installed or released (release_startup, which also starts the
-    day's release check in the background); or None. A
-    subagent's start is not the session's, and without the index there
-    is nothing to say of it: the install advice is the inspect report's,
-    not every session's. What the index's part raises is logged and
-    costs nothing else."""
+    started and each failure that stands (index_message), after the
+    first-chat line of a new install or an update (setup_line, in any
+    mode), and of a newer Longhaul installed or released (release_startup,
+    which also starts the day's release check in the background); or
+    None. A subagent's start is not the session's, and without the index
+    there is nothing to say of it: the install advice is the inspect
+    report's, not every session's. What the index's part, the first-chat
+    line or the release's part raises is logged and costs nothing else."""
     named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
-    started, message = [], ""
+    started, message, first = [], "", None
+    try:  # the first chat after an install or an update: one line pointing to /longhaul:doctor (setup_line)
+        first = setup_line(data)
+    except Exception as e:
+        log(f"setup: no line ({type(e).__name__})")
     try:  # the index's part: whatever it raises (a full disk, a home it cannot write), the guard's note goes
         started, failed = index_start(data, index)
         message = index_message(started, failed)
         named = named and not index_unfinished(data["cwd"])
     except Exception as e:
         log(f"index: not started ({e!r})")
+    message = "\n".join(filter(None, (first, message)))
     try:  # the release's part (release_startup): its one line goes last, on its own; what it raises costs the rest nothing
         message = "\n".join(part for part in (message, release_startup(data)) if part)
     except Exception as e:
@@ -8691,6 +8702,695 @@ def clear(_opts) -> int:
     return 0
 
 
+# --------------------------------------------------------------- doctor
+#
+# `longhaul doctor` and /longhaul:doctor (the owner's decision of
+# 2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
+# what was installed and what they had to do to get the benefit, and on
+# the owner's Mac every problem was something half set up with nothing
+# saying so: the plugin without the terminal command, VS Code tabs and a
+# plain `claude` running outside Longhaul (one on the wrong account in a
+# work folder), Trail-Code installed but not executable, a stale plugin,
+# the Auto Model table applying nowhere outside a trial, a Claude Code
+# outside the checked range. The doctor prints a checklist, one line per
+# part, each marked ✔ (set up), ✘ (broken) or ⚠ (half set up, or not
+# checked), with one next step for each line not ✔, then a count and the
+# first step. It only reads: it writes no file, takes no lock and logs
+# nothing, so the shim runs it from a chat as it runs status. Of other
+# processes it reads, with ps and lsof, only what a chat is (its program
+# and its own flags, never printed), its folder, and its CLAUDE_CONFIG_DIR,
+# never another variable. It names accounts, never their emails.
+#
+# The first chat after an install or an update (the plugin's version is
+# not the one LONGHAUL_HOME/seen.json records) is told, by the guard's
+# startup hook, how much is set up and to type /longhaul:doctor; the count
+# is the quick checks' alone (doctor_checks(quick=True)): no process list,
+# no network, no program run, so the hook stays well inside its timeout.
+
+DOCTOR_MARKS = {"ok": "✔", "bad": "✘", "warn": "⚠"}
+DOCTOR_PLAIN = {"ok": "ok", "bad": "XX", "warn": "!!"}  # for a terminal whose encoding has no ✔
+DOCTOR_RANK = {"ok": 0, "warn": 1, "bad": 2}
+# Each line's name and the function that checks it, by name: looked up at
+# call time, so a test can stand in for one.
+DOCTOR_CHECKS = (("Plugin", "doctor_plugin"), ("Terminal command", "doctor_command"), ("Claude Code", "doctor_claude"),
+                 ("Updates", "doctor_updates"), ("Status line", "doctor_statusline"),
+                 ("VS Code panel", "doctor_vscode"), ("Accounts", "doctor_accounts"),
+                 ("Chats running now", "doctor_chats"), ("Code maps", "doctor_maps"), ("Features", "doctor_features"))
+DOCTOR_UPDATE = "`claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`"
+DOCTOR_STATUS_LINE = '"statusLine": {"type": "command", "command": "~/.local/bin/longhaul statusline"}'
+# The first word after the program (`claude auth ...`): a job, not a chat.
+DOCTOR_JOBS = ("auth", "mcp", "plugin", "plugins", "update", "upgrade", "doctor", "install", "setup-token", "config",
+               "migrate-installer", "--version", "-v", "-h", "--help")
+DOCTOR_PS_TIMEOUT = 10  # seconds each of ps and lsof may take
+SEEN = "seen.json"  # under LONGHAUL_HOME: {"version": the plugin version whose first chat was told, "at": epoch}
+SETUP_LINE = "Longhaul {version} is on: {n} of {m} set up. Type /longhaul:doctor to see what's left."
+SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"
+
+
+def plugin_manifest(folder=None) -> dict:
+    """The plugin.json of the Longhaul in `folder` (default: the one this
+    file is in), or {} for none."""
+    found = read_json(Path(folder or Path(__file__).resolve().parent) / ".claude-plugin" / "plugin.json")
+    return found if isinstance(found, dict) else {}
+
+
+def plugin_version(folder=None):
+    """That plugin.json's version, x.y.z, or None."""
+    version = plugin_manifest(folder).get("version")
+    return version if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version) else None
+
+
+def plugin_repository() -> str:
+    """owner/name of Longhaul's GitHub repository, as its manifest names
+    it, or ""."""
+    found = re.match(r"https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?/?$", str(plugin_manifest().get("repository")))
+    return found.group(1) if found else ""
+
+
+def doctor_result(said: str, items=(), mark: str = "ok", step=None) -> dict:
+    """One line of the checklist: what it says, its items (mark, text,
+    step), its mark, the worst of its own and its items', and its step:
+    its own when the line's own mark is the worst, else its first broken
+    item's, else its first half-set-up item's."""
+    items = list(items)
+    worst = max([mark] + [i[0] for i in items], key=DOCTOR_RANK.get)
+    if DOCTOR_RANK[mark] < DOCTOR_RANK[worst] or not step:
+        step = next((s for want in ("bad", "warn") for m, _, s in items if m == want and s), step)
+    return {"mark": worst, "said": said, "items": items, "step": step if worst != "ok" else None}
+
+
+def doctor_expand(path: str) -> str:
+    """`~` and `~/...` against HOME, as the doctor shows paths (home_path)."""
+    return str(HOME) + path[1:] if path == "~" or path.startswith("~/") else path
+
+
+def doctor_path_hits(name: str) -> list:
+    """Each file called `name` in PATH's absolute entries, in order, as
+    (path, runnable): True for an executable file, False for one that is
+    not, None for a link to nowhere. shutil.which() passes over the last
+    two, which is how a Trail-Code that cannot run went unnoticed."""
+    hits, seen = [], set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isabs(entry) or entry in seen:
+            continue
+        seen.add(entry)
+        path = os.path.join(entry, name)
+        if os.path.islink(path) and not os.path.exists(path):
+            hits.append((path, None))
+        elif os.path.isfile(path):
+            hits.append((path, os.access(path, os.X_OK)))
+    return hits
+
+
+def doctor_is_shim(path: str) -> bool:
+    """Whether `path` is a plugin's bin/longhaul, the in-chat shim (on the
+    Bash tool's PATH while the plugin is enabled): not the terminal command."""
+    real = Path(os.path.realpath(path))
+    return real.name == "longhaul" and real.parent.name == "bin" and (real.parent.parent / "longhaul.py").is_file()
+
+
+def doctor_in_plugins(path: str) -> bool:
+    """Whether a real path is inside Claude Code's plugins folder, whose
+    copies move at every update."""
+    real = os.path.realpath(path)
+    return any(inside(real, os.path.realpath(str(folder / "plugins"))) for folder in (DEFAULT_CONFIG, HOME / ".claude"))
+
+
+def doctor_installed() -> dict:
+    """Longhaul in Claude Code's installed_plugins.json, in either shape it
+    has had (a plugin's entry, or a list of them by scope, the user's
+    first): {"key": "longhaul@<marketplace>", "version"}; {} when it is
+    not there; {"why"} when the file cannot be read."""
+    path = DEFAULT_CONFIG / "plugins" / "installed_plugins.json"
+    try:
+        found = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        return {"why": e.strerror or type(e).__name__}
+    except ValueError:
+        return {"why": "not JSON"}
+    for key, entry in dict_at(found, "plugins").items():
+        if not (isinstance(key, str) and key.split("@", 1)[0] == "longhaul"):
+            continue
+        entries = [e for e in (entry if isinstance(entry, list) else [entry]) if isinstance(e, dict)]
+        chosen = next((e for e in entries if e.get("scope") == "user"), entries[0] if entries else {})
+        version = chosen.get("version")
+        return {"key": key, "version": version if isinstance(version, str) else None}
+    return {}
+
+
+def doctor_plugin() -> dict:
+    """1. The plugin: installed in Claude Code, its version, and not turned
+    off in the user's settings (enabledPlugins); a chat still running the
+    copy an update replaced is told to reload."""
+    found = doctor_installed()
+    repo = plugin_repository()
+    install = (f"in Claude Code: `/plugin marketplace add {repo}`, then `/plugin install longhaul@longhaul`" if repo
+               else "in Claude Code: `/plugin install longhaul@longhaul`, after adding its marketplace")
+    if found.get("why"):
+        return doctor_result(f"Claude Code's list of installed plugins could not be read ({found['why']})",
+                             mark="warn", step="look in Claude Code: `/plugin`")
+    if not found:
+        return doctor_result("not installed in Claude Code, so no guard, checkpoint, report or display",
+                             mark="bad", step=install)
+    key, version = found["key"], found["version"] or "(version unknown)"
+    if dict_at(read_json(DEFAULT_CONFIG / "settings.json"), "enabledPlugins").get(key) is False:
+        return doctor_result(f"{version} is installed but turned off ({key})", mark="bad",
+                             step=f"`/plugin enable {key}` in Claude Code (or `claude plugin enable {key}`)")
+    here = plugin_version()
+    if doctor_in_plugins(__file__) and here and found["version"] and here != found["version"]:
+        return doctor_result(f"{version} is installed; this chat runs {here}", mark="warn",
+                             step=f"start a new chat, or type /reload-plugins, to run {version}")
+    return doctor_result(f"{version}, enabled ({key})")
+
+
+def doctor_command() -> dict:
+    """2. The terminal command: `longhaul` on PATH (the plugin's own shim
+    is not it), runnable, and its version, read from the manifest beside
+    the longhaul.py it links to, against the installed plugin's.
+    Accounts, switching, the status line, trials, models and VS Code all
+    need it."""
+    repo = plugin_repository() or "the repository"
+    link = (f"keep a checkout and link it: `git clone https://github.com/{repo}.git`, then `python3 longhaul.py "
+            "setup` in it (it links ~/.local/bin/longhaul; ~/.local/bin must be on PATH)")
+    hits = [hit for hit in doctor_path_hits("longhaul") if not doctor_is_shim(hit[0])]
+    found = next((path for path, runnable in hits if runnable), None)
+    if found is None:
+        if hits and hits[0][1] is None:
+            return doctor_result(f"{home_path(hits[0][0])} links to a file that is gone", mark="bad",
+                                 step=f"remove it, then {link}")
+        if hits:
+            return doctor_result(f"{home_path(hits[0][0])} is not executable", mark="bad",
+                                 step=f"chmod +x {shlex.quote(hits[0][0])}")
+        local = HOME / ".local" / "bin" / "longhaul"
+        if local.exists() and not doctor_is_shim(str(local)):
+            return doctor_result("~/.local/bin/longhaul is there, but ~/.local/bin is not on PATH", mark="bad",
+                                 step="add ~/.local/bin to PATH in your shell's profile, then open a new terminal")
+        return doctor_result("`longhaul` is not on PATH; accounts, switching, the status line, trials, models and "
+                             "VS Code need it", mark="bad", step=link)
+    real = Path(os.path.realpath(found))
+    if doctor_in_plugins(str(real)):
+        return doctor_result(f"{home_path(found)} links into the plugin's own copy, which moves at every update",
+                             mark="warn", step=link)
+    version = plugin_version(real.parent) if real.name == "longhaul.py" else None
+    if version is None:
+        return doctor_result(f"{home_path(found)} is not a Longhaul checkout's longhaul.py", mark="warn", step=link)
+    plugin = doctor_installed().get("version")
+    if plugin and parse_version(plugin) and parse_version(version) != parse_version(plugin):
+        where = home_path(str(real.parent))
+        step = (f"`git -C {where} pull` brings the checkout up to date" if parse_version(version) < parse_version(plugin)
+                else f"update the plugin: {DOCTOR_UPDATE}")
+        return doctor_result(f"{home_path(found)} runs {version}, and the plugin {plugin}", mark="warn", step=step)
+    return doctor_result(f"{home_path(found)}, from {home_path(str(real.parent))} ({version})")
+
+
+def doctor_claude(quick: bool = False):
+    """3. Claude Code's version against the range Longhaul is checked on
+    (TESTED_VERSIONS, version_note()): `claude --version`; quick, the
+    version the session's own claude names in its path, a native
+    install's .../versions/x.y.z or the VS Code extension's, never a
+    program run, and None (not counted) when the path names none."""
+    if quick:
+        real = os.path.realpath(os.environ.get("CLAUDE_CODE_EXECPATH") or "")
+        named = re.search(r"/versions/(\d+\.\d+\.\d+)(?:/|$)|anthropic\.claude-code-(\d+\.\d+\.\d+)", real)
+        if not (os.environ.get("CLAUDE_CODE_EXECPATH") and named):
+            return None
+        version = parse_version(named.group(1) or named.group(2))
+    else:
+        version = claude_version()
+    low, high = (".".join(map(str, v)) for v in TESTED_VERSIONS)
+    if version is None:
+        return doctor_result("its version could not be read", mark="warn",
+                             step="check that `claude --version` runs in a terminal")
+    shown = ".".join(map(str, version))
+    if version_note(version) is None:
+        return doctor_result(f"{shown}, in the range Longhaul is checked on ({low} to {high})")
+    if version > TESTED_VERSIONS[1]:
+        return doctor_result(f"{shown} is newer than Longhaul has been checked on ({low} to {high}): Claude runs as "
+                             "normal, and switching accounts at a limit may not", mark="warn",
+                             step=f"a newer Longhaul may cover it: {DOCTOR_UPDATE}")
+    return doctor_result(f"{shown} is older than Longhaul has been checked on ({low} to {high})", mark="warn",
+                         step="update Claude Code: `claude update`")
+
+
+def doctor_updates(quick: bool = False):
+    """4. Updates: release_status()'s running, installed and latest
+    versions and whether auto-update is on, when the module has it (it
+    may ask the network, so never quick); without it, "not checked yet"."""
+    if quick:
+        return None
+    status = globals().get("release_status")
+    if not callable(status):
+        return doctor_result("not checked yet", mark="warn", step=f"update by hand: {DOCTOR_UPDATE}")
+    try:
+        found = status()
+    except Exception as e:
+        return doctor_result(f"could not be checked ({type(e).__name__})", mark="warn",
+                             step=f"update by hand: {DOCTOR_UPDATE}")
+    if not isinstance(found, dict):
+        return doctor_result("not checked yet", mark="warn", step=f"update by hand: {DOCTOR_UPDATE}")
+    running, installed, latest = (found.get(k) if isinstance(found.get(k), str) and parse_version(found.get(k))
+                                  else None for k in ("running", "installed", "latest"))
+    auto = next((found[k] for k in ("auto_update", "auto", "auto_updates") if k in found), None)
+    auto = {"on": True, "off": False}.get(auto, auto) if isinstance(auto, str) else auto
+    said = (f"running {running or 'not known'}, installed {installed or 'not known'}, latest {latest or 'not known'}; "
+            f"auto-update {'on' if auto is True else 'off' if auto is False else 'not known'}")
+    if latest and installed and parse_version(latest) > parse_version(installed):
+        return doctor_result(said, mark="warn", step=f"{DOCTOR_UPDATE} (or `longhaul update on` to have it done)")
+    if installed and running and parse_version(installed) > parse_version(running):
+        return doctor_result(said, mark="warn", step=f"start a new chat, or type /reload-plugins, to run {installed}")
+    if auto is False:
+        return doctor_result(said, mark="warn", step="`longhaul update on`")
+    if not (latest and installed and running and auto is True):
+        return doctor_result(said, mark="warn", step=f"update by hand: {DOCTOR_UPDATE}")
+    return doctor_result(said)
+
+
+def doctor_statusline() -> dict:
+    """5. The status line: the user's settings.json points it at `longhaul
+    statusline`, and the program it names is there. Read only."""
+    path = DEFAULT_CONFIG / "settings.json"
+    found = read_json(path)
+    where = home_path(str(path))
+    if found is None and path.exists():
+        return doctor_result(f"{where} could not be read", mark="warn", step=f"fix {where}: it is not JSON")
+    command = dict_at(found, "statusLine").get("command")
+    if not isinstance(command, str) or not command.strip():
+        return doctor_result("not set, so Claude Code's status line shows no account or allowance", mark="warn",
+                             step=f"add {DOCTOR_STATUS_LINE} to {where}")
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    at = next((i for i, w in enumerate(words) if re.fullmatch(r"(?:.*/)?longhaul(?:\.py)?", w)), None)
+    if at is None or words[at + 1:at + 2] != ["statusline"]:
+        return doctor_result("runs another command, not `longhaul statusline`", mark="warn",
+                             step=f"set {DOCTOR_STATUS_LINE} in {where}")
+    program = words[at]
+    if "/" in program:
+        there = os.path.exists(doctor_expand(program))
+    else:
+        there = any(runnable for _, runnable in doctor_path_hits(program))
+    if not there:
+        return doctor_result(f"runs {home_path(doctor_expand(program))}, which is not there", mark="bad",
+                             step="link the terminal command (see Terminal command)")
+    return doctor_result(f"`{home_path(doctor_expand(program))} statusline`")
+
+
+def doctor_vscode() -> dict:
+    """6. The VS Code panel: whether VS Code's settings point its Claude
+    at a longhaul-vscode that is there (`longhaul vscode on`). Nothing to
+    set with one subscription, or without VS Code."""
+    accounts, problem = read_accounts_file()
+    if not accounts and not problem:
+        return doctor_result("nothing to set with one subscription (the panel signs in on its own)")
+    if not VSCODE_SETTINGS.is_file():
+        return doctor_result("VS Code's settings are not on this machine: nothing to set")
+    try:
+        found = jsonc_load(VSCODE_SETTINGS.read_text(errors="replace"))
+    except OSError as e:
+        found = e
+    if not isinstance(found, dict):
+        return doctor_result("VS Code's settings could not be read", mark="warn",
+                             step=f"check {home_path(str(VSCODE_SETTINGS))}, then `longhaul vscode on`")
+    value = found.get(VSCODE_WRAPPER_KEY)
+    if value is None:
+        return doctor_result("its chats sign in on their own, not on your Longhaul accounts", mark="warn",
+                             step="`longhaul vscode on`, then reload VS Code; a tab opened before keeps its "
+                                  "account until it is closed and opened again")
+    if not (isinstance(value, str) and value.endswith("longhaul-vscode")):
+        return doctor_result("runs another wrapper, not Longhaul's", mark="warn", step="`longhaul vscode on`")
+    path = doctor_expand(value)
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return doctor_result(f"points at {home_path(path)}, which is not there", mark="bad",
+                             step="`longhaul vscode on`, then reload VS Code")
+    if doctor_in_plugins(path):
+        return doctor_result(f"points into the plugin's own copy ({home_path(path)}), which moves at every update",
+                             mark="warn", step="`longhaul vscode on` from the terminal command")
+    return doctor_result(f"through Longhaul ({home_path(path)})")
+
+
+def doctor_default_email():
+    """The default sign-in's email (~/.claude.json's oauthAccount), for
+    comparing only: never shown or logged."""
+    email = dict_at(read_json(DEFAULT_GLOBAL_JSON), "oauthAccount").get("emailAddress")
+    return email.strip().casefold() if isinstance(email, str) and email.strip() else None
+
+
+def doctor_accounts() -> dict:
+    """7. The accounts: accounts.json readable, each account's folder
+    there, the folders each is kept for; and two accounts that sign in as
+    one email (the default sign-in among them) are one subscription with
+    one allowance, so a switch between them never helps (the owner's
+    Mac, 2026-10-25). Names, never emails."""
+    accounts, problem = read_accounts_file()
+    where = home_path(str(LONGHAUL_HOME / "accounts.json"))
+    if problem:
+        return doctor_result(unreadable_text(problem), mark="bad", step=f"fix or remove {where}")
+    if not accounts:
+        return doctor_result("one subscription, on ~/.claude (no accounts.json); `longhaul add` adds another")
+    items = []
+    for a in accounts:
+        folder = home_path(str(config_of(a)))
+        if not config_of(a).is_dir():
+            items.append(("bad", f"{a['name']}: {folder} is missing", f"`longhaul setup {a['name']}`"))
+        elif repositories_of(a) is None:
+            items.append(("bad", f"{a['name']}: {folder}, {where_allowed(a)}",
+                          f'make its "repositories" in {where} a list of absolute paths'))
+        else:
+            items.append(("ok", f"{a['name']}: {folder}, {where_allowed(a)}", None))
+    same = "keep one of them, or give the other its own subscription"
+    by_email = collections.defaultdict(list)
+    for a in accounts:
+        if isinstance(a.get("email"), str) and a["email"].strip():
+            by_email[a["email"].strip().casefold()].append(a["name"])
+    for names in by_email.values():
+        if len(names) > 1:
+            items.append(("warn", f"{' and '.join(names)} are one subscription (same email): a switch between them "
+                                  "never helps", same))
+    default = doctor_default_email()
+    on_default = os.path.realpath(DEFAULT_CONFIG)
+    for a in accounts:
+        if default and isinstance(a.get("email"), str) and a["email"].strip().casefold() == default \
+                and a.get("config_dir") and os.path.realpath(config_of(a)) != on_default:
+            items.append(("warn", f"{a['name']} and the default sign-in ({home_path(str(DEFAULT_CONFIG))}) are one "
+                                  "subscription (same email): a switch between them never helps", same))
+    return doctor_result(plural(len(accounts), "account") + f" in {where}", items)
+
+
+def doctor_claude_word(words: list) -> int | None:
+    """Where claude's own arguments start in a process's words: after the
+    program, when it is claude (its name, a native install's
+    .../versions/x.y.z, or node running a script called claude), else None."""
+    name = lambda w: w.rsplit("/", 1)[-1]  # noqa: E731
+    if not words:
+        return None
+    if name(words[0]) == "claude" or re.search(r"/claude/versions/\d+\.\d+\.\d+$", words[0]):
+        return 1
+    if name(words[0]) == "node" and len(words) > 1 and (name(words[1]) == "claude"
+                                                         or words[1].endswith("claude-code/cli.js")):
+        return 2
+    return None
+
+
+def doctor_config_dir(environment: str):
+    """CLAUDE_CONFIG_DIR's value in a process's environment as `ps e`
+    shows it after the arguments (its value runs to the next NAME=), or
+    None when it is unset or empty. No other variable is read."""
+    found = re.search(r"(?:^|\s)CLAUDE_CONFIG_DIR=(.*?)(?=\s[A-Za-z_][A-Za-z0-9_]*=|$)", environment)
+    value = found.group(1).strip() if found else ""
+    return value or None
+
+
+def doctor_processes():
+    """The chats running now, from ps and lsof found on PATH: per claude
+    process that is a chat (not a job such as `claude auth` or `claude
+    -p`), its pid, whether it is the panel's (stream-json in), the
+    conversation it resumed, its CLAUDE_CONFIG_DIR and its folder. The
+    arguments are read to tell a chat from a job and never kept; of the
+    environment only CLAUDE_CONFIG_DIR. None when ps is not there or does
+    not answer."""
+    ps = next((path for path, runnable in doctor_path_hits("ps") if runnable), None)
+    if ps is None:
+        return None
+    try:
+        listed = subprocess.run([ps, "axww", "-o", "pid=,args="], capture_output=True, text=True, errors="replace",
+                                stdin=subprocess.DEVNULL, timeout=DOCTOR_PS_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    chats, lines = {}, {}
+    for line in listed.splitlines():
+        found = re.match(r"\s*(\d+)\s(.*)$", line.rstrip())
+        if not found:
+            continue
+        words = found.group(2).split()
+        start = doctor_claude_word(words)
+        args = words[start:] if start is not None else []
+        if start is None or (args and args[0] in DOCTOR_JOBS) or ("-p" in args or "--print" in args) and not is_chat(args):
+            continue
+        pid = int(found.group(1))
+        chats[pid] = {"pid": pid, "panel": is_chat(args), "resume": resume_id(args), "config_dir": None, "cwd": None}
+        lines[pid] = found.group(2).strip()
+    if not chats:
+        return []
+    pids = ",".join(map(str, chats))
+    try:
+        shown = subprocess.run([ps, "eww", "-o", "pid=,command=", "-p", pids], capture_output=True, text=True,
+                               errors="replace", stdin=subprocess.DEVNULL, timeout=DOCTOR_PS_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        shown = ""
+    for line in shown.splitlines():
+        found = re.match(r"\s*(\d+)\s(.*)$", line.rstrip())
+        pid = int(found.group(1)) if found else None
+        if pid in chats and found.group(2).startswith(lines[pid]):  # what follows the arguments is the environment
+            chats[pid]["config_dir"] = doctor_config_dir(found.group(2)[len(lines[pid]):])
+    lsof = next((path for path, runnable in doctor_path_hits("lsof") if runnable), None)
+    try:
+        folders = subprocess.run([lsof, "-a", "-d", "cwd", "-p", pids, "-Fn"], capture_output=True, text=True,
+                                 errors="replace", stdin=subprocess.DEVNULL,
+                                 timeout=DOCTOR_PS_TIMEOUT).stdout if lsof else ""
+    except (OSError, subprocess.SubprocessError):
+        folders = ""
+    pid = None
+    for line in folders.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid in chats:
+            chats[pid]["cwd"] = line[1:]
+    for pid, chat in chats.items():  # Linux without lsof
+        if chat["cwd"] is None:
+            with contextlib.suppress(OSError):
+                chat["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    return list(chats.values())
+
+
+def doctor_own_folder(cwd: str) -> bool:
+    """Whether a chat's folder is one of Claude's own (~/.claude*, or an
+    account's folder): its background work, not a chat in a project."""
+    real = os.path.realpath(cwd)
+    home = os.path.realpath(str(HOME))
+    first = os.path.relpath(real, home).split(os.sep, 1)[0] if inside(real, home) else ""
+    return first.startswith(".claude") or real == os.path.realpath(DEFAULT_CONFIG) \
+        or inside(real, os.path.realpath(DEFAULT_CONFIG))
+
+
+def doctor_chats(processes=None) -> dict:
+    """8. The chats running now (doctor_processes(), or the list given):
+    each with its folder and account, ✘ for one on an account that may
+    not be used in its folder (eligible()), ⚠ for one on no Longhaul
+    account, each with its fix; ⚠ too for a conversation open in two
+    chats (one --resume id in two processes). Claude's own folders are
+    passed over. With no accounts.json there is no account to be wrong on."""
+    if processes is None:
+        return doctor_result("could not be listed (ps was not found, or did not answer)", mark="warn",
+                             step="run `longhaul doctor` again in a terminal")
+    accounts, problem = read_accounts_file()
+    accounts = accounts or []
+    items, shown, resumed = [], 0, collections.defaultdict(list)
+    for chat in processes:
+        cwd = chat.get("cwd")
+        if isinstance(cwd, str) and doctor_own_folder(cwd):
+            continue
+        shown += 1
+        if chat.get("resume"):
+            resumed[chat["resume"]].append(chat["pid"])
+        value = chat.get("config_dir")
+        folder = os.path.abspath(doctor_expand(value)) if value else str(DEFAULT_CONFIG)
+        on = accounts_on(accounts, folder)
+        label = chat_label(on, folder) if accounts else home_path(folder)
+        kind, fix = (("a VS Code tab", "close the tab and open the chat again") if chat.get("panel")
+                     else ("a terminal chat", "quit it and start it with `longhaul -c`"))
+        where = home_path(cwd) if isinstance(cwd, str) else "folder unknown"
+        head = f"pid {chat['pid']}, {where}: {kind} on {label}"
+        step = f"pid {chat['pid']}: {fix}"
+        if not accounts or problem:
+            items.append(("ok", head, None))
+            continue
+        top = repository_of(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
+        kept = [a["name"] for a in accounts if top and covers(a, top)]
+        allowed = eligible(accounts, top) if top else [a["name"] for a in on]
+        if any(a["name"] in allowed for a in on):
+            items.append(("ok", head, None))
+        elif kept:
+            items.append(("bad", f"{head}, and {home_path(top)} is kept for {' or '.join(kept)}: {fix}", step))
+        elif on:
+            items.append(("bad", f"{head}, which may not be used in {home_path(top)}: {fix}", step))
+        else:
+            items.append(("warn", f"{head}, outside Longhaul's accounts: {fix}", step))
+    for rid, pids in resumed.items():
+        if len(pids) > 1:
+            items.append(("warn", f"conversation {rid[:8]} is open in {len(pids)} chats (pids "
+                                  f"{', '.join(map(str, pids))}): close all but one", "close all but one of them"))
+    said = f"{shown} running" if shown else "none running"
+    if problem:
+        return doctor_result(said, items, mark="warn", step="fix accounts.json (see Accounts)")
+    return doctor_result(said, items)
+
+
+def doctor_maps() -> dict:
+    """9. The code maps' programs, CodeGraph and Trail-Code, found on PATH
+    and runnable: a file that is there but not executable is ✘, its chmod
+    the step; neither installed is ⚠ while the auto-index is on. One is
+    enough."""
+    off = index_mode() == "off"
+    items, runnable = [], 0
+    for program, name in (("codegraph", "CodeGraph"), ("trail", "Trail-Code")):
+        hits = doctor_path_hits(program)
+        found = next((path for path, ok in hits if ok), None)
+        if found:
+            runnable += 1
+            items.append(("ok", f"{name}: {home_path(found)}", None))
+        elif hits and hits[0][1] is None:
+            items.append(("bad", f"{name}: {home_path(hits[0][0])} links to a file that is gone",
+                          f"reinstall {name}, or remove {home_path(hits[0][0])}"))
+        elif hits:
+            items.append(("bad", f"{name}: {home_path(hits[0][0])} is not executable", f"chmod +x {shlex.quote(hits[0][0])}"))
+        else:
+            items.append((None, f"{name}: not installed", None))
+    missing = "ok" if runnable or off else "warn"
+    items = [(mark or missing, text, step) for mark, text, step in items]
+    said = ("the auto-index is off (LONGHAUL_INDEX=off)" if off
+            else f"{runnable} of 2 found; Longhaul builds a map with one in the background")
+    return doctor_result(said, items, mark=missing,
+                         step=f"install CodeGraph (`{CODEGRAPH_INSTALL['npm']}`) or Trail-Code; Longhaul installs neither")
+
+
+def doctor_features() -> dict:
+    """10. The features and their switches: the context reminder's
+    threshold, auto-compact, the guard's mode, Auto Model (its mode, its
+    table, and whether it applies anywhere: in the default mode, trial,
+    only in a models trial's routed half), and the trial. Read from this
+    process's environment, which a chat's Bash tool shares with its hooks."""
+    items = []
+    at, why = reminder_threshold()
+    if why:
+        items.append(("warn", f"context reminder: LONGHAUL_CHECKPOINT_AT is {why}, so the default ({REMINDER_AT:,} "
+                              "tokens) is in force", "set LONGHAUL_CHECKPOINT_AT to a whole number of tokens, or off"))
+    else:
+        items.append(("ok", "context reminder: off (LONGHAUL_CHECKPOINT_AT=off)" if at is None
+                      else f"context reminder: at {at:,} tokens", None))
+    off = (os.environ.get("LONGHAUL_AUTO_COMPACT") or "").strip().lower() == "off"  # as hooks/autocompact.ts reads it
+    items.append(("ok", "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)" if off else "auto-compact: on", None))
+    raw, mode = os.environ.get("LONGHAUL_GUARD"), guard_mode()
+    if raw and raw != mode:
+        items.append(("warn", "guard: advice (LONGHAUL_GUARD is not warn, block or off)",
+                      "set LONGHAUL_GUARD to warn, block or off, or unset it"))
+    else:
+        items.append(("ok", f"guard: {'advice' if mode == 'warn' else mode}", None))
+    table, models_mode = models_settings()
+    trial, problem = trial_read()
+    trial = trial_current()
+    shown = ", ".join(f"{kind} {model}" for kind, model in table.items()) or "no table"
+    if models_mode != "trial":
+        items.append(("ok", f"Auto Model: {models_mode} ({MODELS_SAID[models_mode]}; {shown})", None))
+    elif trial and trial_kind(trial) == "models":
+        items.append(("ok", f"Auto Model: trial ({shown}): applies in the models trial's routed half", None))
+    else:
+        items.append(("warn" if table else "ok",
+                      f"Auto Model: trial ({shown}): applies only in a models trial's routed half; no "
+                      f"{'models ' if trial else ''}trial is on",
+                      "`longhaul models on` to apply it in every session, or `longhaul trial start --kind models`"
+                      if table else None))
+    if problem:
+        items.append(("warn", f"trial: {home_path(str(trial_path()))} is not a trial file ({problem})",
+                      "`longhaul trial status`; remove the file to end it"))
+    elif trial:
+        items.append(("ok", f"trial: on, {trial_kind(trial)} ({trial['name']}), "
+                            f"{(trial_end(trial) - time.time()) / 86_400:.1f} days left", None))
+    else:
+        items.append(("ok", "trial: off", None))
+    return doctor_result("the switches in force here", items)
+
+
+def doctor_checks(quick: bool = False, processes=None) -> list:
+    """The checklist's lines in order, each named; quick, the ones that run
+    no program, list no process and ask no network (the first-chat line's).
+    A check that raises is a ⚠ of its own, and the rest go on."""
+    checks = []
+    for name, function in DOCTOR_CHECKS:
+        check = globals()[function]
+        try:
+            if function in ("doctor_claude", "doctor_updates"):
+                result = check(quick)
+            elif function == "doctor_chats":
+                result = None if quick else check(doctor_processes() if processes is None else processes)
+            else:
+                result = check()
+        except Exception as e:
+            result = doctor_result(f"could not be checked ({type(e).__name__})", mark="warn",
+                                   step="run `longhaul doctor` again in a terminal")
+        if result is not None:
+            checks.append({"name": name, **result})
+    return checks
+
+
+def doctor_count(checks: list) -> tuple:
+    """(the lines set up, the lines)."""
+    return sum(c["mark"] == "ok" for c in checks), len(checks)
+
+
+def doctor_next(checks: list):
+    """The first broken line's step, else the first half-set-up one's."""
+    return next((c["step"] for want in ("bad", "warn") for c in checks if c["mark"] == want and c["step"]), None)
+
+
+def doctor_lines(checks: list) -> list:
+    """The checklist as printed: a heading, a line per check with its
+    items and its step, and the count with the first step."""
+    marks = DOCTOR_MARKS
+    try:
+        "".join(DOCTOR_MARKS.values()).encode(sys.stdout.encoding or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        marks = DOCTOR_PLAIN
+    lines = [f"Longhaul {plugin_version() or '(version unknown)'}: what is set up, and what to do next. "
+             "The doctor only reads; it changes nothing."]
+    for c in checks:
+        lines.append(f"{marks[c['mark']]} {c['name']}: {c['said']}")
+        lines.extend(f"    {marks[mark]} {text}" for mark, text, _ in c["items"])
+        if c["step"]:
+            lines.append(f"    Next: {c['step']}")
+    n, m = doctor_count(checks)
+    step = doctor_next(checks)
+    lines.append(f"{n} of {m} set up." + (f" Next: {step}" if step else ""))
+    return lines
+
+
+def doctor(_opts) -> int:
+    """`longhaul doctor`: the checklist, read-only; exit 0."""
+    for line in doctor_lines(doctor_checks()):
+        print(line)
+    return 0
+
+
+def setup_line(data: dict):
+    """The first-chat line (SETUP_LINE), for the guard's startup hook to
+    add to its systemMessage, or None: only in the main conversation of an
+    attended session, when this plugin's version is not the one seen.json
+    records (a new install or an update). It counts the quick checks,
+    records the version and logs SETUP_LOGGED, which the display module
+    turns into a pop-up (the VS Code panel shows no systemMessage). Under
+    a lock, so two chats starting at once say it once."""
+    if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
+        return None
+    version = plugin_version()
+    path = LONGHAUL_HOME / SEEN
+
+    def seen() -> bool:
+        found = read_json(path)
+        return isinstance(found, dict) and found.get("version") == version
+
+    if version is None or seen():  # the usual start: one small read, no lock
+        return None
+    with locked("seen", wait=1):
+        if seen():
+            return None
+        n, m = doctor_count(doctor_checks(quick=True))
+        write_json(path, {"version": version, "at": int(time.time())})
+    log(SETUP_LOGGED.format(version=version, n=n, m=m))
+    return SETUP_LINE.format(version=version, n=n, m=m)
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "pipe":  # another program drives claude through longhaul
         return pipe(argv[1:])
@@ -8698,7 +9398,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "autocompact-note", "trial", "vscode", "models", "update"):
+                            "account-check", "autocompact-note", "trial", "vscode", "models", "update", "doctor"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -8770,7 +9470,7 @@ def main(argv: list[str]) -> int:
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "autocompact-note": autocompact_note,
-                "trial": trial, "update": update}[cmd](opts)
+                "trial": trial, "update": update, "doctor": doctor}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

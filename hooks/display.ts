@@ -118,6 +118,9 @@ async function popUps($: any, lines: string[]): Promise<void> {
       $.ui.toast(`Longhaul: ${m[1]} is out. To update: claude plugin marketplace update longhaul, then claude plugin update longhaul@longhaul, then /reload-plugins.`, { timeoutMs: 12000 })
     else if ((m = body.match(/^release: Longhaul (\S+) is installed; (\S+) runs (\S+)$/)) && m[2] === sid)
       $.ui.toast(`Longhaul: ${m[1]} is installed; this chat runs ${m[3]}. Type /reload-plugins to use it.`, { timeoutMs: 12000 })
+    // The first chat after an install or an update: the panel shows no systemMessage.
+    else if ((m = body.match(/^setup: Longhaul (\S+) is on: (\d+) of (\d+) set up$/)))
+      $.ui.toast(`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} set up. Type /longhaul:doctor to see what's left.`, { timeoutMs: 12000 })
   }
 }
 

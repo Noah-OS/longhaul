@@ -61,6 +61,8 @@ Longhaul was built from those patterns as they show up in real use: in one perso
 
 Once the plugin is loaded (the next session, or `/reload-plugins`), the guard runs in warn mode and `/longhaul:checkpoint` saves the state when it is worth keeping.
 
+Run `longhaul doctor` in a terminal (or `/longhaul:doctor` in a chat) to see what's set up and what to do next.
+
 **3. The status line** (optional) needs the terminal command. Keep a checkout, since the command links to it:
 
 ```

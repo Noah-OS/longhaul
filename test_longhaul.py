@@ -75,6 +75,15 @@ def requires_git(test: unittest.TestCase):
         test.skipTest("not a git checkout")
 
 
+def seen_this_version(home: Path) -> None:
+    """Longhaul's record that this version's first chat has been had (the
+    doctor's first-chat line, 2026-10-25), in `home`: the classes that start
+    sessions through the guard are not about that line, which would join
+    their startup answer once per fresh home (Doctor tests it)."""
+    version = json.loads((HERE / ".claude-plugin" / "plugin.json").read_text())["version"]
+    (home / "seen.json").write_text(json.dumps({"version": version}))
+
+
 def unreadable_accounts(*accounts) -> dict:
     """accounts.json as a hand edit leaves it, by case: the list of
     `accounts` with a trailing comma, and the first alone as an object, not
@@ -2353,6 +2362,7 @@ class Guard(unittest.TestCase):
         self.home.mkdir()
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
+        seen_this_version(self.home)
         self.big = self.tmp / "big.py"
         self.big.write_text("x" * 30_000)
         self.small = self.tmp / "small.py"
@@ -2951,6 +2961,7 @@ class Index(unittest.TestCase):
         self.home.mkdir()
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
+        seen_this_version(self.home)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         for name in self.MAPS:
@@ -7487,6 +7498,34 @@ class Shim(unittest.TestCase):
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
         self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
 
+    def test_the_shim_runs_doctor_which_only_reads(self):
+        # The owner, 2026-10-25 ("Doctor + first-chat line"): /longhaul:doctor
+        # in any chat runs `longhaul doctor` through the shim; it is read-only
+        # like status and inspect. Every path is scratch, and a fake ps and
+        # lsof stand first on PATH, so the real process list is never read.
+        fake = self.tmp / "fakes"
+        fake.mkdir()
+        for name in ("ps", "lsof"):
+            (fake / name).write_text("#!/bin/sh\nexit 0\n")
+            (fake / name).chmod(0o755)
+        env = dict(PATH=os.pathsep.join([str(fake), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
+                   HOME=str(self.tmp), LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"))
+        self.env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        out = self.shim("doctor", **env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.startswith("Longhaul "), out.stdout)
+        self.assertIn("Chats running now: none running", out.stdout)
+        self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 10 set up\. Next: ")
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+        for args in (("doctor", "--fix"), ("doctor", "-h")):  # nothing after it: the skill's rule names it alone
+            out = self.shim(*args, **env)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("from here only `doctor` runs, with nothing after it", out.stderr, args)
+        self.assertIn("doctor", self.shim("nope").stderr, "the refusal names what does run")
+        self.assertIn("doctor", self.shim().stderr)
+        self.assertIn("longhaul doctor", self.shim("-h").stdout, "the Usage block names it")
+
     def test_the_shim_runs_checkpoint_save_which_writes_the_checkpoint_and_its_record_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
         # saves its own state through the shim; that file, and the record
@@ -7720,6 +7759,7 @@ class Reminder(unittest.TestCase):
         self.home.mkdir()
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
+        seen_this_version(self.home)
         self.transcript = self.tmp / "s1.jsonl"
         self.transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}) + "\n")
         self.n = 0
@@ -11227,9 +11267,11 @@ class Display(unittest.TestCase):
             # out, which names no session, and a newer one installed than a
             # chat runs, which names that chat.
             "out": "release: Longhaul 0.2.10 is out (this is 0.2.4)",
-            "installed": "release: Longhaul 0.2.5 is installed; fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 runs 0.2.4"}
+            "installed": "release: Longhaul 0.2.5 is installed; fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 runs 0.2.4",
+            # The first chat after an install or an update (the doctor, 2026-10-25).
+            "setup": "setup: Longhaul 0.2.4 is on: 7 of 8 set up"}
         patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
-        self.assertEqual(len(patterns), 10)
+        self.assertEqual(len(patterns), 11)
         for pattern, (kind, line) in zip(patterns, lines.items()):
             js = pattern.replace("\\/", "/")
             self.assertRegex(line, js, kind)
@@ -11265,11 +11307,15 @@ class Display(unittest.TestCase):
                       "`Longhaul: ${m[1]} is out. To update: claude plugin marketplace update longhaul, then claude "
                       "plugin update longhaul@longhaul, then /reload-plugins.`"):
             self.assertIn(toast, self.SOURCE)
+        setup = patterns[10].replace("\\/", "/")
+        self.assertEqual(re.match(setup, lines["setup"]).groups(), ("0.2.4", "7", "8"))
+        self.assertIsNone(re.match(setup, "setup: Longhaul 0.2.4 is on: 7 of 8 set up, and more"), "the whole line")
         for toast in ("`Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps "
                       "the context small.`",
                       "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
                       "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
-                      "`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`"):
+                      "`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`",
+                      "`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} set up. Type /longhaul:doctor to see what's left.`"):
             self.assertIn(toast, self.SOURCE)
         # The same shapes in longhaul.py's own log calls.
         source = (HERE / "longhaul.py").read_text()
@@ -11283,7 +11329,8 @@ class Display(unittest.TestCase):
                         'log(f"guard: {verb} a whole read of {shown} ({size:,} bytes) in {sid}{who}")',
                         'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")',
                         'log(f"release: Longhaul {latest} is out (this is {running})")',
-                        'log(f"release: Longhaul {installed} is installed; {sid} runs {running}")'):
+                        'log(f"release: Longhaul {installed} is installed; {sid} runs {running}")',
+                        'SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"'):
             self.assertIn(written, source, written)
 
 
@@ -12616,6 +12663,635 @@ class AccountCheck(unittest.TestCase):
             self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
         self.assertEqual(len(self.logged()), 2, "the two refusals, each logged")
         self.assertNotIn(self.S, self.log())
+
+
+class Doctor(unittest.TestCase):
+    """`longhaul doctor` and /longhaul:doctor (the owner's decision of
+    2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
+    what was installed and what they had to do to get the benefit, and on
+    the owner's Mac every problem was something half set up with nothing
+    saying so. A read-only checklist, a mark per line (✔, ✘ or ⚠) and one
+    next step for each line not ✔. Every path is scratch: HOME, Longhaul's
+    home, Claude Code's folder and .claude.json, VS Code's settings, and
+    PATH, which holds the fakes alone; the process list is injected, or a
+    fake ps's and lsof's, never the real one."""
+
+    MANIFEST = json.loads((HERE / ".claude-plugin" / "plugin.json").read_text())
+    VERSION = MANIFEST["version"]
+    REPO = MANIFEST["repository"].split("github.com/", 1)[1]  # the manifest names it; this file does not
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.user, self.home, self.bin = self.tmp / "user", self.tmp / "home", self.tmp / "bin"
+        self.claude, self.vscode = self.user / ".claude", self.tmp / "vscode" / "settings.json"
+        for folder in (self.user, self.home, self.claude, self.bin):
+            folder.mkdir(parents=True)
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude,
+                            "DEFAULT_GLOBAL_JSON": self.user / ".claude.json", "VSCODE_SETTINGS": self.vscode,
+                            "CONFIG": self.home / "config.json", "CLAUDE": str(HERE / "fake_stream.py")}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.path = os.environ.get("PATH", os.defpath)  # the suite's own, for git
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ATTENDED", "LONGHAUL_GUARD",
+                     "LONGHAUL_CHECKPOINT_AT", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_INDEX"):
+            os.environ.pop(name, None)
+        # The updates check calls release_status(), another change's; none
+        # here unless a test gives one.
+        patcher = mock.patch.object(longhaul, "release_status", None, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # ---------------------------------------------------------- scratch setups
+
+    def write(self, path: Path, data) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def settings(self, **keys):
+        """Claude Code's user settings, these keys merged in."""
+        path = self.claude / "settings.json"
+        found = json.loads(path.read_text()) if path.exists() else {}
+        self.write(path, {**found, **keys})
+
+    def installed(self, version=None, enabled=True, key="longhaul@longhaul", shape=2):
+        """Claude Code's record of the plugin, in either shape it has had, and its switch in the settings."""
+        version = version or self.VERSION
+        entry = {"scope": "user", "version": version,
+                 "installPath": str(self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / version)}
+        self.write(self.claude / "plugins" / "installed_plugins.json",
+                   {"version": 2, "plugins": {key: [entry]}} if shape == 2 else {"version": 1, "plugins": {key: entry}})
+        if enabled is not None:
+            self.settings(enabledPlugins={key: enabled})
+
+    def checkout(self, version, name=None) -> Path:
+        """A checkout of Longhaul at `version`: its longhaul.py and manifest."""
+        root = self.tmp / (name or f"checkout-{version}")
+        self.write(root / ".claude-plugin" / "plugin.json", {"name": "longhaul", "version": version})
+        self.write(root / "longhaul.py", "")
+        (root / "longhaul.py").chmod(0o755)
+        return root
+
+    def link(self, checkout: Path, on_path=True) -> Path:
+        """~/.local/bin/longhaul linked to the checkout, as setup links it, and that folder on PATH."""
+        target = self.user / ".local" / "bin" / "longhaul"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(checkout / "longhaul.py")
+        if on_path:
+            os.environ["PATH"] = f"{target.parent}{os.pathsep}{self.bin}"
+        return target
+
+    def program(self, name, folder=None, mode=0o755) -> Path:
+        path = self.write((folder or self.bin) / name, "#!/bin/sh\nexit 0\n")
+        path.chmod(mode)
+        return path
+
+    def accounts(self, *accounts):
+        self.write(self.home / "accounts.json", list(accounts))
+        for a in accounts:  # each folder made, as `longhaul setup` makes it
+            if a.get("config_dir"):
+                Path(a["config_dir"]).mkdir(parents=True, exist_ok=True)
+
+    def folder(self, name) -> str:
+        """A config folder under the scratch HOME, as accounts.json names it."""
+        return f"{self.user}/{name}"
+
+    def items(self, check) -> dict:
+        """A line's items by their text, each its mark."""
+        return {text: mark for mark, text, _ in check["items"]}
+
+    # ------------------------------------------------------------- the checks
+
+    def test_the_plugin_line_reads_claude_codes_list_of_installed_plugins(self):
+        c = longhaul.doctor_plugin()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("not installed", c["said"])
+        self.assertIn(f"/plugin marketplace add {self.REPO}", c["step"])
+        self.assertIn("/plugin install longhaul@longhaul", c["step"])
+        self.installed()
+        c = longhaul.doctor_plugin()
+        self.assertEqual((c["mark"], c["said"]), ("ok", f"{self.VERSION}, enabled (longhaul@longhaul)"))
+        self.installed(shape=1, enabled=None)  # the older shape, and no switch: enabled is the default
+        self.assertEqual(longhaul.doctor_plugin()["mark"], "ok")
+        self.installed(key="longhaul@mine")
+        self.assertIn("(longhaul@mine)", longhaul.doctor_plugin()["said"], "any marketplace's")
+        self.installed(enabled=False)
+        c = longhaul.doctor_plugin()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("turned off", c["said"])
+        self.assertIn("/plugin enable longhaul@longhaul", c["step"])
+        self.write(self.claude / "plugins" / "installed_plugins.json", "{not json")
+        c = longhaul.doctor_plugin()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("could not be read (not JSON)", c["said"])
+        # A chat still running the copy an update has replaced.
+        self.installed()
+        old = self.checkout("0.0.1", name="user/.claude/plugins/cache/longhaul/longhaul/0.0.1")
+        with mock.patch.object(longhaul, "__file__", str(old / "longhaul.py")):
+            c = longhaul.doctor_plugin()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn(f"{self.VERSION} is installed; this chat runs 0.0.1", c["said"])
+        self.assertIn("/reload-plugins", c["step"])
+
+    def test_the_terminal_command_line_finds_longhaul_on_path_and_compares_its_version(self):
+        self.installed()
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("`longhaul` is not on PATH", c["said"])
+        self.assertIn("accounts, switching, the status line, trials, models and VS Code", c["said"])
+        self.assertIn(f"git clone https://github.com/{self.REPO}.git", c["step"])
+        self.assertIn("python3 longhaul.py setup", c["step"])
+        # A plugin's bin/longhaul is the in-chat shim, on the Bash tool's PATH: not the terminal command.
+        plugin = self.checkout(self.VERSION, name="plugin")
+        shutil.copy(HERE / "bin" / "longhaul", self.write(plugin / "bin" / "longhaul", ""))
+        os.environ["PATH"] = f"{plugin / 'bin'}{os.pathsep}{self.bin}"
+        self.assertEqual(longhaul.doctor_command()["mark"], "bad", "the shim is not the terminal command")
+        os.environ["PATH"] = str(self.bin)
+        # Linked, but the link's folder is not on PATH.
+        target = self.link(self.checkout(self.VERSION), on_path=False)
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("~/.local/bin/longhaul is there, but ~/.local/bin is not on PATH", c["said"])
+        self.assertIn("~/.local/bin", c["step"])
+        os.environ["PATH"] = f"{target.parent}{os.pathsep}{self.bin}"
+        c = longhaul.doctor_command()
+        self.assertEqual((c["mark"], c["said"]),
+                         ("ok", f"~/.local/bin/longhaul, from {self.tmp}/checkout-{self.VERSION} ({self.VERSION})"))
+        # Older than the plugin: the checkout is pulled; newer: the plugin is updated.
+        target.unlink()
+        older = self.checkout("0.0.1")
+        target.symlink_to(older / "longhaul.py")
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn(f"runs 0.0.1, and the plugin {self.VERSION}", c["said"])
+        self.assertIn(f"git -C {older} pull", c["step"])
+        target.unlink()
+        target.symlink_to(self.checkout("99.0.0") / "longhaul.py")
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("claude plugin update longhaul@longhaul", c["step"])
+        # A link to a checkout that is gone.
+        target.unlink()
+        target.symlink_to(self.tmp / "gone" / "longhaul.py")
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("~/.local/bin/longhaul links to a file that is gone", c["said"])
+        self.assertIn("python3 longhaul.py setup", c["step"])
+
+    def test_claude_codes_version_against_the_checked_range(self):
+        low, high = longhaul.TESTED_VERSIONS
+        shown = lambda v: ".".join(map(str, v))  # noqa: E731
+        with mock.patch.object(longhaul, "claude_version", return_value=high):
+            c = longhaul.doctor_claude()
+        self.assertEqual((c["mark"], c["said"]), ("ok", f"{shown(high)}, in the range Longhaul is checked on "
+                                                         f"({shown(low)} to {shown(high)})"))
+        with mock.patch.object(longhaul, "claude_version", return_value=(high[0], high[1], high[2] + 1)):
+            c = longhaul.doctor_claude()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("newer than Longhaul has been checked on", c["said"])
+        self.assertIn("claude plugin update longhaul@longhaul", c["step"])
+        with mock.patch.object(longhaul, "claude_version", return_value=(low[0], low[1], low[2] - 1)):
+            c = longhaul.doctor_claude()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("`claude update`", c["step"])
+        with mock.patch.object(longhaul, "claude_version", return_value=None):
+            c = longhaul.doctor_claude()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("could not be read", c["said"])
+        # Quick: the path the session's claude runs from, never a program run.
+        exe = self.tmp / "versions" / shown(high) / "claude"
+        with mock.patch.object(longhaul, "claude_version", side_effect=AssertionError("ran claude")):
+            self.assertIsNone(longhaul.doctor_claude(quick=True), "no path: not counted")
+            os.environ["CLAUDE_CODE_EXECPATH"] = str(exe)
+            self.assertEqual(longhaul.doctor_claude(quick=True)["mark"], "ok")
+
+    def test_without_release_status_updates_are_not_checked_yet(self):
+        c = longhaul.doctor_updates()
+        self.assertEqual((c["mark"], c["said"]), ("warn", "not checked yet"))
+        self.assertIn("claude plugin marketplace update longhaul", c["step"])
+        self.assertIsNone(longhaul.doctor_updates(quick=True), "no network at a chat's start")
+
+    def test_with_release_status_its_fields_are_shown(self):
+        v = self.VERSION
+        cases = (({"running": v, "installed": v, "latest": v, "auto_update": True}, "ok", None),
+                 ({"running": v, "installed": v, "latest": "99.0.0", "auto_update": True}, "warn",
+                  "claude plugin update longhaul@longhaul"),
+                 ({"running": v, "installed": v, "latest": v, "auto_update": False}, "warn", "`longhaul update on`"),
+                 ({"running": "0.0.1", "installed": v, "latest": v, "auto_update": True}, "warn", "/reload-plugins"))
+        for status, mark, step in cases:
+            with mock.patch.object(longhaul, "release_status", return_value=status):
+                c = longhaul.doctor_updates()
+            self.assertEqual(c["mark"], mark, status)
+            self.assertIn(f"running {status['running']}, installed {v}, latest {status['latest']}", c["said"])
+            self.assertIn(f"auto-update {'on' if status['auto_update'] else 'off'}", c["said"])
+            if step:
+                self.assertIn(step, c["step"], status)
+        with mock.patch.object(longhaul, "release_status", return_value={"running": v}):
+            self.assertIn("latest not known", longhaul.doctor_updates()["said"])
+        with mock.patch.object(longhaul, "release_status", side_effect=RuntimeError("offline")):
+            c = longhaul.doctor_updates()
+        self.assertEqual((c["mark"], c["said"]), ("warn", "could not be checked (RuntimeError)"))
+        with mock.patch.object(longhaul, "release_status", side_effect=AssertionError("asked")) as stub:
+            self.assertIsNone(longhaul.doctor_updates(quick=True))
+        stub.assert_not_called()
+
+    def test_the_status_line_line_reads_the_users_settings_and_changes_nothing(self):
+        c = longhaul.doctor_statusline()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn('"statusLine": {"type": "command", "command": "~/.local/bin/longhaul statusline"}', c["step"])
+        self.settings(statusLine={"type": "command", "command": "~/.local/bin/longhaul statusline"})
+        c = longhaul.doctor_statusline()
+        self.assertEqual(c["mark"], "bad", "the command it names is not there")
+        self.assertIn("~/.local/bin/longhaul, which is not there", c["said"])
+        self.link(self.checkout(self.VERSION))
+        before = (self.claude / "settings.json").read_bytes()
+        self.assertEqual(longhaul.doctor_statusline()["mark"], "ok")
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before, "read only")
+        self.settings(statusLine={"type": "command", "command": "longhaul statusline"})
+        self.assertEqual(longhaul.doctor_statusline()["mark"], "ok", "found on PATH")
+        self.settings(statusLine={"type": "command", "command": "other-line --theme x"})
+        c = longhaul.doctor_statusline()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("runs another command", c["said"])
+        self.assertNotIn("other-line", c["said"], "the user's own command is not repeated")
+
+    def test_the_vscode_line_says_whether_the_panel_goes_through_longhaul(self):
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "ok", "one subscription: nothing to set")
+        self.accounts({"name": "Max", "email": "max@example.com", "config_dir": self.folder(".claude-max")})
+        c = longhaul.doctor_vscode()
+        self.assertEqual((c["mark"], c["said"]), ("ok", "VS Code's settings are not on this machine: nothing to set"))
+        self.write(self.vscode, '{\n  // the user\'s own\n  "editor.fontSize": 13,\n}\n')
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("`longhaul vscode on`", c["step"])
+        wrapper = self.program("longhaul-vscode", folder=self.tmp / "checkout")
+        self.write(self.vscode, json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(wrapper)}))
+        self.assertEqual(longhaul.doctor_vscode()["mark"], "ok")
+        self.write(self.vscode, json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(self.tmp / "gone" / "longhaul-vscode")}))
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("which is not there", c["said"])
+        self.assertIn("`longhaul vscode on`", c["step"])
+
+    def test_the_accounts_line_reads_accounts_json_and_each_accounts_folder(self):
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "ok")
+        self.assertIn("one subscription", c["said"])
+        self.write(self.home / "accounts.json", "[{\"name\": \"Max\"},]")
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("accounts.json is not readable", c["said"])
+        self.accounts({"name": "Max", "email": "max@example.com", "config_dir": self.folder(".claude-max")},
+                      {"name": "Work", "email": "work@example.com", "config_dir": self.folder(".claude-work"),
+                       "repositories": [f"{self.user}/work"]})
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "ok")
+        self.assertEqual(self.items(c), {"Max: ~/.claude-max, anywhere": "ok",
+                                         "Work: ~/.claude-work, only in ~/work": "ok"})
+        shutil.rmtree(self.user / ".claude-work")
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "bad")
+        self.assertEqual(self.items(c)["Work: ~/.claude-work is missing"], "bad")
+        self.assertIn("`longhaul setup Work`", c["step"])
+        self.accounts({"name": "Max", "email": "max@example.com", "config_dir": self.folder(".claude-max"),
+                       "repositories": "~/work"})
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn(f"Max: ~/.claude-max, nowhere ({longhaul.REPOSITORIES_JUNK})", self.items(c))
+
+    def test_two_accounts_with_one_email_are_one_subscription(self):
+        # The coordinator, from the owner's Mac (2026-10-25): personal-2 and
+        # the default sign-in sign in as one email, and both hit their weekly
+        # limit together; a switch between them can never help.
+        self.accounts({"name": "personal-1", "email": "me@example.com", "config_dir": self.folder(".claude-p1")},
+                      {"name": "personal-2", "email": "two@example.com", "config_dir": self.folder(".claude-p2")},
+                      {"name": "personal-3", "email": "TWO@Example.com", "config_dir": self.folder(".claude-p3")})
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "warn")
+        self.assertEqual(self.items(c)["personal-2 and personal-3 are one subscription (same email): a switch "
+                                       "between them never helps"], "warn")
+        self.assertEqual(c["step"], "keep one of them, or give the other its own subscription")
+        self.write(self.user / ".claude.json", {"oauthAccount": {"emailAddress": "Me@example.com"}, "projects": {}})
+        c = longhaul.doctor_accounts()
+        self.assertEqual(self.items(c)["personal-1 and the default sign-in (~/.claude) are one subscription (same "
+                                       "email): a switch between them never helps"], "warn")
+        # An account on ~/.claude itself is the default sign-in, not a second one.
+        self.accounts({"name": "Max", "email": "me@example.com", "config_dir": None},
+                      {"name": "Pro", "email": "pro@example.com", "config_dir": self.folder(".claude-pro")})
+        self.assertEqual(longhaul.doctor_accounts()["mark"], "ok")
+        # The names, never the emails, anywhere it prints or logs.
+        self.accounts({"name": "personal-1", "email": "me@example.com", "config_dir": self.folder(".claude-p1")},
+                      {"name": "personal-2", "email": "me@example.com", "config_dir": self.folder(".claude-p2")})
+        text = "\n".join(longhaul.doctor_lines([{"name": "Accounts", **longhaul.doctor_accounts()}]))
+        for email in ("me@example.com", "Me@example.com", "two@example.com"):
+            self.assertNotIn(email, text)
+        self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
+
+    def chat(self, pid, cwd, config=None, panel=False, resume=None) -> dict:
+        return {"pid": pid, "cwd": str(cwd), "config_dir": config, "panel": panel, "resume": resume}
+
+    def test_the_chats_line_judges_each_chat_by_its_folder_and_account(self):
+        work, notes = self.user / "work" / "client", self.user / "notes"
+        for folder in (work, notes, self.user / ".claude-personal" / "x"):
+            folder.mkdir(parents=True)
+        personal, office = self.folder(".claude-personal"), self.folder(".claude-work")
+        self.accounts({"name": "personal", "email": "me@example.com", "config_dir": personal},
+                      {"name": "work", "email": "work@example.com", "config_dir": office,
+                       "repositories": [f"{self.user}/work"]})
+        rid = "abcd1234-0000-4000-8000-000000000000"
+        procs = [self.chat(101, work, personal, panel=True), self.chat(102, work), self.chat(103, notes),
+                 self.chat(104, notes, personal, panel=True), self.chat(105, self.user / ".claude-personal" / "x"),
+                 self.chat(106, notes, personal, panel=True, resume=rid),
+                 self.chat(107, notes, personal, panel=True, resume=rid), self.chat(108, work, office)]
+        c = longhaul.doctor_chats(procs)
+        self.assertEqual(c["mark"], "bad")
+        self.assertEqual(c["said"], "7 running")
+        marks = {text.split(":", 1)[0]: mark for mark, text, _ in c["items"]}
+        self.assertEqual(marks, {"pid 101, ~/work/client": "bad", "pid 102, ~/work/client": "bad",
+                                 "pid 103, ~/notes": "warn", "pid 104, ~/notes": "ok", "pid 106, ~/notes": "ok",
+                                 "pid 107, ~/notes": "ok", "pid 108, ~/work/client": "ok",
+                                 "conversation abcd1234 is open in 2 chats (pids 106, 107)": "warn"},
+                         "Claude's own folder (pid 105) is skipped")
+        said = {text.split(":", 1)[0]: text for _, text, _ in c["items"]}
+        self.assertIn("a VS Code tab on personal, and ~/work/client is kept for work", said["pid 101, ~/work/client"])
+        self.assertIn("close the tab and open the chat again", said["pid 101, ~/work/client"])
+        self.assertIn("a terminal chat on the default sign-in (~/.claude)", said["pid 102, ~/work/client"])
+        self.assertIn("quit it and start it with `longhaul -c`", said["pid 102, ~/work/client"])
+        self.assertIn("outside Longhaul's accounts", said["pid 103, ~/notes"])
+        self.assertEqual(c["step"], "pid 101: close the tab and open the chat again", "the first ✘'s fix")
+        # One subscription: no account to be wrong on; a chat open twice still is.
+        (self.home / "accounts.json").unlink()
+        c = longhaul.doctor_chats(procs)
+        self.assertEqual(c["mark"], "warn")
+        self.assertEqual([m for m, _, _ in c["items"]].count("warn"), 1)
+        self.assertEqual(longhaul.doctor_chats([])["said"], "none running")
+        self.assertEqual(longhaul.doctor_chats([])["mark"], "ok")
+        c = longhaul.doctor_chats(None)
+        self.assertEqual((c["mark"], c["said"]), ("warn", "could not be listed (ps was not found, or did not answer)"))
+
+    def test_the_process_list_comes_from_ps_and_lsof_and_keeps_only_each_chats_config_folder(self):
+        ext = "/x/.vscode/extensions/anthropic.claude-code-2.1.303-darwin-arm64/resources/native-binary/claude"
+        rid = "abcd1234-0000-4000-8000-000000000000"
+        args = {101: f"{ext} --output-format stream-json --verbose --input-format stream-json --resume {rid} SECRET-ARG",
+                102: f"claude --resume {rid}", 103: "/bin/zsh -l", 104: "claude --version",
+                105: "node /usr/local/lib/node_modules/.bin/claude", 106: "claude auth status --json",
+                107: "/usr/bin/python3 -m claude"}
+        env = {101: "PATH=/usr/bin CLAUDE_CONFIG_DIR=/x/with space/.claude-work ANTHROPIC_API_KEY=sk-ant-SECRET HOME=/x",
+               102: "TERM=xterm SECRET_TOKEN=abc", 105: "CLAUDE_CONFIG_DIR=~/.claude-pro"}
+        self.write(self.tmp / "ps-args.txt", "".join(f"{pid:>6} {line}\n" for pid, line in args.items()))
+        self.write(self.tmp / "ps-env.txt", "".join(f"{pid:>6} {args[pid]} {line}\n" for pid, line in env.items()))
+        self.write(self.tmp / "lsof.txt", "p101\nfcwd\nn/work/client\np102\nfcwd\nn/home/x\np105\nfcwd\nn/tmp/a b\n")
+        calls = self.tmp / "calls"
+        self.write(self.bin / "ps", "#!/bin/sh\n"
+                   f"printf '%s\\n' \"ps $*\" >> '{calls}'\n"
+                   f"case \"$*\" in *eww*) cat '{self.tmp}/ps-env.txt' ;; *) cat '{self.tmp}/ps-args.txt' ;; esac\n")
+        self.write(self.bin / "lsof", "#!/bin/sh\n" f"printf '%s\\n' \"lsof $*\" >> '{calls}'\n"
+                   f"cat '{self.tmp}/lsof.txt'\n")
+        (self.bin / "ps").chmod(0o755)
+        (self.bin / "lsof").chmod(0o755)
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin"  # sh's cat
+        found = longhaul.doctor_processes()
+        self.assertEqual(found, [
+            {"pid": 101, "panel": True, "resume": rid, "config_dir": "/x/with space/.claude-work", "cwd": "/work/client"},
+            {"pid": 102, "panel": False, "resume": rid, "config_dir": None, "cwd": "/home/x"},
+            {"pid": 105, "panel": False, "resume": None, "config_dir": "~/.claude-pro", "cwd": "/tmp/a b"}])
+        for secret in ("SECRET", "sk-ant", "TERM", "PATH", "HOME"):
+            self.assertNotIn(secret, json.dumps(found), "no other variable, and no argument's text")
+        self.assertEqual(calls.read_text().splitlines(),
+                         ["ps axww -o pid=,args=", "ps eww -o pid=,command= -p 101,102,105",
+                          "lsof -a -d cwd -p 101,102,105 -Fn"])
+        os.environ["PATH"] = str(self.tmp / "nowhere")
+        self.assertIsNone(longhaul.doctor_processes(), "no ps: nothing listed, nothing guessed")
+
+    def test_the_code_maps_line_finds_each_program_and_says_when_one_cannot_run(self):
+        c = longhaul.doctor_maps()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn(longhaul.CODEGRAPH_INSTALL["npm"], c["step"])
+        self.program("codegraph")
+        trail = self.program("trail", mode=0o644)
+        c = longhaul.doctor_maps()
+        self.assertEqual(c["mark"], "bad")
+        self.assertEqual(self.items(c), {f"CodeGraph: {self.bin}/codegraph": "ok",
+                                         f"Trail-Code: {trail} is not executable": "bad"})
+        self.assertEqual(c["step"], f"chmod +x {trail}")
+        trail.chmod(0o755)
+        self.assertEqual(longhaul.doctor_maps()["mark"], "ok")
+        trail.unlink()
+        trail.symlink_to(self.tmp / "gone")
+        c = longhaul.doctor_maps()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn(f"Trail-Code: {trail} links to a file that is gone", self.items(c))
+        trail.unlink()
+        self.assertEqual(longhaul.doctor_maps()["mark"], "ok", "one program is enough")
+        (self.bin / "codegraph").unlink()
+        os.environ["LONGHAUL_INDEX"] = "off"
+        c = longhaul.doctor_maps()
+        self.assertEqual(c["mark"], "ok", "nothing to build with")
+        self.assertIn("LONGHAUL_INDEX=off", c["said"])
+
+    def test_the_features_line_names_each_switch_and_where_auto_model_applies(self):
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "ok")
+        self.assertEqual([t for _, t, _ in c["items"]], [
+            "context reminder: at 200,000 tokens", "auto-compact: on", "guard: advice",
+            "Auto Model: trial (no table): applies only in a models trial's routed half; no trial is on",
+            "trial: off"])
+        os.environ.update(LONGHAUL_GUARD="block", LONGHAUL_AUTO_COMPACT="off", LONGHAUL_CHECKPOINT_AT="off")
+        self.assertEqual([t for _, t, _ in longhaul.doctor_features()["items"]][:3], [
+            "context reminder: off (LONGHAUL_CHECKPOINT_AT=off)", "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)",
+            "guard: block"])
+        os.environ.update(LONGHAUL_GUARD="off", LONGHAUL_CHECKPOINT_AT="abc")
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("guard: off", self.items(c))
+        self.assertIn("LONGHAUL_CHECKPOINT_AT", c["step"])
+        for name in ("LONGHAUL_GUARD", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_CHECKPOINT_AT"):
+            del os.environ[name]
+        # A table that applies nowhere: the mode is trial and no models trial is on.
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}})
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "warn")
+        self.assertEqual(self.items(c)["Auto Model: trial (implementer sonnet): applies only in a models trial's "
+                                       "routed half; no trial is on"], "warn")
+        self.assertIn("`longhaul models on`", c["step"])
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models": "on"})
+        self.assertIn("Auto Model: on (every session; implementer sonnet)", self.items(longhaul.doctor_features()))
+        now = time.time()
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}})
+        self.write(self.home / "trial.json", {"schema": 1, "name": "subagent-models", "kind": "models",
+                                              "started_at": now - 86_400, "ends_at": now + 13 * 86_400 - 60,
+                                              "seed": "0123456789abcdef"})
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "ok")
+        self.assertIn("Auto Model: trial (implementer sonnet): applies in the models trial's routed half",
+                      self.items(c))
+        self.assertIn("trial: on, models (subagent-models), 13.0 days left", self.items(c))
+
+    # ---------------------------------------------------- the whole checklist
+
+    def doctor(self, processes=()):
+        with mock.patch.object(longhaul, "doctor_processes", return_value=list(processes)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["doctor"])
+        return code, out.getvalue().splitlines()
+
+    def test_the_last_line_counts_what_is_set_up_and_names_the_first_next_step(self):
+        before = sorted(self.home.rglob("*"))
+        with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]):
+            code, lines = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[0], f"Longhaul {self.VERSION}: what is set up, and what to do next. "
+                                   "The doctor only reads; it changes nothing.")
+        heads = [l for l in lines[1:-1] if not l.startswith(" ")]
+        self.assertEqual([h.split(":", 1)[0][2:] for h in heads],
+                         ["Plugin", "Terminal command", "Claude Code", "Updates", "Status line", "VS Code panel",
+                          "Accounts", "Chats running now", "Code maps", "Features"])
+        self.assertTrue(all(h[0] in "✔✘⚠" and h[1] == " " for h in heads), heads)
+        n = sum(h.startswith("✔") for h in heads)
+        self.assertEqual(lines[-1], f"{n} of 10 set up. Next: {longhaul.doctor_plugin()['step']}",
+                         "the first ✘'s step: the plugin is not installed")
+        self.assertEqual(sorted(self.home.rglob("*")), before, "nothing written")
+        # Every line set up.
+        self.installed()
+        self.link(self.checkout(self.VERSION))
+        self.settings(statusLine={"type": "command", "command": "~/.local/bin/longhaul statusline"})
+        self.program("codegraph")
+        status = {"running": self.VERSION, "installed": self.VERSION, "latest": self.VERSION, "auto_update": True}
+        with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]), \
+                mock.patch.object(longhaul, "release_status", return_value=status):
+            code, lines = self.doctor()
+        self.assertEqual(lines[-1], "10 of 10 set up.", lines)
+        self.assertFalse([l for l in lines if "Next:" in l])
+
+    def test_a_check_that_raises_is_a_warning_and_the_rest_go_on(self):
+        with mock.patch.object(longhaul, "doctor_vscode", side_effect=RuntimeError("x")), \
+                mock.patch.object(longhaul, "claude_version", return_value=None):
+            code, lines = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertIn("⚠ VS Code panel: could not be checked (RuntimeError)", lines)
+        self.assertRegex(lines[-1], r"^\d+ of 10 set up\. Next: ")
+
+    def test_doctor_runs_from_the_terminal_and_writes_nothing(self):
+        fake = self.tmp / "fakes"
+        for name in ("ps", "lsof"):  # the process list is never the real one
+            self.write(fake / name, "#!/bin/sh\nexit 0\n").chmod(0o755)
+        home = self.tmp / "no-home"  # never made: the doctor writes nothing, not even a lock
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")
+               and k not in Checkpoint.SESSION_VARS + ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        env.update(PATH=f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", HOME=str(self.user), LONGHAUL_HOME=str(home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.user / ".claude.json"),
+                   LONGHAUL_VSCODE_SETTINGS=str(self.vscode), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off")
+        for python in (sys.executable, "/usr/bin/python3"):
+            if not os.path.exists(python):
+                continue
+            out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("Chats running now: none running", out.stdout)
+            self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 10 set up\. Next: ")
+            self.assertFalse(home.exists(), "nothing written")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
+                             timeout=60)
+        self.assertIn("longhaul doctor", out.stdout, "the Usage block names it")
+
+    def test_the_skill_runs_the_shims_doctor_and_shows_it_as_it_is(self):
+        text = (HERE / "skills" / "doctor" / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        self.assertIn("name: doctor", head)
+        self.assertIn("description:", head)
+        self.assertIn("allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor)", head)
+        self.assertIn("!`${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor`", body)
+        self.assertIn("as it is", body)
+        self.assertIn("changes nothing", " ".join(body.split()))
+        self.assertIn("take no install step", body, "the steps are the user's")
+        readme = (HERE / "README.md").read_text()
+        self.assertIn("`longhaul doctor`", readme)
+        self.assertIn("`/longhaul:doctor`", readme)
+        os.environ["PATH"] = self.path
+        requires_git(self)
+        self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/doctor/SKILL.md"], cwd=HERE).returncode, 1)
+
+    # ------------------------------------------------- the first-chat line
+
+    def start(self, agent=None):
+        data = {"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "cwd": str(self.tmp),
+                "transcript_path": str(self.tmp / "s1.jsonl")}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "Explore"
+        return data
+
+    def seen(self):
+        path = self.home / "seen.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def execpath(self) -> str:
+        """The session's claude, as a native install names it: its version in the path."""
+        return str(self.tmp / "versions" / ".".join(map(str, longhaul.TESTED_VERSIONS[1])) / "claude")
+
+    def test_the_first_chat_after_an_install_or_an_update_says_how_much_is_set_up_once(self):
+        self.assertEqual(len(longhaul.doctor_checks(quick=True)), 7, "without the session's path, no version")
+        os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
+        n, m = longhaul.doctor_count(longhaul.doctor_checks(quick=True))
+        self.assertEqual(m, 8, "the quick checks: no updates (network) and no process list")
+        line = f"Longhaul {self.VERSION} is on: {n} of {m} set up. Type /longhaul:doctor to see what's left."
+        self.assertIsNone(longhaul.guard_check(self.start(agent="a1"), "warn"), "a subagent's start")
+        os.environ["CLAUDE_CODE_SESSION_ATTENDED"] = "0"
+        self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "a -p run: nobody would read it")
+        del os.environ["CLAUDE_CODE_SESSION_ATTENDED"]
+        self.assertIsNone(self.seen(), "neither counts as the first chat")
+        answer = longhaul.guard_check(self.start(), "off")  # the guard's switch is not this line's
+        self.assertEqual(answer, {"systemMessage": line})
+        self.assertEqual(self.seen()["version"], self.VERSION)
+        self.assertEqual(oct(os.stat(self.home / "seen.json").st_mode & 0o777), "0o600")
+        self.assertEqual(re.findall(r"setup: .*", self.log()), [f"setup: Longhaul {self.VERSION} is on: {n} of {m} set up"])
+        self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "once per version")
+        self.write(self.home / "seen.json", {"version": "0.0.1"})  # an update
+        self.assertEqual(longhaul.guard_check(self.start(), "warn"), {"systemMessage": line})
+        self.assertEqual(len(re.findall(r"setup: ", self.log())), 2)
+
+    def test_the_first_chat_line_runs_no_program_scans_no_process_and_asks_no_network(self):
+        os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
+        boom = AssertionError("not quick")
+        with mock.patch.object(subprocess, "run", side_effect=boom), mock.patch.object(subprocess, "Popen", side_effect=boom), \
+                mock.patch.object(longhaul, "doctor_processes", side_effect=boom), \
+                mock.patch.object(longhaul, "release_status", side_effect=boom), \
+                mock.patch.object(longhaul, "claude_version", side_effect=boom):
+            answer = longhaul.guard_check(self.start(), "warn")
+        self.assertRegex(answer["systemMessage"], rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 set up\. ")
+
+    def test_the_first_chat_line_through_the_hook_is_quick_and_joins_the_index_message(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        env.update(HOME=str(self.user), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.user / ".claude.json"), LONGHAUL_VSCODE_SETTINGS=str(self.vscode),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off", CLAUDE_CODE_EXECPATH=self.execpath())
+        hook = Guard.HOOK  # the startup entry's command (hooks.json registers the same one for compact|clear)
+        started = time.time()
+        out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
+        took = time.time() - started
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertRegex(json.loads(out.stdout)["systemMessage"],
+                         rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 set up\. Type /longhaul:doctor ")
+        self.assertLess(took, 2.0, "well inside the hook's 5 s")
+        out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), "once")
+        # Beside the index's own message, it comes first.
+        self.write(self.home / "seen.json", {"version": "0.0.1"})
+        with mock.patch.object(longhaul, "index_start", return_value=([], [])), \
+                mock.patch.object(longhaul, "index_message", return_value="longhaul: the index's line"):
+            said = longhaul.guard_check(self.start(), "warn")["systemMessage"].split("\n")
+        self.assertEqual(len(said), 2)
+        self.assertTrue(said[0].startswith(f"Longhaul {self.VERSION} is on: "))
+        self.assertEqual(said[1], "longhaul: the index's line")
 
 
 class History(unittest.TestCase):
