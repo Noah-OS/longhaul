@@ -5992,14 +5992,16 @@ class Advisor(unittest.TestCase):
 
     def test_the_plugin_registers_the_advisors_note_on_each_prompt(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
-        entry, _ = hooks["UserPromptSubmit"]  # the reminder's is pinned in Reminder
+        # The reminder's is pinned in Reminder, and the account check's (the
+        # owner's decision of 2026-10-25) in AccountCheck.
+        entry, _, _ = hooks["UserPromptSubmit"]
         self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
         [handler] = entry["hooks"]
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 8,
-                         "the plugin's seventh hook, and the reminder's")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 9,
+                         "the plugin's seventh hook, the reminder's and the account check's")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -7645,7 +7647,9 @@ class Reminder(unittest.TestCase):
 
     def test_the_plugin_registers_the_reminder_on_each_prompt_as_its_eighth_hook(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
-        note, entry = hooks["UserPromptSubmit"]
+        # The account check came third (the owner's decision of 2026-10-25),
+        # pinned in AccountCheck.
+        note, entry, _ = hooks["UserPromptSubmit"]
         self.assertIn("main(['advisor-note'])", note["hooks"][0]["args"][2], "the Advisor's note stays first")
         self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
         [handler] = entry["hooks"]
@@ -7653,7 +7657,8 @@ class Reminder(unittest.TestCase):
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]),
                          (5, "Checking the context's size (longhaul checkpoint)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 8, "the plugin's eighth hook")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 9,
+                         "the plugin's eighth hook, and the account check's (2026-10-25)")
         # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
         # does, BaseException included, the wrapper exits 0.
         wrapper = handler["args"][2]
@@ -11155,6 +11160,250 @@ class Accounts(unittest.TestCase):
                          "add writes back the list it read, and the field only when given")
         self.assertEqual(self.longhaul("remove", "Max").returncode, 0)
         self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
+
+
+class AccountCheck(unittest.TestCase):
+    """`longhaul account-check`, a UserPromptSubmit hook (the owner's
+    decision of 2026-10-25, "Stop the prompt"): two VS Code chats in ~/zain,
+    a folder kept for zain-work, ran on the personal account, because their
+    processes predated Longhaul's VS Code setup. A chat's account is the
+    CLAUDE_CONFIG_DIR its hook inherits from its claude (unset or empty:
+    ~/.claude). In a folder some accounts' "repositories" keep for them, a
+    chat on any other account has each prompt refused, with one line and a
+    log line, so no tokens are spent on the wrong account. Whatever it
+    cannot read lets the prompt through, and a folder no account keeps is
+    never refused."""
+
+    # A prompt's text: it is in the hook's input and nowhere else.
+    S = "SENTINEL-OKAPI-7731"
+    SID = "1b2c3d4e-5f60-4718-9a0b-c1d2e3f40516"
+
+    def setUp(self):
+        # HOME is the scratch folder, so ~/zain and ~/.claude are its own,
+        # as on the owner's Mac; nothing real is read or written.
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.home = self.tmp / "longhaul"
+        self.zain = self.tmp / "zain"
+        self.personal, self.work = self.tmp / ".claude-personal", self.tmp / ".claude-zain"
+        for d in (self.home, self.zain / ".git", self.zain / "src" / "app", self.tmp / "other", self.personal, self.work):
+            d.mkdir(parents=True)
+        self.write_accounts({"name": "personal", "email": "me@example.com", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "email": "zain@example.com", "config_dir": "~/.claude-zain",
+                             "repositories": ["~/zain"]})
+        self.saved = {name: getattr(longhaul, name) for name in ("LONGHAUL_HOME", "HOME", "DEFAULT_CONFIG")}
+        longhaul.LONGHAUL_HOME, longhaul.HOME, longhaul.DEFAULT_CONFIG = self.home, self.tmp, self.tmp / ".claude"
+        # The suite may run inside a Claude Code session: its own
+        # CLAUDE_CONFIG_DIR is never the chat's here.
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")
+                    and k not in Checkpoint.SESSION_VARS and k != "CLAUDE_CONFIG_DIR"}
+        self.env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / ".claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / ".claude.json"), LONGHAUL_NO_NOTIFY="1")
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(longhaul, name, value)
+
+    def write_accounts(self, *accounts):
+        (self.home / "accounts.json").write_text(json.dumps(list(accounts)))
+
+    def ask(self, cwd=None, **fields):
+        """A UserPromptSubmit input as Claude Code sends it: the prompt's text
+        (holding S) beside the session's fields; in ~/zain unless `cwd`."""
+        return {"session_id": self.SID, "transcript_path": str(self.tmp / f"{self.SID}.jsonl"),
+                "cwd": str(self.zain if cwd is None else cwd), "permission_mode": "default",
+                "hook_event_name": "UserPromptSubmit", "prompt": f"Fix the sign-in page ({self.S})", **fields}
+
+    def check(self, data=None, config=None, **env):
+        """`longhaul account-check`'s output for `data` (an input, or its raw
+        text; default: ask()), in this process, in a chat whose
+        CLAUDE_CONFIG_DIR is `config` (None: unset), with `env` over a
+        terminal's environment."""
+        data = self.ask() if data is None else data
+        raw = data if isinstance(data, str) else json.dumps(data)
+        values = {k: v for k, v in {**self.env, "CLAUDE_CONFIG_DIR": config, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), mock.patch.object(sys, "stdin", io.StringIO(raw)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main(["account-check"])
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def refused(self, label, where="~/zain", kept="zain-work", first="zain-work"):
+        """What the hook prints to refuse a prompt, exactly: one JSON object."""
+        return json.dumps({"decision": "block", "reason": (
+            f"Longhaul: {where} is kept for {kept}, and this chat runs on {label}. Nothing was sent. Close this chat "
+            f"and open it again (in a terminal: longhaul -r 1b2c3d4e), so it starts on {first}.")}) + "\n"
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def logged(self):
+        """The check's log lines, without their time stamps."""
+        return [line[20:] for line in self.log().splitlines() if line[20:].startswith("account: ")]
+
+    def test_a_chat_on_another_account_in_a_kept_folder_is_refused_with_one_line_and_a_log_line(self):
+        out = self.check(config=str(self.personal))
+        self.assertEqual(out, self.refused("personal"))
+        self.assertEqual(set(json.loads(out)), {"decision", "reason"}, "nothing else: no context reaches the model")
+        line = f"account: refused a prompt in {self.SID}: ~/zain is kept for zain-work; the chat runs on personal"
+        self.assertEqual(self.logged(), [line])
+        self.assertEqual(self.check(config=str(self.personal)), self.refused("personal"), "each prompt")
+        self.assertEqual(self.logged(), [line, line])
+        self.assertNotIn(self.S, self.log(), "the prompt's text is never logged")
+        self.assertNotIn(self.S, out)
+
+    def test_a_folder_inside_the_kept_repository_is_refused_too(self):
+        self.assertEqual(self.check(self.ask(cwd=self.zain / "src" / "app"), config=str(self.personal)),
+                         self.refused("personal"), "a folder of its work tree: the repository is ~/zain")
+        tools = self.zain / "tools"
+        (tools / ".git").mkdir(parents=True)
+        self.assertEqual(self.check(self.ask(cwd=tools), config=str(self.personal)),
+                         self.refused("personal", where="~/zain/tools"), "a repository of its own inside it")
+        self.assertEqual(self.logged()[-1], f"account: refused a prompt in {self.SID}: ~/zain/tools is kept for "
+                                            "zain-work; the chat runs on personal")
+
+    def test_the_kept_accounts_own_chat_goes_through_however_its_folder_is_written(self):
+        link = self.tmp / "zain-link"
+        link.symlink_to(self.work)
+        for config in (str(self.work), str(self.work) + "/", "~/.claude-zain", "~/.claude-zain/", str(link)):
+            with self.subTest(config=config):
+                self.assertEqual(self.check(config=config), "")
+        # And the other way round: the full path in accounts.json, a ~ in the variable.
+        self.write_accounts({"name": "personal", "config_dir": str(self.personal)},
+                            {"name": "zain-work", "config_dir": str(self.work) + "/", "repositories": [str(self.zain)]})
+        self.assertEqual(self.check(config="~/.claude-zain"), "")
+        self.assertEqual(self.check(self.ask(cwd=self.zain / "src" / "app"), config=str(self.work)), "")
+        self.assertEqual(self.logged(), [], "nothing refused, nothing logged")
+
+    def test_a_folder_no_account_keeps_lets_every_chat_through(self):
+        for cwd in (self.tmp / "other", self.tmp, self.tmp / "zain2"):  # zain2 is not inside zain
+            for config in (str(self.personal), str(self.work), str(self.tmp / ".claude-old"), None, ""):
+                with self.subTest(cwd=cwd.name, config=config):
+                    self.assertEqual(self.check(self.ask(cwd=cwd), config=config), "")
+        # An account whose "repositories" is not a list of paths is allowed
+        # nowhere, but keeps no folder either.
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": "~/zain"})
+        self.assertEqual(self.check(config=str(self.personal)), "")
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"})
+        self.assertEqual(self.check(config=str(self.personal)), "", "one account, no repositories")
+        self.assertEqual(self.logged(), [])
+
+    def test_without_an_accounts_file_or_with_one_it_cannot_read_every_prompt_goes_through(self):
+        path = self.home / "accounts.json"
+        path.unlink()
+        self.assertEqual(self.check(config=str(self.personal)), "")
+        self.assertEqual(self.check(config=None), "")
+        cases = unreadable_accounts({"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]},
+                                    {"name": "personal", "config_dir": "~/.claude-personal"})
+        for case, text in cases.items():
+            with self.subTest(case):
+                path.write_text(text)
+                self.assertEqual(self.check(config=str(self.personal)), "")
+        self.assertEqual(self.logged(), [])
+
+    def test_input_it_cannot_read_lets_the_prompt_through(self):
+        ask = self.ask()
+        for raw in ("", "not json {", "[1]", "null", '"text"', json.dumps({k: v for k, v in ask.items() if k != "cwd"}),
+                    json.dumps({**ask, "cwd": None}), json.dumps({**ask, "cwd": "zain"}), json.dumps({**ask, "cwd": 7}),
+                    json.dumps({k: v for k, v in ask.items() if k != "session_id"}), json.dumps({**ask, "session_id": ""}),
+                    json.dumps({**ask, "session_id": 12}), json.dumps({**ask, "session_id": "a\nb"})):
+            with self.subTest(raw=raw[:40]):
+                self.assertEqual(self.check(raw, config=str(self.personal)), "")
+        self.assertEqual(self.logged(), [])
+        self.assertNotIn(self.S, self.log())
+
+    def test_a_chat_with_no_config_dir_runs_on_the_default_sign_in(self):
+        label = "the default sign-in (~/.claude)"
+        for config in (None, ""):
+            with self.subTest(config=config):
+                self.assertEqual(self.check(config=config), self.refused(label))
+        self.assertEqual(self.logged()[-1], f"account: refused a prompt in {self.SID}: ~/zain is kept for zain-work; "
+                                            f"the chat runs on {label}")
+        self.assertEqual(self.check(config=str(self.tmp / ".claude")), self.refused(label), "named in full")
+        # An account that keeps ~/.claude is named, whether it keeps the
+        # folder or not.
+        self.write_accounts({"name": "Max", "config_dir": None},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]})
+        self.assertEqual(self.check(config=None), self.refused("Max"))
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "repositories": ["~/zain"]})
+        self.assertEqual(self.check(config=None), "", "zain-work signs in on ~/.claude itself")
+        self.assertEqual(self.check(config=str(self.personal)), self.refused("personal"))
+
+    def test_a_folder_no_account_uses_is_named_by_its_path(self):
+        self.assertEqual(self.check(config=str(self.tmp / ".claude-old") + "/"),
+                         self.refused("an account Longhaul doesn't know (~/.claude-old)"))
+        self.assertEqual(self.logged(), [f"account: refused a prompt in {self.SID}: ~/zain is kept for zain-work; "
+                                         "the chat runs on an account Longhaul doesn't know (~/.claude-old)"])
+
+    def test_a_folder_two_accounts_keep_names_both_and_the_first_to_open_it_on(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]},
+                            {"name": "zain-spare", "config_dir": "~/.claude-spare", "repositories": ["~/other", "~/zain/src"]})
+        self.assertEqual(self.check(self.ask(cwd=self.zain / "src" / "app"), config=str(self.personal)),
+                         self.refused("personal"), "the repository is ~/zain, and zain-spare's ~/zain/src does not cover it")
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]},
+                            {"name": "zain-spare", "config_dir": "~/.claude-spare", "repositories": ["~/other", "~/zain"]})
+        self.assertEqual(self.check(config=str(self.personal)), self.refused("personal", kept="zain-work or zain-spare"))
+        self.assertEqual(self.logged()[-1], f"account: refused a prompt in {self.SID}: ~/zain is kept for "
+                                            "zain-work, zain-spare; the chat runs on personal")
+        self.assertEqual(self.check(config=str(self.tmp / ".claude-spare")), "", "either one may be used there")
+
+    def hook(self, root=None):
+        """The check's hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook("UserPromptSubmit", "account-check")
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def run_hook(self, cmd, data, config=None):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        env = {**self.env, **({"CLAUDE_CONFIG_DIR": config} if config is not None else {})}
+        return subprocess.run(cmd, input=raw, env=env, cwd=self.tmp, capture_output=True, text=True, timeout=30)
+
+    def test_the_plugin_registers_the_check_on_each_prompt_and_it_never_fails_a_prompt(self):
+        # The owner's decision of 2026-10-25: the third UserPromptSubmit hook,
+        # beside the Advisor's note and the reminder.
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        note, reminder, entry = hooks["UserPromptSubmit"]
+        self.assertIn("main(['advisor-note'])", note["hooks"][0]["args"][2])
+        self.assertIn("main(['reminder'])", reminder["hooks"][0]["args"][2])
+        self.assertNotIn("matcher", entry, "UserPromptSubmit takes none")
+        [handler] = entry["hooks"]
+        self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+        self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+        self.assertEqual((handler["timeout"], handler["statusMessage"]),
+                         (5, "Checking this chat's account (longhaul accounts)"))
+        # The reminder's wrapper, with this command: an exit 2 on
+        # UserPromptSubmit blocks the prompt, so whatever longhaul does,
+        # BaseException included, the wrapper exits 0.
+        wrapper = handler["args"][2]
+        self.assertEqual(wrapper, reminder["hooks"][0]["args"][2].replace("'reminder'", "'account-check'"))
+        self.assertIn("except BaseException:", wrapper)
+        self.assertTrue(wrapper.endswith("\nsys.exit(0)"), wrapper)
+        self.assertEqual(self.hook()[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+        out = self.run_hook(self.hook(), self.ask(), config=str(self.personal))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.refused("personal"), ""))
+        out = self.run_hook(self.hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.refused("the default sign-in (~/.claude)"), ""))
+        out = self.run_hook(self.hook(), self.ask(), config=str(self.work) + "/")
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        for raw in ("", "not json {", "[1]", json.dumps(self.ask(cwd=self.tmp / "other"))):
+            out = self.run_hook(self.hook(), raw, config=str(self.personal))
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw[:20])
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n",
+                 "interrupted": "def main(argv):\n    raise KeyboardInterrupt\n", "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / "roots" / name
+            if source:
+                root.mkdir(parents=True)
+                (root / "longhaul.py").write_text(source)
+            out = self.run_hook(self.hook(root), self.ask(), config=str(self.personal))
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
+        self.assertEqual(len(self.logged()), 2, "the two refusals, each logged")
+        self.assertNotIn(self.S, self.log())
 
 
 class History(unittest.TestCase):

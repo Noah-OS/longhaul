@@ -134,6 +134,12 @@ Usage:
                           hook says it too, whatever LONGHAUL_GUARD is, and each
                           multiple is said once, the count starting again after
                           a compaction; never in a trial's usual arm
+  longhaul account-check        the plugin's UserPromptSubmit hook: in a folder the
+                          "repositories" in accounts.json keep for some accounts,
+                          refuses each prompt of a chat on any other account (by
+                          its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
+                          is sent on the wrong one; whatever it cannot read lets
+                          the prompt through
   longhaul trial start [--days N] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -1956,6 +1962,105 @@ def session_account(config_dir, home: Path | None = None) -> tuple:
 # The accounts.json problems session_account() has logged in this process:
 # the Advisor's hook asks it up to three times a call.
 UNREADABLE_SAID: set = set()
+
+
+# `longhaul account-check`, a UserPromptSubmit hook (the owner's decision
+# of 2026-10-25, "Stop the prompt"): two VS Code chats in ~/zain, a folder
+# kept for zain-work, ran on the personal account, because their claude
+# processes predated Longhaul's VS Code setup. A chat's account is the
+# CLAUDE_CONFIG_DIR its hook inherits from its claude (unset or empty:
+# ~/.claude). In a folder some accounts' "repositories" keep for them
+# (covers(), as eligible() reads it), a chat on any other account has each
+# prompt refused (ACCOUNT_REFUSED, which the user reads and the model never
+# does) and logged (ACCOUNT_LOGGED, which the display module's pop-up
+# reads), so no tokens are spent on the wrong account. Of the input only
+# session_id and cwd are used: the prompt's text is never used, logged,
+# kept or said. It fails open: no accounts.json, one it cannot read, input
+# it cannot read or any error lets the prompt through, and a folder no
+# account keeps is never refused.
+
+ACCOUNT_REFUSED = ("Longhaul: {where} is kept for {names}, and this chat runs on {label}. Nothing was sent. Close "
+                   "this chat and open it again (in a terminal: longhaul -r {short}), so it starts on {first}.")
+ACCOUNT_LOGGED = "account: refused a prompt in {sid}: {where} is kept for {names}; the chat runs on {label}"
+# The hook's input holds the prompt, and the bigger the prompt the more a
+# wrong account costs: a prompt that fits a 1M-token context is well under
+# this many characters. A bigger input is let through, logged by its size.
+ACCOUNT_STDIN_MAX = 10_000_000
+
+
+def chat_config_dir() -> str:
+    """The config folder this hook's chat runs on: the CLAUDE_CONFIG_DIR
+    its claude passed down, `~` expanded and made absolute; unset or empty
+    is ~/.claude (DEFAULT_CONFIG)."""
+    value = os.environ.get("CLAUDE_CONFIG_DIR")
+    return os.path.abspath(os.path.expanduser(value)) if value else str(DEFAULT_CONFIG)
+
+
+def accounts_on(accounts: list[dict], folder: str) -> list[dict]:
+    """The accounts whose config folder is `folder`, by real path on both
+    sides, so a trailing slash, a `~` or a link names the same folder. An
+    account with no config_dir is on ~/.claude (config_of()); one whose
+    config_dir is not text is on none."""
+    real = os.path.realpath(folder)
+    return [a for a in accounts if (a.get("config_dir") is None or isinstance(a.get("config_dir"), str))
+            and os.path.realpath(config_of(a)) == real]
+
+
+def chat_label(on: list[dict], folder: str) -> str:
+    """What the refusal calls the account a chat runs on: the account's
+    name; the default sign-in, when no account uses ~/.claude; else the
+    folder, an account Longhaul doesn't know."""
+    if on:
+        return on[0]["name"]
+    if os.path.realpath(folder) == os.path.realpath(DEFAULT_CONFIG):
+        return "the default sign-in (~/.claude)"
+    return f"an account Longhaul doesn't know ({home_path(folder)})"
+
+
+def account_refusal(data: dict):
+    """The hook's answer refusing the prompt in `data` (a UserPromptSubmit
+    input), logged, or None to let it through: None unless the session
+    has an id, its cwd is an absolute path whose repository
+    (repository_of()) some accounts keep, and the chat's config folder is
+    none of theirs. The reason names the folder, the accounts that keep it
+    in the file's order, the chat's account, and how to open the chat
+    again on the first of them."""
+    sid, cwd = data.get("session_id"), data.get("cwd")
+    if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and isinstance(cwd, str) and os.path.isabs(cwd)):
+        return None
+    accounts, problem = read_accounts_file()
+    if problem:
+        return None
+    top = repository_of(cwd)
+    kept = [a["name"] for a in accounts if covers(a, top)]
+    if not kept:
+        return None
+    folder = chat_config_dir()
+    on = accounts_on(accounts, folder)
+    if any(a["name"] in kept for a in on):
+        return None
+    label, where = chat_label(on, folder), home_path(top)
+    log(ACCOUNT_LOGGED.format(sid=sid, where=where, names=", ".join(kept), label=label))
+    return {"decision": "block", "reason": ACCOUNT_REFUSED.format(
+        where=where, names=" or ".join(kept), label=label, short=sid[:8], first=kept[0])}
+
+
+def account_check(_opts) -> int:
+    """The UserPromptSubmit hook command: stdin in, account_refusal()'s
+    answer as JSON or nothing out, exit 0 always. An error prints nothing
+    and is logged by its kind alone, as reminder() does."""
+    try:
+        raw = sys.stdin.read(ACCOUNT_STDIN_MAX + 1)
+        if len(raw) > ACCOUNT_STDIN_MAX:
+            log(f"account-check hook: no check (over {ACCOUNT_STDIN_MAX:,} characters)")
+            return 0
+        data = json.loads(raw) if raw.strip() else {}
+        answer = account_refusal(data) if isinstance(data, dict) else None
+        if answer:
+            print(json.dumps(answer))
+    except Exception as e:
+        log(f"account-check hook: no check ({type(e).__name__})")
+    return 0
 
 
 def save_label(sid: str, label: str) -> None:
@@ -7905,7 +8010,7 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "trial", "vscode", "models"):
+                            "account-check", "trial", "vscode", "models"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -7965,7 +8070,8 @@ def main(argv: list[str]) -> int:
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
-                "advisor-note": advisor_note, "reminder": reminder, "trial": trial}[cmd](opts)
+                "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
+                "trial": trial}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

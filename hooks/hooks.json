@@ -101,6 +101,17 @@
             "statusMessage": "Checking the context's size (longhaul checkpoint)"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.main(['account-check'])\nexcept BaseException:\n    pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Checking this chat's account (longhaul accounts)"
+          }
+        ]
       }
     ]
   }
