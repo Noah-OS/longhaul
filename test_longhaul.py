@@ -195,6 +195,30 @@ class Loop(unittest.TestCase):
         self.assertEqual(len(self.state()["handled_limits"]), 1)
         self.assertEqual((self.home / "longhaul.log").read_text().count("ended: limit"), 1)
 
+    def test_a_recorded_stop_failure_alone_does_not_move_or_stop_a_launch(self):
+        # Sprint 10 (L1a, L3a): Claude Code's StopFailure and quota hooks are
+        # recorded and shown, and decide nothing until a live test at a real
+        # limit shows which fire: the supervisor reads the transcript alone.
+        for command, data in (("stop-failure", {"session_id": "sid-1", "hook_event_name": "StopFailure",
+                                                "error": "rate_limit"}),
+                              ("quota-note", {"session_id": "sid-1", "hook_event_name": "Notification",
+                                              "notification_type": "quota_auto_resume_disabled"})):
+            event = data["hook_event_name"]
+            out = subprocess.run(registered_hook(event, command), input=json.dumps(data), capture_output=True,
+                                 text=True, env=dict(os.environ, LONGHAUL_HOME=str(self.home)), timeout=30)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertEqual([row["type"] for row in json.loads((self.home / "stops.json").read_text())["sid-1"]],
+                         ["rate_limit", "quota_auto_resume_disabled"])
+        out, calls = self.run_longhaul(["crash", "exit"])
+        self.assertEqual([c["config"] for c in calls], [None, None], "reopened on Max after the crash, as ever")
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertNotIn("ended: limit", log)
+        self.assertIn("ended: completed", log)
+        state = self.state() if (self.home / "state.json").exists() else {}
+        self.assertEqual(state.get("limited_until", {}), {}, "no account marked at its limit")
+        self.assertEqual(state.get("handled_limits", []), [], "no limit handled")
+
     def test_the_sign_in_is_checked_again_before_every_launch(self):
         self.pin_emails()
         out, calls = self.run_longhaul(["exit_after_signin_change", "exit"], FAKE_EMAIL_MAX="first@example.com",
@@ -1391,6 +1415,30 @@ class Inspect(unittest.TestCase):
         self.assertEqual(r["requests"], {"main": 2, "subagents": 0})
         self.assertEqual(r["models"], {"claude-opus-5-5": 1, "claude-haiku-5-5": 1})
         self.assertEqual(r["api_errors"], {"rate_limit": 1})
+
+    def test_the_failures_count_the_stops_longhauls_hooks_kept(self):
+        # Sprint 10 (L1a, L3a): this conversation's rows of the StopFailure
+        # and quota hooks, by type, under the transcript's API errors, named
+        # by their source; with none kept, no line.
+        self.write(self.reply())
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        self.assertEqual(out[out.index("Failures [transcript, counted]") + 1:], ["  tool errors: none", "  API errors: none"])
+        now = int(time.time())
+        rows = [{"event": "StopFailure", "type": "rate_limit", "at": now},
+                {"event": "Notification", "type": "quota_auto_resume_stale", "at": now},
+                {"event": "StopFailure", "type": "rate_limit", "at": now}, {"event": "StopFailure", "type": "junk", "at": now}]
+        (self.relay / longhaul.STOPS_RECORD).write_text(json.dumps(
+            {"s1": rows, "s2": [{"event": "StopFailure", "type": "server_error", "at": now}]}))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["stops"], {"rate_limit": 2, "quota_auto_resume_stale": 1}, "this conversation's alone")
+        out = longhaul.inspect_lines(r)
+        self.assertEqual(out[out.index("Failures [transcript, counted]") + 1:], [
+            "  tool errors: none", "  API errors: none",
+            "  stops [longhaul stop-failure and quota-note hooks, counted]: rate_limit 2, quota_auto_resume_stale 1"])
+        got = {x["item"]: (x["value"], x["unit"], x["scope"], x["source"], x["confidence"])
+               for x in self.records("s1") if x["metric"] == "stops"}
+        self.assertEqual(got, {"rate_limit": (2, "events", "main", "hooks", "counted"),
+                               "quota_auto_resume_stale": (1, "events", "main", "hooks", "counted")})
 
     def test_tokens_are_summed_per_model_for_main_and_subagents(self):
         # Sprint 8, Region A: each model's input, cache write, cache read and
@@ -6415,8 +6463,8 @@ class Advisor(unittest.TestCase):
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 9,
-                         "the plugin's seventh hook, the reminder's and the account check's")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 11,
+                         "the plugin's seventh hook, the reminder's, the account check's and the stops' two (Sprint 10)")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -6981,8 +7029,9 @@ class Checkpoint(unittest.TestCase):
 
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse", "UserPromptSubmit"},
-                         "these four events and nothing else")
+        # StopFailure and Notification (Sprint 10) are pinned in Stops.
+        self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse", "UserPromptSubmit",
+                                               "StopFailure", "Notification"}, "these six events and nothing else")
         # The Advisor's two entries on Agent, Task, SendMessage and Workflow
         # (Sprint 8) and its note on UserPromptSubmit are pinned in Advisor.
         self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]],
@@ -8144,8 +8193,8 @@ class Reminder(unittest.TestCase):
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]),
                          (5, "Checking the context's size (longhaul checkpoint)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 9,
-                         "the plugin's eighth hook, and the account check's (2026-10-25)")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 11,
+                         "the plugin's eighth hook, the account check's (2026-10-25) and the stops' two (Sprint 10)")
         # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
         # does, BaseException included, the wrapper exits 0.
         wrapper = handler["args"][2]
@@ -12080,9 +12129,15 @@ class Display(unittest.TestCase):
             "setup": "setup: Longhaul 0.2.4 is on: 7 of 8 set up",
             # A checkpoint put back from long ago (review issue 6, 2026-10-25).
             "put back": "checkpoint for fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 put back after resume (4214 bytes, written "
-                        "98444 s earlier)"}
+                        "98444 s earlier)",
+            # Claude Code's StopFailure and quota hooks (Sprint 10): the stop
+            # and the two waits the user must act on; Stops pins the rest.
+            "stop": "stop: fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 turn ended on an API error (rate_limit)",
+            "stale": "quota: fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 waits for Enter: the usage limit reset while the "
+                     "computer slept",
+            "disabled": "quota: Claude Code stopped waiting at a usage limit in fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"}
         patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
-        self.assertEqual(len(patterns), 12)
+        self.assertEqual(len(patterns), 15)
         for pattern, (kind, line) in zip(patterns, lines.items()):
             js = pattern.replace("\\/", "/")
             self.assertRegex(line, js, kind)
@@ -12148,8 +12203,21 @@ class Display(unittest.TestCase):
                         'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")',
                         'log(f"release: Longhaul {latest} is out (this is {running})")',
                         'log(f"release: Longhaul {installed} is installed; {sid} runs {running}")',
-                        'SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"'):
+                        'SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"',
+                        'STOP_LOGGED = "stop: {sid} turn ended on an API error ({error})"',
+                        '"quota_auto_resume_stale": "quota: {sid} waits for Enter: the usage limit reset while the '
+                        'computer slept"',
+                        '"quota_auto_resume_disabled": "quota: Claude Code stopped waiting at a usage limit in {sid}"'):
             self.assertIn(written, source, written)
+        stop, stale, disabled = (pattern.replace("\\/", "/") for pattern in patterns[12:15])
+        self.assertEqual(re.match(stop, lines["stop"]).groups(), (sid, "rate_limit"))
+        self.assertEqual(re.match(stale, lines["stale"]).groups(), (sid,))
+        self.assertEqual(re.match(disabled, lines["disabled"]).groups(), (sid,))
+        for toast in ("$.ui.toast(STOPPED[m[2]], { timeoutMs: 12000 })",
+                      "'Longhaul: the usage limit reset while the computer slept. Press Enter in this chat to carry on.'",
+                      "'Longhaul: Claude Code stopped waiting at the usage limit and will not carry on by itself. Send a "
+                      "message once it resets.'"):
+            self.assertIn(toast, self.SOURCE)
 
 
 class Release(unittest.TestCase):
@@ -12872,6 +12940,290 @@ class Autocompact(unittest.TestCase):
                              text=True, env=env, timeout=30)
         self.assertEqual((out.returncode, out.stdout), (2, ""))
         self.assertIn("run it in a terminal", out.stderr)
+        self.assertFalse(self.home.exists(), "nothing was written")
+
+
+class Stops(unittest.TestCase):
+    """`longhaul stop-failure` and `longhaul quota-note` (Sprint 10, L1a and
+    L3a): Claude Code's StopFailure hook, run when a turn ends on an API
+    error, and its Notification hook for the three moments of a wait at a
+    usage limit. The supervisor's limit stop is read from transcript fields
+    Claude Code does not document; these are its documented signals. Which
+    fire at a real subscription limit is not known yet, so for now they are
+    recorded and shown, and decide nothing: for the main conversation, the
+    type and the time per session, and one log line, which the display
+    turns into a pop-up where the user has to act. The input's text fields
+    are never kept, logged or said."""
+
+    # The text the input carries: it is in the hook's input and nowhere else.
+    S = "SENTINEL-NARWHAL-4410"
+    SID = "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")
+                    and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def failure(self, error="rate_limit", sid=None, **fields):
+        """A StopFailure input as the hooks reference gives it, its text fields holding S."""
+        return {"session_id": sid or self.SID, "transcript_path": str(self.tmp / f"{sid or self.SID}.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "StopFailure", "error": error,
+                "error_details": f"429 Too Many Requests ({self.S})",
+                "last_assistant_message": f"API Error: Request rejected ({self.S})", **fields}
+
+    def notice(self, kind="quota_auto_resume_stale", sid=None, **fields):
+        """A Notification input, its message and title holding S."""
+        return {"session_id": sid or self.SID, "transcript_path": str(self.tmp / f"{sid or self.SID}.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "Notification", "notification_type": kind,
+                "message": f"Your usage limit has reset ({self.S})", "title": f"Claude Code ({self.S})", **fields}
+
+    def send(self, command, data):
+        """`longhaul COMMAND` in this process with `data` (an input, or its raw text) on stdin: what it printed."""
+        raw = data if isinstance(data, str) else json.dumps(data)
+        with mock.patch.object(sys, "stdin", io.StringIO(raw)), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = longhaul.main([command])
+        self.assertEqual(code, 0)
+        return out.getvalue() + err.getvalue()
+
+    def record(self) -> dict:
+        path = self.home / longhaul.STOPS_RECORD
+        return json.loads(path.read_text()) if path.is_file() else {}
+
+    def kept(self, sid=None) -> list:
+        """A session's rows, (event, type) each."""
+        return [(row["event"], row["type"]) for row in self.record().get(sid or self.SID, [])]
+
+    def log(self) -> str:
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def logged(self) -> list:
+        """The stops' log lines, without their time stamps."""
+        return [line[20:] for line in self.log().splitlines() if line[20:].startswith(("stop", "quota"))]
+
+    def everything(self) -> str:
+        """Every file under LONGHAUL_HOME, as text."""
+        return "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+
+    def test_each_documented_error_is_kept_and_any_other_is_unknown(self):
+        # As code.claude.com/docs/en/hooks lists StopFailure's error (2026-10-26).
+        self.assertEqual(longhaul.STOP_ERRORS, (
+            "rate_limit", "overloaded", "authentication_failed", "oauth_org_not_allowed", "account_on_hold",
+            "billing_error", "invalid_request", "model_not_found", "server_error", "max_output_tokens",
+            "cloud_credential_error", "unknown"))
+        for n, error in enumerate(longhaul.STOP_ERRORS):
+            self.assertEqual(self.send("stop-failure", self.failure(error, sid=f"s{n}")), "", "nothing printed")
+            self.assertEqual(self.kept(f"s{n}"), [("StopFailure", error)])
+            self.assertEqual(self.logged()[-1], f"stop: s{n} turn ended on an API error ({error})")
+        junk = ("rate-limit", "RATE_LIMIT", " rate_limit", "", None, 7, True, ["rate_limit"], {"rate_limit": 1},
+                "a" * 200, self.S)
+        for n, error in enumerate(junk):
+            self.send("stop-failure", self.failure(error, sid=f"j{n}"))
+            self.assertEqual(self.kept(f"j{n}"), [("StopFailure", "unknown")], error)
+            self.assertEqual(self.logged()[-1], f"stop: j{n} turn ended on an API error (unknown)")
+        self.send("stop-failure", {k: v for k, v in self.failure().items() if k != "error"})
+        self.assertEqual(self.kept(), [("StopFailure", "unknown")], "no error at all")
+        row = self.record()[self.SID][0]
+        self.assertEqual(set(row), {"event", "type", "at"})
+        self.assertIsInstance(row["at"], int, "whole seconds")
+        self.assertAlmostEqual(row["at"], time.time(), delta=5)
+
+    def test_each_quota_type_is_kept_and_any_other_notification_is_ignored(self):
+        said = {"quota_auto_resume_fired": f"quota: Claude Code continued {self.SID} after a usage limit",
+                "quota_auto_resume_stale": f"quota: {self.SID} waits for Enter: the usage limit reset while the "
+                                           "computer slept",
+                "quota_auto_resume_disabled": f"quota: Claude Code stopped waiting at a usage limit in {self.SID}"}
+        self.assertEqual(longhaul.QUOTA_TYPES, tuple(said))
+        for kind, line in said.items():
+            self.assertEqual(self.send("quota-note", self.notice(kind)), "")
+            self.assertEqual(self.logged()[-1], line)
+        self.assertEqual(self.kept(), [("Notification", kind) for kind in said])
+        before = self.record()
+        for kind in ("permission_prompt", "idle_prompt", "auth_success", "elicitation_dialog", "quota_auto_resume",
+                     "QUOTA_AUTO_RESUME_STALE", "", None, 3, ["quota_auto_resume_stale"], self.S):
+            self.assertEqual(self.send("quota-note", self.notice(kind)), "", kind)
+        self.send("quota-note", {k: v for k, v in self.notice().items() if k != "notification_type"})
+        # Each command takes its own event alone.
+        self.send("quota-note", self.failure())
+        self.send("stop-failure", self.notice())
+        self.send("stop-failure", self.failure(hook_event_name="Stop"))
+        self.send("stop-failure", {k: v for k, v in self.failure().items() if k != "hook_event_name"})
+        self.assertEqual(self.record(), before, "nothing more kept")
+        self.assertEqual(len(self.logged()), 3, "nothing more logged")
+
+    def test_a_subagents_event_and_an_input_naming_no_plain_session_are_skipped(self):
+        for data in (self.failure(agent_id="a1b2c3"), self.failure(agent_id=""), self.failure(agent_id=7),
+                     self.notice(agent_id="a1b2c3"), self.notice("quota_auto_resume_disabled", agent_id="x")):
+            self.send("stop-failure" if data["hook_event_name"] == "StopFailure" else "quota-note", data)
+        for sid in ("", "a/b", "../x", "x" * 101, "a b", "a\nb", None, 12, ["s1"]):
+            self.send("stop-failure", {**self.failure(), "session_id": sid})
+            self.send("quota-note", {**self.notice(), "session_id": sid})
+        self.send("stop-failure", {k: v for k, v in self.failure().items() if k != "session_id"})
+        self.assertFalse(self.home.exists(), "no record, no log")
+        self.send("stop-failure", self.failure(agent_id=None))
+        self.assertEqual(self.kept(), [("StopFailure", "rate_limit")], "agent_id null: the main conversation")
+
+    def test_the_hook_never_raises_and_prints_nothing_on_bad_input(self):
+        for raw in ("", "not json {", "[1]", "null", '"text"', "7", "[" * 100_000, "x" * (longhaul.STOPS_STDIN_MAX + 1),
+                    json.dumps(self.failure()) + " " * longhaul.STOPS_STDIN_MAX):
+            for command in ("stop-failure", "quota-note"):
+                with self.subTest(command=command, raw=raw[:20]):
+                    self.assertEqual(self.send(command, raw), "")
+        self.assertEqual(self.record(), {}, "nothing kept")
+        self.assertNotIn(self.S, self.log())
+        # A record it cannot read is written afresh; one it cannot write is logged, and the hook goes on.
+        self.home.mkdir(exist_ok=True)
+        path = self.home / longhaul.STOPS_RECORD
+        for junk in ("{not json", "[]", '"x"', json.dumps({self.SID: "rows"})):
+            path.write_text(junk)
+            self.send("stop-failure", self.failure())
+            self.assertEqual(self.kept(), [("StopFailure", "rate_limit")], junk)
+        path.unlink()
+        path.mkdir()
+        self.assertEqual(self.send("stop-failure", self.failure("overloaded")), "")
+        self.assertRegex(self.logged()[-1], rf"^stop: {self.SID}'s overloaded was not kept: ")
+        self.assertEqual(self.logged()[-2], f"stop: {self.SID} turn ended on an API error (overloaded)")
+        self.assertNotIn(self.S, self.everything())
+
+    def test_the_text_fields_never_reach_the_record_or_the_log(self):
+        # error_details, last_assistant_message, message and title hold the
+        # API's and Claude Code's text; an error or a type that is no
+        # documented one is never kept as written either.
+        self.send("stop-failure", self.failure())
+        self.send("stop-failure", self.failure(self.S, sid="s2"))
+        self.send("stop-failure", self.failure(f"rate_limit {self.S}", sid="s3"))
+        for kind in longhaul.QUOTA_TYPES:
+            self.send("quota-note", self.notice(kind))
+        self.send("quota-note", self.notice(self.S, sid="s4"))
+        self.send("quota-note", self.notice(f"quota_auto_resume_fired {self.S}", sid="s5"))
+        self.assertEqual(set(self.record()), {self.SID, "s2", "s3"})
+        self.assertEqual(len(self.logged()), 6)
+        self.assertNotIn(self.S, self.everything(), "the record, the log and anything else under LONGHAUL_HOME")
+
+    def test_the_record_stays_capped_and_old_sessions_go(self):
+        errors = longhaul.STOP_ERRORS
+        sent = [errors[n % len(errors)] for n in range(longhaul.STOPS_KEEP + 7)]
+        for error in sent:
+            self.send("stop-failure", self.failure(error))
+        self.assertEqual(longhaul.STOPS_KEEP, 20)
+        self.assertEqual(self.kept(), [("StopFailure", e) for e in sent[-longhaul.STOPS_KEEP:]], "the newest kept")
+        self.assertEqual(len(self.logged()), len(sent), "each logged")
+        path = self.home / longhaul.STOPS_RECORD
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600, "private, like the rest of the home")
+        now = time.time()
+        row = {"event": "StopFailure", "type": "server_error", "at": int(now - 86_400)}
+        path.write_text(json.dumps({
+            "old": [{**row, "at": int(now - 31 * 86_400)}], "recent": [row], "junk": "x", "a/b": [row], "empty": [],
+            "rows": [{"event": "StopFailure", "type": self.S, "at": now}, {"event": "Notification", "type": "rate_limit",
+                     "at": now}, "text", {"event": "StopFailure", "type": "overloaded", "at": "soon"},
+                     {"event": "StopFailure", "type": "overloaded", "at": float("nan")},
+                     {**row, "words": self.S}, row]}))
+        self.send("quota-note", self.notice())
+        kept = self.record()
+        self.assertEqual(set(kept), {"recent", "rows", self.SID}, "over 30 days old, junk and empty go")
+        self.assertEqual(kept["rows"], [row, row], "the rows in the record's shape, and of each its type and time alone")
+        self.assertEqual(self.kept(), [("Notification", "quota_auto_resume_stale")])
+        self.assertNotIn(self.S, self.everything())
+
+    def test_each_log_line_matches_its_display_pattern(self):
+        # The display's pop-ups for this chat's stops and waits the user must
+        # act on, against the lines this code logs: the four stops, the stale
+        # wait and the one Claude Code gave up; not the rest.
+        source = (HERE / "hooks" / "display.ts").read_text()
+        patterns = [p.replace("\\/", "/") for p in re.findall(r"body\.match\(/(.+?)/\)", source)
+                    if p.startswith(("^stop: ", "^quota: "))]
+        self.assertEqual(len(patterns), 3)
+        stop, stale, disabled = patterns
+        shown = ("rate_limit", "authentication_failed", "billing_error", "account_on_hold")
+        for error in longhaul.STOP_ERRORS:
+            self.send("stop-failure", self.failure(error))
+            line = self.logged()[-1]
+            m = re.match(stop, line)
+            self.assertEqual(m.groups() if m else None, (self.SID, error) if error in shown else None, line)
+            self.assertIsNone(re.match(stale, line))
+            self.assertIsNone(re.match(disabled, line))
+        for kind, pattern in (("quota_auto_resume_stale", stale), ("quota_auto_resume_disabled", disabled),
+                              ("quota_auto_resume_fired", None)):
+            self.send("quota-note", self.notice(kind))
+            line = self.logged()[-1]
+            for other in patterns:
+                m = re.match(other, line)
+                self.assertEqual(m.groups() if m else None, (self.SID,) if other == pattern else None, line)
+        # Each shows in its own chat alone, and says what to do.
+        for match in ("/^stop: (\\S+) turn ended on an API error \\((rate_limit|authentication_failed|billing_error|"
+                      "account_on_hold)\\)$/)) && m[1] === sid)",
+                      "/^quota: (\\S+) waits for Enter: the usage limit reset while the computer slept$/)) && m[1] === sid)",
+                      "/^quota: Claude Code stopped waiting at a usage limit in (\\S+)$/)) && m[1] === sid)"):
+            self.assertIn(match, source)
+        for error in shown:
+            self.assertRegex(source, rf"\n  {error}: ['\"]Longhaul: this turn stopped ")
+
+    def hook(self, event, command, root=None):
+        """The hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook(event, command)
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def run_hook(self, cmd, data):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.run(cmd, input=raw, env=self.env, cwd=self.tmp, capture_output=True, text=True, timeout=30)
+
+    def test_the_plugin_registers_both_hooks_and_they_never_fail(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        [stop], [quota] = hooks["StopFailure"], hooks["Notification"]
+        self.assertNotIn("matcher", stop, "every error: one outside the list is kept as unknown")
+        self.assertEqual(quota["matcher"], "quota_auto_resume_fired|quota_auto_resume_stale|quota_auto_resume_disabled")
+        reminder = hooks["UserPromptSubmit"][1]["hooks"][0]
+        for entry, command, says in ((stop, "stop-failure", "Noting why the turn stopped (longhaul stops)"),
+                                     (quota, "quota-note", "Noting a wait at a usage limit (longhaul stops)")):
+            [handler] = entry["hooks"]
+            self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+            self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+            self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, says))
+            # The reminder's wrapper with this command: whatever longhaul does, BaseException included, it exits 0.
+            self.assertEqual(handler["args"][2], reminder["args"][2].replace("'reminder'", f"'{command}'"))
+        out = self.run_hook(self.hook("StopFailure", "stop-failure"), self.failure("billing_error"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        out = self.run_hook(self.hook("Notification", "quota-note"), self.notice("quota_auto_resume_fired"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertEqual(self.kept(), [("StopFailure", "billing_error"), ("Notification", "quota_auto_resume_fired")])
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n",
+                 "interrupted": "def main(argv):\n    raise KeyboardInterrupt\n", "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / "roots" / name
+            if source:
+                root.mkdir(parents=True)
+                (root / "longhaul.py").write_text(source)
+            for event, command, data in (("StopFailure", "stop-failure", self.failure()),
+                                         ("Notification", "quota-note", self.notice())):
+                out = self.run_hook(self.hook(event, command, root), data)
+                self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), (name, command))
+        for raw in ("", "not json {", "[1]"):
+            out = self.run_hook(self.hook("StopFailure", "stop-failure"), raw)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw)
+        self.assertEqual(len(self.kept()), 2)
+        self.assertNotIn(self.S, self.everything())
+
+    def test_the_usage_block_names_them_and_the_shim_refuses_them(self):
+        # The hooks run longhaul.py themselves; bin/longhaul, what the model
+        # may run, is the owner's boundary and stays as it was.
+        self.assertIn("longhaul stop-failure | longhaul quota-note", longhaul.__doc__)
+        shim = (HERE / "bin" / "longhaul").read_text()
+        for command in ("stop-failure", "quota-note"):
+            self.assertNotIn(command, shim)
+            out = subprocess.run([str(HERE / "bin" / "longhaul"), command], input=json.dumps(self.failure()),
+                                 capture_output=True, text=True, env=self.env, timeout=30)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), command)
+            self.assertIn("run it in a terminal", out.stderr)
         self.assertFalse(self.home.exists(), "nothing was written")
 
 

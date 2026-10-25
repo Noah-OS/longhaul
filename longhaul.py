@@ -176,6 +176,12 @@ Usage:
                           its checkpoint after the reminder: logs it and keeps the
                           time, so a chat compacts at most once in ten minutes;
                           LONGHAUL_AUTO_COMPACT=off turns the compaction off
+  longhaul stop-failure | longhaul quota-note
+                          the plugin's StopFailure hook (a turn ended on an API
+                          error) and its Notification hook for a wait at a usage
+                          limit: for the main conversation, each logs one line
+                          and keeps the type and the time per session; it
+                          records only, and decides nothing
   longhaul trial start [--days N] [--kind models] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -2859,6 +2865,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "guard": guard_counts(path.stem),
         "subagent_reminders": subagent_reminders(path.stem),
         "consultations": consulted,
+        "stops": stop_counts(path.stem),
     }
 
 
@@ -3042,6 +3049,9 @@ def inspect_lines(r: dict) -> list[str]:
     out.append("Failures [transcript, counted]")
     out.append("  tool errors: " + (", ".join(f"{t} {c}" for t, c in r["tool_errors"].items()) or "none"))
     out.append("  API errors: " + (", ".join(f"{e} {c}" for e, c in r["api_errors"].items()) or "none"))
+    if r.get("stops"):  # else Claude Code's StopFailure and quota hooks kept none for it: no line
+        out.append("  stops [longhaul stop-failure and quota-note hooks, counted]: "
+                   + ", ".join(f"{k} {n}" for k, n in r["stops"].items()))
     if r["unreadable"]:
         out.append(f"  {r['unreadable']} transcript line{'s' * (r['unreadable'] != 1)} could not be read "
                    "and are not counted")
@@ -3112,6 +3122,8 @@ def inspect_records(r: dict) -> list[dict]:
         add("tool_errors", n, "errors", "all", "transcript", "counted", tool)
     for kind, n in r["api_errors"].items():
         add("api_errors", n, "errors", "all", "transcript", "counted", kind)
+    for kind, n in (r.get("stops") or {}).items():
+        add("stops", n, "events", "main", "hooks", "counted", kind)
     for k in GUARD_RULES if r["guard"] else ():
         add("guard_fired", r["guard"][k], "calls", "all", "guard", "counted", k)
         add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "guard", "counted", k)
@@ -6287,6 +6299,130 @@ def autocompact_note(opts) -> int:
     except OSError as e:
         log(f"autocompact: the time of {sid}'s compaction was not kept: {e.strerror or e}")
     return 0
+
+
+# ---------------------------------------------------------------- stops
+#
+# Claude Code's own word that a turn stopped (Sprint 10, L1a and L3a). The
+# supervisor tells a usage-limit stop from transcript fields Claude Code
+# does not document (limit_stop()), checked on 2.1.295 to 2.1.303 alone.
+# Claude Code documents two hooks for it (code.claude.com/docs/en/hooks):
+# StopFailure, run instead of Stop when a turn ends on an API error, its
+# `error` one of STOP_ERRORS; and Notification, whose `notification_type`
+# names three moments of a wait at a claude.ai usage limit (QUOTA_LOGGED,
+# 2.1.234 and later). Which of them fire at a real subscription limit is
+# not known yet, so `longhaul stop-failure` and `longhaul quota-note` only
+# record and log them: the supervisor, the panel wrapper and `longhaul
+# pipe` decide a limit as before. For the main conversation alone (a
+# subagent's input names its agent_id), each keeps the type and the time
+# in STOPS_RECORD under the session's id, and logs one line, which the
+# display (hooks/display.ts) shows as a pop-up where the user has to act.
+# Of the input only session_id, agent_id, hook_event_name and the type are
+# read: error_details, last_assistant_message, message and title hold
+# text, and are never kept, logged or said. Claude Code ignores the
+# output and the exit code; the hooks print nothing and exit 0.
+
+STOPS_RECORD = "stops.json"  # under LONGHAUL_HOME: {session id: [{"event", "type", "at": epoch seconds}, ...]}
+STOPS_KEEP = 20  # rows per session, the newest kept
+STOPS_KEEP_DAYS = 30  # a session whose newest row is older goes, as the Advisor's state's sessions do
+STOP_ERRORS = ("rate_limit", "overloaded", "authentication_failed", "oauth_org_not_allowed", "account_on_hold",
+               "billing_error", "invalid_request", "model_not_found", "server_error", "max_output_tokens",
+               "cloud_credential_error", "unknown")
+STOP_LOGGED = "stop: {sid} turn ended on an API error ({error})"
+QUOTA_LOGGED = {"quota_auto_resume_fired": "quota: Claude Code continued {sid} after a usage limit",
+                "quota_auto_resume_stale": "quota: {sid} waits for Enter: the usage limit reset while the computer slept",
+                "quota_auto_resume_disabled": "quota: Claude Code stopped waiting at a usage limit in {sid}"}
+QUOTA_TYPES = tuple(QUOTA_LOGGED)
+STOPS_STDIN_MAX = 1_000_000  # characters of the hook's input read; a bigger one is no event of Claude Code's
+
+
+def stop_signal(data, event: str):
+    """The type an `event` hook input says, to keep, or None for nothing
+    to keep: an input that is not an object, is another event's, names
+    no plain session (GUARD_ID) or is a subagent's (agent_id), or a
+    Notification of any other type. A StopFailure's `error` outside
+    STOP_ERRORS (a later version's, or junk) is "unknown"."""
+    if not isinstance(data, dict) or data.get("hook_event_name") != event or data.get("agent_id") is not None:
+        return None
+    sid = data.get("session_id")
+    if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
+        return None
+    kind = data.get("error" if event == "StopFailure" else "notification_type")
+    if event == "StopFailure":
+        return kind if isinstance(kind, str) and kind in STOP_ERRORS else "unknown"
+    return kind if isinstance(kind, str) and kind in QUOTA_TYPES else None
+
+
+def stop_rows(found) -> list:
+    """A session's rows in STOPS_RECORD that are in its shape, as they are
+    written; any other goes, so a rewrite keeps the types and times alone."""
+    rows = []
+    for row in found if isinstance(found, list) else []:
+        row = row if isinstance(row, dict) else {}
+        event, kind, at = row.get("event"), row.get("type"), as_number(row.get("at"))
+        if at is not None and isinstance(kind, str) and ((event == "StopFailure" and kind in STOP_ERRORS)
+                                                         or (event == "Notification" and kind in QUOTA_TYPES)):
+            rows.append({"event": event, "type": kind, "at": int(at)})
+    return rows
+
+
+def stop_keep(data, event: str, now: float | None = None) -> None:
+    """One StopFailure or Notification input (`event`) kept and logged,
+    when stop_signal() finds a type in it: the log's line, then the row
+    added to the session's in STOPS_RECORD, a file only you can read,
+    under its lock; the session's newest STOPS_KEEP rows are kept, and a
+    session whose newest is over STOPS_KEEP_DAYS old goes."""
+    kind = stop_signal(data, event)
+    if kind is None:
+        return
+    sid = data["session_id"]
+    log(STOP_LOGGED.format(sid=sid, error=kind) if event == "StopFailure" else QUOTA_LOGGED[kind].format(sid=sid))
+    now = time.time() if now is None else now
+    try:
+        path = LONGHAUL_HOME / STOPS_RECORD
+        with locked("stops"):
+            kept = read_json(path)
+            cutoff = now - STOPS_KEEP_DAYS * 86400
+            sessions = {}
+            for key, found in (kept.items() if isinstance(kept, dict) else ()):
+                rows = stop_rows(found)
+                if re.fullmatch(GUARD_ID, key) and rows and rows[-1]["at"] >= cutoff:
+                    sessions[key] = rows
+            sessions[sid] = [*sessions.pop(sid, []), {"event": event, "type": kind, "at": int(now)}][-STOPS_KEEP:]
+            write_json(path, sessions)
+    except OSError as e:
+        log(f"stop: {sid}'s {kind} was not kept: {e.strerror or e}")
+
+
+def stop_hook(event: str) -> int:
+    """The StopFailure or Notification hook command (`event`): stdin in,
+    nothing out, exit 0 always. An error is logged by its kind alone, as
+    reminder() does: the input holds text."""
+    try:
+        raw = sys.stdin.read(STOPS_STDIN_MAX + 1)
+        if len(raw) <= STOPS_STDIN_MAX:
+            stop_keep(json.loads(raw) if raw.strip() else {}, event)
+    except Exception as e:
+        log(f"{'stop-failure' if event == 'StopFailure' else 'quota-note'} hook: nothing kept ({type(e).__name__})")
+    return 0
+
+
+def stop_failure(_opts) -> int:
+    return stop_hook("StopFailure")
+
+
+def quota_note(_opts) -> int:
+    return stop_hook("Notification")
+
+
+def stop_counts(sid: str) -> dict:
+    """This session's rows in STOPS_RECORD counted by type, the most first,
+    for inspect; {} when there are none."""
+    if not re.fullmatch(GUARD_ID, sid or ""):
+        return {}
+    kept = read_json(LONGHAUL_HOME / STOPS_RECORD)
+    rows = stop_rows(kept.get(sid) if isinstance(kept, dict) else None)
+    return dict(collections.Counter(row["type"] for row in rows).most_common())
 
 
 # -------------------------------------------------------------- release
@@ -9912,7 +10048,8 @@ def main(argv: list[str]) -> int:
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "autocompact-note", "trial", "vscode", "models", "update", "doctor"):
+                            "account-check", "autocompact-note", "stop-failure", "quota-note", "trial", "vscode",
+                            "models", "update", "doctor"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -9985,7 +10122,7 @@ def main(argv: list[str]) -> int:
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
-                "autocompact-note": autocompact_note,
+                "autocompact-note": autocompact_note, "stop-failure": stop_failure, "quota-note": quota_note,
                 "trial": trial, "update": update, "doctor": doctor}[cmd](opts)
 
     extra: list[str] = []

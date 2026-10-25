@@ -124,7 +124,23 @@ async function popUps($: any, lines: string[]): Promise<void> {
     // A checkpoint put back from six hours ago or more: it may be out of date (review issue 6).
     else if ((m = body.match(/^checkpoint for (\S+) put back after (\S+) \((\d+) bytes, written (\d+) s earlier\)$/)) && m[1] === sid && Number(m[4]) >= 21600)
       $.ui.toast(`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out of date. /longhaul:checkpoint saves a fresh one.`, { timeoutMs: 12000 })
+    // Claude Code's own word that this chat stopped (its StopFailure and
+    // Notification hooks, Sprint 10): the stops and the wait the user must act on.
+    else if ((m = body.match(/^stop: (\S+) turn ended on an API error \((rate_limit|authentication_failed|billing_error|account_on_hold)\)$/)) && m[1] === sid)
+      $.ui.toast(STOPPED[m[2]], { timeoutMs: 12000 })
+    else if ((m = body.match(/^quota: (\S+) waits for Enter: the usage limit reset while the computer slept$/)) && m[1] === sid)
+      $.ui.toast('Longhaul: the usage limit reset while the computer slept. Press Enter in this chat to carry on.', { timeoutMs: 12000 })
+    else if ((m = body.match(/^quota: Claude Code stopped waiting at a usage limit in (\S+)$/)) && m[1] === sid)
+      $.ui.toast('Longhaul: Claude Code stopped waiting at the usage limit and will not carry on by itself. Send a message once it resets.', { timeoutMs: 12000 })
   }
+}
+
+// What the pop-up says for each stop the user has to act on.
+const STOPPED: Record<string, string> = {
+  rate_limit: 'Longhaul: this turn stopped at a rate or usage limit. If Claude Code does not carry on by itself once it lifts, send a message then.',
+  authentication_failed: "Longhaul: this turn stopped because the chat's sign-in failed. Sign in again, then send a message.",
+  billing_error: "Longhaul: this turn stopped on a billing error. Check the account's billing, then send a message.",
+  account_on_hold: 'Longhaul: this turn stopped because the account is on hold. Check it at claude.ai before you go on.',
 }
 
 export const register: Register = on => {

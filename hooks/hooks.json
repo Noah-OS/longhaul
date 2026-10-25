@@ -113,6 +113,33 @@
           }
         ]
       }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.main(['stop-failure'])\nexcept BaseException:\n    pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Noting why the turn stopped (longhaul stops)"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "quota_auto_resume_fired|quota_auto_resume_stale|quota_auto_resume_disabled",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.main(['quota-note'])\nexcept BaseException:\n    pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Noting a wait at a usage limit (longhaul stops)"
+          }
+        ]
+      }
     ]
   }
 }
