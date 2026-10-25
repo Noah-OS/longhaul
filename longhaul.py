@@ -1640,13 +1640,12 @@ def run(opts) -> int:
         # Two windows on one conversation both write to it, and Remote
         # Control jumps between them; moving a session from the VS Code
         # panel to longhaul means closing it there first.
-        for f in (DEFAULT_CONFIG / "sessions").glob("*.json"):
-            s = read_json(f)
-            if s and s.get("sessionId") == resume and pid_alive(s.get("pid")):
-                where = "the VS Code panel" if "vscode" in str(s.get("entrypoint")) else "another window"
-                say(f"This conversation is still open in {where} (process {s.get('pid')}). "
-                    "Close it there first, then run this again.")
-                return 1
+        held = open_elsewhere(resume, accounts)
+        if held:
+            where = held["where"] if held["where"] == "the VS Code panel" else "another window"
+            say(f"This conversation is still open in {where} (process {held['pid']}). "
+                "Close it there first, then run this again.")
+            return 1
 
     lock, locked_sid = None, None
 
@@ -5953,7 +5952,7 @@ REMINDER_USER = ("Longhaul: this conversation's context is about {k}k tokens, an
 # the user line above reaches only the terminal (seen 2026-10-23: the owner
 # saw neither the reminder nor the model's save in VS Code).
 REMINDER_MODEL = ("Longhaul: the context is about {k}k tokens. At your next natural stopping point (not in the middle "
-                  "of an edit or a test run), save a checkpoint with /longhaul:checkpoint, then tell the user in one "
+                  "of an edit or a test run), and in any case before you end your turn, save a checkpoint with /longhaul:checkpoint, then tell the user in one "
                   "line: \"Saved a checkpoint (the context is about {k}k tokens). Type /clear to start fresh; it comes "
                   "back.\" Then continue the work. After a compaction or a /clear it comes back.")
 
@@ -7389,7 +7388,9 @@ def models_rule(data: dict):
     table, mode = models_settings()
     if mode == "off":
         return None
-    model, how = given.get("model"), "guided"
+    # "guided" only where the guide was given (models_guided()); a call naming its model
+    # in the unguided half of a models trial is its own call (2026-10-25).
+    model, how = given.get("model"), ("guided" if models_guided(data.get("session_id"), mode) else "its call")
     if kind == "fork":  # a fork runs on the main conversation's model, whatever the call says
         model, how = None, "inherited"
     elif not (isinstance(model, str) and model.strip() and model != "inherit"):
@@ -7406,7 +7407,7 @@ def models_rule(data: dict):
         log(f"models: {kind} {have} -> {want} in {sid}")
         to = want
     elif data.get("agent_id") is None:
-        said = f"picked {have}" if how == "guided" else f"on {have or 'unknown'}"
+        said = f"picked {have}" if how in ("guided", "its call") else f"on {have or 'unknown'}"
         log(f"models: {kind} {said} ({how}) in {sid}")
     cap = models_cap() if kind != "fork" and models_guided(data.get("session_id"), mode) else None
     capped = bool(cap) and to in MODEL_RANK and MODEL_RANK[to] > MODEL_RANK[cap]
@@ -7702,6 +7703,33 @@ def choose_for_panel(accounts: list[dict], binary: str, start: int = 0, state: d
         wrong.add(accounts[i]["name"])
 
 
+def open_elsewhere(sid, accounts=()) -> dict | None:
+    """A live process holding conversation `sid`, by Claude Code's records of
+    its processes (<config>/sessions/<pid>.json) in the default config folder
+    and each account's (one real folder looked at once): {"pid", "where"},
+    or None. This process's own record is not one. Two windows on one
+    conversation both write to it (the terminal's check, then the panel's,
+    2026-10-25)."""
+    if not isinstance(sid, str) or not sid:
+        return None
+    folders, seen = [DEFAULT_CONFIG] + [Path(os.path.expanduser(a["config_dir"])) for a in accounts
+                                        if isinstance(a, dict) and isinstance(a.get("config_dir"), str)], set()
+    for folder in folders:
+        real = os.path.realpath(folder / "sessions")
+        if real in seen:
+            continue
+        seen.add(real)
+        for f in Path(real).glob("*.json"):
+            s = read_json(f)
+            if isinstance(s, dict) and s.get("sessionId") == sid and s.get("pid") != os.getpid() \
+                    and pid_alive(s.get("pid")):
+                entry = str(s.get("entrypoint"))
+                where = ("the VS Code panel" if "vscode" in entry else "a terminal" if entry == "cli"
+                         else "another window")
+                return {"pid": s.get("pid"), "where": where}
+    return None
+
+
 def wrap(argv: list[str]) -> int:
     """The extension's process wrapper. Runs claude as the extension asked
     on the account longhaul picks (a chat reopened by id: the account it last
@@ -7740,6 +7768,15 @@ def wrap(argv: list[str]) -> int:
             os.execv(binary, [binary] + args)
         mode = panel_switch_mode() if chat else "never"
         resumed = resume_id(args) if chat else None
+        held = open_elsewhere(resumed, accounts) if resumed else None
+        if held:
+            # The other way round from the terminal's check (2026-10-25 22:47:
+            # VS Code reopened a chat a terminal longhaul still ran).
+            msg = (f"This conversation is already open in {held['where']} (process {held['pid']}). "
+                   "Close it there first, then open it here again.")
+            log(f"panel: {msg}")
+            notify(msg)
+            return 1
         # A chat runs in the wrapper's folder, which its claude inherits. A
         # short job is not a session and is chosen for as before.
         top = repository_of(os.getcwd()) if chat else None

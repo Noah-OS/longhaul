@@ -7885,7 +7885,7 @@ class Reminder(unittest.TestCase):
     USER = ("Longhaul: this conversation's context is about {}k tokens, and every request carries all of it again. "
             "To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint comes back.")
     MODEL = ("Longhaul: the context is about {0}k tokens. At your next natural stopping point (not in the middle of an "
-             "edit or a test run), save a checkpoint with /longhaul:checkpoint, then tell the user in one line: \"Saved "
+             "edit or a test run), and in any case before you end your turn, save a checkpoint with /longhaul:checkpoint, then tell the user in one line: \"Saved "
              "a checkpoint (the context is about {0}k tokens). Type /clear to start fresh; it comes back.\" Then "
              "continue the work. After a compaction or a /clear it comes back.")
 
@@ -10453,6 +10453,29 @@ class Panel(StreamHarness):
         p = self.start(["--version"], command=["/bin/sh", str(HERE / "longhaul-vscode")], HOME=str(empty_home))
         self.assertEqual(self.output(), b"fake job done")
 
+    def test_a_panel_chat_open_in_a_terminal_is_not_opened_twice(self):
+        # The owner's machine, 2026-10-25 22:47: VS Code reopened a chat a
+        # terminal longhaul still ran, and both wrote to it. The terminal
+        # refused the other way round; now the panel does too.
+        sessions = self.max / "sessions"
+        sessions.mkdir()
+        (sessions / "1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "sid-c", "entrypoint": "cli"}))
+        p = self.start([*self.EXT_ARGS, "--resume=sid-c"])
+        self.assertEqual(p.wait(10), 1)
+        log = (self.relay / "longhaul.log").read_text()
+        self.assertIn(f"panel: This conversation is already open in a terminal (process {os.getpid()}). Close it there "
+                      "first, then open it here again.", log)
+        self.assertNotIn("panel chat on", log, "no claude started")
+        # A record whose process has ended is no open chat.
+        (sessions / "1.json").write_text(json.dumps({"pid": 2 ** 22 + 7, "sessionId": "sid-c", "entrypoint": "cli"}))
+        self.plan(["reply"])
+        p = self.start([*self.EXT_ARGS, "--resume=sid-c"])
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertEqual(self.wait_for(self.result_for(self.user(p, "hello")))["result"], "reply to: hello")
+        p.stdin.close()
+        p.wait(10)
+
     def test_a_reopened_panel_chat_starts_on_the_account_it_last_ran_on(self):
         # Sprint 5, D3d. With no readings yet, choose_for_panel() starts in
         # order, on Max; the record names Pro.
@@ -11575,6 +11598,13 @@ class Models(unittest.TestCase):
         self.assertEqual(self.routed(self.call()), "sonnet")
         self.assertEqual(longhaul.MODELS_MODES, ("off", "guide", "on", "trial"))
 
+    def test_a_pick_where_no_guide_was_given_is_logged_as_its_call(self):
+        # 2026-10-25: in the models trial's unguided half, a call naming its
+        # model was logged "(guided)", so the report would credit the guide.
+        self.config(models="on")
+        self.assertIsNone(self.routed(self.call(model="haiku")))
+        self.assertEqual(self.logged(), [f"models: implementer picked haiku (its call) in {self.SID[:8]}"])
+
     def test_each_pick_is_logged_guided_its_own_or_inherited_and_never_its_text(self):
         self.config()
         self.define("planner", "model: Sonnet\n")
@@ -11619,8 +11649,9 @@ class Models(unittest.TestCase):
         self.config(subagents={"implementer": "sonnet"}, models="on")
         self.assertEqual(self.routed(self.call()), "sonnet")
         self.assertIsNone(self.routed(self.call("reviewer", model="haiku")))
+        # No guide is given in on mode: the call's own pick (2026-10-25).
         self.assertEqual(self.logged()[before:], [f"models: implementer opus -> sonnet in {sid}",
-                                                  f"models: reviewer picked haiku (guided) in {sid}"])
+                                                  f"models: reviewer picked haiku (its call) in {sid}"])
         log = (self.home / "longhaul.log").read_text()
         for text in ("do the task", "Run it", self.S):
             self.assertNotIn(text, log)

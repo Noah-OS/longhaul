@@ -6,6 +6,9 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ### Fixed
 
+- **A VS Code tab no longer opens a chat a terminal is running.** Longhaul refused to resume in a terminal a chat open in the VS Code panel, but not the other way round: a tab reopened a chat a terminal `longhaul` still ran, and both wrote to it. The panel now refuses too, says where the chat is open and to close it there first. Both checks read Claude Code's records of its processes, in every account's folder.
+- **The reminder also asks Claude to save before it ends its turn.** A reminder late in a long, unattended turn was saved only at the next prompt, hours later, so auto-compact waited as long. The line still keeps saves out of the middle of an edit or a test run.
+- **A model pick is "guided" only where the guide was given.** In a models trial's unguided half, a call that named its model was logged `(guided)`, so the trial would have credited the guide; it is now `(its call)`.
 - **The doctor names a terminal chat's own conversation.** For a chat started outside Longhaul it said "start it with `longhaul -c`", which in a folder with two chats could resume the other one. It now reads Claude Code's record of the process (its `sessionId` only) and says `longhaul -r ID`. The same record shows a conversation open in two chats when no `--resume` names it.
 
 ### Changed
