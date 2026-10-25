@@ -8239,11 +8239,13 @@ class Trial(unittest.TestCase):
         return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     def session(self, sid, start, requests=6, read=100_000, write=2_000, out=500, model="claude-opus-5-5",
-                compactions=0, reminders=(), minutes=30, folder="-code-app", cwd=None):
+                compactions=0, reminders=(), minutes=30, folder="-code-app", cwd=None, append=False):
         """A main transcript as Claude Code writes it, `start` seconds from now: a
         prompt holding S, then `requests` responses over `minutes`, with
         `compactions` among them and a reminder's line (as the engine records a
-        hook's additionalContext) at each minute in `reminders`."""
+        hook's additionalContext) at each minute in `reminders`. With `append`,
+        added to the end of the session's transcript: the same chat taken up
+        again later."""
         t0 = time.time() + start
         step = minutes * 60 / max(requests, 1)
         lines = [(t0, {"type": "user", "cwd": cwd or str(self.work), "sessionId": sid,
@@ -8265,8 +8267,9 @@ class Trial(unittest.TestCase):
                 "toolUseID": "t1", "hookEvent": "PreToolUse"}}))
         path = self.claude / "projects" / folder / f"{sid}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(json.dumps({**line, "timestamp": self.stamp(t)}) + "\n"
-                                for t, line in sorted(lines, key=lambda tl: tl[0])))
+        with path.open("a" if append else "w") as f:
+            f.write("".join(json.dumps({**line, "timestamp": self.stamp(t)}) + "\n"
+                            for t, line in sorted(lines, key=lambda tl: tl[0])))
         return path
 
     def test_an_arm_comes_from_the_seed_and_the_id_half_and_half_and_stays(self):
@@ -8386,7 +8389,11 @@ class Trial(unittest.TestCase):
         self.link(child, habit[0])
         self.session(habit[1], -2 * self.DAY)
         self.session(usual[0], -1 * self.DAY)
-        self.session(habit[2], -11 * self.DAY)  # before the trial began
+        # Begun and ended before the trial began: no line of it is in the
+        # window. (A chat begun before it counts from its start on, the
+        # owner's decision of 2026-10-25, "Checkpoint trial, long chats too";
+        # this one has nothing after the start to count.)
+        self.session(habit[2], -11 * self.DAY)
         self.session(usual[1], -1 * self.DAY, folder="-private-var-folders-x")  # a temporary folder's
         self.session("agent-a1", -1 * self.DAY, folder=f"-code-app/{usual[0]}/subagents")  # not a main transcript
         old = self.session(self.ids("usual", 1, "o")[0], -1 * self.DAY)
@@ -8436,7 +8443,7 @@ class Trial(unittest.TestCase):
         self.session(child, t0 + 3600, requests=6, read=150_000, compactions=1, minutes=60)
         self.session(short, t0 + 2 * 3600, requests=4)  # under 5 requests: dropped
         self.session(edge, t0 + 3 * 3600, requests=5)  # 5: kept
-        self.session(early, -11 * self.DAY)  # before the trial began
+        self.session(early, -11 * self.DAY)  # begun and ended before the trial began: no line in the window
         r = self.report()
         self.assertEqual(r["trial"]["name"], "checkpoint-habit")
         chains = {c["chain"]: c for c in r["chains"]}
@@ -8467,6 +8474,142 @@ class Trial(unittest.TestCase):
         self.assertNotIn(self.S, out)
         self.assertIn("at least 15 chains per arm: habit 1, usual 1: not met", out)
         self.assertEqual(out.splitlines()[-1], "no saving shown")
+
+    def subagent(self, sid, name, *starts, folder="-code-app"):
+        """A subagent's transcript under session `sid`'s: a haiku response at each of `starts` seconds from now."""
+        path = self.claude / "projects" / folder / sid / "subagents" / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps({"type": "assistant", "isSidechain": True, "timestamp": self.stamp(time.time() + t),
+                                            "message": {"id": f"{name}_{i}", "model": "claude-haiku-4-5", "role": "assistant",
+                                                        "content": [], "usage": {"input_tokens": 50, "output_tokens": 70,
+                                                                                 "cache_read_input_tokens": 1_000}}}) + "\n"
+                                for i, t in enumerate(starts)))
+        return path
+
+    def test_a_chat_begun_before_the_start_counts_only_its_lines_inside_the_window(self):
+        # The owner, 2026-10-25 ("Checkpoint trial, long chats too"): a chat
+        # begun before the trial's start counts from the start on, in its
+        # half for the whole trial. Until then a transcript counted only when
+        # its first line was inside the window, so a long chat never did.
+        self.trial(started=-10, stopped_at=time.time() - 3 * self.DAY)  # the window: 10 days ago to 3 days ago
+        long_chat, inside, gone, late = self.ids("habit", 4, "l")
+        t1, t2, t3 = -12 * self.DAY, -6 * self.DAY, -1 * self.DAY  # before the window, inside it, after it
+        path = self.session(long_chat, t1, requests=6, read=400_000, compactions=1, reminders=[5], minutes=60)
+        before = path.stat().st_size
+        self.session(long_chat, t2, requests=7, read=150_000, compactions=2, reminders=[10, 20], minutes=90, append=True)
+        inside_bytes = path.stat().st_size - before
+        self.session(long_chat, t3, requests=5, read=600_000, compactions=1, reminders=[5], append=True)
+        self.subagent(long_chat, "agent-a1", t1 + 60, t1 + 120, t2 + 60, t3 + 60)  # one response inside
+        old = self.subagent(long_chat, "agent-a2", t1 + 60)
+        os.utime(old, (time.time() + t1 + 60,) * 2)  # last written before the start
+        # Begun inside the window: counted whole, as before, its lines after the window too.
+        self.session(inside, -5 * self.DAY, requests=6, read=100_000)
+        self.session(inside, t3, requests=6, read=120_000, compactions=1, append=True)
+        self.session(gone, t1)  # begun and ended before the start: no line in the window
+        self.session(late, t3)  # begun after the window: not the trial's, as before
+        # The scan finds where the lines inside begin, so that the figures'
+        # read starts there; its size is theirs.
+        trial = self.trial_file()
+        window = (trial["started_at"], trial["stopped_at"])
+        scan = longhaul.trial_scan(path, *window)
+        self.assertEqual((scan["window"], scan["offset"], scan["bytes"]), (window, before, inside_bytes))
+        self.assertEqual(path.read_bytes()[before - 1:before], b"\n", "the start of a line")
+        self.assertAlmostEqual(scan["first"], time.time() + t2, delta=5)
+        self.assertAlmostEqual(scan["last"], time.time() + t2 + 90 * 60, delta=5)
+        self.assertEqual(len(scan["reminders"]), 2)
+        whole = longhaul.trial_scan(self.claude / "projects" / "-code-app" / f"{inside}.jsonl", *window)
+        self.assertEqual((whole["window"], whole["offset"]), (None, 0))
+        self.assertIsNone(longhaul.trial_scan(self.claude / "projects" / "-code-app" / f"{gone}.jsonl", *window))
+        r = self.report()
+        chains = {c["chain"]: c for c in r["chains"]}
+        self.assertEqual(set(chains), {long_chat, inside})
+        c = chains[long_chat]
+        self.assertEqual((c["arm"], c["sessions"], c["requests"], c["compactions"]), ("habit", 1, 7 + 1, 2))
+        self.assertEqual(c["tokens"], {"input": 7 * 3 + 50, "cache_write": 7 * 2_000, "cache_read": 7 * 150_000 + 1_000,
+                                       "output": 7 * 500 + 70})
+        self.assertAlmostEqual(c["price_usd"], 7 * self.price("opus", 3, 2_000, 150_000, 500)
+                               + self.price("haiku", 50, 0, 1_000, 70), places=6)
+        self.assertEqual(c["context_peak"], 3 + 2_000 + 150_000, "the peak before the start is not the trial's")
+        self.assertEqual((c["reminders_shown"], c["reminders_followed"]), (2, 0))
+        self.assertAlmostEqual(c["seconds"], 90 * 60, delta=1)
+        self.assertAlmostEqual(c["started_at"], time.time() + t2, delta=5)
+        self.assertEqual(c["began_before"], True)
+        c = chains[inside]
+        self.assertEqual((c["arm"], c["sessions"], c["requests"], c["compactions"], c["began_before"]),
+                         ("habit", 1, 12, 1, False))
+        self.assertEqual(c["tokens"], {"input": 12 * 3, "cache_write": 12 * 2_000, "cache_read": 6 * 100_000 + 6 * 120_000,
+                                       "output": 12 * 500})
+        self.assertEqual(c["context_peak"], 3 + 2_000 + 120_000)
+        self.assertAlmostEqual(c["seconds"], 4 * self.DAY + 30 * 60, delta=1)
+        # The arm's medians are of these numbers.
+        self.assertEqual((r["arms"]["habit"]["chains"], r["arms"]["habit"]["requests_median"]), (2, (8 + 12) / 2))
+
+    def test_a_session_carried_from_a_chat_begun_before_the_start_keeps_its_roots_arm_and_counts(self):
+        # The owner's decision of 2026-10-25: the chat begun before the start
+        # counts from it on, and a /clear's carry from it stays in its chain.
+        self.trial(started=-10)
+        root, child = self.ids("habit", 1, "lr")[0], self.ids("usual", 1, "lc")[0]
+        t2 = -6 * self.DAY
+        self.session(root, -12 * self.DAY, requests=6, reminders=[5])
+        self.session(root, t2, requests=6, reminders=[10], append=True)
+        self.link(child, root, at=time.time() + t2 + 40 * 60)  # after the reminder inside the window: followed
+        self.session(child, t2 + 3600, requests=6, read=150_000)
+        self.assertEqual((longhaul.trial_arm(root), longhaul.trial_arm(child)), ("habit", "habit"))
+        r = self.report()
+        self.assertEqual([c["chain"] for c in r["chains"]], [root])
+        c = r["chains"][0]
+        self.assertEqual((c["arm"], c["sessions"], c["requests"]), ("habit", 2, 12))
+        self.assertEqual(c["tokens"]["cache_read"], 6 * 100_000 + 6 * 150_000)
+        self.assertEqual((c["reminders_shown"], c["reminders_followed"]), (1, 1))
+        self.assertAlmostEqual(c["seconds"], 3600 + 30 * 60, delta=1)
+        self.assertEqual(c["began_before"], True)
+        # A root with no line after the start: the session carried from it
+        # counts alone, in the root's arm, as before.
+        other_root, other_child = self.ids("habit", 1, "or")[0], self.ids("usual", 1, "oc")[0]
+        self.session(other_root, -12 * self.DAY)
+        self.link(other_child, other_root, at=time.time() - 4 * self.DAY)
+        self.session(other_child, -4 * self.DAY)
+        chains = {c["chain"]: c for c in self.report()["chains"]}
+        self.assertEqual(set(chains), {root, other_root})
+        c = chains[other_root]
+        self.assertEqual((c["arm"], c["sessions"], c["requests"]), ("habit", 1, 6))
+        self.assertEqual(c["began_before"], False, "none of its sessions in the window began before the start")
+
+    def test_status_and_the_report_say_how_many_chains_began_before_the_trial(self):
+        # The owner's decision of 2026-10-25: those chains count from the
+        # trial's start, and both commands say how many there are. The
+        # models trial reads its sessions the same way.
+        for kind, name, label in (("checkpoint", "checkpoint-habit", "habit"), ("models", "subagent-models", "routed")):
+            with self.subTest(kind):
+                shutil.rmtree(self.claude / "projects", ignore_errors=True)
+                self.trial(started=-10, name=name, kind=kind)
+                (long_habit,), (long_usual, short_long, fresh) = self.ids("habit", 1, "bh"), self.ids("usual", 3, "bu")
+                for sid, requests in ((long_habit, 6), (long_usual, 6), (short_long, 3)):
+                    self.session(sid, -13 * self.DAY)
+                    self.session(sid, -3 * self.DAY, requests=requests, append=True)
+                self.session(fresh, -2 * self.DAY)
+                code, out, err = self.cli("status")
+                self.assertEqual((code, err), (0, ""))
+                lines = out.splitlines()
+                self.assertIn(f"{label}: 1 session in 1 chain (1 began before the trial and counts from its start)", lines)
+                self.assertIn("usual: 3 sessions in 3 chains (2 began before the trial and count from its start)", lines)
+                r = self.report()
+                self.assertEqual({c["chain"]: (c["began_before"], c["dropped"]) for c in r["chains"]},
+                                 {long_habit: (True, False), long_usual: (True, False), short_long: (True, True),
+                                  fresh: (False, False)})
+                self.assertEqual((r["arms"]["habit"]["began_before"], r["arms"]["usual"]["began_before"]), (1, 1),
+                                 "of the chains kept")
+                code, out, err = self.cli("report")
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn(f"Chains kept: {label} 1, usual 2 (2 began before the trial and count from its start); "
+                              f"dropped (under 5 requests): {label} 0, usual 1", out.splitlines())
+        # With none begun before, the lines are as they were.
+        shutil.rmtree(self.claude / "projects")
+        self.trial(started=-10)
+        self.session(self.ids("usual", 1, "f")[0], -2 * self.DAY)
+        self.assertIn("usual: 1 session in 1 chain", self.cli("status")[1].splitlines())
+        self.assertIn("Chains kept: habit 0, usual 1; dropped (under 5 requests): habit 0, usual 0",
+                      self.cli("report")[1].splitlines())
 
     def arms(self, habit=15, usual=15, habit_read=80_000, usual_read=100_000, habit_compactions=0,
              usual_compactions=0, short=0):

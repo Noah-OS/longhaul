@@ -170,6 +170,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import heapq
+import io
 import json
 import math
 import os
@@ -2576,8 +2577,28 @@ def consultations(sid: str, keep: bool = False):
             "no_outcome": len(admitted_ids - outcome_ids), "admitted_ids": admitted_ids}
 
 
-def inspect_transcript(path: Path) -> dict:
-    """The numbers `longhaul inspect` shows for the conversation in `path`."""
+def text_from(path: Path, offset: int = 0):
+    """The file open as text, a bad byte replaced, read from byte `offset`
+    on: the start of a line, as trial_scan() finds it, so that the text
+    reads from there. From 0, the plain open it always was."""
+    if not offset:
+        return path.open(errors="replace")
+    binary = path.open("rb")
+    try:
+        binary.seek(offset)
+        return io.TextIOWrapper(binary, errors="replace")
+    except BaseException:
+        binary.close()
+        raise
+
+
+def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0) -> dict:
+    """The numbers `longhaul inspect` shows for the conversation in `path`.
+    With a `window`, (start, end), only the lines whose time is inside it
+    are counted (a line with none keeps the one before's): the trial's,
+    for a chat begun before it (trial_figures()). The main file is read
+    from byte `offset` on, where trial_scan() found its first such line,
+    and a subagent's file last written before the start is not opened."""
     # files_of(): a link to nowhere among the subagents' is no transcript to open.
     files = [path] + sorted(files_of(path.with_suffix("").glob("subagents/agent-*.jsonl")))
     responses: dict = {}  # message id -> (scope, model, usage, file), from the id's last line with usage
@@ -2589,7 +2610,9 @@ def inspect_transcript(path: Path) -> dict:
     for n, file in enumerate(files):
         events.append([])
         when = 0.0  # a line with no time keeps its place after the one before
-        with file.open(errors="replace") as f:
+        if window is not None and n and file.stat().st_mtime < window[0]:
+            continue  # a subagent's last written before the window: no line of it is inside
+        with text_from(file, 0 if n else offset) as f:
             for raw in f:
                 if not raw.strip():
                     continue
@@ -2603,10 +2626,12 @@ def inspect_transcript(path: Path) -> dict:
                 kind, msg = line.get("type"), dict_at(line, "message")
                 if kind not in ("assistant", "user", "system"):
                     continue
+                when = parse_ts(line.get("timestamp")) or when
+                if window is not None and not window[0] <= when < window[1]:
+                    continue  # outside the window asked for: not counted
                 lines += 1
                 if cwd is None and not n and isinstance(line.get("cwd"), str):
                     cwd = line["cwd"]  # the main file's first, looked under for an index, never shown
-                when = parse_ts(line.get("timestamp")) or when
                 scope = "subagents" if n or line.get("isSidechain") else "main"
                 blocks = [b for b in msg.get("content") or [] if isinstance(b, dict)] \
                     if isinstance(msg.get("content"), list) else []
@@ -5943,7 +5968,10 @@ def reminder(_opts) -> int:
 # from (the carry's <session>.from.json), so a chain never mixes arms.
 # Habit hears the reminder as before; usual never does. The carry works
 # alike in both. `trial report` reads the trial's transcripts, numbers
-# only, and applies the rule the plan wrote before looking; `trial rate`
+# only, and applies the rule the plan wrote before looking: a chat begun
+# before the trial's start counts too, its lines inside the window alone,
+# in its chain's arm for the whole trial (the owner, 2026-10-25,
+# "Checkpoint trial, long chats too"; trial_scan()). `trial rate`
 # records the owner's blind rating of a finished chain, 1 to 5, in
 # trial-ratings.json (0600). The trial's files hold ids, times, arms,
 # ratings and folder paths, never a message's text, and the log holds
@@ -6091,8 +6119,19 @@ def trial_scan(path: Path, start: float = -math.inf, end: float = math.inf):
     cwd its first line names, and the times the reminder's line reached
     the model (an attachment of a hook's additionalContext that holds
     REMINDER_MODEL's start). None for a file with no timestamp, or one
-    whose first is outside [start, end), which is read no further."""
-    first = last = cwd = None
+    whose first is at or after `end`, which is read no further.
+
+    One whose first is before `start`, a chat begun before the trial and
+    taken up in it, counts from the start on (the owner, 2026-10-25,
+    "Checkpoint trial, long chats too"): its first and last are those of
+    its lines inside [start, end), its reminders the ones inside, its
+    bytes those from the first such line to the end of the last, and its
+    `window` is (start, end), with the byte `offset` its first such line
+    begins at, for trial_figures() to count those lines alone; None when
+    it has no line inside. One begun inside counts whole, as before: no
+    window, offset 0."""
+    first = last = cwd = before = None  # before: whether its first timestamp is before the start
+    offset = stop = 0
     reminders = []
     stamp = re.compile(rb'"timestamp":\s*"([^"]{1,64})"')
     said = REMINDER_MODEL.split("{")[0]
@@ -6101,11 +6140,15 @@ def trial_scan(path: Path, start: float = -math.inf, end: float = math.inf):
             for raw in f:
                 found = stamp.search(raw)
                 when = parse_ts(found.group(1).decode(errors="replace")) if found else 0.0
-                if when:
-                    if first is None and not start <= when < end:
+                if when and before is None:
+                    if when >= end:
                         return None
-                    first = when if first is None else first
-                    last = when
+                    before = when < start
+                counted = bool(when) and (not before or start <= when < end)
+                if counted:
+                    if first is None:
+                        first, offset = when, (f.tell() - len(raw) if before else 0)
+                    last, stop = when, f.tell()
                 if cwd is None and b'"cwd"' in raw:
                     try:
                         line = json.loads(raw)
@@ -6113,7 +6156,7 @@ def trial_scan(path: Path, start: float = -math.inf, end: float = math.inf):
                         line = None
                     if isinstance(line, dict) and isinstance(line.get("cwd"), str) and os.path.isabs(line["cwd"]):
                         cwd = line["cwd"]
-                if b'"hook_additional_context"' in raw and said.encode() in raw and when:
+                if b'"hook_additional_context"' in raw and said.encode() in raw and counted:
                     try:
                         line = json.loads(raw)
                     except (ValueError, RecursionError):
@@ -6125,26 +6168,29 @@ def trial_scan(path: Path, start: float = -math.inf, end: float = math.inf):
                             and any(isinstance(t, str) and any(part.startswith(said) for part in t.split("\n"))
                                     for t in texts):
                         reminders.append(when)
-            size = f.tell()
+            size = stop - offset if before else f.tell()
     except OSError:
         return None
     if first is None:
         return None
-    return {"first": first, "last": last, "cwd": cwd, "reminders": reminders, "bytes": size}
+    return {"first": first, "last": last, "cwd": cwd, "reminders": reminders, "bytes": size,
+            "window": (start, end) if before else None, "offset": offset}
 
 
 def trial_sessions(trial: dict) -> list:
     """The trial's sessions: the main transcripts under the projects folder
     (none of the scratch, temporary or system folders the baseline leaves
-    out) whose first timestamp is inside the trial's window, each with
-    trial_scan()'s figures and its chain's root."""
+    out) with a line inside the trial's window: begun inside it, or begun
+    before its start and counted from the start on (trial_scan(); the
+    owner, 2026-10-25), each with trial_scan()'s figures and its chain's
+    root."""
     start, end, found = trial["started_at"], trial_end(trial), {}
     for path in sorted(files_of((DEFAULT_CONFIG / "projects").glob("*/*.jsonl"))):
         if any(skip in path.parent.name for skip in TRIAL_SKIP) or not re.fullmatch(GUARD_ID, path.stem) \
                 or path.stem in found:
             continue
         try:
-            if path.stat().st_mtime < start:  # last written before the trial began: it began before too
+            if path.stat().st_mtime < start:  # last written before the trial began: no line of it is inside
                 continue
         except OSError:
             continue
@@ -6158,12 +6204,20 @@ def trial_sessions(trial: dict) -> list:
 
 def trial_chains(trial: dict, sessions: list) -> list:
     """The trial's sessions by chain, the oldest chain first: its root,
-    arm and sessions in order."""
+    arm and sessions in order, and whether one of them began before the
+    trial and counts from its start (trial_scan())."""
     chains: dict = {}
     for s in sessions:
         chains.setdefault(s["root"], []).append(s)
-    return [{"chain": root, "arm": trial_arm_of(trial, root), "sessions": members}
+    return [{"chain": root, "arm": trial_arm_of(trial, root), "sessions": members,
+             "before": any(s["window"] is not None for s in members)}
             for root, members in sorted(chains.items(), key=lambda kv: kv[1][0]["first"])]
+
+
+def trial_before(n: int) -> str:
+    """What status and the report add for the chains begun before the
+    trial (the owner, 2026-10-25): nothing for none."""
+    return f" ({n} began before the trial and count{'s' * (n == 1)} from its start)" if n else ""
 
 
 def plural(n: int, word: str) -> str:
@@ -6198,8 +6252,9 @@ def trial_start(days: float, now: float, kind: str = "checkpoint") -> int:
                   "seed": os.urandom(8).hex()}
         write_json(trial_path(), record)
     log(f"trial: started, {days:g} days")
-    print(f"longhaul trial: {name} started; it ends {trial_day(record['ends_at'])} ({days:g} days). Each new "
-          f"session gets an arm, {label} or usual, by its id; a session a /clear's carry starts keeps its chain's.")
+    print(f"longhaul trial: {name} started; it ends {trial_day(record['ends_at'])} ({days:g} days). Each "
+          f"session gets an arm, {label} or usual, by its id, a chat begun before now too, counted from now on; "
+          "a session a /clear's carry starts keeps its chain's.")
     return 0
 
 
@@ -6238,7 +6293,8 @@ def trial_status(now: float) -> int:
     for arm in TRIAL_ARMS:
         mine = [c for c in chains if c["arm"] == arm]
         shown = trial_label(trial) if arm == "habit" else arm
-        print(f"{shown}: {plural(sum(len(c['sessions']) for c in mine), 'session')} in {plural(len(mine), 'chain')}")
+        print(f"{shown}: {plural(sum(len(c['sessions']) for c in mine), 'session')} in {plural(len(mine), 'chain')}"
+              f"{trial_before(sum(c['before'] for c in mine))}")
     return 0
 
 
@@ -6254,13 +6310,15 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
     sessions (main and subagents) summed, priced by PRICES, with the
     reminders shown and the ones followed (a carry from a session after a
     reminder in it), the owner's rating, and whether the drop rule takes
-    it."""
+    it. A session begun before the trial counts its lines inside the
+    trial's window alone (trial_scan()), for every figure, and its chain
+    is one that began before."""
     tokens = {k: 0 for k, _ in TOKEN_KINDS}
     price, requests, compactions, peak = 0.0, 0, 0, 0
     by_id = {s["session"]: s for s in chain["sessions"]}
     for s in chain["sessions"]:
         try:
-            r = inspect_transcript(s["path"])
+            r = inspect_transcript(s["path"], s["window"], s["offset"])
         except OSError as e:  # gone, or no longer readable, since the scan: the chain goes without it
             log(f"trial: a session's transcript was not read ({type(e).__name__})")
             continue
@@ -6279,13 +6337,15 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
             "seconds": round(last - first, 3), "requests": requests, "tokens": tokens, "price_usd": round(price, 6),
             "compactions": compactions, "context_peak": peak,
             "reminders_shown": sum(len(s["reminders"]) for s in chain["sessions"]), "reminders_followed": followed,
-            "rating": ratings.get(chain["chain"]), "dropped": requests < TRIAL_REQUESTS}
+            "rating": ratings.get(chain["chain"]), "dropped": requests < TRIAL_REQUESTS,
+            "began_before": chain["before"]}
 
 
 def trial_decide(records: list) -> dict:
-    """Each arm's medians over its kept chains, the plan's four checks
-    (True, False, or None for the rating while it is not counted) and the
-    verdict: "saving shown" only when no check fails."""
+    """Each arm's medians over its kept chains (and how many of those
+    began before the trial), the plan's four checks (True, False, or None
+    for the rating while it is not counted) and the verdict: "saving
+    shown" only when no check fails."""
     import statistics  # here, not at the top: the hooks import this module
 
     def median(values):
@@ -6296,6 +6356,7 @@ def trial_decide(records: list) -> dict:
         mine = [r for r in records if r["arm"] == arm and not r["dropped"]]
         rated = [r["rating"] for r in mine if r["rating"] is not None]
         arms[arm] = {"chains": len(mine), "dropped": sum(1 for r in records if r["arm"] == arm and r["dropped"]),
+                     "began_before": sum(1 for r in mine if r["began_before"]),
                      "sessions": sum(r["sessions"] for r in mine), "rated": len(rated),
                      "price_usd_median": median([r["price_usd"] for r in mine]),
                      **{f"{k}_tokens_median": median([r["tokens"][k] for r in mine]) for k, _ in TOKEN_KINDS},
@@ -6338,7 +6399,8 @@ def trial_report_lines(trial: dict, decided: dict) -> list:
         return f"  {name:<36}{habit:>14}{usual:>14}"
 
     lines = [f"Trial {trial['name']}: {trial_day(trial['started_at'])} to {trial_day(end)} ({state})",
-             f"Chains kept: {t} {h['chains']}, usual {u['chains']}; dropped (under {TRIAL_REQUESTS} requests): "
+             f"Chains kept: {t} {h['chains']}, usual {u['chains']}"
+             f"{trial_before(h['began_before'] + u['began_before'])}; dropped (under {TRIAL_REQUESTS} requests): "
              f"{t} {h['dropped']}, usual {u['dropped']}",
              row("Per chain, median", t, "usual"),
              row("API-price equivalent", trial_number(h["price_usd_median"], True),
