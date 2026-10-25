@@ -219,6 +219,98 @@ class Loop(unittest.TestCase):
         self.assertEqual(state.get("limited_until", {}), {}, "no account marked at its limit")
         self.assertEqual(state.get("handled_limits", []), [], "no limit handled")
 
+    # Sprint 10, L1: in this terminal a rate_limit StopFailure of the
+    # session, written during the launch, is a limit stop too when the
+    # account's own reading has a window at its limit, which gives the reset
+    # and the kind. The transcript's line stays the other route.
+
+    def full_week(self, account="Max"):
+        """`account`'s reading at its weekly limit, with room in its five
+        hours; the weekly reset it names."""
+        self.reading(account, five=40, week=100, week_in=7200)
+        return json.loads((self.home / "usage" / f"{account}.json").read_text())["seven_day"]["resets_at"]
+
+    def test_a_rate_limit_stop_failure_at_a_full_weekly_window_is_a_limit_stop(self):
+        resets = self.full_week()
+        # --account Max: pick() alone does not start on an account at its limit.
+        out, calls = self.run_longhaul(["stop_failure:rate_limit", "stay", "exit"], "--account", "Max")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertTrue(calls[1]["args"][-1].startswith("The Max account hit its weekly limit, so longhaul reopened"))
+        self.assertIn(f"Max hit its weekly limit (resets {longhaul.clock(resets)}). Carrying on with Pro.", out.stdout)
+        state = self.state()
+        self.assertAlmostEqual(state["limited_until"]["Max"], resets, places=3)
+        self.assertEqual(len(state["handled_limits"]), 1)
+        self.assertTrue(state["handled_limits"][0].startswith("stop-failure:"), state["handled_limits"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("stop: sid-1 turn ended on an API error (rate_limit)", log, "the hook's own line")
+        self.assertIn("Max ended: limit (session sid-1, StopFailure: rate_limit, exit ", log)
+        self.assertEqual(log.count("ended: limit"), 1)
+        self.assertIn("Pro ended: completed", log)
+        self.assertNotIn("not a limit stop", log)
+
+    def test_a_rate_limit_stop_failure_below_the_limit_is_a_passing_rate_limit(self):
+        self.reading("Max", five=60, week=90)
+        out, calls = self.run_longhaul(["stop_failure:rate_limit", "exit"], "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: limit", log)
+        self.assertEqual(log.count("limit: sid-1 turn ended on rate_limit, but Max is not at its limit; "
+                                   "not a limit stop"), 1, "once, however often the watcher looks")
+        self.assertEqual(log.count("not a limit stop"), 1)
+        self.assertNotIn("limited_until", (self.home / "state.json").read_text()
+                         if (self.home / "state.json").exists() else "")
+
+    def test_a_rate_limit_stop_failure_with_no_reading_is_not_a_limit_stop(self):
+        out, calls = self.run_longhaul(["stop_failure:rate_limit", "exit"], "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertEqual(log.count("limit: sid-1 turn ended on rate_limit, but Max has no usage reading; "
+                                   "not a limit stop"), 1)
+        self.assertEqual(log.count("not a limit stop"), 1)
+
+    def test_a_stop_failure_row_from_before_the_launch_or_of_another_session_is_ignored(self):
+        self.full_week()
+        (self.home / "stops.json").write_text(json.dumps(
+            {"sid-1": [{"event": "StopFailure", "type": "rate_limit", "at": int(time.time()) - 5}]}))
+        out, calls = self.run_longhaul(["stop_failure:rate_limit:sid-other", "exit"], "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("stop: sid-other turn ended on an API error (rate_limit)", log, "the other session's row is kept")
+        self.assertEqual(set(json.loads((self.home / "stops.json").read_text())), {"sid-1", "sid-other"})
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: limit", log)
+        self.assertNotIn("not a limit stop", log, "neither row is looked at")
+
+    def test_a_billing_error_or_overloaded_stop_failure_is_never_a_limit_stop(self):
+        self.full_week()
+        out, calls = self.run_longhaul(["stop_failure:billing_error", "stop_failure:overloaded", "exit"],
+                                       "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertEqual([row["type"] for row in json.loads((self.home / "stops.json").read_text())["sid-1"]],
+                         ["billing_error", "overloaded"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: limit", log)
+        self.assertNotIn("not a limit stop", log)
+
+    def test_a_limit_stop_seen_in_the_transcript_and_by_stop_failure_is_acted_on_once(self):
+        # One real stop, both ways in one launch: a third launch would mean it
+        # was acted on twice; Pro has no reading, so a row looked at again
+        # under Pro would log that it was not a limit stop.
+        self.full_week()
+        out, calls = self.run_longhaul(["stop_failure:rate_limit", f"limit:{time.time() + 3600}", "exit"],
+                                       "--account", "Max", runs=3)
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertEqual(len(self.state()["handled_limits"]), 1)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertEqual(log.count("ended: limit"), 1)
+        self.assertIn("Pro ended: completed", log)
+        self.assertNotIn("not a limit stop", log)
+        self.assertEqual(out.stdout.count("hit its"), 1, out.stdout)
+
     def test_the_sign_in_is_checked_again_before_every_launch(self):
         self.pin_emails()
         out, calls = self.run_longhaul(["exit_after_signin_change", "exit"], FAKE_EMAIL_MAX="first@example.com",
@@ -10212,6 +10304,29 @@ class Pieces(unittest.TestCase):
                 "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "quotaLimits": {"status": "rejected", "resetsAt": 5}}
         self.assertIsNone(longhaul.limit_stop(line, time.time() + 1))
+
+    def test_the_full_window_is_the_open_one_at_its_limit_that_resets_last(self):
+        # Sprint 10, L1: a StopFailure's reset and kind come from the
+        # account's reading; both windows must reset before it is usable.
+        now, edge = 1_000_000.0, longhaul.NEAR_FULL
+        full = longhaul.full_window
+        five, week = {"used_percentage": 100, "resets_at": now + 60}, {"used_percentage": edge, "resets_at": now + 600}
+        self.assertEqual(full({"five_hour": five, "seven_day": week}, now), ("seven_day", now + 600))
+        self.assertEqual(full({"five_hour": {**five, "resets_at": now + 6000}, "seven_day": week}, now),
+                         ("five_hour", now + 6000))
+        self.assertEqual(full({"five_hour": five, "seven_day": {**week, "used_percentage": edge - 1}}, now),
+                         ("five_hour", now + 60))
+        self.assertEqual(full({"seven_day": week}, now), ("seven_day", now + 600))
+        self.assertIsNone(full({"five_hour": {**five, "used_percentage": edge - 0.5}}, now), "below NEAR_FULL")
+        self.assertIsNone(full({"five_hour": {**five, "resets_at": now}, "seven_day": {**week, "resets_at": now - 1}},
+                               now), "both windows have reset")
+        for junk in (None, [], "x", {}, {"at": now}, {"five_hour": None}, {"five_hour": []},
+                     {"five_hour": {"used_percentage": "100", "resets_at": now + 60}},
+                     {"five_hour": {"used_percentage": 100, "resets_at": str(now + 60)}},
+                     {"five_hour": {"used_percentage": True, "resets_at": now + 60}},
+                     {"five_hour": {"used_percentage": float("nan"), "resets_at": now + 60}},
+                     {"five_hour": {"used_percentage": 100, "resets_at": float("inf")}}):
+            self.assertIsNone(full(junk, now), junk)
 
     def test_the_default_account_never_gets_claude_config_dir(self):
         os.environ["CLAUDE_CONFIG_DIR"] = "/somewhere"

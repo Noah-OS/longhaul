@@ -29,7 +29,7 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   stops too. Claude crashed: longhaul reopens the conversation after a
   countdown that grows with each crash, and stops after a few.
 
-How it sees what Claude is doing. Claude Code documents no API for any of
+How it sees what Claude is doing. Claude Code documents no API for most of
 it, so longhaul reads the files Claude Code itself writes (checked on 2.1.295 to
 2.1.303; if a later version moves them, longhaul stops switching but Claude runs
 as normal):
@@ -39,7 +39,16 @@ as normal):
   Control is connected;
 - <config>/projects/*/<sessionId>.jsonl: the conversation. A limit stop is
   an assistant line with isApiErrorMessage true, error "rate_limit" and
-  quotaLimits {status: rejected, resetsAt: epoch seconds, rateLimitType}.
+  quotaLimits {status: rejected, resetsAt: epoch seconds, rateLimitType};
+- LONGHAUL_HOME/stops.json, the one documented route (Sprint 10, L1): the
+  plugin's StopFailure hook keeps there that a turn ended on an API error.
+  A "rate_limit" one of this session, kept during this launch, is a limit
+  stop too when the account's own status-line reading (usage/<account>.json)
+  has a window still open at NEAR_FULL or over; the reading gives the
+  reset and the kind. With no such window it is a passing rate limit,
+  logged and nothing else. One stop seen both ways is acted on once. The
+  VS Code panel and `longhaul pipe` read the stream's rate_limit_event and
+  the conversation, as before.
 
 Each account is a config directory with its own claude.ai sign-in. Remote
 Control refuses the long-lived `claude setup-token` token, so each account
@@ -694,6 +703,23 @@ def near_full(reading, now: float) -> bool:
     return any(used >= NEAR_FULL for used, _ in windows(reading, now))
 
 
+def full_window(reading, now: float):
+    """(key, resets_at) of the window that keeps this account at its limit
+    by its reading, else None: of the windows still open at NEAR_FULL or
+    over, the one that resets last, since both must reset before the
+    account can be used again. What the terminal takes a StopFailure's
+    reset and kind from (Sprint 10, L1); a reading in another shape has
+    no full window."""
+    found = None
+    for key in ("five_hour", "seven_day"):
+        part = dict_at(reading, key)
+        resets, used = as_number(part.get("resets_at")), as_number(part.get("used_percentage"))
+        if resets is not None and used is not None and resets > now and used >= NEAR_FULL \
+                and (found is None or resets > found[1]):
+            found = (key, resets)
+    return found
+
+
 def expires(reading, now: float) -> float:
     """When the soonest unused allowance on this account is lost.
 
@@ -1002,7 +1028,7 @@ class Watch:
     """What one launched claude process is doing, read from its files."""
 
     def __init__(self, acct: dict, pid: int, started: float, rc: bool,
-                 offsets: dict | None = None, handled=(), label: str | None = None):
+                 offsets: dict | None = None, handled=(), label: str | None = None, stops: bool = False):
         self.cfg = config_of(acct)
         self.acct_name = acct["name"]
         self.label = label
@@ -1018,6 +1044,10 @@ class Watch:
         # key the offsets by the real path so a link and its target agree.
         self.offsets: dict[Path, int] = {p.resolve(): n for p, n in (offsets or {}).items()}
         self.handled = set(handled)
+        # The StopFailure route (_read_stops) is the terminal's alone: the
+        # panel wrapper and longhaul pipe read the stream's rate_limit_event.
+        self.stops = stops
+        self.stops_seen: set[tuple[str, int]] = set()
         self.paths: dict[str, Path | None] = {}
         self.rc_seen = False
         self.rc_lost_at = None
@@ -1036,6 +1066,8 @@ class Watch:
                 self._remote_control(s)
         if self.sid:
             self._read_transcript()
+            if self.stops:
+                self._read_stops()
 
     def _remote_control(self, s: dict) -> None:
         if s.get("bridgeSessionId"):
@@ -1076,6 +1108,41 @@ class Watch:
                 continue
             if hit and not self.limit:
                 self.limit, self.limit_seen_at = hit, time.time()
+
+    def _read_stops(self) -> None:
+        """Claude Code's own word that this session's turn ended on a rate
+        limit, the second route to a limit stop beside the transcript's
+        (Sprint 10, L1): a rate_limit row the StopFailure hook kept in
+        STOPS_RECORD during this launch is a limit stop when the account's
+        own reading has a full window (full_window()), which gives the
+        reset and the kind. Without one it is a passing rate limit, logged
+        once. Each row is looked at once, and not while a limit is had: one
+        real stop seen both ways is acted on once. A row from before the
+        launch (`at` is whole seconds, so at most the launch's first second
+        is lost, before any turn can end) is the previous launch's, already
+        handled or not a limit stop. Read whole, under no lock, as
+        stop_counts() does: the hook replaces the file in one rename."""
+        kept = read_json(LONGHAUL_HOME / STOPS_RECORD)
+        for row in stop_rows(kept.get(self.sid) if isinstance(kept, dict) else None):
+            at, seen = row["at"], (self.sid, row["at"])
+            if row["event"] != "StopFailure" or row["type"] != "rate_limit" or at < self.started \
+                    or seen in self.stops_seen:
+                continue
+            self.stops_seen.add(seen)
+            uuid_ = f"stop-failure:{at}"
+            if self.limit or uuid_ in self.handled:
+                continue
+            reading = read_json(USAGE_DIR / f"{self.acct_name}.json")
+            full = full_window(reading, time.time())
+            if full is None:
+                why = "is not at its limit" if isinstance(reading, dict) else "has no usage reading"
+                log(f"limit: {self.sid} turn ended on rate_limit, but {self.acct_name} {why}; not a limit stop")
+                continue
+            key, resets = full
+            # The shape limit_stop() gives, and "via" for the log's line.
+            self.limit = {"resets_at": float(resets), "kind": KIND[key], "uuid": uuid_, "type": key,
+                          "via": "StopFailure"}
+            self.limit_seen_at = time.time()
 
     def opened_elsewhere(self) -> bool:
         """Another live claude has this conversation: you opened it
@@ -1824,7 +1891,7 @@ def run(opts) -> int:
         signal.signal(signal.SIGINT, lambda *_: None)
         proc = subprocess.Popen(cmd, env=env_for(acct))
         w = Watch(acct, proc.pid, started, opts.rc, offsets=marks,
-                  handled=state.get("handled_limits", []), label=opts.name)
+                  handled=state.get("handled_limits", []), label=opts.name, stops=True)
 
         def other_has_room(here=acct["name"], skip=frozenset(wrong)) -> bool:
             st, now = load_state(), time.time()
@@ -1856,6 +1923,8 @@ def run(opts) -> int:
             ended = session_end_reason(w.sid, started)
             why = "completed" if proc.returncode == 0 or ended in SESSION_END_DONE else "crashed"
         noted = f", SessionEnd: {ended}" if ended else ""
+        if why == "limit" and w.limit.get("via") == "StopFailure":  # Claude Code's own word, not the transcript's (L1)
+            noted = ", StopFailure: rate_limit"
         log(f"{acct['name']} ended: {why} (session {w.sid}{noted}, exit {proc.returncode})")
         log(f"state: running -> {why}")
         if w.sid:  # where it ran, for a later `longhaul -r` in ask or never
@@ -6382,12 +6451,18 @@ def autocompact_note(opts) -> int:
 # names three moments of a wait at a claude.ai usage limit (QUOTA_LOGGED,
 # 2.1.234 and later). Which of them fire at a real subscription limit is
 # not known yet, so `longhaul stop-failure` and `longhaul quota-note` only
-# record and log them: the supervisor, the panel wrapper and `longhaul
-# pipe` decide a limit as before. For the main conversation alone (a
-# subagent's input names its agent_id), each keeps the type and the time
-# in STOPS_RECORD under the session's id, and logs one line, which the
-# display (hooks/display.ts) shows as a pop-up where the user has to act.
-# Of the input only session_id, agent_id, hook_event_name and the type are
+# record and log them, and decide nothing themselves. The terminal
+# supervisor reads the rows too (Watch._read_stops, L1): a rate_limit
+# StopFailure of its session kept during its launch is a limit stop when
+# the account's own reading has a full window (full_window()), which gives
+# the reset and the kind; the transcript's line (limit_stop()) is still
+# the other route, and one stop seen both ways is acted on once. The panel
+# wrapper and `longhaul pipe` decide a limit as before.
+#
+# For the main conversation alone (a subagent's input names its agent_id),
+# each hook keeps the type and the time in STOPS_RECORD under the session's
+# id, and logs one line, which the display (hooks/display.ts) shows as a
+# pop-up where the user has to act. Of the input only session_id, agent_id, hook_event_name and the type are
 # read: error_details, last_assistant_message, message and title hold
 # text, and are never kept, logged or said. Claude Code ignores the
 # output and the exit code; the hooks print nothing and exit 0.

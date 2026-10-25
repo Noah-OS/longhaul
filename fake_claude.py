@@ -7,18 +7,26 @@ network or a terminal.
 Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
 rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
 exit_after_signin_change | clear_then_crash | stay |
-session_end:<reason>:<code>[:<sid>]
+session_end:<reason>:<code>[:<sid>] | stop_failure:<error>[:<sid>]
 
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
 2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
 sees as -9. `session_end` runs the SessionEnd hooks hooks/hooks.json
 registers, as Claude Code does as it closes, with that reason and this
 session's id (or <sid>, another session's), then ends with <code>.
+`stop_failure` runs the StopFailure hooks, as Claude Code does when a turn
+ends on an API error, with that error and this session's id (or <sid>),
+then acts out the plan's next step in the same launch: followed by
+`limit:<resetsAt>` it is one stop seen both ways, by `stay` a stop after
+which Claude sits idle. It first waits for the next whole second after
+this process started: the hook keeps whole seconds, and a real turn ends
+seconds after a launch, never within its first second.
 `--version` prints FAKE_VERSION.
 """
 
 import datetime as dt
 import json
+import math
 import os
 import signal
 import subprocess
@@ -26,6 +34,7 @@ import sys
 import time
 from pathlib import Path
 
+born = time.time()
 home = Path(os.environ["LONGHAUL_HOME"])
 cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.environ["LONGHAUL_DEFAULT_CONFIG_DIR"])
 args = sys.argv[1:]
@@ -65,8 +74,34 @@ def session(**extra):
     (sessions / f"{os.getpid()}.json").write_text(json.dumps(data))
 
 
+def run_hooks(event: str, **fields) -> None:
+    """The `event` hooks hooks/hooks.json registers, run as Claude Code runs
+    them: CLAUDE_PLUGIN_ROOT set, the event's fields on stdin; what a hook
+    prints is not shown, and one past its timeout is ended."""
+    root = str(Path(__file__).resolve().parent)
+    data = {"session_id": sid, "transcript_path": str(transcript), "cwd": os.getcwd(),
+            "hook_event_name": event, **fields}
+    for entry in json.loads((Path(root) / "hooks" / "hooks.json").read_text())["hooks"].get(event, []):
+        for hook in entry["hooks"]:
+            try:
+                subprocess.run([hook["command"], *(a.replace("${CLAUDE_PLUGIN_ROOT}", root) for a in hook["args"])],
+                               input=json.dumps(data), env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root),
+                               capture_output=True, text=True, timeout=hook.get("timeout", 60))
+            except subprocess.TimeoutExpired:
+                pass
+
+
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 session(status="busy")
+
+while step.startswith("stop_failure:"):
+    # The turn ends on an API error: Claude Code runs StopFailure's hooks,
+    # and the launch goes on with the plan's next step.
+    _, error, *named = step.split(":", 2)
+    time.sleep(max(0.0, math.floor(born) + 1 - time.time()))
+    run_hooks("StopFailure", session_id=named[0] if named else sid, error=error)
+    step = plan.pop(0) if plan else "exit"
+    plan_file.write_text(json.dumps(plan))
 
 if step.startswith(("limit:", "limit_busy:")):
     resets = float(step.split(":", 1)[1])
@@ -129,17 +164,7 @@ elif step.startswith("session_end:"):
     _, reason, code, *named = step.split(":", 3)
     session(status="idle")
     time.sleep(0.2)  # the watcher sees the session's id first
-    root = str(Path(__file__).resolve().parent)
-    event = {"session_id": named[0] if named else sid, "transcript_path": str(transcript), "cwd": os.getcwd(),
-             "hook_event_name": "SessionEnd", "reason": reason}
-    for entry in json.loads((Path(root) / "hooks" / "hooks.json").read_text())["hooks"].get("SessionEnd", []):
-        for hook in entry["hooks"]:
-            try:  # one past its timeout is ended, and the close goes on
-                subprocess.run([hook["command"], *(a.replace("${CLAUDE_PLUGIN_ROOT}", root) for a in hook["args"])],
-                               input=json.dumps(event), env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root),
-                               capture_output=True, text=True, timeout=hook.get("timeout", 60))
-            except subprocess.TimeoutExpired:
-                pass
+    run_hooks("SessionEnd", session_id=named[0] if named else sid, reason=reason)  # then the close goes on
     sys.exit(int(code))
 elif step == "killed":
     # What the Sprint 6 live check does to a real claude (`kill -9`): no exit
