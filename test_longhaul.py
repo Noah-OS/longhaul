@@ -8360,6 +8360,271 @@ class Reminder(unittest.TestCase):
             if path.is_file():
                 self.assertNotIn(self.S.encode(), path.read_bytes(), path)
 
+    # A subagent's own context (the owner's decision of 2026-10-25, "A
+    # reminder for long subagent runs"): subagents were most of the cost on
+    # the owner's chat, and the long runs the dearest, each request
+    # re-reading the subagent's whole, growing context. Past
+    # LONGHAUL_SUBAGENT_AT tokens (150,000) of its own, and at each multiple,
+    # the guard's hook tells the subagent to finish its step and report back.
+
+    SUB = ("Longhaul: your context as a subagent is about {}k tokens, and every request you make re-reads all of "
+           "it. Finish the step you are on, then stop and report back: what you have done, what is left, and "
+           "anything the next agent needs to know, so the main conversation can hand the rest to a fresh subagent.")
+
+    def sub_path(self, agent="a1", session="s1"):
+        """Where Claude Code keeps a subagent's own transcript: beside the session's, under subagents/."""
+        return self.tmp / session / "subagents" / f"agent-{agent}.jsonl"
+
+    def sub_grow(self, size, agent="a1", path=None):
+        """The subagent's next response, `size` tokens of its own context; every line of its transcript is a sidechain."""
+        path = path or self.sub_path(agent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.grow(self.response(size, isSidechain=True, agentId=agent), path=path)
+
+    def sub_ls(self, agent="a1", **env):
+        return self.guard(self.tool("Bash", agent=agent, command="ls"), **env)
+
+    def sub_told(self, k, context=None):
+        """The guard's hook answer to a subagent at about k thousand tokens: the line for the model alone."""
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                       "additionalContext": "\n".join(filter(None, [context, self.SUB.format(k)]))}}
+
+    def sub_logged(self):
+        return [entry.split(" ", 2)[2] for entry in self.log().splitlines() if " subagent " in entry]
+
+    def test_a_subagent_is_told_to_report_back_once_per_multiple_of_its_own_context(self):
+        self.grow(50_000)
+        self.sub_grow(100_000)
+        self.assertIsNone(self.sub_ls(), "under the threshold")
+        self.sub_grow(149_999)
+        self.assertIsNone(self.sub_ls())
+        self.assertFalse((self.home / "guard").exists(), "nothing is written below it")
+        self.sub_grow(160_500)
+        self.assertEqual(self.sub_ls(), self.sub_told(160), "in thousands, rounded down; no line for the user")
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 150_000}}, "the subagent's own record")
+        self.assertIsNone(self.record(), "the main conversation's is not touched")
+        self.assertIsNone(self.sub_ls(), "once")
+        self.sub_grow(299_000)
+        self.assertIsNone(self.sub_ls(), "150k was said")
+        self.sub_grow(301_000)
+        self.assertEqual(self.sub_ls(), self.sub_told(301), "the next multiple")
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 300_000}})
+        self.sub_grow(800_000)
+        self.assertEqual(self.sub_ls(), self.sub_told(800), "past several multiples at once: one line")
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 750_000}})
+        self.assertIsNone(self.sub_ls())
+        self.assertEqual(self.sub_logged(), [
+            "reminder: s1 subagent a1 (Explore) reminded at 150,000 tokens (the context is 160,500)",
+            "reminder: s1 subagent a1 (Explore) reminded at 300,000 tokens (the context is 301,000)",
+            "reminder: s1 subagent a1 (Explore) reminded at 750,000 tokens (the context is 800,000)"])
+        # The display's pop-up and the auto-compact (hooks/display.ts,
+        # hooks/autocompact.ts) read the main reminder's line by this
+        # pattern: a subagent's line is not one, so it compacts nothing.
+        for line in self.sub_logged():
+            self.assertIsNone(re.match(r"^reminder: (\S+) reminded at [\d,]+ tokens", line), line)
+        # An agent type that is no plain name is not logged.
+        data = self.tool("Bash", agent="a2", command="ls")
+        data["agent_type"] = f"odd type {self.S}"
+        self.sub_grow(155_000, "a2")
+        self.assertEqual(self.guard(data), self.sub_told(155))
+        self.assertIn("reminder: s1 subagent a2 (?) reminded at 150,000 tokens (the context is 155,000)", self.log())
+        self.assertNotIn(self.S, self.log())
+
+    def test_the_main_conversation_never_hears_the_subagents_line_nor_a_subagent_the_main_one(self):
+        self.sub_grow(900_000)
+        self.grow(160_000)
+        self.assertIsNone(self.ls(), "the main conversation's call: its own context alone counts")
+        self.assertIsNone(self.record())
+        self.assertEqual(self.remind(), "", "nor its prompts")
+        self.grow(605_000)
+        self.assertEqual(self.ls(), self.told(605), "the main reminder, as before, and nothing of the subagent's")
+        self.assertEqual(self.record(), {"reminder": {"at": 600_000}})
+        self.assertEqual(self.sub_ls(), self.sub_told(900), "the subagent: its own line, never the main one")
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 900_000}})
+        self.assertEqual(self.record(), {"reminder": {"at": 600_000}})
+
+    def test_each_subagent_has_its_own_record(self):
+        self.sub_grow(160_000, "a1")
+        self.sub_grow(155_000, "a2")
+        self.assertEqual(self.sub_ls("a1"), self.sub_told(160))
+        self.assertEqual(self.sub_ls("a2"), self.sub_told(155), "a1's record is not a2's")
+        self.assertIsNone(self.sub_ls("a1"))
+        self.assertIsNone(self.sub_ls("a2"))
+        self.assertEqual((self.record("s1+a1"), self.record("s1+a2")),
+                         ({"subagent_reminder": {"at": 150_000}}, {"subagent_reminder": {"at": 150_000}}))
+        # Another session's subagent of the same id: its own folder, its own record.
+        other = self.tmp / "s2.jsonl"
+        other.write_text("")
+        self.sub_grow(170_000, path=self.sub_path("a1", "s2"))
+        data = {**self.tool("Bash", agent="a1", command="ls"), "session_id": "s2", "transcript_path": str(other)}
+        self.assertEqual(self.guard(data), self.sub_told(170))
+        self.assertEqual(self.record("s2+a1"), {"subagent_reminder": {"at": 150_000}})
+        # Parallel calls of one subagent run their hooks at once: the lock lets one say it.
+        self.sub_grow(305_000, "a1")
+        cmd = registered_hook("PreToolUse", "guard")
+        procs = [subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=self.env, cwd=self.tmp, text=True) for _ in range(6)]
+        outs = [p.communicate(json.dumps(self.tool("Bash", agent="a1", command="ls")), timeout=30) for p in procs]
+        self.assertEqual([json.loads(out) for out, _ in outs if out], [self.sub_told(305)], "one of the six")
+        self.assertEqual([err for _, err in outs], [""] * 6)
+
+    def test_the_subagent_threshold_is_longhaul_subagent_at_and_off_turns_it_off(self):
+        self.sub_grow(450_000)
+        for off in ("off", "OFF", "Off"):
+            self.assertIsNone(self.sub_ls(LONGHAUL_SUBAGENT_AT=off), off)
+        self.assertIsNone(self.record("s1+a1"), "off writes nothing")
+        self.assertEqual(self.log(), "")
+        self.assertEqual(self.sub_ls(LONGHAUL_SUBAGENT_AT="100000"), self.sub_told(450))
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 400_000}})
+        self.assertEqual(self.sub_ls(), self.sub_told(450), "at the default, 450k is a multiple above 400k")
+        self.assertIsNone(self.sub_ls())
+        self.sub_grow(160_000, "a2")
+        self.assertEqual(self.sub_ls("a2", LONGHAUL_SUBAGENT_AT=""), self.sub_told(160), "empty is unset")
+        self.sub_grow(160_000, "a3")
+        self.assertEqual(self.sub_ls("a3", LONGHAUL_SUBAGENT_AT=" 50000 "), self.sub_told(160))
+        self.assertEqual(self.record("s1+a3"), {"subagent_reminder": {"at": 150_000}}, "three times 50,000")
+        # The two switches are apart: the main reminder's off is not the subagent's, nor the other way.
+        self.sub_grow(160_000, "a4")
+        self.assertEqual(self.sub_ls("a4", LONGHAUL_CHECKPOINT_AT="off"), self.sub_told(160))
+        self.grow(205_000)
+        self.assertEqual(self.ls(LONGHAUL_SUBAGENT_AT="off"), self.told(205))
+        # And the guard's: off stops its rules, not the reminder.
+        self.sub_grow(160_000, "a5")
+        self.assertEqual(self.sub_ls("a5", LONGHAUL_GUARD="off"), self.sub_told(160))
+
+    def test_any_other_subagent_threshold_counts_as_the_default_and_is_logged_once_by_kind(self):
+        cases = [("abc", "not a whole number"), ("150k", "not a whole number"), ("1.5", "not a whole number"),
+                 ("+5", "not a whole number"), (self.S, "not a whole number"), ("0", "not above zero"),
+                 ("-5", "not above zero")]
+        self.sub_grow(149_000, "j")
+        for value, _ in cases:
+            self.assertIsNone(self.sub_ls("j", LONGHAUL_SUBAGENT_AT=value), (value, "149k is under the default"))
+        for n, (value, _) in enumerate(cases):
+            self.sub_grow(160_000, f"j{n}")
+            self.assertEqual(self.sub_ls(f"j{n}", LONGHAUL_SUBAGENT_AT=value), self.sub_told(160), value)
+            self.assertIsNone(self.sub_ls(f"j{n}", LONGHAUL_SUBAGENT_AT=value), (value, "once"))
+        line = "reminder: LONGHAUL_SUBAGENT_AT is {}, so the default, 150,000 tokens, is used ({})"
+        said = [entry.split(" ", 2)[2] for entry in self.log().splitlines() if "LONGHAUL_SUBAGENT_AT" in entry]
+        self.assertEqual(said, [line.format("not a whole number", "s1+j"), line.format("not above zero", "s1+j")]
+                         + [line.format(kind, f"s1+j{n}") for n, (_, kind) in enumerate(cases)])
+        self.assertNotIn(self.S, self.log())
+
+    def test_the_subagents_line_joins_the_guards_answer_and_a_denials_reason(self):
+        self.files()
+        self.sub_grow(100_000)
+        self.guard(self.tool(agent="a1", file_path=str(self.small)))
+        self.sub_grow(160_000)
+        answer = self.guard(self.tool(agent="a1", file_path=str(self.small)))  # the guard's repeat
+        warning = answer["hookSpecificOutput"]["additionalContext"].split("\n")[0]
+        self.assertTrue(warning.startswith("longhaul guard (advice; the call went ahead): "), warning)
+        self.assertEqual(answer, self.sub_told(160, warning), "the guard's warning, a newline, the subagent's line")
+        # The guard's own write keeps what was said, and the reminder's keeps the guard's.
+        kept = self.record("s1+a1")
+        self.assertEqual((kept["subagent_reminder"], kept["fired"]["repeat"]), ({"at": 150_000}, 1))
+        self.guard(self.tool(agent="a1", file_path=str(self.small)))
+        self.assertEqual(self.record("s1+a1")["subagent_reminder"], {"at": 150_000})
+        longhaul.guard_check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}, "warn")
+        self.assertEqual(self.record("s1+a1")["subagent_reminder"], {"at": 150_000}, "kept through a compaction")
+        self.assertEqual(longhaul.guard_counts("s1")["repeat"], 2, "the guard's counts, as before")
+        # In block mode the warning is the denial's reason: the line joins it there.
+        self.sub_grow(310_000)
+        answer = self.guard(self.tool(agent="a1", file_path=str(self.big)), LONGHAUL_GUARD="block")
+        out = answer["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "deny"))
+        reason, line = out["permissionDecisionReason"].split("\n")
+        self.assertTrue(reason.startswith("longhaul guard blocked this call. "), reason)
+        self.assertEqual(line, self.SUB.format(310))
+        self.assertNotIn("additionalContext", out)
+        self.assertNotIn("systemMessage", answer, "the user's line is the main reminder's")
+        # A record the reminder alone wrote is no record of the guard's (inspect's Guard section).
+        self.sub_grow(160_000, "a2")
+        self.sub_ls("a2")
+        self.assertEqual(set(self.record("s1+a2")), {"subagent_reminder"})
+        self.assertEqual(longhaul.guard_counts("s1")["big"], 1, "a2's record adds nothing to them")
+
+    def test_the_subagents_transcript_is_found_as_the_advisor_code_finds_it(self):
+        data = self.tool("Bash", agent="a1", command="ls")
+        self.assertIsNone(longhaul.subagent_transcript(data), "none yet")
+        self.sub_grow(160_000)
+        self.sub_path().with_name("agent-a1.meta.json").write_text(json.dumps({"agentType": "Explore"}))
+        found = longhaul.subagent_transcript(data)
+        self.assertEqual(found, str(self.sub_path()))
+        self.assertEqual(longhaul.advisor_subagents(str(self.transcript)), [("a1", self.sub_path())],
+                         "the file the advisor code lists for the agent")
+        # A path the input gives for the agent itself is taken first, when it is the agent's.
+        own = self.tmp / "elsewhere" / "agent-a1.jsonl"
+        own.parent.mkdir()
+        own.write_text("")
+        other = own.with_name("agent-a2.jsonl")
+        other.write_text("")
+        self.assertEqual(longhaul.subagent_transcript({**data, "agent_transcript_path": str(own)}), str(own))
+        self.assertEqual(longhaul.subagent_transcript({**data, "transcript_path": str(own)}), str(own),
+                         "a transcript_path that is the agent's own")
+        for wrong in (str(other), str(self.transcript), str(own.with_name("gone") / "agent-a1.jsonl"),
+                      "agent-a1.jsonl", "", 7, None, ["x"]):
+            self.assertEqual(longhaul.subagent_transcript({**data, "agent_transcript_path": wrong}), found, wrong)
+        self.assertIsNone(longhaul.subagent_transcript({**data, "transcript_path": str(other)}),
+                          "another agent's transcript, beside which a1 has none")
+        # An agent a workflow ran keeps its transcript a folder or two below.
+        deep = self.tmp / "s1" / "subagents" / "workflows" / "run1" / "agent-w1.jsonl"
+        self.sub_grow(170_000, "w1", path=deep)
+        self.assertEqual(longhaul.subagent_transcript(self.tool("Bash", agent="w1", command="ls")), str(deep))
+        self.assertEqual(self.sub_ls("w1"), self.sub_told(170))
+        # No id, or one that is no plain id: none.
+        for agent in (None, "../a1", "a/1", "*", 7, ""):
+            self.assertIsNone(longhaul.subagent_transcript({**data, "agent_id": agent}), agent)
+
+    def test_a_missing_or_unreadable_subagent_transcript_says_nothing(self):
+        self.grow(605_000)  # the main conversation's size is no subagent's
+        self.assertIsNone(self.sub_ls(), "no transcript of its own")
+        for path in (str(self.tmp / "missing.jsonl"), str(self.tmp), "", None, 7, ["x"]):
+            data = {**self.tool("Bash", agent="a1", command="ls"), "transcript_path": path}
+            self.assertIsNone(self.guard(data), path)
+        self.sub_path().parent.mkdir(parents=True)
+        self.sub_path().write_text("not json {\n" + json.dumps({"type": "user", "isSidechain": True}) + "\n")
+        self.assertIsNone(self.sub_ls(), "no response in it")
+        self.sub_grow(160_000)
+        self.grow({"type": "user", "isSidechain": True, "message": {"content": "x" * (2 * longhaul.ADVISOR_TAIL)}},
+                  path=self.sub_path())
+        self.assertIsNone(self.sub_ls(), "no response in the tail")
+        self.sub_grow(160_000)
+        self.sub_path().chmod(0)
+        try:
+            if not os.access(self.sub_path(), os.R_OK):  # root reads it all the same
+                self.assertIsNone(self.sub_ls(), "a transcript that cannot be read")
+        finally:
+            self.sub_path().chmod(0o600)
+        self.assertIsNone(self.record("s1+a1"))
+        self.assertEqual(self.sub_ls(), self.sub_told(160), "readable again: the tail alone is read")
+        for agent in ("../a1", "a b"):
+            self.assertIsNone(self.guard(self.tool("Bash", agent=agent, command="ls")), agent)
+
+    def test_inspect_counts_the_subagents_told_to_report_back(self):
+        self.grow(50_000)
+        self.sub_grow(160_000, "a1")
+        self.sub_grow(320_000, "a2")
+        r = longhaul.inspect_transcript(self.transcript)
+        self.assertEqual(r["subagent_reminders"], {"subagents": 0, "highest": 0})
+        self.assertNotIn("Subagent reminders", "\n".join(longhaul.inspect_lines(r)), "none: no line")
+        self.assertNotIn("subagents_reminded", {x["metric"] for x in longhaul.inspect_records(r)})
+        self.sub_ls("a1")
+        self.sub_ls("a2")
+        r = longhaul.inspect_transcript(self.transcript)
+        self.assertEqual(r["subagent_reminders"], {"subagents": 2, "highest": 300_000})
+        lines = longhaul.inspect_lines(r)
+        head = lines.index("Subagent reminders [longhaul guard records, counted]")
+        self.assertEqual(lines[head + 1], "  2 subagents told to finish and report back, the highest at 300,000 tokens")
+        self.assertGreater(head, lines.index("Guard [longhaul guard: no record: the hook was off, or saw no whole "
+                                             "Read, cat or search]"), "after the guard's section")
+        records = {x["metric"]: x for x in longhaul.inspect_records(r)}
+        self.assertEqual((records["subagents_reminded"]["value"], records["subagents_reminded"]["source"]), (2, "guard"))
+
+    def test_the_usage_text_and_the_readme_name_the_subagent_switch(self):
+        usage = " ".join(longhaul.__doc__.split())
+        self.assertTrue("LONGHAUL_SUBAGENT_AT tokens (150000 unless set; off turns it off)" in usage, "the usage text")
+        readme = (HERE / "README.md").read_text()
+        self.assertTrue("`LONGHAUL_SUBAGENT_AT`" in readme, "the README")
+
 
 class Trial(unittest.TestCase):
     """`longhaul trial` (docs/plans/2026-10-23-checkpoint-ab-plan.md; the
@@ -8584,6 +8849,39 @@ class Trial(unittest.TestCase):
         self.assertTrue(said(prompt(usual[1]), "UserPromptSubmit"))
         self.assertTrue(said(tool(usual[2]), "PreToolUse"))
         self.assertTrue(said(prompt(usual[3]), "UserPromptSubmit"))
+
+    def test_a_subagent_in_the_checkpoint_trials_usual_half_is_not_told_to_report_back(self):
+        # The subagent's reminder follows the main one's rule (the owner,
+        # 2026-10-25): none in a checkpoint trial's usual half, which records
+        # nothing either; a models trial's usual half hears it.
+        transcript = self.tmp / "t.jsonl"
+        transcript.write_text("")
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 157_994,
+                 "output_tokens": 900}
+        own = self.tmp / "t" / "subagents" / "agent-a1.jsonl"
+        own.parent.mkdir(parents=True)
+        own.write_text(json.dumps({"type": "assistant", "isSidechain": True, "agentId": "a1", "message": {
+            "id": "msg_1", "model": "claude-opus-5-5", "role": "assistant", "content": [], "usage": usage}}) + "\n")
+
+        def tool(sid):
+            return self.hook("guard", {"session_id": sid, "transcript_path": str(transcript), "cwd": str(self.work),
+                                       "hook_event_name": "PreToolUse", "tool_name": "Bash", "agent_id": "a1",
+                                       "agent_type": "implementer", "tool_input": {"command": "ls"},
+                                       "tool_use_id": "t1"})
+
+        def said(out):
+            return json.loads(out)["hookSpecificOutput"]["additionalContext"].startswith(
+                "Longhaul: your context as a subagent is about 160k tokens")
+
+        self.trial()
+        usual, habit = self.ids("usual", 3, "u"), self.ids("habit", 1, "h")
+        self.assertEqual(tool(usual[0]), "", "usual: not said")
+        self.assertFalse((self.home / "guard" / f"{usual[0]}+a1.json").exists(), "nor recorded")
+        self.assertTrue(said(tool(habit[0])), "habit: said")
+        self.trial(name="subagent-models", kind="models")
+        self.assertTrue(said(tool(usual[1])), "a models trial's usual half hears it")
+        (self.home / "trial.json").unlink()
+        self.assertTrue(said(tool(usual[2])), "and with no trial on")
 
     def test_status_counts_the_trials_sessions_and_chains_per_arm(self):
         self.trial(started=-10)
@@ -13230,7 +13528,7 @@ class Doctor(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ATTENDED", "LONGHAUL_GUARD",
-                     "LONGHAUL_CHECKPOINT_AT", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_INDEX"):
+                     "LONGHAUL_CHECKPOINT_AT", "LONGHAUL_SUBAGENT_AT", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_INDEX"):
             os.environ.pop(name, None)
         # The updates check calls release_status(), another change's; none
         # here unless a test gives one.
@@ -13665,20 +13963,32 @@ class Doctor(unittest.TestCase):
         self.assertEqual(c["mark"], "ok")
         # The owner's decision of 2026-10-25 ("Claude picks, Longhaul
         # guides"): guide is the default mode, where it was trial.
+        # The subagent reminder (the owner, 2026-10-25, "A reminder for long
+        # subagent runs") has its own line after the context reminder's.
         self.assertEqual([t for _, t, _ in c["items"]], [
-            "context reminder: at 200,000 tokens", "auto-compact: on", "guard: advice",
-            "Auto Model: guide: Claude picks each subagent's model; cap none",
+            "context reminder: at 200,000 tokens", "subagent reminder: at 150k tokens", "auto-compact: on",
+            "guard: advice", "Auto Model: guide: Claude picks each subagent's model; cap none",
             "trial: off"])
-        os.environ.update(LONGHAUL_GUARD="block", LONGHAUL_AUTO_COMPACT="off", LONGHAUL_CHECKPOINT_AT="off")
-        self.assertEqual([t for _, t, _ in longhaul.doctor_features()["items"]][:3], [
-            "context reminder: off (LONGHAUL_CHECKPOINT_AT=off)", "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)",
-            "guard: block"])
+        os.environ.update(LONGHAUL_GUARD="block", LONGHAUL_AUTO_COMPACT="off", LONGHAUL_CHECKPOINT_AT="off",
+                          LONGHAUL_SUBAGENT_AT="off")
+        self.assertEqual([t for _, t, _ in longhaul.doctor_features()["items"]][:4], [
+            "context reminder: off (LONGHAUL_CHECKPOINT_AT=off)", "subagent reminder: off (LONGHAUL_SUBAGENT_AT=off)",
+            "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)", "guard: block"])
+        for value, shown in (("100000", "100k"), ("120500", "120,500"), (" 80000 ", "80k")):
+            os.environ["LONGHAUL_SUBAGENT_AT"] = value
+            self.assertEqual(self.items(longhaul.doctor_features())[f"subagent reminder: at {shown} tokens"], "ok")
+        os.environ.update(LONGHAUL_SUBAGENT_AT="abc")
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "warn")
+        self.assertEqual(self.items(c)["subagent reminder: LONGHAUL_SUBAGENT_AT is not a whole number, so the default "
+                                       "(150,000 tokens) is in force"], "warn")
+        self.assertIn("LONGHAUL_SUBAGENT_AT", c["step"])
         os.environ.update(LONGHAUL_GUARD="off", LONGHAUL_CHECKPOINT_AT="abc")
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "warn")
         self.assertIn("guard: off", self.items(c))
-        self.assertIn("LONGHAUL_CHECKPOINT_AT", c["step"])
-        for name in ("LONGHAUL_GUARD", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_CHECKPOINT_AT"):
+        self.assertIn("LONGHAUL_CHECKPOINT_AT", c["step"], "the first warning's step")
+        for name in ("LONGHAUL_GUARD", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_CHECKPOINT_AT", "LONGHAUL_SUBAGENT_AT"):
             del os.environ[name]
         # In guide mode the table is not applied, and that is no warning.
         self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models_cap": "sonnet"})

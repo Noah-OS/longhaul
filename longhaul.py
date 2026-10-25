@@ -159,7 +159,11 @@ Usage:
                           save a checkpoint and start fresh; the guard's PreToolUse
                           hook says it too, whatever LONGHAUL_GUARD is, and each
                           multiple is said once, the count starting again after
-                          a compaction; never in a trial's usual arm
+                          a compaction; never in a trial's usual arm. A subagent
+                          whose own context passes LONGHAUL_SUBAGENT_AT tokens
+                          (150000 unless set; off turns it off), and each multiple,
+                          is told by the guard's hook to finish its step and
+                          report back what is done and what is left
   longhaul account-check        the plugin's UserPromptSubmit hook: in a folder the
                           "repositories" in accounts.json keep for some accounts,
                           refuses each prompt of a chat on any other account (by
@@ -2853,6 +2857,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "api_errors": dict(api_errors.most_common()),
         "unreadable": unreadable,
         "guard": guard_counts(path.stem),
+        "subagent_reminders": subagent_reminders(path.stem),
         "consultations": consulted,
     }
 
@@ -3004,6 +3009,11 @@ def inspect_lines(r: dict) -> list[str]:
                 [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in
                  (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
                  if g[k]])
+    s = r.get("subagent_reminders") or {}
+    if s.get("subagents"):  # else none was told: no section
+        out.append("Subagent reminders [longhaul guard records, counted]")
+        out.append(f"  {s['subagents']} subagent{'s' * (s['subagents'] != 1)} told to finish and report back, "
+                   f"the highest at {s['highest']:,} tokens")
 
     c = r["consultations"]
     if c is not None:  # else the trace has no line of this conversation's, or there is none: no section
@@ -3105,6 +3115,8 @@ def inspect_records(r: dict) -> list[dict]:
     for k in GUARD_RULES if r["guard"] else ():
         add("guard_fired", r["guard"][k], "calls", "all", "guard", "counted", k)
         add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "guard", "counted", k)
+    if (r.get("subagent_reminders") or {}).get("subagents"):
+        add("subagents_reminded", r["subagent_reminders"]["subagents"], "subagents", "subagents", "guard", "counted")
     c = r["consultations"]
     if c is not None:  # none when the trace has no line of this conversation's
         counted = ("consultations", "all", "advisor", "counted")
@@ -3685,7 +3697,7 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
-GUARD_KEPT = ("reminder",)  # a record's keys that are the reminder's: every rewrite of it keeps them
+GUARD_KEPT = ("reminder", "subagent_reminder")  # a record's keys that are the reminders': every rewrite keeps them
 
 
 def guard_mode() -> str:
@@ -5940,11 +5952,26 @@ def advisor(opts) -> int:
 # unattended run with no prompts hears it as well; the one record serves
 # both, so a multiple is said once wherever it is crossed first. Of the
 # input only session_id, transcript_path and agent_id (a subagent's call is
-# never reminded) are used: the prompt's text is never used, logged,
-# kept or said. Like the other hooks it fails open:
+# never given the conversation's reminder) are used: the prompt's text is
+# never used, logged, kept or said. Like the other hooks it fails open:
 # an error prints nothing, and the hook never blocks a prompt.
+#
+# A subagent has a reminder of its own (the owner's decision of
+# 2026-10-25, "A reminder for long subagent runs"): measured on the
+# owner's chat, subagents were most of the cost (about $2,408 over 351
+# runs), and the long runs the dearest, each request re-reading the
+# subagent's whole, growing context (an implementer on Opus averaged 189
+# requests of 266k tokens). Once a subagent's own context passes
+# LONGHAUL_SUBAGENT_AT tokens (SUBAGENT_AT; off turns it off), and again at
+# each multiple, the guard's PreToolUse hook tells that subagent to finish
+# its step and report back what is done and what is left
+# (SUBAGENT_MODEL), so the main conversation can hand the rest to a fresh
+# one. Its size is read from its own transcript (subagent_transcript()),
+# the multiple said is kept in its own guard record (subagent_reminder),
+# and nothing is said to the user or to the main conversation.
 
 REMINDER_AT = 200_000  # tokens: the default threshold
+SUBAGENT_AT = 150_000  # tokens: the default threshold of a subagent's own context
 REMINDER_USER = ("Longhaul: this conversation's context is about {k}k tokens, and every request carries all of it "
                  "again. To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint "
                  "comes back.")
@@ -5955,29 +5982,35 @@ REMINDER_MODEL = ("Longhaul: the context is about {k}k tokens. At your next natu
                   "of an edit or a test run), and in any case before you end your turn, save a checkpoint with /longhaul:checkpoint, then tell the user in one "
                   "line: \"Saved a checkpoint (the context is about {k}k tokens). Type /clear to start fresh; it comes "
                   "back.\" Then continue the work. After a compaction or a /clear it comes back.")
+SUBAGENT_MODEL = ("Longhaul: your context as a subagent is about {k}k tokens, and every request you make re-reads all "
+                  "of it. Finish the step you are on, then stop and report back: what you have done, what is left, "
+                  "and anything the next agent needs to know, so the main conversation can hand the rest to a fresh "
+                  "subagent.")
 
 
-def reminder_threshold() -> tuple:
-    """LONGHAUL_CHECKPOINT_AT, read at call time: (tokens, None); (None,
-    None) for off, in any case; or (REMINDER_AT, the kind of value it is)
-    for anything else, which the caller logs by that kind, never the
-    value. Unset or empty is the default."""
-    raw = (os.environ.get("LONGHAUL_CHECKPOINT_AT") or "").strip()
+def reminder_threshold(name: str = "LONGHAUL_CHECKPOINT_AT", default: int = REMINDER_AT) -> tuple:
+    """A threshold setting (LONGHAUL_CHECKPOINT_AT, or `name` with its
+    `default`: LONGHAUL_SUBAGENT_AT's is SUBAGENT_AT), read at call time:
+    (tokens, None); (None, None) for off, in any case; or (the default,
+    the kind of value it is) for anything else, which the caller logs by
+    that kind, never the value. Unset or empty is the default."""
+    raw = (os.environ.get(name) or "").strip()
     if not raw:
-        return REMINDER_AT, None
+        return default, None
     if raw.lower() == "off":
         return None, None
     if not re.fullmatch(r"-?[0-9]+", raw):
-        return REMINDER_AT, "not a whole number"
-    return (int(raw), None) if int(raw) > 0 else (REMINDER_AT, "not above zero")
+        return default, "not a whole number"
+    return (int(raw), None) if int(raw) > 0 else (default, "not above zero")
 
 
-def reminder_size(tail: list):
+def reminder_size(tail: list, sidechain: bool = False):
     """The context's size, in tokens, from the transcript's tail
     (advisor_tail()): the last main-conversation response's input, cache
     write and cache read, as inspect's context figures count it (no
     subagent's line, no API error, none of the engine's own, none
-    without them); or None."""
+    without them); or None. With `sidechain`, for a subagent's own
+    transcript, every line of which is one, its last response's."""
     for raw in reversed(tail):
         if b'"assistant"' not in raw or b'"usage"' not in raw:
             continue
@@ -5985,8 +6018,8 @@ def reminder_size(tail: list):
             entry = json.loads(raw)
         except (ValueError, RecursionError):
             continue
-        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain") \
-                or entry.get("isApiErrorMessage"):
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" \
+                or (entry.get("isSidechain") and not sidechain) or entry.get("isApiErrorMessage"):
             continue
         msg = dict_at(entry, "message")
         if msg.get("model") == "<synthetic>":
@@ -6011,11 +6044,11 @@ def reminder_fell(said: dict, size: int, at: int) -> bool:
 def reminder_due(data: dict):
     """The context's size when it has crossed a multiple of the threshold
     above the highest this session was told of since its last compaction,
-    which is recorded; else None. A subagent's input is never reminded: its
-    context is not the conversation's, and neither is a session in the
-    trial's usual arm (trial_arm()), which records nothing either. A
-    threshold that is neither a number nor off is logged once per session
-    and kind."""
+    which is recorded; else None. A subagent's input is never given this
+    reminder: its context is not the conversation's (it has its own,
+    subagent_due()), and neither is a session in the trial's usual arm
+    (trial_arm()), which records nothing either. A threshold that is
+    neither a number nor off is logged once per session and kind."""
     at, junk = reminder_threshold()
     if at is None or data.get("agent_id") is not None:
         return None
@@ -6057,18 +6090,117 @@ def reminder_due(data: dict):
     return size if due else None
 
 
+def subagent_transcript(data: dict):
+    """A subagent's own transcript, for a hook input that names one
+    (agent_id), as a path, or None when there is none to read. A path the
+    input gives for the agent itself is taken first, when it is named
+    agent-<id>.jsonl and is a file: agent_transcript_path (Claude Code
+    2.1.310 sends it with SubagentStop alone, so for a later version that
+    sends it here) or a transcript_path that is the agent's own. Else the
+    file beside the session's transcript, where the advisor code finds a
+    subagent's (advisor_subagents()): <transcript minus .jsonl>/subagents/
+    agent-<id>.jsonl, or, for an agent a workflow ran, the same name in a
+    folder below it (Claude Code's transcriptSubdir)."""
+    agent = advisor_id(data.get("agent_id"))
+    if agent is None:
+        return None
+    name = f"agent-{agent}.jsonl"
+    for key in ("agent_transcript_path", "transcript_path"):
+        given = data.get(key)
+        try:
+            if isinstance(given, str) and os.path.isabs(given) and Path(given).name == name \
+                    and files_of([Path(given)]):
+                return given
+        except ValueError:  # a path with a NUL in it
+            pass
+    path = data.get("transcript_path")
+    if not (isinstance(path, str) and path):
+        return None
+    try:
+        folder = Path(path).with_suffix("") / "subagents"
+        found = files_of([folder / name]) or sorted(files_of(folder.glob(f"*/**/{name}")))
+    except (OSError, ValueError):  # a path with a NUL in it, or no name to take a suffix from
+        return None
+    return str(found[0]) if found else None
+
+
+def subagent_due(data: dict):
+    """A subagent's own context's size when it has crossed a multiple of
+    LONGHAUL_SUBAGENT_AT above the highest this subagent was told of,
+    which is recorded in its own guard record (subagent_reminder, under
+    the guard's lock); else None. Only for a subagent's input (agent_id):
+    the main conversation's is reminder_due()'s. The size is its last
+    response's, from the tail of its own transcript (subagent_transcript()).
+    None, and nothing recorded, in the checkpoint trial's usual half, as
+    for the main reminder. A threshold that is neither a number nor off is
+    logged once per subagent and kind. One line is logged each time it is
+    said, of names, ids and numbers alone."""
+    at, junk = reminder_threshold("LONGHAUL_SUBAGENT_AT", SUBAGENT_AT)
+    if at is None or data.get("agent_id") is None:
+        return None
+    record = guard_record_path(data)
+    if record is None:
+        return None
+    size = reminder_size(advisor_tail(subagent_transcript(data)), sidechain=True)
+    if size is None:
+        return None
+    crossed = size // at * at
+    if not crossed and not junk:
+        return None
+    trial = trial_current()
+    if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
+        return None  # the checkpoint A/B's usual arm hears no reminder, a subagent's included
+    with locked("guard"):  # the guard's record, written by its hook at the same moments
+        kept = read_json(record)
+        kept = kept if isinstance(kept, dict) else {}
+        said = dict_at(kept, "subagent_reminder")
+        before = dict(said)
+        logged = said.get("junk") if isinstance(said.get("junk"), list) else []
+        if junk and junk not in logged:
+            log(f"reminder: LONGHAUL_SUBAGENT_AT is {junk}, so the default, {SUBAGENT_AT:,} tokens, is used "
+                f"({record.stem})")
+            said["junk"] = [*logged, junk]
+        due = crossed > as_int(said.get("at"))
+        if due:
+            said["at"] = crossed
+        if said != before:
+            write_json(record, {**kept, "subagent_reminder": said})
+    if due:
+        kind = data.get("agent_type")
+        kind = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", kind) else "?"
+        log(f"reminder: {data['session_id']} subagent {data['agent_id']} ({kind}) reminded at {crossed:,} tokens "
+            f"(the context is {size:,})")
+    return size if due else None
+
+
+def subagent_reminders(sid: str) -> dict:
+    """How many of a conversation's subagents were told to report back,
+    and the highest multiple any was told of, from their guard records
+    (subagent_due()), for inspect."""
+    told = []
+    if re.fullmatch(GUARD_ID, sid or ""):
+        for file in guard_records(sid)[1:]:  # the first is the conversation's own
+            at = as_int(dict_at(read_json(file) if file.is_file() else None, "subagent_reminder").get("at"))
+            if at > 0:
+                told.append(at)
+    return {"subagents": len(told), "highest": max(told, default=0)}
+
+
 def reminder_join(data, answer):
     """The guard's hook answer (`answer`, or None) for a PreToolUse input,
-    with the reminder added when one is due (reminder_due()): the model's
-    line after the guard's own words with a newline, in its
-    additionalContext or, for a call it denies, in the denial's reason,
-    which the model reads either way; and the user's line as the
-    systemMessage. Anything else goes as it came. What the reminder
-    raises is logged by its kind, and the guard's answer goes unchanged."""
+    with the reminder added when one is due: for the main conversation
+    (reminder_due()), the model's line after the guard's own words with a
+    newline, in its additionalContext or, for a call it denies, in the
+    denial's reason, which the model reads either way, and the user's
+    line as the systemMessage; for a subagent's call (subagent_due()),
+    the subagent's line in the same place and no line for the user.
+    Anything else goes as it came. What the reminder raises is logged by
+    its kind, and the guard's answer goes unchanged."""
     if not isinstance(data, dict) or data.get("hook_event_name") != "PreToolUse":
         return answer
+    sub = data.get("agent_id") is not None
     try:
-        size = reminder_due(data)
+        size = subagent_due(data) if sub else reminder_due(data)
     except Exception as e:
         log(f"reminder: none with the guard ({type(e).__name__})")
         return answer
@@ -6077,9 +6209,12 @@ def reminder_join(data, answer):
     answer = dict(answer or {})
     out = {"hookEventName": "PreToolUse", **dict_at(answer, "hookSpecificOutput")}
     key = "permissionDecisionReason" if out.get("permissionDecision") == "deny" else "additionalContext"
-    out[key] = "\n".join(filter(None, [out.get(key), REMINDER_MODEL.format(k=size // 1000)]))
+    line = (SUBAGENT_MODEL if sub else REMINDER_MODEL).format(k=size // 1000)
+    out[key] = "\n".join(filter(None, [out.get(key), line]))
     answer["hookSpecificOutput"] = out
-    answer["systemMessage"] = "\n".join(filter(None, [answer.get("systemMessage"), REMINDER_USER.format(k=size // 1000)]))
+    if not sub:  # a subagent's line is for it alone: the user hears the conversation's reminder
+        answer["systemMessage"] = "\n".join(filter(None, [answer.get("systemMessage"),
+                                                          REMINDER_USER.format(k=size // 1000)]))
     return answer
 
 
@@ -9615,10 +9750,11 @@ def doctor_maps() -> dict:
 
 def doctor_features() -> dict:
     """10. The features and their switches: the context reminder's
-    threshold, auto-compact, the guard's mode, Auto Model (its mode: guide,
-    the default since 2026-10-25, with its cap; or the table, and whether
-    it applies anywhere: in trial mode, only in a models trial's routed
-    half), and the trial. Read from this process's environment, which a
+    threshold, the subagent reminder's (LONGHAUL_SUBAGENT_AT), auto-compact,
+    the guard's mode, Auto Model (its mode: guide, the default since
+    2026-10-25, with its cap; or the table, and whether it applies
+    anywhere: in trial mode, only in a models trial's routed half), and
+    the trial. Read from this process's environment, which a
     chat's Bash tool shares with its hooks."""
     items = []
     at, why = reminder_threshold()
@@ -9628,6 +9764,14 @@ def doctor_features() -> dict:
     else:
         items.append(("ok", "context reminder: off (LONGHAUL_CHECKPOINT_AT=off)" if at is None
                       else f"context reminder: at {at:,} tokens", None))
+    at, why = reminder_threshold("LONGHAUL_SUBAGENT_AT", SUBAGENT_AT)
+    if why:
+        items.append(("warn", f"subagent reminder: LONGHAUL_SUBAGENT_AT is {why}, so the default ({SUBAGENT_AT:,} "
+                              "tokens) is in force", "set LONGHAUL_SUBAGENT_AT to a whole number of tokens, or off"))
+    else:
+        shown = "" if at is None else f"{at // 1000}k" if at % 1000 == 0 else f"{at:,}"  # 150k; 120,500
+        items.append(("ok", "subagent reminder: off (LONGHAUL_SUBAGENT_AT=off)" if at is None
+                      else f"subagent reminder: at {shown} tokens", None))
     off = (os.environ.get("LONGHAUL_AUTO_COMPACT") or "").strip().lower() == "off"  # as hooks/autocompact.ts reads it
     items.append(("ok", "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)" if off else "auto-compact: on", None))
     raw, mode = os.environ.get("LONGHAUL_GUARD"), guard_mode()
