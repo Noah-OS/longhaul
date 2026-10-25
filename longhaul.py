@@ -9405,6 +9405,17 @@ def doctor_config_dir(environment: str):
     return value or None
 
 
+def doctor_session_of(pid: int, config_dir) -> str | None:
+    """The conversation a running chat holds, from Claude Code's record of
+    the process (<its config folder>/sessions/<pid>.json): its sessionId
+    alone, when it has a session id's shape; None otherwise. The .key file
+    beside it is never opened."""
+    folder = Path(doctor_expand(config_dir)) if config_dir else DEFAULT_CONFIG
+    kept = read_json(folder / "sessions" / f"{int(pid)}.json")
+    sid = kept.get("sessionId") if isinstance(kept, dict) else None
+    return sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and "-" in sid else None
+
+
 def doctor_processes():
     """The chats running now, from ps and lsof found on PATH: per claude
     process that is a chat (not a job such as `claude auth` or `claude
@@ -9447,6 +9458,8 @@ def doctor_processes():
         pid = int(found.group(1)) if found else None
         if pid in chats and found.group(2).startswith(lines[pid]):  # what follows the arguments is the environment
             chats[pid]["config_dir"] = doctor_config_dir(found.group(2)[len(lines[pid]):])
+    for pid, chat in chats.items():  # the conversation each holds, by Claude Code's record of the process
+        chat["session"] = doctor_session_of(pid, chat["config_dir"])
     lsof = next((path for path, runnable in doctor_path_hits("lsof") if runnable), None)
     try:
         folders = subprocess.run([lsof, "-a", "-d", "cwd", "-p", pids, "-Fn"], capture_output=True, text=True,
@@ -9495,15 +9508,20 @@ def doctor_chats(processes=None) -> dict:
         if isinstance(cwd, str) and doctor_own_folder(cwd):
             continue
         shown += 1
-        if chat.get("resume"):
-            resumed[chat["resume"]].append(chat["pid"])
+        held = chat.get("session") or chat.get("resume")
+        if held:
+            resumed[held].append(chat["pid"])
         value = chat.get("config_dir")
         folder = os.path.abspath(doctor_expand(value)) if value else str(DEFAULT_CONFIG)
         on = accounts_on(accounts, folder)
         label = chat_label(on, folder) if accounts else home_path(folder)
-        kind, fix = (("a VS Code tab", "close the tab and open the chat again") if chat.get("panel")
-                     else ("a terminal chat", "quit it and start it with `longhaul -c`"))
         where = home_path(cwd) if isinstance(cwd, str) else "folder unknown"
+        # Its own conversation when the record names it: with two chats in one
+        # folder, -c could resume the other (2026-10-25).
+        again = (f"`longhaul -r {chat['session'][:8]}` in {where}" if chat.get("session") and isinstance(cwd, str)
+                 else "`longhaul -c`")
+        kind, fix = (("a VS Code tab", "close the tab and open the chat again") if chat.get("panel")
+                     else ("a terminal chat", f"quit it and start it with {again}"))
         head = f"pid {chat['pid']}, {where}: {kind} on {label}"
         step = f"pid {chat['pid']}: {fix}"
         if not accounts or problem:

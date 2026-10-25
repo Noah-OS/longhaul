@@ -13494,8 +13494,39 @@ class Doctor(unittest.TestCase):
             self.assertNotIn(email, text)
         self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
 
-    def chat(self, pid, cwd, config=None, panel=False, resume=None) -> dict:
-        return {"pid": pid, "cwd": str(cwd), "config_dir": config, "panel": panel, "resume": resume}
+    def chat(self, pid, cwd, config=None, panel=False, resume=None, session=None) -> dict:
+        return {"pid": pid, "cwd": str(cwd), "config_dir": config, "panel": panel, "resume": resume, "session": session}
+
+    def test_a_terminal_chat_whose_conversation_is_known_is_told_its_own_resume(self):
+        # The owner's machine, 2026-10-25: a plain `claude` in a folder with two
+        # chats; `longhaul -c` could resume the other one. Claude Code's record
+        # of the process (sessions/<pid>.json) names its conversation.
+        notes = self.user / "notes"
+        notes.mkdir()
+        self.accounts({"name": "personal", "email": "me@example.com", "config_dir": self.folder(".claude-personal")})
+        sid = "f71dca49-021b-4b61-a3e4-1e7738aa9509"
+        c = longhaul.doctor_chats([self.chat(201, notes, session=sid), self.chat(202, notes)])
+        said = {text.split(":", 1)[0]: text for _, text, _ in c["items"]}
+        self.assertIn("quit it and start it with `longhaul -r f71dca49` in ~/notes", said["pid 201, ~/notes"])
+        self.assertIn("quit it and start it with `longhaul -c`", said["pid 202, ~/notes"], "no record: as before")
+        # The same conversation in two processes, by the record when no --resume names it.
+        c = longhaul.doctor_chats([self.chat(203, notes, session=sid), self.chat(204, notes, resume=sid)])
+        self.assertIn("conversation f71dca49 is open in 2 chats (pids 203, 204): close all but one",
+                      [text for _, text, _ in c["items"]])
+
+    def test_the_session_record_gives_a_chat_its_conversation_and_never_its_key(self):
+        config = self.folder(".claude-personal")
+        sessions = Path(config) / "sessions"
+        sessions.mkdir(parents=True)
+        sid = "f71dca49-021b-4b61-a3e4-1e7738aa9509"
+        (sessions / "301.json").write_text(json.dumps({"sessionId": sid, "cwd": "/x", "kind": "interactive"}))
+        (sessions / "301.abcdef.key").write_text("SECRET-KEY")
+        (sessions / "302.json").write_text(json.dumps({"sessionId": "../not-an-id"}))
+        (sessions / "303.json").write_text("{not json")
+        self.assertEqual(longhaul.doctor_session_of(301, config), sid)
+        for pid in (302, 303, 304):
+            self.assertIsNone(longhaul.doctor_session_of(pid, config), pid)
+        self.assertIsNone(longhaul.doctor_session_of(301, None), "no config: the default's, which has none here")
 
     def test_the_chats_line_judges_each_chat_by_its_folder_and_account(self):
         work, notes = self.user / "work" / "client", self.user / "notes"
@@ -13559,9 +13590,11 @@ class Doctor(unittest.TestCase):
         os.environ["PATH"] = f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin"  # sh's cat
         found = longhaul.doctor_processes()
         self.assertEqual(found, [
-            {"pid": 101, "panel": True, "resume": rid, "config_dir": "/x/with space/.claude-work", "cwd": "/work/client"},
-            {"pid": 102, "panel": False, "resume": rid, "config_dir": None, "cwd": "/home/x"},
-            {"pid": 105, "panel": False, "resume": None, "config_dir": "~/.claude-pro", "cwd": "/tmp/a b"}])
+            {"pid": 101, "panel": True, "resume": rid, "config_dir": "/x/with space/.claude-work", "cwd": "/work/client",
+             "session": None},
+            {"pid": 102, "panel": False, "resume": rid, "config_dir": None, "cwd": "/home/x", "session": None},
+            {"pid": 105, "panel": False, "resume": None, "config_dir": "~/.claude-pro", "cwd": "/tmp/a b",
+             "session": None}])
         for secret in ("SECRET", "sk-ant", "TERM", "PATH", "HOME"):
             self.assertNotIn(secret, json.dumps(found), "no other variable, and no argument's text")
         self.assertEqual(calls.read_text().splitlines(),

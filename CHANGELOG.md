@@ -2,6 +2,16 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.6 - 2026-10-25
+
+### Fixed
+
+- **The doctor names a terminal chat's own conversation.** For a chat started outside Longhaul it said "start it with `longhaul -c`", which in a folder with two chats could resume the other one. It now reads Claude Code's record of the process (its `sessionId` only) and says `longhaul -r ID`. The same record shows a conversation open in two chats when no `--resume` names it.
+
+### Changed
+
+- **The README says that each account is its own claude.ai sign-in**, so a chat that moves to another account takes that account's connectors and artifacts, not the first one's.
+
 ## 0.2.5 - 2026-10-25
 
 Claude picks each subagent's model by how hard its job is, and Longhaul tells you more of what it does.
