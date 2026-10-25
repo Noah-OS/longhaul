@@ -2496,6 +2496,60 @@ class Guard(unittest.TestCase):
         self.assertNotIn(str(self.big), self.record()["reads"])
         self.assertIsNone(self.check(self.hook("Read", file_path=str(self.small)), mode="off"))
 
+    def logged(self) -> list:
+        """The guard's lines in the log, without their time stamps."""
+        log = self.home / "longhaul.log"
+        lines = log.read_text().splitlines() if log.is_file() else []
+        bodies = [re.sub(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ", "", line) for line in lines]
+        return [body for body in bodies if body.startswith("guard: ")]
+
+    def test_each_read_the_guard_flags_is_one_line_in_the_log_with_its_path_and_size_and_never_its_text(self):
+        # The owner, 2026-10-25 ("Advice, and show me"): the advice is the
+        # model's alone, so the owner saw nothing of the guard at work. Each
+        # read it flags is now one line in the log, which the display turns
+        # into a pop-up (hooks/display.ts, Display below). A subagent's line
+        # says so and carries the main session's id; block mode's says
+        # refused. A path, a size and an id: never the file's text, never
+        # the command line.
+        self.big.write_text("SECRET" * 5_000)  # 30,000 bytes
+        other = self.tmp / "other big.txt"  # a space in the name, as a path may have
+        other.write_text("SECRET" * 5_000)
+        big, small, other_ = (longhaul.home_path(str(p)) for p in (self.big, self.small, other))
+        token = "sk-ant-TOKEN" + "Q" * 40
+        self.check(self.hook("Read", file_path=str(self.small)))
+        self.check(self.hook("Read", file_path=str(self.big), limit=200))
+        self.assertEqual(self.logged(), [], "a first read of a small file and a part of a big one flag nothing")
+        self.check(self.hook("Read", file_path=str(self.small)))  # a repeat
+        self.check(self.hook("Read", file_path=str(self.big)))  # a whole Read of a big file
+        self.check(self.hook("Bash", command=f"TOKEN={token} cat '{other}'"))  # a bare cat of one
+        self.check(self.hook("Read", agent="agent-1", file_path=str(self.big)))  # a subagent's own context
+        self.check(self.hook("Read", agent="agent-1", file_path=str(self.big)))  # and its repeat
+        self.assertEqual(self.logged(), [
+            f"guard: advised on a repeat read of {small} in s1",
+            f"guard: advised on a whole read of {big} (30,000 bytes) in s1",
+            f"guard: advised on a whole read of {other_} (30,000 bytes) in s1",
+            f"guard: advised on a whole read of {big} (30,000 bytes) in s1 (a subagent)",
+            f"guard: advised on a repeat read of {big} in s1 (a subagent)"])
+        self.assertNotIn("SECRET", (self.home / "longhaul.log").read_text())
+        self.assertNotIn("TOKEN", (self.home / "longhaul.log").read_text())
+        self.assertNotIn("agent-", (self.home / "longhaul.log").read_text(), "a subagent is named as one, not by id")
+        (self.home / "longhaul.log").unlink()
+        self.check(self.hook("Read", session="s2", file_path=str(self.small)))
+        self.check(self.hook("Read", session="s2", file_path=str(self.small)), mode="block")
+        self.check(self.hook("Read", session="s2", file_path=str(self.big)), mode="block")
+        self.check(self.hook("Bash", session="s2", command=f"cat {self.big} '{other}'"), mode="block")  # one line a file
+        self.check(self.hook("Read", session="s2", agent="agent-2", file_path=str(self.big)), mode="block")
+        self.assertEqual(self.logged(), [
+            f"guard: refused a repeat read of {small} in s2",
+            f"guard: refused a whole read of {big} (30,000 bytes) in s2",
+            f"guard: refused a whole read of {big} (30,000 bytes) in s2",
+            f"guard: refused a whole read of {other_} (30,000 bytes) in s2",
+            f"guard: refused a whole read of {big} (30,000 bytes) in s2 (a subagent)"])
+        self.assertNotIn("SECRET", (self.home / "longhaul.log").read_text())
+        (self.home / "longhaul.log").unlink()
+        self.assertIsNone(self.check(self.hook("Read", session="s3", file_path=str(self.big)), mode="off"))
+        self.assertFalse((self.home / "longhaul.log").exists(), "off, nothing is flagged and nothing logged")
+
     def test_a_compaction_or_a_clear_forgets_what_was_read(self):
         # Review, Sprint 3: after /compact the file is no longer in the
         # context, and the record said it was. The plugin's SessionStart
@@ -10755,19 +10809,58 @@ class Display(unittest.TestCase):
                        "saved 3 minutes ago)",
             "reminded": "reminder: fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 reminded at 800,000 tokens (the context is 880,332)",
             "moved": "personal-1 hit its 5-hour limit (resets 19:40); the panel chat carries on with personal-2.",
-            "index": "index: started codegraph init in ~/project (pid 4242)"}
+            "index": "index: started codegraph init in ~/project (pid 4242)",
+            "whole": "guard: advised on a whole read of ~/code/my app/longhaul.py (412,345 bytes) in "
+                     "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6",
+            "repeat": "guard: advised on a repeat read of ~/code/my app/test_longhaul.py in "
+                      "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6",
+            # The account's refusal is logged by another change's code (the
+            # wrong-account guard of 2026-10-25), not this one's: the pattern
+            # is pinned against that line's exact format as given, and its
+            # log call is not pinned below.
+            "account": "account: refused a prompt in fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6: ~/code/client is kept for "
+                       "work and work-2; the chat runs on personal-1"}
         patterns = re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
-        self.assertEqual(len(patterns), 5)
+        self.assertEqual(len(patterns), 8)
         for pattern, (kind, line) in zip(patterns, lines.items()):
             js = pattern.replace("\\/", "/")
             self.assertRegex(line, js, kind)
+        # What each new pop-up reads out of its line (the groups the toast
+        # uses, in the same order in JavaScript): the guard's whole read in
+        # either mode, a subagent's line marked so that it shows nothing (the
+        # main chat did not make that read), and the account's four parts.
+        whole, repeat, account = (pattern.replace("\\/", "/") for pattern in patterns[5:8])
+        sid = "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"
+        self.assertEqual(re.match(whole, lines["whole"]).groups(),
+                         ("advised on", "~/code/my app/longhaul.py", "412,345", sid, None))
+        self.assertEqual(re.match(whole, f"guard: refused a whole read of ~/a.py (20,001 bytes) in {sid}").groups(),
+                         ("refused", "~/a.py", "20,001", sid, None))
+        self.assertEqual(re.match(whole, f"guard: advised on a whole read of ~/a.py (20,001 bytes) in {sid} "
+                                         "(a subagent)").groups()[3:], (sid, " (a subagent)"))
+        self.assertEqual(re.match(repeat, lines["repeat"]).groups(), ("~/code/my app/test_longhaul.py", sid, None))
+        self.assertEqual(re.match(repeat, f"guard: advised on a repeat read of ~/a.py in {sid} (a subagent)").groups(),
+                         ("~/a.py", sid, " (a subagent)"))
+        self.assertIsNone(re.match(repeat, f"guard: refused a repeat read of ~/a.py in {sid}"),
+                          "the decision names no pop-up for a refused repeat")
+        self.assertEqual(re.match(account, lines["account"]).groups(),
+                         (sid, "~/code/client", "work and work-2", "personal-1"))
+        for toast in ("`Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps "
+                      "the context small.`",
+                      "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
+                      "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
+                      "`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`"):
+            self.assertIn(toast, self.SOURCE)
         # The same shapes in longhaul.py's own log calls.
         source = (HERE / "longhaul.py").read_text()
         for written in ('log(f"checkpoint for {sid} saved ({size:,} bytes)")',
                         'log(f"checkpoint for {old} carried into {sid} after clear (',
                         'log(f"reminder: {record.stem} reminded at {crossed:,} tokens (the context is {size:,})")',
                         'f"the panel chat carries on with {new}."',
-                        'log(f"index: started {program} init in {home_path(top)} (pid {pid})")'):
+                        'log(f"index: started {program} init in {home_path(top)} (pid {pid})")',
+                        'verb = "refused" if mode == "block" else "advised on"',
+                        'who = " (a subagent)" if data.get("agent_id") is not None else ""',
+                        'log(f"guard: {verb} a whole read of {shown} ({size:,} bytes) in {sid}{who}")',
+                        'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")'):
             self.assertIn(written, source, written)
 
 

@@ -3456,10 +3456,13 @@ def index_note(program: str, top: str) -> str:
 # exits 0: the engine lets a call run on any exit but 2, and a guard must
 # never stop a call it did not mean to stop. Its record holds numbers
 # only: file paths, sizes, times and counts; never a command line or a
-# file's text. A subagent is its own context (the hook input names it),
-# so its first read of a file is never a repeat of the main
-# conversation's. After a compaction or a clear nothing read before is in
-# the context, so the record forgets its reads and keeps its counts.
+# file's text. Each read it flags is one line in the log, by path, size
+# and session (the owner, 2026-10-25): the advice is the model's, and the
+# display (hooks/display.ts) shows the user the line as a pop-up. A
+# subagent is its own context (the hook input names it), so its first
+# read of a file is never a repeat of the main conversation's. After a
+# compaction or a clear nothing read before is in the context, so the
+# record forgets its reads and keeps its counts.
 # In a project with a CodeGraph index (.codegraph/) the guard also names
 # the index to the model, at startup and once a context's Bash searches
 # (SEARCH_PROGRAMS, inspect's definition) reach GUARD_SEARCHES (Sprint 6,
@@ -3570,10 +3573,11 @@ def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float)
     and unchanged since; a cat and a big are a whole cat or Read of a
     file over GUARD_BIG, the surer waste, a repeat, taken first. Each
     firing adds one to fired and the file's size to cost under its rule.
-    Returns the notes for the model and, for each file read whole, the
-    stamp to record; whether a denied call's reads are kept is the
-    caller's."""
-    notes, seen = [], {}
+    Returns the notes for the model; for each file read whole, the stamp
+    to record (whether a denied call's reads are kept is the caller's);
+    and each firing as (rule, the file by home_path, its size), for the
+    caller's log line."""
+    notes, seen, flagged = [], {}, []
     for how, path, whole in targets:
         try:
             if not path.is_file():
@@ -3599,19 +3603,22 @@ def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float)
             notes.append(f"{shown} ({size:,} bytes) was read in full {when} and has not changed since: "
                          "it is already in the context. For a part of it, use Read with offset and limit, or "
                          "grep -n for the lines you need.")
+            flagged.append(("repeat", shown, size))
         elif whole and size > GUARD_BIG and how == "cat":
             fired["cat"] += 1
             cost["cat"] += size
             notes.append(f"`cat` of {shown} ({size:,} bytes) puts the whole file into the context. "
                          "Use head, sed -n with a range, or grep -n for the part you need.")
+            flagged.append(("cat", shown, size))
         elif whole and size > GUARD_BIG and path.suffix.lower() not in GUARD_NO_PART:
             fired["big"] += 1
             cost["big"] += size
             notes.append(f"{shown} is {size:,} bytes, and a whole Read puts all of it into the context. "
                          "Read it with offset and limit, or grep -n for the part you need.")
+            flagged.append(("big", shown, size))
         if whole:
             seen[str(path)] = {**stamp, "at": round(now, 1)}
-    return notes, seen
+    return notes, seen, flagged
 
 
 def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
@@ -3624,7 +3631,8 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     PreToolUse's files are judged by the rules (guard_rules) and
     recorded; a Bash search is counted and, once the context's count
     reaches GUARD_SEARCHES in an indexed project, answered once with the
-    index."""
+    index. Each read a rule flags is one line in the log (guard_logged),
+    which the display turns into a pop-up for the user."""
     if not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
@@ -3658,13 +3666,14 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
         if search and searches >= GUARD_SEARCHES and not nudged and codegraph_index_at(data.get("cwd")):
             nudged = True  # once per context: the count goes on, the note does not
             nudge = f"{GUARD_CODEGRAPH} (This context has made {searches} searches so far.)"
-        notes, seen = guard_rules(targets, reads, fired, cost, now)
+        notes, seen, flagged = guard_rules(targets, reads, fired, cost, now)
         if not (mode == "block" and notes):  # a denied call read nothing
             reads.update(seen)
         if len(reads) > GUARD_KEEP:
             reads = dict(sorted(reads.items(), key=lambda kv: as_number(kv[1].get("at")) or 0)[-GUARD_KEEP:])
         write_json(record, {**{k: kept[k] for k in GUARD_KEPT if k in kept},
                             "reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged})
+    guard_logged(data, mode, flagged)
     if nudge:  # a search fires no rule, so the note is the whole answer; in block mode too, it is never a denial
         log(f"guard: {record.stem} was told of the CodeGraph index after {searches} searches")
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": nudge}}
@@ -3676,6 +3685,25 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
                                        "permissionDecisionReason": text}}
     text = "longhaul guard (advice; the call went ahead): " + " ".join(notes)
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+
+
+def guard_logged(data: dict, mode: str, flagged: list) -> None:
+    """One log line for each read the rules flagged (the owner, 2026-10-25,
+    "Advice, and show me": the advice is the model's alone, so the user
+    saw nothing of the guard at work; hooks/display.ts turns the line
+    into a pop-up). A whole read, by Read or by cat, names the file and
+    its size; a repeat, the file. Block mode's line says refused; a
+    subagent's says so, with the main session's id, and never names the
+    agent. A path, a size and an id: never the file's text or the
+    command line."""
+    sid = data["session_id"]
+    verb = "refused" if mode == "block" else "advised on"
+    who = " (a subagent)" if data.get("agent_id") is not None else ""
+    for rule, shown, size in flagged:
+        if rule == "repeat":
+            log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")
+        else:
+            log(f"guard: {verb} a whole read of {shown} ({size:,} bytes) in {sid}{who}")
 
 
 def guard_records(sid: str) -> list:

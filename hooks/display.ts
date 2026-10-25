@@ -59,6 +59,15 @@ async function status($: any): Promise<void> {
   } catch {}
 }
 
+// A file's name from the path a log line gives, and "412,345" bytes in KB.
+function base(path: string): string {
+  return path.split('/').pop() || path
+}
+
+function kb(bytes: string): number {
+  return Math.round(Number(bytes.replace(/,/g, '')) / 1000)
+}
+
 // The log's new lines, at most TAIL bytes of them; a log moved aside starts over.
 async function newLines($: any): Promise<string[]> {
   try {
@@ -91,6 +100,17 @@ async function popUps($: any, lines: string[]): Promise<void> {
       $.ui.toast(`Longhaul: ${m[1]} hit its ${m[2]} limit (resets ${m[3]}); this chat now runs on ${m[4]}.`, { timeoutMs: 12000 })
     else if ((m = body.match(/^index: started (\S+) init in (\S+)/)))
       $.ui.toast(`Longhaul: building a ${m[1] === 'trail' ? 'Trail-Code' : 'CodeGraph'} map of ${m[2]} in the background.`, { timeoutMs: 8000 })
+    // The guard's advice is Claude's alone; these show the user it acted.
+    // A subagent's line shows nothing: the main chat did not make that read.
+    else if ((m = body.match(/^guard: (advised on|refused) a whole read of (.+) \(([\d,]+) bytes\) in (\S+)( \(a subagent\))?$/)) && m[4] === sid && !m[5])
+      $.ui.toast(m[1] === 'refused'
+        ? `Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`
+        : `Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps the context small.`,
+        { timeoutMs: 8000 })
+    else if ((m = body.match(/^guard: advised on a repeat read of (.+) in (\S+)( \(a subagent\))?$/)) && m[2] === sid && !m[3])
+      $.ui.toast(`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`, { timeoutMs: 8000 })
+    else if ((m = body.match(/^account: refused a prompt in (\S+?): (.+?) is kept for (.+?); the chat runs on (.+)$/)) && m[1] === sid)
+      $.ui.toast(`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`, { timeoutMs: 12000 })
   }
 }
 
