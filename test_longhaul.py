@@ -11372,6 +11372,13 @@ class Release(unittest.TestCase):
             self.addCleanup(patcher.stop)
         for name in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ATTENDED"):
             os.environ.pop(name, None)  # put back by the patch of the environment
+        # The doctor's first-chat line would join every startup answer here; this
+        # class is not about it (Doctor tests it): this version is seen, and in
+        # this process the line is off, whatever version a test's manifest names.
+        seen_this_version(self.home)
+        patched = mock.patch.object(longhaul, "setup_line", lambda data: None)
+        patched.start()
+        self.addCleanup(patched.stop)
 
     def unexpected(self, *args, **kwargs):
         raise AssertionError("a request to the network this test did not give an answer for")
@@ -11544,7 +11551,7 @@ class Release(unittest.TestCase):
                 self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
                 spawn.assert_not_called()
                 self.assertEqual(longhaul.release_status()["check"], "off")
-        self.assertEqual(list(self.home.iterdir()), [], "nothing written")
+        self.assertEqual([p for p in self.home.iterdir() if p.name != "seen.json"], [], "nothing written (seen.json is setUp's)")
         self.assertEqual(longhaul.release_status()["check"], "on")
         with mock.patch.object(longhaul, "release_spawn") as spawn:
             self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
