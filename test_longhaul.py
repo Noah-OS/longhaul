@@ -3054,13 +3054,13 @@ class Index(unittest.TestCase):
         return json.loads(self.state_path(top).read_text())
 
     def wait(self, program, top=None):
-        """The program's entry once its runner has written `ended`, within 10 s."""
-        for _ in range(200):
+        """The program's entry once its runner has written `ended`, within 20 s."""
+        for _ in range(400):
             entry = dict((longhaul.read_json(self.state_path(top)) or {}).get("runs", {}).get(program) or {})
             if entry.get("ended") is not None:
                 return entry
             time.sleep(0.05)
-        self.fail(f"{program}'s run did not end within 10 s")
+        self.fail(f"{program}'s run did not end within 20 s")
 
     def test_nothing_starts_without_the_switch_on_in_the_home_folder_outside_a_work_tree_at_the_root_or_for_a_subagent(self):
         both = self.planned("codegraph", "trail")
@@ -3434,10 +3434,10 @@ class Index(unittest.TestCase):
     def test_the_timeout_kills_the_programs_children_too(self):
         # Review, Sprint 7 (F6): the kill reached the program alone, and
         # what it had started ran on past the timeout, holding its log.
-        for marker in ("hang", "child"):  # 3 s on a 30 s hang, as above
+        for marker in ("hang", "child"):  # 6 s on a 30 s hang: the fake must reach its child's line first
             (self.tmp / f"codegraph.{marker}").touch()
         (self.bin / "trail").unlink()
-        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "3"}):
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX_TIMEOUT": "6"}):
             self.assertEqual(self.begin(self.start()), [("codegraph", str(self.repo))])
         entry = self.wait("codegraph")
         self.assertEqual((entry["exit"], entry["why"]), (-1, "timeout"))

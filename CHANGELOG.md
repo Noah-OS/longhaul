@@ -4,7 +4,17 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## 0.2.4 - 2026-10-25
 
-The context reminder keeps working through a long conversation.
+The context reminder keeps working through a long conversation, work folders stay on the work account, and the guard shows what it does.
+
+### Added
+
+- **A chat on the wrong account is stopped in a folder kept for another one.** A new prompt hook, `longhaul account-check`, refuses each prompt in a folder that `accounts.json` keeps for some accounts (their `repositories`) when the chat runs on any other account, by its `CLAUDE_CONFIG_DIR`. Nothing is sent, and the line says how to fix it: close the chat and open it again, so it starts on the right account. It is logged, and the Longhaul display shows it. This catches a chat whose process began before Longhaul was set up, as two VS Code chats in a work folder did. Whatever the hook cannot read lets the prompt through.
+- **The guard shows what it does.** Each read it flags, advised on or refused, is one line in `~/.longhaul/longhaul.log` with the file's path and size, never its content, and the Longhaul display shows a pop-up for this chat's flags. It still advises only Claude by default.
+
+### Changed
+
+- **A code map folder that git doesn't ignore goes into the repository's local exclude.** When Longhaul builds a CodeGraph or Trail-Code map in a repository that doesn't ignore `.codegraph/` or `.trail/`, it adds the folder to `.git/info/exclude`, which is never committed, and logs it. Before, the new folder showed as untracked in `git status`.
+- **A trial counts long chats too.** A chat begun before a trial's start now counts from the start onward, only its lines inside the trial, and stays in its half for the whole trial. `longhaul trial status` and `report` say how many began before.
 
 ### Fixed
 
