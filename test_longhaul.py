@@ -84,6 +84,18 @@ def seen_this_version(home: Path) -> None:
     (home / "seen.json").write_text(json.dumps({"version": version}))
 
 
+def no_guide(test: unittest.TestCase, home: Path) -> None:
+    """Auto Model off in `home`'s config.json, and in this process (CONFIG)
+    for the test: since the owner's decision of 2026-10-25 its guide joins
+    the answer of every session start in guide mode, the default. The
+    classes that start sessions through the guard or the checkpoint's hook
+    are not about the guide (Models tests it)."""
+    (home / "config.json").write_text(json.dumps({"models": "off"}))
+    patcher = mock.patch.object(longhaul, "CONFIG", home / "config.json")
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 def unreadable_accounts(*accounts) -> dict:
     """accounts.json as a hand edit leaves it, by case: the list of
     `accounts` with a trailing comma, and the first alone as an object, not
@@ -1404,7 +1416,11 @@ class Inspect(unittest.TestCase):
             "  main      claude-haiku-5-5           7            50             0           2",
             "  subagents claude-haiku-5-5           2         7,105             0         308",
             "  subagents claude-opus-5-5            1             0           200           5"])
-        self.assertTrue(out[head + 6].startswith("Context"), out[head + 6])
+        # The owner, 2026-10-25: the subagents by type and model come next, then the context.
+        self.assertEqual(out[head + 6], "Subagents by type and model [transcript, measured]")
+        self.assertEqual([line.split()[:2] for line in out[head + 9:head + 11]], [["?", "haiku"], ["?", "opus"]])
+        self.assertTrue(out[head + 11].startswith("  total"), out[head + 11])
+        self.assertTrue(out[head + 12].startswith("Context"), out[head + 12])
 
     def test_tokens_by_model_add_up_to_the_tokens_and_a_response_with_no_model_is_kept_as_unknown(self):
         unnamed = self.reply(inp=5, out=3)
@@ -1427,6 +1443,87 @@ class Inspect(unittest.TestCase):
         out = longhaul.inspect_lines(r)
         head = out.index("Tokens by model [transcript, measured: the API's own counts]")
         self.assertEqual(out[head + 1], "  none")
+
+    def test_subagents_are_shown_by_agent_type_and_model_with_their_api_price(self):
+        # The owner, 2026-10-25 (Auto Model by the task's difficulty): what
+        # ran where. A row per agent type, from each subagent's meta.json,
+        # and model family, from its responses: runs, requests, cache read
+        # and the API-price equivalent, by PRICES. A transcript with no
+        # meta.json is "?"; one with no response is no run; a type that is
+        # not a plain name is "other", never shown as written.
+        self.write(self.reply())
+        self.agent(self.reply(inp=10, write=100, read=1_000_000, out=50, model="claude-haiku-4-5")
+                   + self.reply(inp=1, read=2_000_000, out=5, model="claude-haiku-4-5"), "agent-a1")
+        self.meta("agent-a1", agentType="Explore", model="haiku")
+        self.agent(self.reply(inp=1, read=500_000, out=5, model="claude-haiku-4-5"), "agent-a2")
+        self.meta("agent-a2", agentType="Explore")
+        self.agent(self.reply(inp=2, write=50_000, read=3_000_000, out=20_000), "agent-a3")
+        self.meta("agent-a3", agentType="implementer")
+        self.agent(self.reply(inp=2, read=100_000, out=20, model="claude-sonnet-5-5"), "agent-a4")  # no meta.json
+        self.agent([{"type": "assistant", "isApiErrorMessage": True, "error": "server_error",
+                     "message": {"id": "e1", "model": "<synthetic>", "content": []}}], "agent-a5")
+        self.meta("agent-a5", agentType="Explore")
+        self.agent(self.reply(inp=1, out=1, model="claude-haiku-4-5"), "agent-a6")
+        self.meta("agent-a6", agentType="do the task SENTINEL")
+        r = longhaul.inspect_transcript(self.path)
+
+        def price(family, inp, write, read, out):
+            rates = longhaul.PRICES[family]
+            return (inp * rates["input"] + write * rates["cache_write"] + read * rates["cache_read"]
+                    + out * rates["output"]) / 1e6
+
+        rows = r["subagent_models"]
+        self.assertEqual([(x["type"], x["model"], x["runs"], x["requests"], x["cache_read"]) for x in rows], [
+            ("implementer", "opus", 1, 1, 3_000_000), ("Explore", "haiku", 2, 3, 3_500_000),
+            ("?", "sonnet", 1, 1, 100_000), ("other", "haiku", 1, 1, 0)])
+        for x, want in zip(rows, (price("opus", 2, 50_000, 3_000_000, 20_000),
+                                  price("haiku", 12, 100, 3_500_000, 60), price("sonnet", 2, 0, 100_000, 20),
+                                  price("haiku", 1, 0, 0, 1))):
+            self.assertAlmostEqual(x["price_usd"], want, places=6)
+        out = longhaul.inspect_lines(r)
+        head = out.index("Subagents by type and model [transcript, measured]")
+        # Right after Tokens by model: its heading, its column header and a row per model.
+        self.assertEqual(out[head - 2 - len(r["model_tokens"])], "Tokens by model [transcript, measured: the API's own counts]")
+        self.assertEqual(out[head + 1:head + 9], [
+            "  runs: subagent transcripts with a response on that model; API price: their tokens at Longhaul's price table",
+            "  type         model     runs  requests    cache read   API price",
+            "  implementer  opus         1         1     3,000,000       $1.22",
+            "  Explore      haiku        2         3     3,500,000       $0.55",
+            "  ?            sonnet       1         1       100,000       $0.02",
+            "  other        haiku        1         1             0       $0.00",
+            "  total                     5         6     6,600,000       $1.79",
+            "Context, main conversation [transcript, measured: input, cache write and cache read per request]"])
+        # --json: a record per number of each row, its source; no total.
+        got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["scope"], x["source"], x["confidence"])
+               for x in self.records("s1") if x["metric"].startswith("subagent_") and x["metric"] != "subagent_transcripts"}
+        self.assertEqual({k: v for k, v in got.items() if k[0] != "subagent_price_usd"}, {
+            ("subagent_runs", "implementer opus"): (1, "runs", "subagents", "transcript", "counted"),
+            ("subagent_requests", "implementer opus"): (1, "requests", "subagents", "transcript", "counted"),
+            ("subagent_cache_read", "implementer opus"): (3_000_000, "tokens", "subagents", "transcript", "measured"),
+            ("subagent_runs", "Explore haiku"): (2, "runs", "subagents", "transcript", "counted"),
+            ("subagent_requests", "Explore haiku"): (3, "requests", "subagents", "transcript", "counted"),
+            ("subagent_cache_read", "Explore haiku"): (3_500_000, "tokens", "subagents", "transcript", "measured"),
+            ("subagent_runs", "? sonnet"): (1, "runs", "subagents", "transcript", "counted"),
+            ("subagent_requests", "? sonnet"): (1, "requests", "subagents", "transcript", "counted"),
+            ("subagent_cache_read", "? sonnet"): (100_000, "tokens", "subagents", "transcript", "measured"),
+            ("subagent_runs", "other haiku"): (1, "runs", "subagents", "transcript", "counted"),
+            ("subagent_requests", "other haiku"): (1, "requests", "subagents", "transcript", "counted"),
+            ("subagent_cache_read", "other haiku"): (0, "tokens", "subagents", "transcript", "measured")})
+        prices = {k[1]: v for k, v in got.items() if k[0] == "subagent_price_usd"}
+        self.assertEqual(set(prices), {"implementer opus", "Explore haiku", "? sonnet", "other haiku"})
+        self.assertAlmostEqual(prices["implementer opus"][0], price("opus", 2, 50_000, 3_000_000, 20_000), places=6)
+        self.assertEqual(prices["implementer opus"][1:], ("usd", "subagents", "estimate", "estimated"))
+        self.assertNotIn("SENTINEL", "\n".join(out) + self.cli("s1", "--json").stdout)
+
+    def test_no_subagent_no_rows_by_type_and_model(self):
+        self.write(self.reply())
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["subagent_models"], [])
+        out = longhaul.inspect_lines(r)
+        head = out.index("Subagents by type and model [transcript, measured]")
+        self.assertEqual(out[head + 1], "  none")
+        self.assertFalse(any(x["metric"].startswith("subagent_") and x["metric"] != "subagent_transcripts"
+                             for x in self.records("s1")))
 
     CONSULTATIONS = "Consultations [longhaul advisor trace, counted; own tokens: the advisor's transcripts, measured]"
 
@@ -2363,6 +2460,7 @@ class Guard(unittest.TestCase):
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
         seen_this_version(self.home)
+        no_guide(self, self.home)
         self.big = self.tmp / "big.py"
         self.big.write_text("x" * 30_000)
         self.small = self.tmp / "small.py"
@@ -2962,6 +3060,7 @@ class Index(unittest.TestCase):
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
         seen_this_version(self.home)
+        no_guide(self, self.home)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         for name in self.MAPS:
@@ -4805,7 +4904,14 @@ class Advisor(unittest.TestCase):
         out = self.run_hook(self.HOOK, "")
         self.assertEqual((out.returncode, out.stdout), (0, ""))
         written = sorted(p.relative_to(self.home).as_posix() for p in self.home.rglob("*") if p.is_file())
-        self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "usage/main.json"], "the fixture's own files alone")
+        # The fixture's own files, and since the owner's decision of
+        # 2026-10-25 (Auto Model: Claude picks, Longhaul guides) the log's
+        # line for each subagent call's model: its type and model alone.
+        self.assertEqual(written, ["advisor/enabled.json", "advisor/probe.json", "longhaul.log", "usage/main.json"])
+        lines = [line.split(" ", 2)[2] for line in (self.home / "longhaul.log").read_text().splitlines()]
+        self.assertEqual(len(lines), 2, lines)
+        for line, kind in zip(lines, ("Explore", "general-purpose")):
+            self.assertRegex(line, rf"^models: {kind} on [a-z?]+ \(inherited\) in s1$")
         # The agent type's name, however it is cased or spaced, is a consultation.
         self.assertTrue(longhaul.advisor_consultation(self.call(agent=" Longhaul:Advisor ")))
 
@@ -6634,6 +6740,9 @@ class Checkpoint(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+        # Auto Model's guide joins this hook's answer at every compact, clear
+        # and resume in guide mode; the size test below has the two together.
+        no_guide(self, self.home)
         # The carry window is read when the hook runs: the default unless a test sets it.
         patcher = mock.patch.dict(os.environ)
         patcher.start()
@@ -6757,6 +6866,14 @@ class Checkpoint(unittest.TestCase):
             os.utime(self.work / name, (at + 5, at + 5))
         text = self.context(self.check(self.start(), now=at + 10))
         self.assertEqual(text.count(" (changed)"), 20)
+        self.assertLess(len(text), 10_000, len(text))
+        # With Auto Model's guide after it, as the hook answers in guide mode
+        # (the owner, 2026-10-25): still under the cap.
+        with mock.patch.object(longhaul, "CONFIG", self.tmp / "no-config.json"):
+            answer = longhaul.models_guide_join(self.start(), self.check(self.start(), now=at + 10),
+                                                longhaul.CHECKPOINT_SOURCES)
+        text = self.context(answer)
+        self.assertTrue(text.endswith("\n\n" + longhaul.MODELS_GUIDE))
         self.assertLess(len(text), 10_000, len(text))
         # Carried over after a /clear, its line first: still under the cap.
         text = self.context(self.check(self.start("clear", "s2", cwd=self.work), now=at + 10))
@@ -7664,6 +7781,8 @@ class InspectSkill(unittest.TestCase):
         # Sprint 8: the two new sections, and the trace among the sources the body names.
         self.assertIn("usage by kind and by model", head)
         self.assertIn("the Advisor's consultations when there were any", head)
+        # The owner, 2026-10-25: the section of subagents by type and model.
+        self.assertIn("the subagents by agent type and model", head)
         self.assertIn("the guard's record and the Advisor experiment's trace", " ".join(body.split()))
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/inspect/SKILL.md"], cwd=HERE).returncode, 1)
@@ -7760,6 +7879,7 @@ class Reminder(unittest.TestCase):
         self.saved = longhaul.LONGHAUL_HOME
         longhaul.LONGHAUL_HOME = self.home
         seen_this_version(self.home)
+        no_guide(self, self.home)
         self.transcript = self.tmp / "s1.jsonl"
         self.transcript.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}) + "\n")
         self.n = 0
@@ -8553,6 +8673,102 @@ class Trial(unittest.TestCase):
                                                                                  "cache_read_input_tokens": 1_000}}}) + "\n"
                                 for i, t in enumerate(starts)))
         return path
+
+    def run_of(self, sid, name, kind, start, model="claude-haiku-4-5", requests=2, ends="answer", read=1_000_000,
+               folder="-code-app"):
+        """A subagent's run under session `sid`: its transcript, `start` seconds
+        from now, a prompt and then `requests` responses over two minutes,
+        each but the last a tool call and its result; and its meta.json,
+        naming its agent type `kind`. It ends as `ends` says: answer (the
+        last response a text reply), error (the last tool call's result,
+        then an API error) or open (the last response a tool call, with
+        nothing after it: stopped before its final answer)."""
+        t0 = time.time() + start
+        step = 120 / (requests + 1)
+        lines = [(t0, {"type": "user", "isSidechain": True, "message": {"role": "user", "content": f"task {self.S}"}})]
+        for i in range(requests):
+            self.n += 1
+            final = i == requests - 1 and ends == "answer"
+            block = ({"type": "text", "text": f"done {self.S}"} if final else
+                     {"type": "tool_use", "id": f"tu{self.n}", "name": "Read", "input": {"file_path": f"/{self.S}"}})
+            lines.append((t0 + (i + 1) * step, {"type": "assistant", "isSidechain": True, "message": {
+                "id": f"sub_{self.n}", "model": model, "role": "assistant", "content": [block],
+                "usage": {"input_tokens": 50, "output_tokens": 70, "cache_read_input_tokens": read}}}))
+            if not final and (i < requests - 1 or ends == "error"):
+                lines.append((t0 + (i + 1.5) * step, {"type": "user", "isSidechain": True, "message": {
+                    "role": "user", "content": [{"type": "tool_result", "tool_use_id": f"tu{self.n}",
+                                                 "content": f"ok {self.S}"}]}}))
+        if ends == "error":
+            lines.append((t0 + 120, {"type": "assistant", "isSidechain": True, "isApiErrorMessage": True,
+                                     "error": "server_error", "message": {
+                                         "id": f"err_{self.n}", "model": "<synthetic>", "role": "assistant",
+                                         "content": [{"type": "text", "text": f"API Error {self.S}"}]}}))
+        folder = self.claude / "projects" / folder / sid / "subagents"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"agent-{name}.jsonl").write_text("".join(json.dumps({**line, "timestamp": self.stamp(at)}) + "\n"
+                                                           for at, line in lines))
+        (folder / f"agent-{name}.meta.json").write_text(json.dumps({"agentType": kind, "description": self.S}))
+
+    def test_the_report_gives_each_arm_its_subagents_by_model_and_its_redos(self):
+        # The owner, 2026-10-25 ("Claude picks, Longhaul guides"): a models
+        # trial compares guided (routed) against unguided (usual), so each
+        # arm shows its subagent requests and cost by model family, and its
+        # redos: a run of an agent type started again within 10 minutes of
+        # the end of a run of that type that failed, its last line an API
+        # error or no final answer.
+        self.trial(started=-10, name="subagent-models", kind="models")
+        (routed,), (usual,) = self.ids("habit", 1, "g"), self.ids("usual", 1, "u")
+        t0 = -9 * self.DAY
+        self.session(routed, t0, minutes=180)
+        self.session(usual, t0, minutes=180)
+        self.run_of(routed, "r1", "Explore", t0 + 60, ends="error")  # ends at t0 + 180
+        self.run_of(routed, "r2", "Explore", t0 + 480)  # 5 minutes after: a redo
+        self.run_of(routed, "r3", "implementer", t0 + 1200, model="claude-sonnet-5-5", requests=3)
+        opus = "claude-opus-5-5"
+        self.run_of(usual, "u1", "implementer", t0 + 60, model=opus, ends="open")  # ends at t0 + 180
+        self.run_of(usual, "u2", "implementer", t0 + 180 + 20 * 60, model=opus)  # 20 minutes after: none
+        self.run_of(usual, "u3", "reviewer", t0 + 3000, model=opus, ends="open")  # ends at t0 + 3120
+        self.run_of(usual, "u4", "Explore", t0 + 3150, model=opus)  # another type: none
+        self.run_of(usual, "u5", "reviewer", t0 + 3120 + 9 * 60, model=opus)  # 9 minutes after: a redo
+        self.run_of(usual, "u6", "reviewer", t0 + 5000, model=opus)  # an answer
+        self.run_of(usual, "u7", "reviewer", t0 + 5180, model=opus)  # after an answer: none
+        self.run_of(usual, "u8", "Explore", t0 + 6000, model=opus, ends="error")  # ends at t0 + 6120
+        self.run_of(usual, "u9", "Explore", t0 + 6121, model=opus)  # a redo
+        r = self.report()
+        chains = {c["chain"]: c for c in r["chains"]}
+        self.assertEqual((chains[routed]["arm"], chains[usual]["arm"]), ("habit", "usual"))
+        self.assertEqual(chains[routed]["subagent_requests"], {"sonnet": 3, "haiku": 4})
+        self.assertEqual(chains[usual]["subagent_requests"], {"opus": 18})
+        self.assertEqual((chains[routed]["redos"], chains[usual]["redos"]), (1, 2))
+        each = {"haiku": self.price("haiku", 50, 0, 1_000_000, 70), "sonnet": self.price("sonnet", 50, 0, 1_000_000, 70),
+                "opus": self.price("opus", 50, 0, 1_000_000, 70)}
+        self.assertEqual(set(chains[routed]["subagent_price_usd"]), {"sonnet", "haiku"})
+        self.assertAlmostEqual(chains[routed]["subagent_price_usd"]["haiku"], 4 * each["haiku"], places=6)
+        self.assertAlmostEqual(chains[routed]["subagent_price_usd"]["sonnet"], 3 * each["sonnet"], places=6)
+        self.assertAlmostEqual(chains[usual]["subagent_price_usd"]["opus"], 18 * each["opus"], places=6)
+        h, u = r["arms"]["habit"], r["arms"]["usual"]
+        self.assertEqual((h["subagent_requests"], u["subagent_requests"]), ({"sonnet": 3, "haiku": 4}, {"opus": 18}))
+        self.assertEqual((h["redos"], u["redos"]), (1, 2))
+        self.assertAlmostEqual(u["subagent_price_usd"]["opus"], 18 * each["opus"], places=6)
+        code, out, err = self.cli("report")
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn(self.S, out)
+
+        def row(name, routed_half, usual_half):
+            return f"  {name:<36}{routed_half:>14}{usual_half:>14}"
+
+        lines = out.splitlines()
+        start = lines.index(row("subagent requests, opus", "0", "18"))
+        self.assertEqual(lines[start:start + 7], [
+            row("subagent requests, opus", "0", "18"),
+            row("subagent requests, sonnet", "3", "0"),
+            row("subagent requests, haiku", "4", "0"),
+            row("subagent cost, opus", "$0.00", f"${18 * each['opus']:,.2f}"),
+            row("subagent cost, sonnet", f"${3 * each['sonnet']:,.2f}", "$0.00"),
+            row("subagent cost, haiku", f"${4 * each['haiku']:,.2f}", "$0.00"),
+            row("redos (same type within 10 min)", "1", "2")])
+        self.assertLess(start, lines.index(next(l for l in lines if l.startswith("The rule ("))))
+        self.assertEqual(lines[-1], "no saving shown")
 
     def test_a_chat_begun_before_the_start_counts_only_its_lines_inside_the_window(self):
         # The owner, 2026-10-25 ("Checkpoint trial, long chats too"): a chat
@@ -11039,10 +11255,22 @@ class PipePieces(unittest.TestCase):
 
 
 class Models(unittest.TestCase):
-    """Auto Model for subagents (the owner, 2026-10-23): a table of agent type
-    -> model in config.json, applied by the PreToolUse hook, lowered only."""
+    """Auto Model for subagents. The owner, 2026-10-23: a table of agent type
+    -> model in config.json, applied by the PreToolUse hook, lowered only.
+    The owner, 2026-10-25 ("Claude picks, Longhaul guides"; the design in
+    docs/plans/2026-10-25-auto-model-by-task.md): by default the main
+    conversation is given a short guide at each start and sets each
+    subagent's model itself; every pick is logged, by type and model; an
+    optional cap lowers a call above it. The table is `on` mode's."""
 
     S = "SENTINEL-OKAPI-7731"
+    SID = "5e0c1a2b-0000-4000-8000-000000000001"
+    # The owner's text, word for word (2026-10-25): one paragraph.
+    GUIDE = ("Longhaul: when you start a subagent (Agent or Task), set its `model` by how hard its job is: `haiku` "
+             "for lookups, listing, reading and summarizing, and small mechanical edits; `sonnet` for ordinary "
+             "implementation, tests, refactors in a few files and routine reviews; `opus` for design and "
+             "architecture, hard or long debugging, security review, work across many files, or anything where a "
+             "wrong answer is costly. When unsure, `sonnet`. Set it on every call.")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
@@ -11080,6 +11308,44 @@ class Models(unittest.TestCase):
         folder = (where or self.repo) / ".claude" / "agents"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{kind}.md").write_text(f"---\nname: {kind}\n{front}---\nThe body, {self.S}.\n")
+
+    def start(self, source="startup", session=SID, agent=None):
+        """A SessionStart hook's input, as Claude Code gives it."""
+        data = {"session_id": session, "transcript_path": str(self.transcript), "cwd": str(self.tmp),
+                "hook_event_name": "SessionStart", "source": source}
+        if agent is not None:
+            data["agent_id"] = agent
+        return data
+
+    def given(self, command, data):
+        """What the SessionStart hook `command` (guard, checkpoint) adds to the
+        model's context, run as hooks.json runs it but in this process; ""
+        for nothing. The startup's other parts are quiet: no index, no
+        release check, no first-chat line (an unattended run)."""
+        os.environ.update(LONGHAUL_INDEX="off", LONGHAUL_UPDATE_CHECK="off", CLAUDE_CODE_SESSION_ATTENDED="0")
+        for name in Checkpoint.SESSION_VARS:
+            os.environ.pop(name, None)
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(longhaul.main([command]), 0)
+        text = out.getvalue()
+        return json.loads(text).get("hookSpecificOutput", {}).get("additionalContext", "") if text.strip() else ""
+
+    def arms(self):
+        """A models trial on, from a second ago, and a session id in each of its halves."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.trial_start(14, time.time() - 1, "models"), 0)
+        arms = {}
+        for n in range(64):
+            sid = f"5e0c1a2b-0000-4000-8000-{n:012d}"
+            arms.setdefault(longhaul.trial_arm(sid), sid)
+        return arms
+
+    def logged(self):
+        """The log's models lines, without their time."""
+        path = self.home / "longhaul.log"
+        lines = [line.split(" ", 2) for line in (path.read_text() if path.exists() else "").splitlines()]
+        return [parts[2] for parts in lines if len(parts) == 3 and parts[2].startswith("models: ")]
 
     def test_the_table_lowers_a_type_to_its_model_and_keeps_every_other_field(self):
         self.config(subagents={"implementer": "sonnet"}, models="on")
@@ -11134,7 +11400,12 @@ class Models(unittest.TestCase):
     def test_where_it_applies_off_on_or_a_models_trials_routed_arm(self):
         self.config(subagents={"implementer": "sonnet"}, models="off")
         self.assertIsNone(self.routed(self.call()))
-        self.config(subagents={"implementer": "sonnet"})  # trial, the default: no trial on, so nowhere
+        # The default was trial until the owner's decision of 2026-10-25
+        # ("Claude picks, Longhaul guides"): it is guide now, which applies
+        # no table; trial mode keeps its meaning, so it is named here.
+        self.config(subagents={"implementer": "sonnet"})
+        self.assertIsNone(self.routed(self.call()), "guide, the default: the table is not applied")
+        self.config(subagents={"implementer": "sonnet"}, models="trial")  # no trial on, so nowhere
         self.assertIsNone(self.routed(self.call()))
         now = time.time()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -11148,16 +11419,23 @@ class Models(unittest.TestCase):
         record = json.loads((self.home / "trial.json").read_text())
         self.assertEqual((record["kind"], record["name"]), ("models", "subagent-models"))
 
-    def test_a_models_trial_needs_a_table_and_the_trial_mode_and_names_its_arm_routed(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(longhaul.trial_start(14, time.time(), "models"), 2)
-        self.assertIn("no table of subagent models", err.getvalue())
-        self.config(subagents={"implementer": "sonnet"}, models="on")
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(longhaul.trial_start(14, time.time(), "models"), 2)
-        self.assertIn("`longhaul models trial`", err.getvalue())
+    def test_a_models_trial_needs_the_guide_or_the_trial_mode_and_names_its_arm_routed(self):
+        # Until the owner's decision of 2026-10-25 a models trial routed by
+        # the table alone, so it needed one. It compares guided against
+        # unguided now: guide (the default) or trial mode, with or without
+        # a table; on and off would leave no half usual or none routed.
+        for mode in ("on", "off"):
+            self.config(subagents={"implementer": "sonnet"}, models=mode)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(longhaul.trial_start(14, time.time(), "models"), 2)
+            self.assertIn("`longhaul models guide`", err.getvalue(), mode)
+            self.assertIn("`longhaul models trial`", err.getvalue(), mode)
+        self.assertFalse((self.home / "trial.json").exists())
+        self.config()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.trial_start(14, time.time() - 1, "models"), 0, "guide, no table")
+        (self.home / "trial.json").unlink()
         self.config(subagents={"implementer": "sonnet"}, models="trial")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -11189,6 +11467,11 @@ class Models(unittest.TestCase):
         code, out = run()
         self.assertEqual(code, 0)
         self.assertIn("`longhaul models implementer sonnet`", out, "the owner's starting table, suggested")
+        # The owner's decision of 2026-10-25: guide is the default.
+        self.assertIn("Where it applies: guide (Claude picks each subagent's model by Longhaul's guide; the table is not "
+                      "applied)", out)
+        self.assertIn("The guide: given at each start of the main conversation", out)
+        self.assertIn("Cap: none", out)
         self.assertEqual(run("implementer", "Sonnet")[0], 0)
         self.assertEqual(run("reviewer", "keep")[0], 0)
         self.assertEqual(run("on")[0], 0)
@@ -11197,8 +11480,173 @@ class Models(unittest.TestCase):
         code, out = run()
         self.assertRegex(out, r"implementer\s+sonnet")
         self.assertIn("Where it applies: on (every session)", out)
+        self.assertIn("The guide: not given", out, "on is the table's mode")
         self.assertEqual(run("implementer", "gpt-5")[0], 2)
         self.assertEqual(run("one", "two", "three")[0], 2)
+        # guide sets the mode; cap MODEL sets the cap and cap off removes it.
+        self.assertEqual(run("guide")[0], 0)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "guide")
+        self.assertEqual(run("cap", "Sonnet")[0], 0)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models_cap"], "sonnet")
+        self.assertIn("Cap: sonnet", run()[1])
+        self.assertEqual(run("cap", "gpt-5")[0], 2)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models_cap"], "sonnet", "unchanged")
+        self.assertEqual(run("cap", "off")[0], 0)
+        self.assertNotIn("models_cap", json.loads((self.home / "config.json").read_text()))
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["subagents"],
+                         {"implementer": "sonnet", "reviewer": "keep"}, "the table kept")
+
+    def test_the_guide_is_given_once_at_each_start_of_the_main_conversation(self):
+        # The owner, 2026-10-25: "Claude picks, Longhaul guides". Startup's
+        # answer is the guard's hook's; compact, clear and resume's the
+        # checkpoint's (the guard's compact|clear hook runs too and adds
+        # nothing), so each start has the guide once.
+        self.assertNotIn("\n", self.GUIDE, "one paragraph")
+        for source, command in (("startup", "guard"), ("compact", "checkpoint"), ("clear", "checkpoint"),
+                                ("resume", "checkpoint")):
+            with self.subTest(source):
+                self.assertEqual(self.given(command, self.start(source)), self.GUIDE)
+        for source in ("compact", "clear"):
+            self.assertEqual(self.given("guard", self.start(source)), "", source)
+        self.assertEqual(self.given("checkpoint", self.start("startup")), "")
+        self.assertEqual(self.logged().count(f"models: the guide given at startup in {self.SID[:8]}"), 1)
+        # After the checkpoint's own text, in the same answer.
+        state = json.dumps({"goal": f"the parser {self.S}", "next_action": "its tests"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.checkpoint_save(self.SID, state, str(self.tmp), None), 0)
+        text = self.given("checkpoint", self.start("compact"))
+        self.assertTrue(text.startswith("longhaul checkpoint, written "), text[:80])
+        self.assertTrue(text.endswith("\n\n" + self.GUIDE), text[-80:])
+        self.assertEqual(text.count(self.GUIDE), 1)
+        # Never a subagent's start; never with Auto Model off; not in on
+        # mode, the table's, or trial mode with no models trial on.
+        for source, command in (("startup", "guard"), ("compact", "checkpoint"), ("resume", "checkpoint")):
+            self.assertEqual(self.given(command, self.start(source, agent="agent-1")), "", source)
+        for mode in ("off", "on", "trial"):
+            self.config(models=mode)
+            for source, command in (("startup", "guard"), ("resume", "checkpoint")):
+                self.assertEqual(self.given(command, self.start(source, session="s9")), "", (mode, source))
+        log = (self.home / "longhaul.log").read_text()
+        self.assertNotIn(self.S, log)
+
+    def test_in_a_models_trial_the_routed_half_gets_the_guide_and_the_usual_half_never(self):
+        self.config()
+        arms = self.arms()
+        for mode in ("guide", "trial", "on"):
+            self.config(models=mode)
+            with self.subTest(mode):
+                self.assertEqual(self.given("guard", self.start(session=arms["habit"])), self.GUIDE)
+                self.assertEqual(self.given("checkpoint", self.start("resume", session=arms["habit"])), self.GUIDE)
+                self.assertEqual(self.given("guard", self.start(session=arms["usual"])), "")
+                self.assertEqual(self.given("checkpoint", self.start("resume", session=arms["usual"])), "")
+        self.config(models="off")
+        self.assertEqual(self.given("guard", self.start(session=arms["habit"])), "", "off: never")
+
+    def test_the_default_mode_is_guide_and_the_table_applies_only_in_on_and_trial(self):
+        # The owner's decision of 2026-10-25: guide is the default for a
+        # config.json that names no mode (it was trial), and in guide mode
+        # the table is not applied; on keeps it exactly as before.
+        self.config(subagents={"implementer": "sonnet"})
+        self.assertEqual(longhaul.models_settings(), ({"implementer": "sonnet"}, "guide"))
+        self.assertIsNone(self.routed(self.call()))
+        for junk in ("nonsense", 7, None):
+            self.config(subagents={"implementer": "sonnet"}, models=junk)
+            self.assertEqual(longhaul.models_settings()[1], "guide", junk)
+        self.config(subagents={"implementer": "sonnet"}, models="guide")
+        self.assertIsNone(self.routed(self.call()))
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        self.assertEqual(self.routed(self.call()), "sonnet")
+        self.assertEqual(longhaul.MODELS_MODES, ("off", "guide", "on", "trial"))
+
+    def test_each_pick_is_logged_guided_its_own_or_inherited_and_never_its_text(self):
+        self.config()
+        self.define("planner", "model: Sonnet\n")
+        self.define("helper", "model: inherit\n")
+        self.assertIsNone(self.routed(self.call(model="haiku")), "a pick is never changed without a cap")
+        self.assertIsNone(self.routed(self.call(model="claude-opus-5-5")))
+        self.assertIsNone(self.routed(self.call("planner")))
+        self.assertIsNone(self.routed(self.call("helper")))
+        self.assertIsNone(self.routed(self.call("reviewer")))
+        os.environ["CLAUDE_CODE_SUBAGENT_MODEL"] = "haiku"
+        self.assertIsNone(self.routed(self.call("reviewer")))
+        del os.environ["CLAUDE_CODE_SUBAGENT_MODEL"]
+        data = self.call()
+        del data["tool_input"]["subagent_type"]  # Claude Code's default type
+        self.assertIsNone(self.routed(data))
+        self.transcript.unlink()
+        self.assertIsNone(self.routed(self.call("reviewer")))
+        sid = self.SID[:8]
+        self.assertEqual(self.logged(), [
+            f"models: implementer picked haiku (guided) in {sid}",
+            f"models: implementer picked opus (guided) in {sid}",
+            f"models: planner on sonnet (its own) in {sid}",
+            f"models: helper on opus (inherited) in {sid}",
+            f"models: reviewer on opus (inherited) in {sid}",
+            f"models: reviewer on haiku (inherited) in {sid}",
+            f"models: general-purpose on opus (inherited) in {sid}",
+            f"models: reviewer on unknown (inherited) in {sid}"])
+        # Not a subagent's own call, not a consultation, not with the model
+        # forced or Auto Model off: no line.
+        self.main("claude-opus-5-5")
+        before = len(self.logged())
+        self.routed({**self.call(model="haiku"), "agent_id": "agent-1"})
+        longhaul.advisor_check(self.call("longhaul:advisor"), time.time())
+        os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
+        self.routed(self.call(model="haiku"))
+        del os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
+        self.config(models="off")
+        self.routed(self.call(model="haiku"))
+        self.assertEqual(self.logged()[before:], [])
+        # In on mode the table's lowering is the one line; a call it leaves
+        # alone is a pick like any other.
+        self.config(subagents={"implementer": "sonnet"}, models="on")
+        self.assertEqual(self.routed(self.call()), "sonnet")
+        self.assertIsNone(self.routed(self.call("reviewer", model="haiku")))
+        self.assertEqual(self.logged()[before:], [f"models: implementer opus -> sonnet in {sid}",
+                                                  f"models: reviewer picked haiku (guided) in {sid}"])
+        log = (self.home / "longhaul.log").read_text()
+        for text in ("do the task", "Run it", self.S):
+            self.assertNotIn(text, log)
+
+    def test_the_cap_lowers_a_call_above_it_leaves_the_rest_and_the_forced_model_wins(self):
+        self.config(models_cap="sonnet")
+        data = self.call(model="opus", run_in_background=True, isolation="worktree")
+        out = longhaul.advisor_check(data, time.time())["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertEqual(out["updatedInput"], {**data["tool_input"], "model": "sonnet"}, "every other field as it was")
+        sid = self.SID[:8]
+        self.assertEqual(self.logged(), [f"models: implementer picked opus (guided) in {sid}",
+                                         f"models: implementer capped opus -> sonnet in {sid}"])
+        self.assertIsNone(self.routed(self.call(model="sonnet")), "at the cap: left alone")
+        self.assertIsNone(self.routed(self.call(model="haiku")), "below it: left alone, never raised")
+        self.assertEqual(self.routed(self.call()), "sonnet", "the main conversation's opus, inherited")
+        self.define("planner", "model: fable\n")
+        self.assertEqual(self.routed(self.call("planner")), "sonnet", "the definition's own")
+        self.main("claude-sonnet-5-5")
+        self.assertIsNone(self.routed(self.call()))
+        self.main("claude-fable-5-1")
+        self.assertEqual(self.routed(self.call()), "sonnet")
+        os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
+        self.assertIsNone(self.routed(self.call(model="opus")), "Claude Code's forced model wins, as before")
+        del os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
+        self.config(models_cap="haiku")
+        self.assertEqual(self.routed(self.call(model="sonnet")), "haiku")
+        # Where the guide is not given, there is no cap: off, on (the
+        # table's mode), a models trial's usual half; its routed half has it.
+        for mode in ("off", "on"):
+            self.config(models=mode, models_cap="sonnet")
+            self.assertIsNone(self.routed(self.call(model="opus")), mode)
+        self.config(models_cap="sonnet")
+        arms = self.arms()
+        self.assertEqual(self.routed(self.call(model="opus", session=arms["habit"])), "sonnet")
+        self.assertIsNone(self.routed(self.call(model="opus", session=arms["usual"])))
+        # In trial mode's routed half, the table first and then the cap.
+        self.config(subagents={"implementer": "opus"}, models="trial", models_cap="sonnet")
+        self.assertEqual(self.routed(self.call(model="fable", session=arms["habit"])), "sonnet")
+        # No cap set, or one that is not a model: nothing is lowered.
+        for cap in (None, "gpt-5", 3):
+            self.config(models_cap=cap)
+            self.assertIsNone(self.routed(self.call(model="fable")), cap)
 
     def test_the_hook_as_registered_lowers_the_model_and_the_shim_refuses_the_command(self):
         self.config(subagents={"implementer": "sonnet"}, models="on")
@@ -11376,6 +11824,7 @@ class Release(unittest.TestCase):
         # class is not about it (Doctor tests it): this version is seen, and in
         # this process the line is off, whatever version a test's manifest names.
         seen_this_version(self.home)
+        no_guide(self, self.home)
         patched = mock.patch.object(longhaul, "setup_line", lambda data: None)
         patched.start()
         self.addCleanup(patched.stop)
@@ -11551,7 +12000,8 @@ class Release(unittest.TestCase):
                 self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
                 spawn.assert_not_called()
                 self.assertEqual(longhaul.release_status()["check"], "off")
-        self.assertEqual([p for p in self.home.iterdir() if p.name != "seen.json"], [], "nothing written (seen.json is setUp's)")
+        self.assertEqual([p for p in self.home.iterdir() if p.name not in ("seen.json", "config.json")], [],
+                         "nothing written (seen.json and config.json are setUp's)")
         self.assertEqual(longhaul.release_status()["check"], "on")
         with mock.patch.object(longhaul, "release_spawn") as spawn:
             self.assertIsNone(longhaul.guard_check(self.start(), "warn", index="off"))
@@ -13108,9 +13558,11 @@ class Doctor(unittest.TestCase):
     def test_the_features_line_names_each_switch_and_where_auto_model_applies(self):
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "ok")
+        # The owner's decision of 2026-10-25 ("Claude picks, Longhaul
+        # guides"): guide is the default mode, where it was trial.
         self.assertEqual([t for _, t, _ in c["items"]], [
             "context reminder: at 200,000 tokens", "auto-compact: on", "guard: advice",
-            "Auto Model: trial (no table): applies only in a models trial's routed half; no trial is on",
+            "Auto Model: guide: Claude picks each subagent's model; cap none",
             "trial: off"])
         os.environ.update(LONGHAUL_GUARD="block", LONGHAUL_AUTO_COMPACT="off", LONGHAUL_CHECKPOINT_AT="off")
         self.assertEqual([t for _, t, _ in longhaul.doctor_features()["items"]][:3], [
@@ -13123,8 +13575,14 @@ class Doctor(unittest.TestCase):
         self.assertIn("LONGHAUL_CHECKPOINT_AT", c["step"])
         for name in ("LONGHAUL_GUARD", "LONGHAUL_AUTO_COMPACT", "LONGHAUL_CHECKPOINT_AT"):
             del os.environ[name]
+        # In guide mode the table is not applied, and that is no warning.
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models_cap": "sonnet"})
+        c = longhaul.doctor_features()
+        self.assertEqual(c["mark"], "ok")
+        self.assertEqual(self.items(c)["Auto Model: guide: Claude picks each subagent's model; cap sonnet"], "ok")
+        self.assertFalse(any("nowhere" in t or "applies only" in t for t in self.items(c)))
         # A table that applies nowhere: the mode is trial and no models trial is on.
-        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}})
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models": "trial"})
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "warn")
         self.assertEqual(self.items(c)["Auto Model: trial (implementer sonnet): applies only in a models trial's "
@@ -13133,15 +13591,19 @@ class Doctor(unittest.TestCase):
         self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models": "on"})
         self.assertIn("Auto Model: on (every session; implementer sonnet)", self.items(longhaul.doctor_features()))
         now = time.time()
-        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}})
+        self.write(self.home / "config.json", {"subagents": {"implementer": "sonnet"}, "models": "trial"})
         self.write(self.home / "trial.json", {"schema": 1, "name": "subagent-models", "kind": "models",
                                               "started_at": now - 86_400, "ends_at": now + 13 * 86_400 - 60,
                                               "seed": "0123456789abcdef"})
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "ok")
-        self.assertIn("Auto Model: trial (implementer sonnet): applies in the models trial's routed half",
-                      self.items(c))
+        self.assertIn("Auto Model: trial (implementer sonnet): applies in the models trial's routed half, with the "
+                      "guide; cap none", self.items(c))
         self.assertIn("trial: on, models (subagent-models), 13.0 days left", self.items(c))
+        # Guide mode in a models trial: the routed half alone has it.
+        self.write(self.home / "config.json", {})
+        self.assertIn("Auto Model: guide: Claude picks each subagent's model in the models trial's routed half; "
+                      "cap none", self.items(longhaul.doctor_features()))
 
     # ---------------------------------------------------- the whole checklist
 
@@ -13294,7 +13756,10 @@ class Doctor(unittest.TestCase):
                          rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 set up\. Type /longhaul:doctor ")
         self.assertLess(took, 2.0, "well inside the hook's 5 s")
         out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual((out.returncode, out.stdout), (0, ""), "once")
+        # Once. Auto Model's guide joins every startup's answer since the
+        # owner's decision of 2026-10-25, for the model alone: no systemMessage.
+        self.assertEqual(out.returncode, 0)
+        self.assertNotIn("systemMessage", json.loads(out.stdout or "{}"), "once")
         # Beside the index's own message, it comes first.
         self.write(self.home / "seen.json", {"version": "0.0.1"})
         with mock.patch.object(longhaul, "index_start", return_value=([], [])), \

@@ -72,9 +72,15 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
-  longhaul models [on|off|trial | TYPE MODEL]
-                          subagents' models by agent type, lowered only: the
-                          table, and where it applies (trial by default)
+  longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]
+                          Auto Model, subagents' models: guide (the default)
+                          gives the main conversation a short guide at each
+                          start, so Claude sets each subagent's model by how
+                          hard its job is, and each pick is logged; cap MODEL
+                          lowers a call above MODEL there (off: no cap); on
+                          applies the table of agent type -> model instead
+                          (TYPE MODEL sets a row; lowered only), trial applies
+                          it in a models trial's routed half; off: nothing
   longhaul vscode [on|off]      VS Code's Claude panel uses your Longhaul accounts
                           (on), or its own sign-in again (off); it edits VS
                           Code's settings for you, a copy kept
@@ -99,6 +105,8 @@ Usage:
                           CodeGraph index it names the index at the twentieth.
                           SessionStart: names the index at startup; at compact and
                           clear forgets the reads. LONGHAUL_GUARD=off does nothing.
+                          At startup it gives Auto Model's guide (longhaul models),
+                          whatever LONGHAUL_GUARD is.
                           At startup in a git work tree with no code map, starts
                           `codegraph init` or `trail init` in the background, once
                           per project (the README says what each writes);
@@ -125,7 +133,8 @@ Usage:
   longhaul checkpoint           the plugin's SessionStart hook: puts that state back
                           after a compaction or a resume, and once after a /clear
                           in the folder it was saved in, within
-                          LONGHAUL_CHECKPOINT_CARRY_HOURS (6; 0 or off: never)
+                          LONGHAUL_CHECKPOINT_CARRY_HOURS (6; 0 or off: never);
+                          at those starts it gives Auto Model's guide too
   longhaul advisor status       the Advisor experiment's gate: its switch
                           (LONGHAUL_ADVISOR, off unless experiment), the probe
                           record's Claude Code version, the running one, and
@@ -163,15 +172,18 @@ Usage:
                           its checkpoint after the reminder: logs it and keeps the
                           time, so a chat compacts at most once in ten minutes;
                           LONGHAUL_AUTO_COMPACT=off turns the compaction off
-  longhaul trial start [--days N] | stop | status
+  longhaul trial start [--days N] [--kind models] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
                           habit (the reminder) or usual (none); a session a
-                          /clear's carry starts keeps its chain's
+                          /clear's carry starts keeps its chain's. --kind
+                          models: routed (Auto Model's guide and cap) or usual
   longhaul trial report [--json]
                           per chain, numbers only: tokens, API-price equivalent,
-                          compactions, reminders, rating; then the plan's rule:
-                          "saving shown" or "no saving shown"
+                          compactions, reminders, rating; per arm, subagent
+                          requests and cost by model and redos (the same agent
+                          type again within 10 minutes of a run that failed);
+                          then the plan's rule: "saving shown" or "no saving shown"
   longhaul trial rate [CHAIN N]
                           the finished chains to rate, without their arms; with
                           CHAIN N, records a rating from 1 to 5
@@ -2630,6 +2642,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     events = []           # per file, in its order: (time, file, "call" or "compact", (scope, tool, input, id))
     compactions, api_errors, unreadable, lines, cwd = [], collections.Counter(), 0, 0, None
     tool_calls, tool_chars = collections.Counter(), collections.Counter()  # (scope, tool) -> calls, output characters
+    spans, ends = {}, {}  # a subagent's file -> [its first time, its last], and how it ends (subagent_runs below)
     for n, file in enumerate(files):
         events.append([])
         when = 0.0  # a line with no time keeps its place after the one before
@@ -2658,6 +2671,15 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                 scope = "subagents" if n or line.get("isSidechain") else "main"
                 blocks = [b for b in msg.get("content") or [] if isinstance(b, dict)] \
                     if isinstance(msg.get("content"), list) else []
+                if n:  # a subagent's run: its span, and whether its last line is a final answer (by block kinds alone)
+                    if when:
+                        spans.setdefault(n, [when, when])[1] = when
+                    if kind == "assistant":
+                        kinds = {b.get("type") for b in blocks}
+                        ends[n] = ("error" if line.get("isApiErrorMessage")
+                                   else "answer" if "text" in kinds and "tool_use" not in kinds else "open")
+                    elif kind == "user":
+                        ends[n] = "open"
                 if kind == "system" and line.get("subtype") == "compact_boundary":
                     meta = dict_at(line, "compactMetadata")
                     compactions.append({"trigger": meta.get("trigger") if meta.get("trigger") in ("auto", "manual")
@@ -2750,6 +2772,42 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         consulted["tokens"] = [{"model": m, **t} for m, t in sorted(own.items(),
                                                                      key=lambda kv: (-sum(kv[1].values()), kv[0]))]
 
+    # Subagents by agent type and model family (the owner, 2026-10-25: what
+    # ran where, now that Claude picks each subagent's model): a row per
+    # type, from the run's meta.json ("?" with none; "other" for a type
+    # that is not a plain name, never shown as written), and family, from
+    # its responses; a run is a subagent transcript with a response on that
+    # family. Priced by PRICES, any other family as opus (the trial's
+    # rule). A sidechain line of the main file has no type and is left out.
+    def type_of(meta):
+        kind = meta.get("agentType")
+        return ("?" if not isinstance(kind, str) else kind
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", kind) else "other")
+
+    by_type: dict = {}  # (type, family) -> {"files", "requests", "cache_read", "price"}
+    per_run = collections.Counter()  # file -> responses
+    for _, model, usage, where in responses.values():
+        if not where:
+            continue
+        family = advisor_family(model) if isinstance(model, str) else "?"
+        row = by_type.setdefault((type_of(metas[where]), family),
+                                 {"files": set(), "requests": 0, "cache_read": 0, "price": 0.0})
+        rates = PRICES.get(family, PRICES["opus"])
+        row["files"].add(where)
+        row["requests"] += 1
+        row["cache_read"] += as_int(usage.get("cache_read_input_tokens"))
+        row["price"] += sum(as_int(usage.get(field)) * rates[k] for k, field in TOKEN_KINDS) / 1e6
+        per_run[where] += 1
+    subagent_models = [{"type": t, "model": f, "runs": len(x["files"]), "requests": x["requests"],
+                        "cache_read": x["cache_read"], "price_usd": x["price"]}
+                       for (t, f), x in sorted(by_type.items(), key=lambda kv: (-kv[1]["price"], kv[0]))]
+    # Each run's type, span and end, for the trial's redo count (trial_redos()):
+    # finished when its last line is a response with a text block and no
+    # tool call; an API error last, a tool call or a result last (stopped
+    # before its final answer), or no line at all, is not.
+    subagent_runs = [{"type": type_of(meta), "started": spans.get(n, [None])[0], "ended": spans.get(n, [None, None])[1],
+                      "finished": ends.get(n) == "answer", "requests": per_run[n]} for n, meta in metas.items()]
+
     rereads, searches = {}, collections.Counter()
     for scope, name, what, tid in repeats:
         if name == "Read":
@@ -2780,6 +2838,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         # main first; in each scope, the model with the most tokens first
         "model_tokens": [{"model": m, "scope": s, **t} for (s, m), t in
                          sorted(by_model.items(), key=lambda kv: (kv[0][0] != "main", -sum(kv[1].values()), kv[0][1]))],
+        "subagent_models": subagent_models, "subagent_runs": subagent_runs,
         "context": {"first": context[0], "peak": max(context), "last": context[-1]} if context else None,
         "compactions": compactions, "cache": cache,
         "outputs": [{"tool": calls.get(tid, ("?", ""))[0], "what": calls.get(tid, ("?", ""))[1],
@@ -2864,6 +2923,20 @@ def inspect_lines(r: dict) -> list[str]:
 
     out.append("Tokens by model [transcript, measured: the API's own counts]")
     out.extend(token_table(r["model_tokens"], "  ", lambda t: f"{t['scope']:<10}{t['model']}"))
+
+    out.append("Subagents by type and model [transcript, measured]")
+    rows = r["subagent_models"]
+    if rows:
+        width = max(len(x["type"]) for x in rows + [{"type": "total"}])
+        total = {k: sum(x[k] for x in rows) for k in ("runs", "requests", "cache_read", "price_usd")}
+        out.append("  runs: subagent transcripts with a response on that model; API price: their tokens at Longhaul's "
+                   "price table")
+        out.append(f"  {'type':<{width}}  {'model':<8}{'runs':>6}{'requests':>10}{'cache read':>14}{'API price':>12}")
+        for x in rows + [{"type": "total", "model": "", **total}]:
+            out.append(f"  {x['type']:<{width}}  {x['model']:<8}{x['runs']:>6,}{x['requests']:>10,}"
+                       f"{x['cache_read']:>14,}{'$' + format(x['price_usd'], ',.2f'):>12}")
+    else:
+        out.append("  none")
 
     out.append("Context, main conversation [transcript, measured: input, cache write and cache read per request]")
     c = r["context"]
@@ -2987,6 +3060,12 @@ def inspect_records(r: dict) -> list[dict]:
     for m in r["model_tokens"]:
         for kind, _ in TOKEN_KINDS:
             add("model_tokens", m[kind], "tokens", m["scope"], "transcript", "measured", m["model"], kind)
+    for x in r["subagent_models"]:  # the item: the agent type and the model family, a space between
+        item = f"{x['type']} {x['model']}"
+        add("subagent_runs", x["runs"], "runs", "subagents", "transcript", "counted", item)
+        add("subagent_requests", x["requests"], "requests", "subagents", "transcript", "counted", item)
+        add("subagent_cache_read", x["cache_read"], "tokens", "subagents", "transcript", "measured", item)
+        add("subagent_price_usd", x["price_usd"], "usd", "subagents", "estimate", "estimated", item)
     for scope, kinds in r["tokens"].items():
         for kind, n in kinds.items():
             add(f"{kind}_tokens", n, "tokens", scope, "transcript", "measured")
@@ -3917,8 +3996,11 @@ def run_hook(check, name: str) -> int:
 def guard(_opts) -> int:
     """The hook command: stdin in, JSON or nothing out, exit 0 always. On
     PreToolUse the reminder joins the answer when it is due, in any mode:
-    LONGHAUL_GUARD=off stops the rules, not the reminder."""
-    return run_hook(lambda data: reminder_join(data, guard_check(data, guard_mode(), index=index_mode())), "guard")
+    LONGHAUL_GUARD=off stops the rules, not the reminder. At a startup,
+    Auto Model's guide joins it (models_guide_join(); the checkpoint's
+    hook gives it at the other starts), whatever the guard's mode."""
+    return run_hook(lambda data: reminder_join(data, models_guide_join(
+        data, guard_check(data, guard_mode(), index=index_mode()), ("startup",))), "guard")
 
 
 # ----------------------------------------------------------- checkpoint
@@ -4404,7 +4486,9 @@ def checkpoint(opts) -> int:
                   f"not for {shown(sid, 100)}", file=sys.stderr)
             log(f"checkpoint for {shown(sid, 100)} not put back: run by hand from inside session {shown(here, 100)}")
             raise SystemExit(2)
-        return checkpoint_check(data)
+        # Auto Model's guide after the checkpoint, at a compaction, a clear
+        # or a resume (the guard's hook gives it at a startup).
+        return models_guide_join(data, checkpoint_check(data), CHECKPOINT_SOURCES)
 
     return run_hook(check, "checkpoint")
 
@@ -6515,11 +6599,17 @@ def update(opts) -> int:
 TRIAL_NAME = "checkpoint-habit"
 # A trial's kind: its name, what its treatment arm is called, and its plan.
 # The arms stay habit and usual inside (trial_arm()); only the kind decides
-# what the treatment arm gets: the reminder (checkpoint), or the subagent
-# models' table (models; the owner, 2026-10-23: its own trial, after the
-# checkpoint one).
+# what the treatment arm gets: the reminder (checkpoint), or Auto Model's
+# guide and cap, and in trial mode its table (models; the owner,
+# 2026-10-23: its own trial, after the checkpoint one; 2026-10-25: guided
+# against unguided).
 TRIAL_KINDS = {"checkpoint": ("checkpoint-habit", "habit", "docs/plans/2026-10-23-checkpoint-ab-plan.md"),
-               "models": ("subagent-models", "routed", "docs/plans/2026-10-23-auto-model-design.md")}
+               "models": ("subagent-models", "routed", "docs/plans/2026-10-25-auto-model-by-task.md")}
+# A redo (the owner, 2026-10-25): a subagent run of an agent type started
+# within this many seconds after the end of a run of that type that failed,
+# its transcript ending in an API error or without a final answer
+# (inspect_transcript()'s subagent_runs).
+TRIAL_REDO_SECONDS = 600
 TRIAL_DAYS = 14
 TRIAL_ARMS = ("habit", "usual")
 # The plan's rule, written before looking: at least TRIAL_CHAINS chains per
@@ -6767,11 +6857,15 @@ def trial_start(days: float, now: float, kind: str = "checkpoint") -> int:
         print("longhaul trial: --days must be a number of days above zero", file=sys.stderr)
         return 2
     if kind == "models":
-        table, mode = models_settings()
-        why = ("there is no table of subagent models to route by: set one with `longhaul models TYPE MODEL`"
-               if not any(m != "keep" for m in table.values()) else
-               f"`longhaul models` is {mode}, so no session would be left usual or routed: set it back with "
-               "`longhaul models trial`" if mode != "trial" else None)
+        # The routed half gets the guide and the cap (the owner, 2026-10-25),
+        # and in trial mode the table too; the usual half none of them. Off
+        # would route none; on applies the table everywhere, usual included.
+        _, mode = models_settings()
+        why = None if mode in ("guide", "trial") else (
+            f"`longhaul models` is {mode}, so "
+            + ("no session would be routed" if mode == "off" else "its table applies in the usual half too")
+            + ": set `longhaul models guide` (the guide in the routed half) or `longhaul models trial` "
+              "(the guide and the table there)")
         if why:
             print(f"longhaul trial: not started, because {why}", file=sys.stderr)
             return 2
@@ -6849,6 +6943,7 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
     is one that began before."""
     tokens = {k: 0 for k, _ in TOKEN_KINDS}
     price, requests, compactions, peak = 0.0, 0, 0, 0
+    sub_requests, sub_price, runs = collections.Counter(), collections.Counter(), []
     by_id = {s["session"]: s for s in chain["sessions"]}
     for s in chain["sessions"]:
         try:
@@ -6864,6 +6959,10 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
         requests += sum(r["requests"].values())
         compactions += len(r["compactions"])
         peak = max(peak, (r["context"] or {}).get("peak", 0))
+        for row in r["subagent_models"]:  # by model family, whatever the agent type
+            sub_requests[row["model"]] += row["requests"]
+            sub_price[row["model"]] += row["price_usd"]
+        runs.extend(r["subagent_runs"])
     followed = sum(1 for s in chain["sessions"] if s["parent"] in by_id and s["carried_at"] is not None
                    and any(t <= s["carried_at"] for t in by_id[s["parent"]]["reminders"]))
     first, last = chain["sessions"][0]["first"], max(s["last"] for s in chain["sessions"])
@@ -6872,7 +6971,22 @@ def trial_figures(chain: dict, ratings: dict) -> dict:
             "compactions": compactions, "context_peak": peak,
             "reminders_shown": sum(len(s["reminders"]) for s in chain["sessions"]), "reminders_followed": followed,
             "rating": ratings.get(chain["chain"]), "dropped": requests < TRIAL_REQUESTS,
-            "began_before": chain["before"]}
+            "began_before": chain["before"], "subagent_requests": dict(sub_requests),
+            "subagent_price_usd": {k: round(v, 6) for k, v in sub_price.items()}, "redos": trial_redos(runs)}
+
+
+def trial_redos(runs: list) -> int:
+    """How many of a chain's subagent runs (inspect_transcript()'s
+    subagent_runs, from every session of it) are redos: a run of an agent
+    type started within TRIAL_REDO_SECONDS after the end of another run of
+    that type that did not finish (its last line an API error, or no final
+    answer). A run of no known type ("?", "other") or with no time is none,
+    and is redone by none."""
+    timed = [r for r in runs if r["type"] not in ("?", "other") and r["started"] is not None and r["ended"] is not None]
+    failed = [r for r in timed if not r["finished"]]
+    return sum(1 for r in timed if any(f is not r and f["type"] == r["type"]
+                                       and f["ended"] <= r["started"] <= f["ended"] + TRIAL_REDO_SECONDS
+                                       for f in failed))
 
 
 def trial_decide(records: list) -> dict:
@@ -6899,6 +7013,16 @@ def trial_decide(records: list) -> dict:
                      "rating_median": median(rated),
                      "reminders_shown": sum(r["reminders_shown"] for r in mine),
                      "reminders_followed": sum(r["reminders_followed"] for r in mine)}
+        # In all, over the kept chains (the owner, 2026-10-25: guided against
+        # unguided): subagent requests and cost by model family, and redos.
+        sub_requests, sub_price = collections.Counter(), collections.Counter()
+        for r in mine:
+            sub_requests.update(r["subagent_requests"])
+            for family, value in r["subagent_price_usd"].items():
+                sub_price[family] += value
+        arms[arm].update(subagent_requests=dict(sub_requests),
+                         subagent_price_usd={k: round(v, 6) for k, v in sub_price.items()},
+                         redos=sum(r["redos"] for r in mine))
     h, u = arms["habit"], arms["usual"]
     priced = h["price_usd_median"] is not None and bool(u["price_usd_median"])
     checks = {"chains": h["chains"] >= TRIAL_CHAINS and u["chains"] >= TRIAL_CHAINS,
@@ -6952,6 +7076,14 @@ def trial_report_lines(trial: dict, decided: dict) -> list:
     lines.append(row("sessions", str(h["sessions"]), str(u["sessions"])))
     lines.append(row("reminders shown / followed", *(f"{a['reminders_shown']} / {a['reminders_followed']}"
                                                      for a in (h, u))))
+    # By model family (the families advisor_family() names, then "other" and "?"), each in either arm.
+    families = [f for f in ADVISOR_FAMILIES + ("other", "?") if f in h["subagent_requests"] or f in u["subagent_requests"]]
+    for f in families:
+        lines.append(row(f"subagent requests, {f}", *(trial_number(a["subagent_requests"].get(f, 0)) for a in (h, u))))
+    for f in families:
+        lines.append(row(f"subagent cost, {f}", *(trial_number(a["subagent_price_usd"].get(f, 0.0), True)
+                                                  for a in (h, u))))
+    lines.append(row(f"redos (same type within {TRIAL_REDO_SECONDS // 60} min)", str(h["redos"]), str(u["redos"])))
 
     def met(check):
         return {True: "met", False: "not met"}[checks[check]]
@@ -7067,36 +7199,106 @@ def trial(opts) -> int:
 
 # ------------------------------------------------------------- models
 #
-# Auto Model for subagents (the owner, 2026-10-23; the design in
-# docs/plans/2026-10-23-auto-model-design.md): a table of agent type ->
-# model in config.json ("subagents"), applied by the PreToolUse hook on
-# Agent and Task. It only lowers: a call on the table's model or a cheaper
-# one is left as it is. "models" in config.json says where it applies: off,
-# on (every session), or trial (the default: only in a models trial's
-# routed arm). Logged by type and model, never text.
+# Auto Model for subagents. The owner, 2026-10-25 ("that's not how it
+# should work it should pick the model based on the task complexity"; of
+# three ways, "Claude picks, Longhaul guides"; the design in
+# docs/plans/2026-10-25-auto-model-by-task.md): the main conversation,
+# which knows the task, sets each subagent's model from a short guide
+# (MODELS_GUIDE) Longhaul adds to its context at each start (startup,
+# compact, clear, resume; models_guide_join()). No extra request, and
+# Longhaul reads no task text. The PreToolUse hook on Agent and Task logs
+# every pick by agent type and model (models_rule()), and an optional cap
+# (`longhaul models cap MODEL`, config.json's "models_cap") lowers a call
+# above it. "models" in config.json is the mode: off; guide (the default):
+# the guide and the cap in every session; on: the table of agent type ->
+# model ("subagents"; the owner, 2026-10-23, docs/plans/2026-10-23-auto-
+# model-design.md), which only lowers, in every session, and no guide;
+# trial: the table in a models trial's routed half. In a models trial the
+# routed half gets the guide and the cap whatever the mode (off aside),
+# the usual half neither. Logged by type and model, never text.
 
 MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
-MODELS_MODES = ("off", "on", "trial")
+MODELS_MODES = ("off", "guide", "on", "trial")
 MODELS_START = {"implementer": "sonnet", "security-auditor": "sonnet", "qa-engineer": "sonnet"}  # the owner's first
+# The owner's text (2026-10-25), word for word: one paragraph.
+MODELS_GUIDE = ("Longhaul: when you start a subagent (Agent or Task), set its `model` by how hard its job is: `haiku` "
+                "for lookups, listing, reading and summarizing, and small mechanical edits; `sonnet` for ordinary "
+                "implementation, tests, refactors in a few files and routine reviews; `opus` for design and "
+                "architecture, hard or long debugging, security review, work across many files, or anything where a "
+                "wrong answer is costly. When unsure, `sonnet`. Set it on every call.")
+MODELS_DEFAULT_TYPE = "general-purpose"  # Claude Code's agent type for a call that names none
+
+
+def models_config() -> dict:
+    found = read_json(CONFIG)
+    return found if isinstance(found, dict) else {}
 
 
 def models_settings() -> tuple:
     """(the table of agent type -> model alias or keep, the mode). Junk in
-    the table is no entry; a mode that is not one of the three is trial."""
-    found = read_json(CONFIG)
-    found = found if isinstance(found, dict) else {}
+    the table is no entry; a mode that is not one of the four is guide,
+    the default since the owner's decision of 2026-10-25 (it was trial)."""
+    found = models_config()
     table = found.get("subagents")
     table = {k: v for k, v in table.items() if isinstance(k, str) and isinstance(v, str)
              and (v in MODEL_RANK or v == "keep")} if isinstance(table, dict) else {}
     mode = found.get("models")
-    return table, mode if mode in MODELS_MODES else "trial"
+    return table, mode if mode in MODELS_MODES else "guide"
+
+
+def models_cap():
+    """The cap, a MODEL_RANK alias, or None for none (off, the default)."""
+    cap = models_config().get("models_cap")
+    return cap if isinstance(cap, str) and cap in MODEL_RANK else None
+
+
+def models_trial():
+    """The models trial on now, or None."""
+    trial = trial_current()
+    return trial if trial and trial_kind(trial) == "models" else None
 
 
 def models_applies(session_id, mode: str) -> bool:
+    """Whether the table applies to the session: on, every session; trial,
+    a models trial's routed half; guide and off, none."""
     if mode != "trial":
         return mode == "on"
-    trial = trial_current()
-    return bool(trial and trial_kind(trial) == "models" and trial_arm(session_id) == "habit")
+    return bool(models_trial() and trial_arm(session_id) == "habit")
+
+
+def models_guided(session_id, mode: str) -> bool:
+    """Whether the session gets the guide and the cap: with a models trial
+    on, its routed half alone, in any mode but off; else guide mode's
+    every session. A checkpoint trial changes nothing here."""
+    if mode == "off":
+        return False
+    if models_trial():
+        return trial_arm(session_id) == "habit"
+    return mode == "guide"
+
+
+def models_guide_join(data, answer, sources: tuple):
+    """The SessionStart answer with the guide added to the model's
+    additionalContext, after what is there, when it applies: a start of
+    one of `sources` (each hook its own, so each start has it once), of
+    the main conversation (no agent_id), in a guided session; else the
+    answer as it was. What it raises is logged and costs the answer
+    nothing."""
+    try:
+        if not isinstance(data, dict) or data.get("hook_event_name") != "SessionStart" \
+                or data.get("source") not in sources or data.get("agent_id") is not None:
+            return answer
+        if not models_guided(data.get("session_id"), models_settings()[1]):
+            return answer
+        answer = dict(answer or {})
+        out = dict(answer.get("hookSpecificOutput") or {"hookEventName": "SessionStart"})
+        out["additionalContext"] = "\n\n".join(filter(None, (out.get("additionalContext"), MODELS_GUIDE)))
+        answer["hookSpecificOutput"] = out
+        log(f"models: the guide given at {data['source']} in {str(data.get('session_id'))[:8]}")
+        return answer
+    except Exception as e:
+        log(f"models: no guide ({type(e).__name__})")
+        return answer
 
 
 def agent_definition_model(cwd, agent_type):
@@ -7121,44 +7323,100 @@ def agent_definition_model(cwd, agent_type):
 
 
 def models_rule(data: dict):
-    """The table's answer to a subagent call, or None to leave it as it is:
-    the call's model lowered to the table's for its type. The model it
-    would run on: the call's own, else its definition's, else
-    CLAUDE_CODE_SUBAGENT_MODEL, else the main conversation's (the order
-    Claude Code's docs give). Unknown, or not above the table's: no change."""
+    """Auto Model's answer to a subagent call, or None to leave it as it is.
+    The model it would run on, and why: the call's own (guided), else its
+    definition's (its own), else CLAUDE_CODE_SUBAGENT_MODEL, else the main
+    conversation's (inherited; the order Claude Code's docs give); a fork
+    always runs on the main conversation's. Then the table's lowering,
+    where it applies (models_applies()), with its own log line; any other
+    call of the main conversation is one pick line (the owner,
+    2026-10-25). Then, in a guided session, the cap: a model above it is
+    lowered to it. Each change goes through updatedInput, every other
+    field kept. Nothing with Auto Model off or the model forced
+    (CLAUDE_CODE_SUBAGENT_MODEL_FORCE: Claude Code ignores the call's
+    model then); unknown, or not above the table's or the cap: no change.
+    Names and ids only, never the prompt or the description."""
     if data.get("tool_name") not in ("Agent", "Task") or os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE"):
         return None
     given = data.get("tool_input")
-    kind = given.get("subagent_type") if isinstance(given, dict) else None
-    if not isinstance(kind, str):
+    if not isinstance(given, dict):
+        return None
+    kind = given.get("subagent_type", MODELS_DEFAULT_TYPE)
+    if not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", kind):
         return None
     table, mode = models_settings()
-    want = table.get(kind)
-    if want in (None, "keep") or not models_applies(data.get("session_id"), mode):
+    if mode == "off":
         return None
-    model, defined = given.get("model"), None
-    if not (isinstance(model, str) and model.strip()):
+    model, how = given.get("model"), "guided"
+    if kind == "fork":  # a fork runs on the main conversation's model, whatever the call says
+        model, how = None, "inherited"
+    elif not (isinstance(model, str) and model.strip() and model != "inherit"):
         defined = agent_definition_model(data.get("cwd"), kind)
-        model = defined if defined not in (None, "none", "inherit") else os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+        model, how = ((defined, "its own") if defined not in (None, "none", "inherit")
+                      else (os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"), "inherited"))
     have = (advisor_family(model) if isinstance(model, str) and model.strip() and model != "inherit"
             else advisor_executor(advisor_tail(data.get("transcript_path"))))
-    if have not in MODEL_RANK or MODEL_RANK[want] >= MODEL_RANK[have]:
+    sid = str(data.get("session_id"))[:8]
+    want = table.get(kind)
+    to = have
+    if kind != "fork" and want not in (None, "keep") and have in MODEL_RANK and MODEL_RANK[want] < MODEL_RANK[have] \
+            and models_applies(data.get("session_id"), mode):
+        log(f"models: {kind} {have} -> {want} in {sid}")
+        to = want
+    elif data.get("agent_id") is None:
+        said = f"picked {have}" if how == "guided" else f"on {have or 'unknown'}"
+        log(f"models: {kind} {said} ({how}) in {sid}")
+    cap = models_cap() if kind != "fork" and models_guided(data.get("session_id"), mode) else None
+    capped = bool(cap) and to in MODEL_RANK and MODEL_RANK[to] > MODEL_RANK[cap]
+    if capped:
+        log(f"models: {kind} capped {to} -> {cap} in {sid}")
+        to = cap
+    if to == have:
         return None
-    log(f"models: {kind} {have} -> {want} in {str(data.get('session_id'))[:8]}")
+    reason = f"longhaul models: {kind} on {to} (was {have})" + (" by the cap" if capped else "")
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
-                                   "permissionDecisionReason": f"longhaul models: {kind} on {want} (was {have})",
-                                   "updatedInput": {**given, "model": want}}}
+                                   "permissionDecisionReason": reason,
+                                   "updatedInput": {**given, "model": to}}}
+
+
+MODELS_SAID = {"off": "nowhere", "guide": "Claude picks each subagent's model by Longhaul's guide; the table is not "
+                                          "applied",
+               "on": "every session", "trial": "only in a models trial's routed arm"}
+
+
+def models_guide_said(mode: str) -> str:
+    """Where the guide is given, for `longhaul models`."""
+    if mode == "off":
+        return "not given (Auto Model is off)"
+    if models_trial():
+        return "given in the models trial's routed half, never in its usual half"
+    if mode == "guide":
+        return "given at each start of the main conversation"
+    return (f"not given: {mode} applies the table instead (`longhaul models guide` gives it)" if mode == "on"
+            else "not given: no models trial is on")
 
 
 def models(opts) -> int:
-    """`longhaul models [on|off|trial | TYPE MODEL]`: the table and where it
-    applies, or one change to either."""
+    """`longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]`:
+    the mode, the guide, the cap and the table, or one change to one of
+    them."""
     args = opts.args or []
-    found = read_json(CONFIG)
-    found = found if isinstance(found, dict) else {}
+    found = models_config()
     if len(args) == 1 and args[0] in MODELS_MODES:
         write_json(CONFIG, {**found, "models": args[0]})
         say(f"subagent models: {args[0]} ({MODELS_SAID[args[0]]})")
+        return 0
+    if len(args) == 2 and args[0] == "cap":
+        cap = args[1].lower()
+        if cap == "off":
+            write_json(CONFIG, {k: v for k, v in found.items() if k != "models_cap"})
+            say("cap: off (none)")
+            return 0
+        if cap not in MODEL_RANK:
+            say("longhaul models cap MODEL|off: MODEL one of haiku, sonnet, opus or fable")
+            return 2
+        write_json(CONFIG, {**found, "models_cap": cap})
+        say(f"cap: {cap}: where the guide is given, a subagent call above {cap} runs on {cap}")
         return 0
     if len(args) == 2:
         kind, model = args[0], args[1].lower()
@@ -7171,23 +7429,24 @@ def models(opts) -> int:
         say(f"{kind}: {model}" + ("" if model == "keep" else ", or the model it would run on when that is cheaper"))
         return 0
     if args:
-        say("longhaul models [on|off|trial | TYPE MODEL]")
+        say("longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]")
         return 2
     table, mode = models_settings()
-    if table:
-        say("Subagent models (lowered only, never raised):")
-        for kind, model in table.items():
-            print(f"  {kind:<24} {model}")
-    else:
-        say("No table yet. The one decided on 2026-10-23: "
-            + "; ".join(f"`longhaul models {k} {v}`" for k, v in MODELS_START.items()))
     trial = trial_current()
     on = f" A {trial['name']} trial is on." if trial else ""
     say(f"Where it applies: {mode} ({MODELS_SAID[mode]}).{on}")
+    say(f"The guide: {models_guide_said(mode)}.")
+    cap = models_cap()
+    say(f"Cap: {cap}: where the guide is given, a subagent call above {cap} runs on {cap}." if cap
+        else "Cap: none (`longhaul models cap MODEL` sets one).")
+    if table:
+        say("Subagent models, the table of on and trial modes (lowered only, never raised):")
+        for kind, model in table.items():
+            print(f"  {kind:<24} {model}")
+    else:
+        say("No table (on and trial modes apply one). The one decided on 2026-10-23: "
+            + "; ".join(f"`longhaul models {k} {v}`" for k, v in MODELS_START.items()))
     return 0
-
-
-MODELS_SAID = {"off": "nowhere", "on": "every session", "trial": "only in a models trial's routed arm"}
 
 
 # ------------------------------------------------------------- VS Code
@@ -9258,10 +9517,11 @@ def doctor_maps() -> dict:
 
 def doctor_features() -> dict:
     """10. The features and their switches: the context reminder's
-    threshold, auto-compact, the guard's mode, Auto Model (its mode, its
-    table, and whether it applies anywhere: in the default mode, trial,
-    only in a models trial's routed half), and the trial. Read from this
-    process's environment, which a chat's Bash tool shares with its hooks."""
+    threshold, auto-compact, the guard's mode, Auto Model (its mode: guide,
+    the default since 2026-10-25, with its cap; or the table, and whether
+    it applies anywhere: in trial mode, only in a models trial's routed
+    half), and the trial. Read from this process's environment, which a
+    chat's Bash tool shares with its hooks."""
     items = []
     at, why = reminder_threshold()
     if why:
@@ -9279,13 +9539,19 @@ def doctor_features() -> dict:
     else:
         items.append(("ok", f"guard: {'advice' if mode == 'warn' else mode}", None))
     table, models_mode = models_settings()
+    cap = models_cap() or "none"
     trial, problem = trial_read()
     trial = trial_current()
     shown = ", ".join(f"{kind} {model}" for kind, model in table.items()) or "no table"
-    if models_mode != "trial":
+    routed = trial and trial_kind(trial) == "models"
+    if models_mode == "guide":  # the default (the owner, 2026-10-25): no table applies, and that is no warning
+        where = " in the models trial's routed half" if routed else ""
+        items.append(("ok", f"Auto Model: guide: Claude picks each subagent's model{where}; cap {cap}", None))
+    elif models_mode != "trial":
         items.append(("ok", f"Auto Model: {models_mode} ({MODELS_SAID[models_mode]}; {shown})", None))
-    elif trial and trial_kind(trial) == "models":
-        items.append(("ok", f"Auto Model: trial ({shown}): applies in the models trial's routed half", None))
+    elif routed:
+        items.append(("ok", f"Auto Model: trial ({shown}): applies in the models trial's routed half, with the guide; "
+                            f"cap {cap}", None))
     else:
         items.append(("warn" if table else "ok",
                       f"Auto Model: trial ({shown}): applies only in a models trial's routed half; no "
@@ -9432,7 +9698,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("rating", nargs="?", metavar="N", help="rate: 1 (badly) to 5 (well)")
             p.add_argument("--days", type=float, default=TRIAL_DAYS, help=f"start: how long (default: {TRIAL_DAYS})")
             p.add_argument("--kind", choices=sorted(TRIAL_KINDS), default="checkpoint",
-                           help="start: checkpoint (the reminder's A/B, the default) or models (the subagent models' table)")
+                           help="start: checkpoint (the reminder's A/B, the default) or models (Auto Model's guide "
+                                "and cap, guided against unguided)")
             p.add_argument("--json", action="store_true", help="report: the chains' records and the decision, as JSON")
         if cmd == "add":
             p.add_argument("name", nargs="?", help="what to call it (Max, Pro, Team...); with neither name nor "
@@ -9445,9 +9712,10 @@ def main(argv: list[str]) -> int:
         if cmd == "remove":
             p.add_argument("name")
         if cmd == "models":
-            p.add_argument("args", nargs="*", metavar="on|off|trial | TYPE MODEL",
-                           help="nothing: the table and where it applies; on, off or trial: where it applies; "
-                                "TYPE MODEL: an agent type's model (haiku, sonnet, opus, fable or keep)")
+            p.add_argument("args", nargs="*", metavar="guide|on|off|trial | cap MODEL|off | TYPE MODEL",
+                           help="nothing: the mode, the guide, the cap and the table; guide (the default), on, off "
+                                "or trial: the mode; cap MODEL or cap off: the cap where the guide is given; "
+                                "TYPE MODEL: an agent type's model in the table (haiku, sonnet, opus, fable or keep)")
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")

@@ -1,6 +1,6 @@
 ---
 name: inspect
-description: "Show where this conversation's tokens went: usage by kind and by model, context growth, the cache, the biggest tool outputs, searches (their chains and big results, and whether a code index was seen), repeated reads, what the guard caught, and the Advisor's consultations when there were any. Numbers only, each with its source."
+description: "Show where this conversation's tokens went: usage by kind and by model, the subagents by agent type and model, context growth, the cache, the biggest tool outputs, searches (their chains and big results, and whether a code index was seen), repeated reads, what the guard caught, and the Advisor's consultations when there were any. Numbers only, each with its source."
 argument-hint: "[conversation id, or nothing for this one]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul inspect *)
 ---
