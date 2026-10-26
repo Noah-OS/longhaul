@@ -6499,8 +6499,12 @@ def autocompact_note(opts) -> int:
 # StopFailure of its session kept during its launch is a limit stop when
 # the account's own reading has a full window (full_window()), which gives
 # the reset and the kind; the transcript's line (limit_stop()) is still
-# the other route, and one stop seen both ways is acted on once. The panel
-# wrapper and `longhaul pipe` decide a limit as before.
+# the other route, and one stop seen both ways is acted on once. A
+# quota_auto_resume_disabled row (L3), Claude Code's word that it ended its
+# wait without continuing, ends LIMIT_BUSY_GRACE for a limit already had,
+# and with none is a limit stop on the same full reading; fired and stale
+# stay the hook's record alone. The panel wrapper and `longhaul pipe`
+# decide a limit as before.
 #
 # For the main conversation alone (a subagent's input names its agent_id),
 # each hook keeps the type and the time in STOPS_RECORD under the session's
