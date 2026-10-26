@@ -1129,7 +1129,7 @@ class Watch:
                     or seen in self.stops_seen:
                 continue
             self.stops_seen.add(seen)
-            uuid_ = f"stop-failure:{at}"
+            uuid_ = f"stop-failure:{self.sid}:{at}"  # handled_limits is every session's: the id names its own
             if self.limit or uuid_ in self.handled:
                 continue
             reading = read_json(USAGE_DIR / f"{self.acct_name}.json")

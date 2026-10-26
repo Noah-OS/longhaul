@@ -197,8 +197,8 @@ class Loop(unittest.TestCase):
 
     def test_a_recorded_stop_failure_alone_does_not_move_or_stop_a_launch(self):
         # Sprint 10 (L1a, L3a): Claude Code's StopFailure and quota hooks are
-        # recorded and shown, and decide nothing until a live test at a real
-        # limit shows which fire: the supervisor reads the transcript alone.
+        # recorded and shown. Rows from before the launch, and a rate_limit
+        # row with no reading at the account's limit (L1), decide nothing.
         for command, data in (("stop-failure", {"session_id": "sid-1", "hook_event_name": "StopFailure",
                                                 "error": "rate_limit"}),
                               ("quota-note", {"session_id": "sid-1", "hook_event_name": "Notification",
@@ -241,7 +241,7 @@ class Loop(unittest.TestCase):
         state = self.state()
         self.assertAlmostEqual(state["limited_until"]["Max"], resets, places=3)
         self.assertEqual(len(state["handled_limits"]), 1)
-        self.assertTrue(state["handled_limits"][0].startswith("stop-failure:"), state["handled_limits"])
+        self.assertTrue(state["handled_limits"][0].startswith("stop-failure:sid-1:"), state["handled_limits"])
         log = (self.home / "longhaul.log").read_text()
         self.assertIn("stop: sid-1 turn ended on an API error (rate_limit)", log, "the hook's own line")
         self.assertIn("Max ended: limit (session sid-1, StopFailure: rate_limit, exit ", log)
