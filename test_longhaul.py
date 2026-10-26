@@ -891,6 +891,15 @@ class Loop(unittest.TestCase):
         _, calls = self.run_longhaul(["exit"], "--account", "Max", runs=1)
         self.assertIsNone(calls[0]["config"])
 
+    def test_the_account_flag_naming_an_account_at_its_limit_says_why_another_is_picked(self):
+        # The owner's live test, 2026-10-26: `--account personal-2`, at its
+        # weekly limit, started on personal-1 with no word of why.
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Max": time.time() + 3600}}))
+        out, calls = self.run_longhaul(["exit"], "--account", "Max", runs=1)
+        self.assertEqual(calls[0]["config"], str(self.pro), "Max is at its limit, so Pro")
+        self.assertIn("Max is at its limit until", out.stdout)
+        self.assertIn("picking an account", out.stdout)
+
     def test_longhaul_remembers_a_named_session_for_longhaul_usage(self):
         self.run_longhaul(["exit"], "--name", "docs", runs=1)
         self.assertEqual(json.loads((self.home / "labels.json").read_text()), {"sid-1": "docs"})

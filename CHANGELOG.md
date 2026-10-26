@@ -14,10 +14,12 @@ Longhaul hears Claude Code's own word when a turn stops or a chat ends.
 ### Changed
 
 - **The model guide names Fable, narrowly, and a step up after two failures.** Claude was told `haiku`, `sonnet` or `opus` for each subagent. The guide now adds `fable` only for a decision that is hard to undo, the review before a release, or a problem Opus has failed at twice, at most one Fable run per task and with the reason said; and when a run's work fails its tests twice, the next run starts one model higher, not again on the same one. Longhaul still never raises a subagent's model itself, and a cap (`longhaul models cap opus`) still lowers a Fable call. In a models trial only the guided half gets the guide.
+- **Checked on Claude Code 2.1.310.** A live test at a real weekly limit on 2.1.310 saw the limit stop, the question, and a yes carry the chat on on the other account; Claude Code's StopFailure `rate_limit` fired in the same second as the transcript's line, and no quota notification did. `longhaul` no longer says 2.1.304 to 2.1.310 are unchecked.
 
 ### Fixed
 
 - **The README said the code index is off until you turn it on.** It has been on by default since 0.2.2, where CodeGraph or Trail-Code is installed; `LONGHAUL_INDEX=off` turns it off.
+- **`--account` naming an account at its limit says so.** It started the chat on another account with no word of why; it now says the account is at its limit until its reset and that it is picking another.
 
 ## 0.2.7 - 2026-10-26
 

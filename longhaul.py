@@ -31,7 +31,7 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
 
 How it sees what Claude is doing. Claude Code documents no API for most of
 it, so longhaul reads the files Claude Code itself writes (checked on 2.1.295 to
-2.1.303; if a later version moves them, longhaul stops switching but Claude runs
+2.1.310; if a later version moves them, longhaul stops switching but Claude runs
 as normal):
 
 - <config>/sessions/<pid>.json: the running process's sessionId, its
@@ -310,9 +310,11 @@ MAX_RECONNECTS = setting("LONGHAUL_MAX_RECONNECTS", 5, int)
 LIMIT_BUSY_GRACE = setting("LONGHAUL_LIMIT_BUSY_GRACE", 30, float)
 # The Claude Code versions whose internal files longhaul has been seen to read
 # correctly: 2.1.295 and 2.1.300 by hand, 2.1.301 to 2.1.303 from limit
-# switches in real use. Outside this range longhaul still runs Claude, and says
-# that switching may not work (the files it reads are undocumented).
-TESTED_VERSIONS = ((2, 1, 295), (2, 1, 303))
+# switches in real use, 2.1.310 in the owner's live test (2026-10-26: a weekly
+# limit, the question, a yes, the chat carried on on the other account).
+# Outside this range longhaul still runs Claude, and says that switching may
+# not work (the files it reads are undocumented).
+TESTED_VERSIONS = ((2, 1, 295), (2, 1, 310))
 # Tests end the loop after this many launches; 0 runs until you stop it.
 MAX_RUNS = setting("LONGHAUL_MAX_RUNS", 0, int)
 # A limit's reset time plus this margin before longhaul tries that account again.
@@ -1845,7 +1847,13 @@ def run(opts) -> int:
             idx, until, chosen = names.index(stay), None, True
         elif forced:
             i, forced = names.index(forced), None
-            if state["limited_until"].get(names[i], 0) <= time.time() and signed_in_as_expected(accounts[i]):
+            resets = state["limited_until"].get(names[i], 0)
+            if resets > time.time():
+                # Said, not only picked: in the owner's live test (2026-10-26)
+                # `--account personal-2` at its weekly limit started on
+                # personal-1 with no word of why.
+                say(f"{names[i]} is at its limit until {clock(resets)}; picking an account")
+            elif signed_in_as_expected(accounts[i]):
                 idx, until, chosen = i, None, True
         while not chosen:
             idx, until = pick(accounts, state, idx, skip=wrong, seen=seen)
@@ -6444,14 +6452,16 @@ def autocompact_note(opts) -> int:
 #
 # Claude Code's own word that a turn stopped (Sprint 10, L1a and L3a). The
 # supervisor tells a usage-limit stop from transcript fields Claude Code
-# does not document (limit_stop()), checked on 2.1.295 to 2.1.303 alone.
+# does not document (limit_stop()), checked on 2.1.295 to 2.1.310.
 # Claude Code documents two hooks for it (code.claude.com/docs/en/hooks):
 # StopFailure, run instead of Stop when a turn ends on an API error, its
 # `error` one of STOP_ERRORS; and Notification, whose `notification_type`
 # names three moments of a wait at a claude.ai usage limit (QUOTA_LOGGED,
-# 2.1.234 and later). Which of them fire at a real subscription limit is
-# not known yet, so `longhaul stop-failure` and `longhaul quota-note` only
-# record and log them, and decide nothing themselves. The terminal
+# 2.1.234 and later). At a real weekly limit on 2.1.310 (the owner's live
+# test, 2026-10-26) StopFailure `rate_limit` fired in the same second as the
+# transcript's line, and no quota notification did: Claude Code ended the
+# turn rather than wait. `longhaul stop-failure` and `longhaul quota-note`
+# only record and log them, and decide nothing themselves. The terminal
 # supervisor reads the rows too (Watch._read_stops, L1): a rate_limit
 # StopFailure of its session kept during its launch is a limit stop when
 # the account's own reading has a full window (full_window()), which gives
