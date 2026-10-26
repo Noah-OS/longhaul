@@ -311,6 +311,97 @@ class Loop(unittest.TestCase):
         self.assertNotIn("not a limit stop", log)
         self.assertEqual(out.stdout.count("hit its"), 1, out.stdout)
 
+    # Sprint 10, L3: a quota_auto_resume_disabled notification of the
+    # session, written during the launch, is Claude Code's word that it
+    # stopped waiting at a usage limit and will not carry on by itself. A
+    # limit already had is acted on at once, busy or not; with none, it is a
+    # limit stop as a rate_limit StopFailure is (L1), when the account's own
+    # reading has a window at its limit. The other two quota types are
+    # recorded and logged, nothing else.
+
+    def test_claude_code_ending_its_wait_at_the_limit_ends_the_busy_grace_at_once(self):
+        # The transcript's stop with the status still busy, as while Claude
+        # Code waits for the reset: without the notification longhaul would
+        # wait out the grace. Max has no reading: none is needed here.
+        start = time.time()
+        out, calls = self.run_longhaul([f"limit_busy:{time.time() + 3600}", "quota_note:quota_auto_resume_disabled",
+                                        "exit"], LONGHAUL_LIMIT_BUSY_GRACE="15")
+        self.assertLess(time.time() - start, 15, "acted on before the grace ran out")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertTrue(calls[1]["args"][-1].startswith("The Max account hit its session limit"))
+        state = self.state()
+        self.assertEqual(len(state["handled_limits"]), 1)
+        self.assertTrue(state["handled_limits"][0].startswith("limit-"), "the transcript's stop, acted on once")
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("quota: Claude Code stopped waiting at a usage limit in sid-1", log, "the hook's own line")
+        self.assertIn("Max ended: limit (session sid-1, Notification: quota_auto_resume_disabled, exit ", log)
+        self.assertEqual(log.count("ended: limit"), 1)
+        self.assertIn("Pro ended: completed", log)
+        self.assertNotIn("not a limit stop", log)
+
+    def test_a_quota_disabled_notification_at_a_full_weekly_window_is_a_limit_stop(self):
+        resets = self.full_week()
+        out, calls = self.run_longhaul(["quota_note:quota_auto_resume_disabled", "stay", "exit"], "--account", "Max")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertTrue(calls[1]["args"][-1].startswith("The Max account hit its weekly limit, so longhaul reopened"))
+        self.assertIn(f"Max hit its weekly limit (resets {longhaul.clock(resets)}). Carrying on with Pro.", out.stdout)
+        state = self.state()
+        self.assertAlmostEqual(state["limited_until"]["Max"], resets, places=3)
+        self.assertEqual(len(state["handled_limits"]), 1)
+        self.assertTrue(state["handled_limits"][0].startswith("quota-disabled:sid-1:"), state["handled_limits"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("quota: Claude Code stopped waiting at a usage limit in sid-1", log, "the hook's own line")
+        self.assertIn("Max ended: limit (session sid-1, Notification: quota_auto_resume_disabled, exit ", log)
+        self.assertEqual(log.count("ended: limit"), 1)
+        self.assertIn("Pro ended: completed", log)
+        self.assertNotIn("not a limit stop", log)
+
+    def test_a_quota_disabled_notification_below_the_limit_is_logged_once_and_is_not_a_limit_stop(self):
+        self.reading("Max", five=60, week=90)
+        out, calls = self.run_longhaul(["quota_note:quota_auto_resume_disabled", "exit"], "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: limit", log)
+        self.assertEqual(log.count("limit: sid-1 Claude Code stopped waiting at a usage limit, but Max is not at its "
+                                   "limit; not a limit stop"), 1, "once, however often the watcher looks")
+        self.assertEqual(log.count("not a limit stop"), 1)
+        self.assertNotIn("limited_until", (self.home / "state.json").read_text()
+                         if (self.home / "state.json").exists() else "")
+
+    def test_a_quota_fired_or_stale_notification_is_recorded_and_logged_and_nothing_else(self):
+        self.full_week()
+        out, calls = self.run_longhaul(["quota_note:quota_auto_resume_fired", "quota_note:quota_auto_resume_stale",
+                                        "exit"], "--account", "Max")
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertEqual([row["type"] for row in json.loads((self.home / "stops.json").read_text())["sid-1"]],
+                         ["quota_auto_resume_fired", "quota_auto_resume_stale"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("quota: Claude Code continued sid-1 after a usage limit", log)
+        self.assertIn("quota: sid-1 waits for Enter: the usage limit reset while the computer slept", log)
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: limit", log)
+        self.assertNotIn("not a limit stop", log)
+
+    def test_a_limit_stop_seen_by_stop_failure_and_by_the_ended_wait_is_acted_on_once(self):
+        # Both rows often fall in one second: each is still looked at, and
+        # the one stop is acted on once (a third launch would say otherwise).
+        self.full_week()
+        out, calls = self.run_longhaul(["stop_failure:rate_limit", "quota_note:quota_auto_resume_disabled", "stay",
+                                        "exit"], "--account", "Max", runs=3)
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        state = self.state()
+        self.assertEqual(len(state["handled_limits"]), 1)
+        self.assertTrue(state["handled_limits"][0].startswith("stop-failure:sid-1:"), state["handled_limits"])
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: limit (session sid-1, StopFailure: rate_limit, Notification: "
+                      "quota_auto_resume_disabled, exit ", log)
+        self.assertEqual(log.count("ended: limit"), 1)
+        self.assertIn("Pro ended: completed", log)
+        self.assertNotIn("not a limit stop", log)
+        self.assertEqual(out.stdout.count("hit its"), 1, out.stdout)
+
     def test_the_sign_in_is_checked_again_before_every_launch(self):
         self.pin_emails()
         out, calls = self.run_longhaul(["exit_after_signin_change", "exit"], FAKE_EMAIL_MAX="first@example.com",
@@ -10336,6 +10427,94 @@ class Pieces(unittest.TestCase):
                      {"five_hour": {"used_percentage": float("nan"), "resets_at": now + 60}},
                      {"five_hour": {"used_percentage": 100, "resets_at": float("inf")}}):
             self.assertIsNone(full(junk, now), junk)
+
+    def stops_watch(self, rows, handled=()):
+        """The terminal's Watch of sid-1, launched a minute ago and busy, in a
+        scratch home holding `rows` for it in STOPS_RECORD; the time it was
+        made, the home, and a writer of more rows (session, event, type, at)."""
+        home = Path(tempfile.mkdtemp())
+        for name, value in (("LONGHAUL_HOME", home), ("USAGE_DIR", home / "usage"),
+                            ("LIMIT_BUSY_GRACE", 3600)):
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        def write(*more):
+            kept = {}
+            for sid, event, kind, at in [*rows, *more]:
+                kept.setdefault(sid, []).append({"event": event, "type": kind, "at": int(at)})
+            (home / longhaul.STOPS_RECORD).write_text(json.dumps(kept))
+
+        now = time.time()
+        write()
+        watch = longhaul.Watch({"name": "Max"}, 0, now - 60, False, handled=handled, stops=True)
+        watch.sid, watch.status = "sid-1", "busy"
+        return watch, now, home, write
+
+    def full_reading(self, home, now):
+        (home / "usage").mkdir(exist_ok=True)
+        (home / "usage" / "Max.json").write_text(json.dumps(
+            {"at": now, "five_hour": {"used_percentage": 30, "resets_at": now + 600},
+             "seven_day": {"used_percentage": 100, "resets_at": now + 7200}}))
+
+    def test_claude_code_ending_its_wait_acts_on_a_limit_had_at_once(self):
+        # Sprint 10, L3: Claude Code will not carry on by itself, so the
+        # grace for a status file that still says busy is over. Fired and
+        # stale do not end it, nor a row from before the launch or another
+        # session's; a limit had needs no reading.
+        watch, now, home, write = self.stops_watch([
+            ("sid-1", "Notification", "quota_auto_resume_disabled", time.time() - 120),
+            ("sid-2", "Notification", "quota_auto_resume_disabled", time.time()),
+            ("sid-1", "Notification", "quota_auto_resume_fired", time.time()),
+            ("sid-1", "Notification", "quota_auto_resume_stale", time.time())])
+        hit = {"resets_at": now + 3600, "kind": "session", "uuid": "limit-1", "type": "five_hour"}
+        watch.limit, watch.limit_seen_at = dict(hit), now
+        watch._read_stops()
+        self.assertFalse(watch.should_switch(), "busy, within the grace")
+        write(("sid-1", "Notification", "quota_auto_resume_disabled", now))
+        watch._read_stops()
+        self.assertTrue(watch.should_switch(), "at once")
+        self.assertEqual({k: watch.limit[k] for k in hit}, hit, "the limit had is the one acted on")
+        self.assertFalse((home / "longhaul.log").exists(), "nothing to say: the hook said it")
+
+    def test_claude_code_ending_its_wait_is_a_limit_stop_only_with_a_full_reading_and_is_read_once(self):
+        watch, now, home, write = self.stops_watch([("sid-1", "Notification", "quota_auto_resume_disabled", time.time())])
+        for _ in range(3):
+            watch._read_stops()
+        self.assertIsNone(watch.limit)
+        self.assertFalse(watch.should_switch())
+        said = (home / "longhaul.log").read_text()
+        self.assertEqual(said.count("limit: sid-1 Claude Code stopped waiting at a usage limit, but Max has no usage "
+                                    "reading; not a limit stop"), 1)
+        self.full_reading(home, now)
+        watch._read_stops()
+        self.assertIsNone(watch.limit, "a row is looked at once")
+        write(("sid-1", "Notification", "quota_auto_resume_disabled", now + 1))
+        watch._read_stops()
+        # The reading gives the reset and the kind, as for a StopFailure (L1).
+        limit = dict(watch.limit)
+        self.assertAlmostEqual(limit.pop("resets_at"), now + 7200, places=3)
+        self.assertEqual(limit, {"kind": "weekly", "uuid": f"quota-disabled:sid-1:{int(now + 1)}",
+                                 "type": "seven_day", "via": "Notification"})
+        self.assertTrue(watch.should_switch(), "busy, and acted on at once")
+        self.assertEqual((home / "longhaul.log").read_text().count("not a limit stop"), 1)
+        # A row whose stop was acted on already is not taken again.
+        again, _, other, _ = self.stops_watch([("sid-1", "Notification", "quota_auto_resume_disabled", now + 1)],
+                                              handled=[f"quota-disabled:sid-1:{int(now + 1)}"])
+        self.full_reading(other, now)
+        again._read_stops()
+        self.assertIsNone(again.limit)
+
+    def test_a_stop_failure_and_the_ended_wait_in_one_second_are_one_stop_both_read(self):
+        # Two rows of one second are two rows: the StopFailure gives the
+        # limit, the ended wait acts on it at once.
+        at = int(time.time())
+        watch, now, home, _ = self.stops_watch([("sid-1", "StopFailure", "rate_limit", at),
+                                                ("sid-1", "Notification", "quota_auto_resume_disabled", at)])
+        self.full_reading(home, now)
+        watch._read_stops()
+        self.assertEqual((watch.limit["uuid"], watch.limit["via"]), (f"stop-failure:sid-1:{at}", "StopFailure"))
+        self.assertTrue(watch.should_switch())
 
     def test_the_default_account_never_gets_claude_config_dir(self):
         os.environ["CLAUDE_CONFIG_DIR"] = "/somewhere"

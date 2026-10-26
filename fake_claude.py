@@ -7,7 +7,8 @@ network or a terminal.
 Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
 rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
 exit_after_signin_change | clear_then_crash | stay |
-session_end:<reason>:<code>[:<sid>] | stop_failure:<error>[:<sid>]
+session_end:<reason>:<code>[:<sid>] | stop_failure:<error>[:<sid>] |
+quota_note:<type>[:<sid>]
 
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
 2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
@@ -21,6 +22,11 @@ then acts out the plan's next step in the same launch: followed by
 which Claude sits idle. It first waits for the next whole second after
 this process started: the hook keeps whole seconds, and a real turn ends
 seconds after a launch, never within its first second.
+`quota_note` runs the Notification hooks with that notification_type, as
+Claude Code does at a moment of its wait at a usage limit (2.1.234+), the
+same way: first in a launch, then the plan's next step. Right after a
+`limit_busy:<resetsAt>` it is the end of the wait Claude Code started at
+that stop: a second on, with the status file still saying busy.
 `--version` prints FAKE_VERSION.
 """
 
@@ -94,12 +100,22 @@ def run_hooks(event: str, **fields) -> None:
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 session(status="busy")
 
-while step.startswith("stop_failure:"):
-    # The turn ends on an API error: Claude Code runs StopFailure's hooks,
-    # and the launch goes on with the plan's next step.
-    _, error, *named = step.split(":", 2)
+def quota_note(step: str) -> None:
+    """A `quota_note:<type>[:<sid>]` step's Notification hooks."""
+    _, kind, *named = step.split(":", 2)
+    run_hooks("Notification", session_id=named[0] if named else sid, notification_type=kind)
+
+
+while step.startswith(("stop_failure:", "quota_note:")):
+    # The turn ends on an API error: Claude Code runs StopFailure's hooks;
+    # or a moment of its wait at a usage limit: Notification's. The launch
+    # goes on with the plan's next step.
     time.sleep(max(0.0, math.floor(born) + 1 - time.time()))
-    run_hooks("StopFailure", session_id=named[0] if named else sid, error=error)
+    if step.startswith("quota_note:"):
+        quota_note(step)
+    else:
+        _, error, *named = step.split(":", 2)
+        run_hooks("StopFailure", session_id=named[0] if named else sid, error=error)
     step = plan.pop(0) if plan else "exit"
     plan_file.write_text(json.dumps(plan))
 
@@ -115,6 +131,12 @@ if step.startswith(("limit:", "limit_busy:")):
     # limit_busy: the status file still says busy after the stop, as it may
     # while Claude Code waits for the reset itself (autoContinueAtUsageLimit).
     session(status="busy" if step.startswith("limit_busy:") else "idle")
+    if step.startswith("limit_busy:") and plan and plan[0].startswith("quota_note:"):
+        # The wait ends a second on, the watcher holding off meanwhile.
+        ended = plan.pop(0)
+        plan_file.write_text(json.dumps(plan))
+        time.sleep(1)
+        quota_note(ended)
     while True:
         time.sleep(0.05)
 elif step.startswith("rc_drop"):

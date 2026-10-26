@@ -306,7 +306,9 @@ REOPEN_WINDOW = setting("LONGHAUL_REOPEN_WINDOW", 1800, float)
 MAX_RECONNECTS = setting("LONGHAUL_MAX_RECONNECTS", 5, int)
 # How long a limit stop may go unacted on while the status file still says
 # busy: it can lag, and Claude Code 2.1.234+ may sit waiting for the reset
-# itself (autoContinueAtUsageLimit), so longhaul moves on after this.
+# itself (autoContinueAtUsageLimit), so longhaul moves on after this. In the
+# terminal, Claude Code's word that it ended that wait without continuing
+# (quota_auto_resume_disabled, Sprint 10, L3) ends the grace at once.
 LIMIT_BUSY_GRACE = setting("LONGHAUL_LIMIT_BUSY_GRACE", 30, float)
 # The Claude Code versions whose internal files longhaul has been seen to read
 # correctly: 2.1.295 and 2.1.300 by hand, 2.1.301 to 2.1.303 from limit
@@ -1046,10 +1048,14 @@ class Watch:
         # key the offsets by the real path so a link and its target agree.
         self.offsets: dict[Path, int] = {p.resolve(): n for p, n in (offsets or {}).items()}
         self.handled = set(handled)
-        # The StopFailure route (_read_stops) is the terminal's alone: the
-        # panel wrapper and longhaul pipe read the stream's rate_limit_event.
+        # The StopFailure and quota route (_read_stops) is the terminal's
+        # alone: the panel wrapper and longhaul pipe read the stream's
+        # rate_limit_event.
         self.stops = stops
-        self.stops_seen: set[tuple[str, int]] = set()
+        self.stops_seen: set[tuple[str, str, int]] = set()
+        # Claude Code said it ended its wait at the limit had without
+        # continuing (L3): a busy status is no reason to hold off then.
+        self.wait_ended = False
         self.paths: dict[str, Path | None] = {}
         self.rc_seen = False
         self.rc_lost_at = None
@@ -1111,40 +1117,64 @@ class Watch:
             if hit and not self.limit:
                 self.limit, self.limit_seen_at = hit, time.time()
 
+    # The rows of STOPS_RECORD that bear on a limit stop (_read_stops), by
+    # event and type: what the log says the row was, and its id's prefix in
+    # handled_limits.
+    STOP_ROWS = {("StopFailure", "rate_limit"): ("turn ended on rate_limit", "stop-failure"),
+                 ("Notification", "quota_auto_resume_disabled"):
+                     ("Claude Code stopped waiting at a usage limit", "quota-disabled")}
+
     def _read_stops(self) -> None:
-        """Claude Code's own word that this session's turn ended on a rate
-        limit, the second route to a limit stop beside the transcript's
-        (Sprint 10, L1): a rate_limit row the StopFailure hook kept in
-        STOPS_RECORD during this launch is a limit stop when the account's
-        own reading has a full window (full_window()), which gives the
-        reset and the kind. Without one it is a passing rate limit, logged
-        once. Each row is looked at once, and not while a limit is had: one
-        real stop seen both ways is acted on once. A row from before the
-        launch (`at` is whole seconds, so at most the launch's first second
-        is lost, before any turn can end) is the previous launch's, already
-        handled or not a limit stop. Read whole, under no lock, as
-        stop_counts() does: the hook replaces the file in one rename."""
+        """Claude Code's own word that this session stopped at a limit, the
+        second route to a limit stop beside the transcript's (Sprint 10, L1
+        and L3): a row of STOP_ROWS kept in STOPS_RECORD during this launch
+        is a limit stop when the account's own reading has a full window
+        (full_window()), which gives the reset and the kind. Without one it
+        is not, and is logged once. The rows are StopFailure's rate_limit
+        (L1), and Notification's quota_auto_resume_disabled (L3): Claude
+        Code ended its own wait at a claude.ai usage limit without
+        continuing (2.1.234+; the setting turned off, the reset moved past
+        24 hours, repeated hits after continuing, or the continuation
+        blocked), so it will not carry on by itself. That row also ends the
+        grace of a limit already had, whichever route gave it (wait_ended,
+        should_switch()). quota_auto_resume_fired and _stale come once usage
+        is available again, and are the hook's record alone. Claude Code
+        starts no wait of its own in a Remote Control session (the docs,
+        2026-10-26), as a terminal's is by default: there the row comes of a
+        wait picked from /rate-limit-options, or of repeated hits.
+
+        Each row is looked at once, and none but the ended wait while a
+        limit is had: one real stop seen several ways is acted on once. A
+        row from before the launch (`at` is whole seconds, so at most the
+        launch's first second is lost, before any turn can end) is the
+        previous launch's, already handled or not a limit stop. Read whole,
+        under no lock, as stop_counts() does: the hook replaces the file in
+        one rename."""
         kept = read_json(LONGHAUL_HOME / STOPS_RECORD)
         for row in stop_rows(kept.get(self.sid) if isinstance(kept, dict) else None):
-            at, seen = row["at"], (self.sid, row["at"])
-            if row["event"] != "StopFailure" or row["type"] != "rate_limit" or at < self.started \
-                    or seen in self.stops_seen:
+            at, said = row["at"], self.STOP_ROWS.get((row["event"], row["type"]))
+            seen = (self.sid, row["type"], at)  # a StopFailure and the ended wait can share a second
+            if said is None or at < self.started or seen in self.stops_seen:
                 continue
             self.stops_seen.add(seen)
-            uuid_ = f"stop-failure:{self.sid}:{at}"  # handled_limits is every session's: the id names its own
-            if self.limit or uuid_ in self.handled:
+            (what, prefix), ended = said, row["type"] == "quota_auto_resume_disabled"
+            if self.limit:
+                self.wait_ended |= ended
+                continue
+            uuid_ = f"{prefix}:{self.sid}:{at}"  # handled_limits is every session's: the id names its own
+            if uuid_ in self.handled:
                 continue
             reading = read_json(USAGE_DIR / f"{self.acct_name}.json")
             full = full_window(reading, time.time())
             if full is None:
                 why = "is not at its limit" if isinstance(reading, dict) else "has no usage reading"
-                log(f"limit: {self.sid} turn ended on rate_limit, but {self.acct_name} {why}; not a limit stop")
+                log(f"limit: {self.sid} {what}, but {self.acct_name} {why}; not a limit stop")
                 continue
             key, resets = full
             # The shape limit_stop() gives, and "via" for the log's line.
             self.limit = {"resets_at": float(resets), "kind": KIND[key], "uuid": uuid_, "type": key,
-                          "via": "StopFailure"}
-            self.limit_seen_at = time.time()
+                          "via": row["event"]}
+            self.limit_seen_at, self.wait_ended = time.time(), ended
 
     def opened_elsewhere(self) -> bool:
         """Another live claude has this conversation: you opened it
@@ -1168,8 +1198,9 @@ class Watch:
     def should_switch(self) -> bool:
         # After a limit stop Claude goes idle; give it LIMIT_BUSY_GRACE at
         # most in case the status file lags, since nothing more can run on
-        # this account.
-        return bool(self.limit) and (self.status != "busy"
+        # this account. None once Claude Code has said it ended its wait at
+        # the limit (wait_ended, L3): it will not carry on by itself.
+        return bool(self.limit) and (self.status != "busy" or self.wait_ended
                                      or time.time() - self.limit_seen_at > LIMIT_BUSY_GRACE)
 
     def should_move(self, other_has_room) -> bool:
@@ -1933,6 +1964,8 @@ def run(opts) -> int:
         noted = f", SessionEnd: {ended}" if ended else ""
         if why == "limit" and w.limit.get("via") == "StopFailure":  # Claude Code's own word, not the transcript's (L1)
             noted = ", StopFailure: rate_limit"
+        if why == "limit" and w.wait_ended:  # and its word that it ended its wait there (L3)
+            noted += ", Notification: quota_auto_resume_disabled"
         log(f"{acct['name']} ended: {why} (session {w.sid}{noted}, exit {proc.returncode})")
         log(f"state: running -> {why}")
         if w.sid:  # where it ran, for a later `longhaul -r` in ask or never
