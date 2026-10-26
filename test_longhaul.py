@@ -11957,12 +11957,15 @@ class Models(unittest.TestCase):
 
     S = "SENTINEL-OKAPI-7731"
     SID = "5e0c1a2b-0000-4000-8000-000000000001"
-    # The owner's text, word for word (2026-10-25): one paragraph.
+    # The owner's text, word for word (2026-10-25; Fable and the step up, 2026-10-26): one paragraph.
     GUIDE = ("Longhaul: when you start a subagent (Agent or Task), set its `model` by how hard its job is: `haiku` "
              "for lookups, listing, reading and summarizing, and small mechanical edits; `sonnet` for ordinary "
              "implementation, tests, refactors in a few files and routine reviews; `opus` for design and "
              "architecture, hard or long debugging, security review, work across many files, or anything where a "
-             "wrong answer is costly. When unsure, `sonnet`. Set it on every call.")
+             "wrong answer is costly; `fable` only for a decision that is hard to undo, the review before a "
+             "release, or a problem Opus has failed at twice: at most one Fable run per task, and say why. If a "
+             "run's work fails its tests twice, start the next run one model higher, not again on the same one. "
+             "When unsure, `sonnet`. Set it on every call.")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()

@@ -7608,12 +7608,15 @@ def trial(opts) -> int:
 MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
 MODELS_MODES = ("off", "guide", "on", "trial")
 MODELS_START = {"implementer": "sonnet", "security-auditor": "sonnet", "qa-engineer": "sonnet"}  # the owner's first
-# The owner's text (2026-10-25), word for word: one paragraph.
+# The owner's text (2026-10-25; Fable and the step up, 2026-10-26), word for word: one paragraph.
 MODELS_GUIDE = ("Longhaul: when you start a subagent (Agent or Task), set its `model` by how hard its job is: `haiku` "
                 "for lookups, listing, reading and summarizing, and small mechanical edits; `sonnet` for ordinary "
                 "implementation, tests, refactors in a few files and routine reviews; `opus` for design and "
                 "architecture, hard or long debugging, security review, work across many files, or anything where a "
-                "wrong answer is costly. When unsure, `sonnet`. Set it on every call.")
+                "wrong answer is costly; `fable` only for a decision that is hard to undo, the review before a "
+                "release, or a problem Opus has failed at twice: at most one Fable run per task, and say why. If a "
+                "run's work fails its tests twice, start the next run one model higher, not again on the same one. "
+                "When unsure, `sonnet`. Set it on every call.")
 MODELS_DEFAULT_TYPE = "general-purpose"  # Claude Code's agent type for a call that names none
 
 
