@@ -1875,12 +1875,12 @@ class CodexRollouts(unittest.TestCase):
 class CodexInspect(unittest.TestCase):
     """`longhaul inspect --agent codex`: where one OpenAI Codex chat's tokens
     went, from its rollout (docs plans/2026-10-27-codex.md, X1). Two shapes:
-    the 0.146 alphas' on the owner's Mac (P1: no token_usage_record, one
-    token_count, the work in exec cells and the McpToolCall items inside
-    them), and a 0.164 paginated rollout's, from Codex's source (per-request
-    usage, CommandExecution with parsed_cmd, FileChange, a compaction, a
-    sub-agent's rollout). Every text field holds SECRET, which no report
-    may show."""
+    the 0.146 alphas' on the owner's Mac (P1: a token_count per response
+    and no token_usage_record, the work in exec cells and the McpToolCall
+    items inside them), and a 0.164 paginated rollout's, from Codex's
+    source (a token_usage_record beside each token_count, CommandExecution
+    with parsed_cmd, FileChange, a compaction, a sub-agent's rollout).
+    Every text field holds SECRET, which no report may show."""
 
     MAIN = "019a2b3c-0000-7000-8000-00000000aaaa"
     CHILD = "019a2b3c-0000-7000-8000-00000000bbbb"
@@ -1899,6 +1899,7 @@ class CodexInspect(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.second = 0
+        self.running = dict.fromkeys(self.six(0), 0)  # the token_counts' total so far: count() adds to it
 
     # ------------------------------------------------ records, as Codex writes them
 
@@ -1931,11 +1932,20 @@ class CodexInspect(unittest.TestCase):
                                                "thread_id": thread, "session_id": thread, "usage": u,
                                                "turn_token_usage": u, "thread_token_usage": u})
 
-    def count(self, last, total=None, window=258400, limits=None):
-        """A token_count event: the last response's usage, the chat's so far, and the allowance."""
-        info = {"last_token_usage": self.six(last), "total_token_usage": self.six(**(total or {"inp": last})),
-                "model_context_window": window}
+    def count(self, window=258400, limits=None, **six):
+        """A token_count event, as Codex writes one after each response: that
+        response's usage (six()), the total so far, grown by exactly it (P1),
+        and the allowance."""
+        last = self.six(**six)
+        for k, v in last.items():
+            self.running[k] += v
+        info = {"last_token_usage": last, "total_token_usage": dict(self.running), "model_context_window": window}
         return self.rec("event_msg", {"type": "token_count", "info": info, "rate_limits": limits})
+
+    def respond(self, turn_id, response, thread=None, limits=None, **six):
+        """A response as newer builds write it: its token_usage_record, then
+        the token_count after it with the same numbers (P1: 27 of 27)."""
+        return [self.usage(turn_id, response, thread=thread, **six), self.count(limits=limits, **six)]
 
     def limits(self, used=42.0, week=10.0, reached=None):
         return {"primary": {"used_percent": used, "window_minutes": 300, "resets_at": self.RESETS[0]},
@@ -1998,7 +2008,7 @@ class CodexInspect(unittest.TestCase):
 
     def alpha(self, thread=None):
         """The 0.146 alphas' (P1): messages, a code cell and the MCP tools it
-        called, a wait, one token_count with the allowance, no token_usage_record."""
+        called, a wait, the response's token_count with the allowance, no token_usage_record."""
         s = self.SECRET
         return [self.meta(thread or self.MAIN, "0.146.0-alpha.3.1", thread_source="user"),
                 self.rec("world_state", {"cwd": "/work/app", "note": s}),
@@ -2012,8 +2022,7 @@ class CodexInspect(unittest.TestCase):
                 self.call("wait", "w1", cell_id="1", note=s),
                 self.output("w1", "y" * 300),
                 self.said("assistant"), self.item("AgentMessage", id="a1", text=s),
-                self.count(41000, total=dict(inp=50000, cached=30000, write=1000, out=2000, reasoning=500),
-                           limits=self.limits()),
+                self.count(limits=self.limits(), inp=40000, cached=30000, write=1000, out=1000, reasoning=500),
                 self.rec("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": s})]
 
     def paged(self, thread=None):
@@ -2025,15 +2034,13 @@ class CodexInspect(unittest.TestCase):
         s = self.SECRET
         return [self.meta(thread or self.MAIN),
                 self.turn("t1", "gpt-5.6-terra"), self.said(), self.thought(),
-                self.usage("t1", "r1", inp=10000, cached=8000, write=500, out=300, reasoning=100),
-                self.count(10300),
+                *self.respond("t1", "r1", inp=10000, cached=8000, write=500, out=300, reasoning=100),
                 self.call("exec_command", "s1", cmd=f"rg -n {s} src", workdir="/work/app"),
                 self.command("s1", f"rg -n {s} src", [{"type": "search", "cmd": s, "query": s, "path": "src"}], s),
                 self.output("s1", "z" * 700),
                 self.call("exec_command", "s2", cmd="cat a.py"), self.command("s2", "cat a.py", self.reads(), s),
                 self.output("s2", "a" * 400),
-                self.usage("t1", "r2", inp=12000, cached=10000, out=200),
-                self.count(12200),
+                *self.respond("t1", "r2", inp=12000, cached=10000, out=200),
                 self.call("exec_command", "s3", cmd="cat a.py"), self.command("s3", "cat a.py", self.reads(), s),
                 self.output("s3", "a" * 400),  # read again, unchanged: a repeat
                 self.custom("apply_patch", "p1", f"*** Begin Patch\n{s}"),
@@ -2048,8 +2055,7 @@ class CodexInspect(unittest.TestCase):
                                        "window_number": 1, "previous_window_id": "w0"}),
                 self.item("ContextCompaction", id="k1"),
                 self.turn("t2", "gpt-5.6-sol"),
-                self.usage("t2", "r3", inp=5000, write=5000, out=100, reasoning=20),
-                self.count(5100, limits=self.limits(used=42.5)),
+                *self.respond("t2", "r3", limits=self.limits(used=42.5), inp=5000, write=5000, out=100, reasoning=20),
                 self.call("exec_command", "s5", cmd="cat a.py"), self.command("s5", "cat a.py", self.reads(), s),
                 self.output("s5", "a" * 400),  # after the compaction: no repeat
                 self.rec("future_record", {"text": s}),
@@ -2062,8 +2068,7 @@ class CodexInspect(unittest.TestCase):
         spawn = {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": depth, "agent_role": "explorer"}}}
         return [self.meta(thread, source=spawn, parent_thread_id=parent, thread_source="subagent"),
                 self.turn("ct1", "gpt-5.6-terra"), self.said(),
-                self.usage("ct1", f"cr-{thread}", thread=thread, inp=3000, cached=1000, out=200, reasoning=50),
-                self.count(3200),
+                *self.respond("ct1", f"cr-{thread}", thread=thread, inp=3000, cached=1000, out=200, reasoning=50),
                 self.call("exec_command", "cs1", cmd="cat b.py"),
                 self.item("CommandExecution", thread=thread, id="cs1", command=["/bin/zsh", "-lc", "cat b.py"],
                           cwd="/work/app", parsed_cmd=self.reads("/work/app/b.py"), status="completed",
@@ -2075,7 +2080,7 @@ class CodexInspect(unittest.TestCase):
         main = self.write(self.MAIN, self.paged(), when=3000)
         self.write(self.CHILD, self.child(), when=2000, stamp="2026-10-27T10-05-00")
         self.write(self.OTHER, [self.meta(self.OTHER), self.turn("o1", "gpt-5.6-sol"),
-                                self.usage("o1", "or1", thread=self.OTHER, inp=99999, out=9)], when=1000)
+                                *self.respond("o1", "or1", thread=self.OTHER, inp=99999, out=9)], when=1000)
         return main
 
     def cli(self, *args, agent="codex"):
@@ -2100,25 +2105,45 @@ class CodexInspect(unittest.TestCase):
 
     # ------------------------------------------------ the 0.146 alphas
 
-    def test_a_rollout_with_no_per_request_usage_says_so_and_totals_from_its_last_token_count(self):
+    def test_the_alphas_token_counts_are_their_requests_and_a_rollout_with_none_says_so(self):
+        # The 0.146 alphas wrote no token_usage_record: each response's token_count is its request.
         r = longhaul.inspect_rollout(self.write(self.MAIN, self.alpha()))
-        self.assertEqual(r["requests"], {"main": 0, "subagents": 0})
-        self.assertEqual(r["unrecorded"], {"main": 1, "subagents": 0})
-        self.assertEqual(r["tokens"]["main"], {"new_input": 20000, "cache_read": 30000, "cache_write": 1000,
-                                               "output": 2000, "reasoning": 500})
-        self.assertEqual((r["models"], r["turn_models"], r["model_tokens"]), ({}, {"gpt-5.6-terra": 1}, []))
+        self.assertEqual((r["requests"], r["bare"]), ({"main": 1, "subagents": 0}, {"main": 0, "subagents": 0}))
+        self.assertEqual(r["tokens"]["main"], {"new_input": 10000, "cache_read": 30000, "cache_write": 1000,
+                                               "output": 1000, "reasoning": 500})
+        self.assertEqual((r["models"], r["turn_models"]), ({"gpt-5.6-terra": 1}, {"gpt-5.6-terra": 1}))
+        # A chat handed off (P1: 15 of 21): messages, and a token_count with no usage in it.
+        handed = [self.meta(self.LONE, "0.146.0-alpha.3.1", thread_source="chatgpt_handoff"),
+                  self.turn("t1", "gpt-5.6-terra"), self.said(), self.said("assistant"),
+                  self.count(limits=self.limits(), inp=0)]
+        r = longhaul.inspect_rollout(self.write(self.LONE, handed, stamp="2026-10-27T11-00-00"))
+        self.assertEqual((r["requests"]["main"], r["bare"]["main"], r["tokens"]["main"]["new_input"]), (0, 1, 0))
         out = longhaul.rollout_lines(r)
         requests = self.section(out, "Requests [rollout")
-        self.assertIn("  main: no per-request usage written", requests)
+        self.assertIn("  main: no usage written", requests)
         self.assertIn("  models by turn: gpt-5.6-terra 1", requests)
-        tokens = self.section(out, "Tokens [rollout")
-        self.assertIn("no per-request usage written", tokens[0])
-        self.assertIn("  main: no per-request usage written; its total is the last token_count's total_token_usage",
-                      tokens)
-        self.assertEqual(next(l for l in tokens if l.startswith("  main ")).split(),
-                         ["main", "20,000", "30,000", "1,000", "2,000", "500"])
-        self.assertEqual(self.section(out, "Tokens by model")[1:],
-                         ["  none: no per-request usage written; the models by turn are under Requests"])
+        self.assertIn("  main: no usage written", self.section(out, "Tokens [rollout"))
+        self.assertEqual(self.section(out, "Tokens by model")[1:], ["  none"])
+        self.assertIn(("rollouts_without_usage", "main", 1),
+                      {(x["metric"], x["scope"], x["value"]) for x in longhaul.rollout_metrics(r)})
+
+    def test_a_chat_on_two_builds_counts_each_response_once_and_adds_up_to_codexs_total(self):
+        # P1's newest chat: its first 60 responses had a token_count alone,
+        # its last 27 a token_usage_record too with the same numbers, and
+        # one token_count repeated the total before it (the allowance
+        # refreshed). Counting the records alone missed 60 of the 87.
+        records = [self.meta(self.MAIN, "0.146.0-alpha.3.1"), self.turn("t1", "gpt-5.6-terra"),
+                   self.count(inp=1000, cached=600, out=10), self.count(inp=2000, cached=1500, out=20)]
+        records.append(dict(records[-1]))  # the same total again
+        records += [self.turn("t2", "gpt-5.6-terra"), *self.respond("t2", "r3", inp=3000, cached=2500, out=30)]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual((r["requests"]["main"], r["models"]), (3, {"gpt-5.6-terra": 3}))
+        self.assertEqual(r["tokens"]["main"], {"new_input": 1400, "cache_read": 4600, "cache_write": 0, "output": 60,
+                                               "reasoning": 0})
+        codex = records[-1]["payload"]["info"]["total_token_usage"]
+        self.assertEqual((r["tokens"]["main"]["new_input"] + r["tokens"]["main"]["cache_read"],
+                          r["tokens"]["main"]["output"]), (codex["input_tokens"], codex["output_tokens"]))
+        self.assertEqual(r["context"]["last"], 3030)
 
     def test_code_cells_say_that_the_searches_and_reads_inside_them_are_not_recorded(self):
         r = longhaul.inspect_rollout(self.write(self.MAIN, self.alpha()))
@@ -2157,9 +2182,10 @@ class CodexInspect(unittest.TestCase):
         self.assertEqual(r["tokens"], {
             "main": {"new_input": 9000, "cache_read": 18000, "cache_write": 5500, "output": 600, "reasoning": 120},
             "subagents": {"new_input": 2000, "cache_read": 1000, "cache_write": 0, "output": 200, "reasoning": 50}})
-        self.assertEqual(r["unrecorded"], {"main": 0, "subagents": 0})
+        self.assertEqual(r["bare"], {"main": 0, "subagents": 0})
         tokens = self.section(longhaul.rollout_lines(r), "Tokens [rollout")
-        self.assertEqual(tokens[0], "Tokens [rollout, measured: Codex's own counts per request (token_usage_record)]")
+        self.assertEqual(tokens[0], "Tokens [rollout, measured: Codex's own counts per response (token_count's "
+                                    "last_token_usage)]")
         self.assertIn("input less cache read", tokens[1])
         self.assertEqual([l.split() for l in tokens[2:]], [
             ["new", "input", "cache", "read", "cache", "write", "output", "reasoning"],
@@ -2188,9 +2214,9 @@ class CodexInspect(unittest.TestCase):
                          [["main", "gpt-5.6-terra", "4,000"], ["main", "gpt-5.6-sol", "5,000"],
                           ["sub-agents", "gpt-5.6-terra", "2,000"]])
 
-    def test_a_response_written_twice_is_counted_once(self):
+    def test_a_token_count_repeating_the_total_before_it_is_no_new_response(self):
         records = self.paged()
-        records.insert(6, dict(records[4]))  # r1's record again
+        records.insert(6, dict(records[5]))  # r1's token_count again, as when the allowance refreshes
         r = longhaul.inspect_rollout(self.write(self.MAIN, records))
         self.assertEqual((r["requests"]["main"], r["tokens"]["main"]["cache_read"]), (3, 18000))
 
@@ -2221,7 +2247,7 @@ class CodexInspect(unittest.TestCase):
                                        "  compacted: 12,200 -> 5,100 tokens"])
 
     def test_a_compaction_with_no_token_count_after_it_shows_what_is_not_known(self):
-        records = [self.meta(self.MAIN), self.count(9000),
+        records = [self.meta(self.MAIN), self.count(inp=9000),
                    self.rec("compacted", {"message": self.SECRET, "window_number": 1})]
         r = longhaul.inspect_rollout(self.write(self.MAIN, records))
         self.assertEqual(r["compactions"], [{"before": 9000, "after": None, "scope": "main"}])
@@ -2325,14 +2351,15 @@ class CodexInspect(unittest.TestCase):
                                          "  plan: plus"])
 
     def test_a_limit_reached_is_named_and_a_window_label_reads_as_its_length(self):
-        records = [self.meta(self.MAIN), self.count(100, limits={**self.limits(used=100.0, reached="primary"),
-                                                                 "secondary": None, "spend_control_reached": True})]
+        records = [self.meta(self.MAIN), self.count(limits={**self.limits(used=100.0, reached="primary"),
+                                                            "secondary": None, "spend_control_reached": True}, inp=100)]
         allowance = self.section(longhaul.rollout_lines(longhaul.inspect_rollout(self.write(self.MAIN, records))),
                                  "Allowance")
         self.assertEqual(allowance[1:], [f"  5h: 100% used, resets {longhaul.clock(self.RESETS[0])}",
                                          "  plan: plus", "  limit reached: primary", "  spend control reached"])
-        self.assertEqual([longhaul.rollout_window(m) for m in (300, 10080, 60, 1440, 45, 90, None, -5)],
-                         ["5h", "week", "1h", "24h", "45 min", "90 min", "?", "?"])
+        # Named as `longhaul usage` names them: 30d is the owner's plan's (P1).
+        self.assertEqual([longhaul.codex_window_name(m) for m in (300, 10080, 60, 1440, 45, 90, 43200, 2880, None, -5)],
+                         ["5h", "week", "1h", "24h", "45min", "90min", "30d", "2d", "window", "window"])
 
     def test_failures_count_bad_lines_unknown_record_types_and_tool_errors(self):
         r = longhaul.inspect_rollout(self.chat())
@@ -2343,7 +2370,7 @@ class CodexInspect(unittest.TestCase):
 
     def test_names_that_are_not_plain_are_not_shown_as_written(self):
         records = [self.meta(self.MAIN, source=self.SECRET), self.turn("t1", "gpt\x1b]0;x\x07"),
-                   self.usage("t1", "r1", inp=10), self.call(self.SECRET, "c1"), self.call("bad name", "c2"),
+                   self.count(inp=10), self.call(self.SECRET, "c1"), self.call("bad name", "c2"),
                    self.item("McpToolCall", id="m1", server=self.SECRET, tool="ok"),
                    self.rec("weird type!", {}), self.rec(self.SECRET, {})]
         r = longhaul.inspect_rollout(self.write(self.MAIN, records))

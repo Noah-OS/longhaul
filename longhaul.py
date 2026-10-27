@@ -2874,13 +2874,17 @@ def codex_reading(home: Path | None = None) -> dict | None:
 
 def codex_window_name(minutes) -> str:
     """A window's name by its length: 5h and week as the Claude Code lines
-    name theirs, else hours when whole (2h) or minutes (45min); "window"
-    when Codex gave no length."""
-    whole = round(minutes) if minutes is not None else 0
+    name theirs, else days when whole and more than one (30d: the owner's
+    plan's, P1's real rollout), hours when whole (2h, 24h) or minutes
+    (45min); "window" when Codex gave no length. `usage` and `inspect`
+    both name them so."""
+    whole = round(minutes) if as_number(minutes) is not None else 0
     if whole < 1:
         return "window"
     if whole in (300, 10080):
         return "5h" if whole == 300 else "week"
+    if whole % 1440 == 0 and whole > 1440:
+        return f"{whole // 1440}d"
     return f"{whole // 60}h" if whole % 60 == 0 else f"{whole}min"
 
 
@@ -2922,12 +2926,18 @@ def codex_usage_line(reading, now: float):
 # same CODEX_HOME whose session_meta names it, or one of them, as their
 # parent_thread_id). Read from Codex's source at eec8bde and the owner's
 # rollouts (P1), structure only:
-# - a token_usage_record per model response holds Codex's own counts, in
-#   which input_tokens includes the cached tokens (Codex's non-cached input
-#   is input less cached) and output_tokens the reasoning. The 0.146
-#   alphas wrote none: a rollout's last token_count total is then its total;
+# - a token_count event after each model response holds Codex's own
+#   counts: info.last_token_usage that response's, total_token_usage the
+#   chat's so far, grown by exactly it (P1: 86 steps of 86). In them
+#   input_tokens includes the cached tokens (Codex's non-cached input is
+#   input less cached) and output_tokens the reasoning. A token_count that
+#   repeats the total before it refreshes the allowance only, and one with
+#   no usage is none. Newer builds also write a token_usage_record per
+#   response with the same numbers (P1: 27 of 27), but older ones did not,
+#   and one chat can run on both (P1's newest: its first 60 responses had
+#   none), so the token_counts are read and the records are not;
 # - the model is per turn, in turn_context; the context per response is
-#   each token_count's info.last_token_usage.total_tokens (Codex's own
+#   its last_token_usage.total_tokens (Codex's own
 #   tokens_in_context_window); a compaction is a `compacted` record with no
 #   counts, so the token_counts on either side of it give them;
 # - the model's tool calls are response items (function_call,
@@ -2960,7 +2970,6 @@ CODEX_ITEMS = ("message", "reasoning", "function_call", "function_call_output", 
 CODEX_SHELLS = ("shell", "exec_command", "local_shell", "shell_command", "container.exec")
 CODEX_CELLS = ("exec",)  # code mode's tool: a cell of JavaScript that calls tools inside it (P1)
 CODEX_TOKEN_KINDS = ("new_input", "cache_read", "cache_write", "output", "reasoning")
-CODEX_WINDOWS = {300: "5h", 10080: "week"}  # an allowance window's minutes, as the status line names Claude's
 
 
 def codex_name(value) -> str:
@@ -3000,17 +3009,6 @@ def rollout_source(source) -> str:
     role, depth = spawn.get("agent_role"), as_int(spawn.get("depth"))
     parts = ([codex_name(role)] if isinstance(role, str) else []) + ([f"depth {depth}"] if depth else [])
     return f"sub-agent ({', '.join(parts)})" if parts else "sub-agent"
-
-
-def rollout_window(minutes) -> str:
-    """An allowance window's name from its length: 5h and week as Codex's
-    two are, else its hours or minutes; "?" for none."""
-    m = as_number(minutes)
-    if m is None or m <= 0:
-        return "?"
-    if m in CODEX_WINDOWS:
-        return CODEX_WINDOWS[m]
-    return f"{m // 60:g}h" if m % 60 == 0 else f"{m:g} min"
 
 
 def rollout_output_chars(output) -> int:
@@ -3104,10 +3102,10 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
     head: dict = {}  # the chat's own session_meta: its id, version and source, nothing else of it
     lines, unreadable, cells = 0, 0, 0
     unknown, items = collections.Counter(), collections.Counter()
-    requests, turns, unrecorded, bare = (collections.Counter() for _ in range(4))
+    requests, turns, bare = (collections.Counter() for _ in range(3))
     tokens = {s: dict.fromkeys(CODEX_TOKEN_KINDS, 0) for s in scopes}
     by_model: dict = {}  # (scope, model) -> {kind: tokens}
-    models, turn_models, answered = collections.Counter(), collections.Counter(), set()
+    models, turn_models = collections.Counter(), collections.Counter()
     context, window, compactions, reading = [], None, [], None  # reading: (time, rate_limits), the latest
     calls: dict = {}  # (file, call id) -> the model's call: {name, scope, command (shells), cwd}
     done: dict = {}   # (file, item id) -> a finished item: {kind, scope, chars, ok; a command's parsed, command, cwd}
@@ -3117,7 +3115,7 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
     def read(n: int, file: Path, scope: str):
         nonlocal lines, unreadable, cells, window, reading
         when, cwd, model_of, last_model = 0.0, None, {}, None
-        recorded, total, size, waiting = 0, None, None, None
+        responses, running, size, waiting = 0, None, None, None
         events.append([])
         for record in rollout_records(file):
             if record is None:
@@ -3143,30 +3141,24 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
                     model_of[turn] = name
                 last_model = name
                 cwd = payload["cwd"] if isinstance(payload.get("cwd"), str) else cwd
-            elif kind == "token_usage_record":
-                response = payload.get("response_id")
-                if isinstance(response, str):
-                    if response in answered:
-                        continue  # a response written twice, counted once
-                    answered.add(response)
-                turn = payload.get("turn_id")
-                model = (model_of.get(turn) if isinstance(turn, str) else None) or last_model or "?"
-                recorded += 1
-                requests[scope] += 1
-                models[model] += 1
-                row = by_model.setdefault((scope, model), dict.fromkeys(CODEX_TOKEN_KINDS, 0))
-                for k, v in codex_tokens(dict_at(payload, "usage")).items():
-                    tokens[scope][k] += v
-                    row[k] += v
             elif kind == "compacted":
                 waiting = {"before": size, "after": None, "scope": scope}
                 compactions.append(waiting)
                 events[n].append((when, n, "compact", None))
             elif kind == "event_msg" and sub == "token_count":
                 info = dict_at(payload, "info")
-                total = dict_at(info, "total_token_usage") or total
-                now = as_int(dict_at(info, "last_token_usage").get("total_tokens"))
-                if now:
+                last, total = dict_at(info, "last_token_usage"), dict_at(info, "total_token_usage")
+                now = as_int(last.get("total_tokens"))
+                if now and (not total or total != running):  # a response: not a repeat of the total before
+                    running = total
+                    responses += 1
+                    requests[scope] += 1
+                    model = last_model or "?"
+                    models[model] += 1
+                    row = by_model.setdefault((scope, model), dict.fromkeys(CODEX_TOKEN_KINDS, 0))
+                    for k, v in codex_tokens(last).items():
+                        tokens[scope][k] += v
+                        row[k] += v
                     size = now
                     if scope == "main":
                         context.append(now)
@@ -3233,13 +3225,8 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
                     outs[(n, cid)] = rollout_output_chars(payload.get("output"))
                 elif sub not in CODEX_ITEMS:
                     unknown[f"response_item:{codex_name(sub)}"] += 1
-        if not recorded:  # no per-request usage written: the rollout's total is its last token_count's
-            unrecorded[scope] += 1
-            if total:
-                for k, v in codex_tokens(total).items():
-                    tokens[scope][k] += v
-            else:
-                bare[scope] += 1
+        if not responses:  # no token_count with usage: a chat handed off, or one that never reached the model
+            bare[scope] += 1
 
     read(0, path, "main")
     sid = head.get("id")
@@ -3358,7 +3345,7 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
             resets = as_number(w.get("resets_at"))
             if resets is None and as_number(w.get("resets_in_seconds")) is not None and at:
                 resets = at + w["resets_in_seconds"]  # the older field
-            windows.append({"window": name, "label": rollout_window(w.get("window_minutes")),
+            windows.append({"window": name, "label": codex_window_name(w.get("window_minutes")),
                             "minutes": as_number(w.get("window_minutes")), "used": as_number(w.get("used_percent")),
                             "resets": resets})
         plan, reached = limits.get("plan_type"), limits.get("rate_limit_reached_type")
@@ -3376,7 +3363,7 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
         "cli_version": shown(version, 40) if isinstance(version, str) and CODEX_VERSION.fullmatch(version) else "?",
         "source": rollout_source(head.get("source")), "lines": lines, "unreadable": unreadable,
         "requests": {s: requests[s] for s in scopes}, "turns": {s: turns[s] for s in scopes},
-        "unrecorded": {s: unrecorded[s] for s in scopes}, "bare": {s: bare[s] for s in scopes},
+        "bare": {s: bare[s] for s in scopes},
         "models": dict(models.most_common()), "turn_models": dict(turn_models.most_common()),
         "items": dict(items.most_common()), "tokens": tokens,
         "model_tokens": [{"model": m, "scope": s, **t} for (s, m), t in
@@ -3415,13 +3402,11 @@ def rollout_lines(r: dict) -> list[str]:
         out.append(f"  {plural(r['packed'], 'compressed rollout')} under CODEX_HOME not looked in (Python 3.14 and "
                    f"later read {them}): a sub-agent's there is not counted")
 
-    none = "no per-request usage written"
-    lost = r["unrecorded"]["subagents"]
-    subs = f"sub-agents {r['requests']['subagents']:,}" + (
-        f" ({lost} of their {plural(kids, 'rollout')} with {none})" if lost and lost < kids
-        else f": {none}" if lost else "")
-    rows = ([f"  main {r['requests']['main']:,}, {subs}"] if not r["unrecorded"]["main"]
-            else [f"  main: {none}"] + ([f"  {subs}"] if kids else []))
+    none = "no usage written"  # a rollout with no token_count with usage in it: a chat handed off, say (P1)
+    bare = [("main" if s == "main" else plural(r["bare"][s], "sub-agent rollout")) + f": {none}"
+            for s in ("main", "subagents") if r["bare"][s]]
+    rows = [f"  main {r['requests']['main']:,}, sub-agents {r['requests']['subagents']:,}"]
+    rows += [f"  {b}" for b in bare]
     if r["models"]:
         rows.append("  " + ", ".join(f"{m} {c:,}" for m, c in r["models"].items()))
     elif r["turn_models"]:
@@ -3429,7 +3414,8 @@ def rollout_lines(r: dict) -> list[str]:
     rows.append(f"  turns: main {r['turns']['main']:,}" + (f", sub-agents {r['turns']['subagents']:,}" if kids else ""))
     if r["items"]:
         rows.append("  completed items: " + ", ".join(f"{k} {c:,}" for k, c in r["items"].items()))
-    section("Requests [rollout, counted: token_usage_record, one per model response]", rows)
+    section("Requests [rollout, counted: the token_counts with usage, one per model response; one repeating the "
+            "total before it is not one]", rows)
 
     def table(rows, label):
         """Tokens by kind, a row each, named by label(row)."""
@@ -3440,33 +3426,16 @@ def rollout_lines(r: dict) -> list[str]:
                    f"{t['output']:>13,}{t['reasoning']:>13,}" for t in rows])
 
     names = {"main": "main", "subagents": "sub-agents"}
-    if not any(r["unrecorded"].values()):
-        out.append("Tokens [rollout, measured: Codex's own counts per request (token_usage_record)]")
-    else:
-        out.append(f"Tokens [rollout, measured: Codex's own counts; with {none}, a rollout's total is its last "
-                   "token_count's]")
+    out.append("Tokens [rollout, measured: Codex's own counts per response (token_count's last_token_usage)]")
     out.append("  new input: input less cache read (Codex's input includes the cached tokens); cache write is part "
                "of the input, as Codex reports it; output includes reasoning")
-    for scope in ("main", "subagents"):  # the rollouts with no per-request usage: those with a total, those without
-        n, empty = r["unrecorded"][scope], r["bare"][scope]
-        who = "main" if scope == "main" else plural(n - empty, "sub-agent rollout")
-        if n > empty:
-            out.append(f"  {who}: {none}; {'its total is' if n - empty == 1 else 'their totals are'} the last "
-                       "token_count's total_token_usage")
-        if empty:
-            out.append(f"  {'main' if scope == 'main' else plural(empty, 'sub-agent rollout')}: "
-                       "no usage written at all")
+    out.extend(f"  {b}" for b in bare)
     total = {k: r["tokens"]["main"][k] + r["tokens"]["subagents"][k] for k in CODEX_TOKEN_KINDS}
     rows = [{"name": names[s], **r["tokens"][s]} for s in ("main", "subagents")] + [{"name": "total", **total}]
     out.extend(table(rows, lambda t: t["name"]))
 
-    if r["model_tokens"]:
-        rows = table(r["model_tokens"], lambda t: f"{names[t['scope']]:<11}{t['model']}")
-        if any(r["unrecorded"].values()):
-            rows.append(f"  not by model: the totals of the rollouts with {none}")
-    else:
-        rows = [f"  none: {none}; the models by turn are under Requests"] if any(r["unrecorded"].values()) else []
-    section("Tokens by model [rollout, measured: Codex's own counts per request, each by its turn's model]", rows)
+    rows = table(r["model_tokens"], lambda t: f"{names[t['scope']]:<11}{t['model']}") if r["model_tokens"] else []
+    section("Tokens by model [rollout, measured: Codex's own counts per response, each by its turn's model]", rows)
 
     c = r["context"]
     rows = ([f"  first {c['first']:,}, peak {c['peak']:,}, last {c['last']:,} tokens"
@@ -3546,8 +3515,8 @@ def rollout_metrics(r: dict) -> list[dict]:
     add("subagent_rollouts", r["subagents"], "files", "subagents", "counted")
     for scope, n in r["requests"].items():
         add("requests", n, "requests", scope, "counted")
-    for scope, n in r["unrecorded"].items():
-        add("rollouts_without_request_usage", n, "files", scope, "counted")
+    for scope, n in r["bare"].items():
+        add("rollouts_without_usage", n, "files", scope, "counted")
     for scope, n in r["turns"].items():
         add("turns", n, "turns", scope, "counted")
     for model, n in r["models"].items():
