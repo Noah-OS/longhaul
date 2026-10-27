@@ -13230,16 +13230,18 @@ def doctor_features() -> dict:
     return doctor_result("the switches in force here", items)
 
 
-# The Codex program, run for its version alone; tests put a fake on PATH.
+# The Codex program, run for its version alone, as PATH's absolute entries
+# find it (doctor_path_hits): never a `codex` in the folder the doctor runs
+# in. Tests put a fake on PATH.
 CODEX = "codex"
 
 
-def codex_version():
-    """`codex --version`'s version, 0.164.0 from "codex-cli 0.164.0": the
-    last word it prints, when that is a plain version (CODEX_VERSION); else
-    None. Never raises."""
+def codex_version(program: str = CODEX):
+    """`program --version`'s version, 0.164.0 from "codex-cli 0.164.0":
+    the last word it prints, when that is a plain version (CODEX_VERSION);
+    else None. Never raises."""
     try:
-        out = subprocess.run([CODEX, "--version"], capture_output=True, text=True, errors="replace", timeout=15,
+        out = subprocess.run([program, "--version"], capture_output=True, text=True, errors="replace", timeout=15,
                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -13295,10 +13297,11 @@ def codex_version_said(quick: bool, newest: list) -> str:
     one, else, and always quick (no program run), the one the newest of the
     chats in `newest` wrote, with where it was started; or why there is none."""
     program = ""
-    if not quick and not shutil.which(CODEX):
+    found = None if quick else next((path for path, runnable in doctor_path_hits(CODEX) if runnable), None)
+    if not quick and not found:
         program = "`codex` is not on PATH"
     elif not quick:
-        version = codex_version()
+        version = codex_version(found)
         if version:
             return f"version {version}, from `codex --version`"
         program = "`codex --version` gave none"
@@ -13350,8 +13353,7 @@ def doctor_codex(quick: bool = False):
         items.append(("warn", f"{unread:,} compressed chat{'s' * (unread != 1)} (a week old and more) that this "
                               f"Python ({sys.version.split()[0]}) cannot read: `inspect --agent codex` and `usage` "
                               "see only the newer ones",
-                      f"Python 3.14 or later reads {them} when it is the `python3` on PATH (`longhaul` and the in-chat "
-                      "`bin/longhaul` run `python3`); Longhaul installs nothing"))
+                      f"Python 3.14 or later reads {them} when it is the `python3` on PATH; Longhaul installs nothing"))
     return doctor_result("Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and installs nothing "
                          "in Codex yet", items)
 

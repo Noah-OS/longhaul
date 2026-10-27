@@ -18632,6 +18632,24 @@ class CodexDoctor(unittest.TestCase):
                 self.assertEqual(c["mark"], "ok", "no Codex range is checked yet: the version is said, not judged")
         self.assertTrue(self.ran.exists())
 
+    def test_a_codex_that_only_a_relative_path_entry_finds_is_never_run(self):
+        # PATH's "." or "bin" would find a `codex` in the folder the doctor
+        # runs in, a cloned repository's: like doctor_path_hits, it counts
+        # PATH's absolute entries alone.
+        self.rollout()
+        here = self.tmp / "repo"
+        here.mkdir()
+        self.fake_codex(folder=here)
+        was = os.getcwd()
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join((".", str(self.bin)))}):
+            os.chdir(here)
+            try:
+                c = longhaul.doctor_codex()
+            finally:
+                os.chdir(was)
+        self.assertFalse(self.ran.exists(), "the folder's own codex was run")
+        self.assertTrue(self.version(c).endswith(f"; {self.NO_CODEX}"))
+
     def test_without_codex_on_path_and_always_quick_the_version_is_the_newest_chats(self):
         self.rollout(version="0.146.0-alpha.9.2", ago=900)
         self.rollout(version="0.154.0-alpha.6.2", source="cli", ago=60)
@@ -18705,8 +18723,8 @@ class CodexDoctor(unittest.TestCase):
             ("warn", f"2 compressed chats (a week old and more) that this Python ({python}) cannot read: "
                      "`inspect --agent codex` and `usage` see only the newer ones")])
         self.assertEqual((c["mark"], c["said"]), ("warn", self.SAID))
-        self.assertEqual(c["step"], "Python 3.14 or later reads them when it is the `python3` on PATH (`longhaul` and "
-                                    "the in-chat `bin/longhaul` run `python3`); Longhaul installs nothing")
+        self.assertEqual(c["step"], "Python 3.14 or later reads them when it is the `python3` on PATH; Longhaul installs "
+                                    "nothing")
         self.assertEqual(one["mark"], "warn", "quick too")
         self.assertEqual(self.printed(c)[-1], f"    Next: {c['step']}")
         # One, in either folder.
