@@ -2736,15 +2736,17 @@ def usage(opts) -> int:
 # ---------------------------------------------------------------- codex
 #
 # OpenAI's Codex (docs plans/2026-10-27-codex.md, Phase 1): its rollouts,
-# read for `inspect --agent codex` and `usage`. A rollout is one chat,
-# CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl, a JSON record a line:
-# {type, timestamp, ordinal, payload}. Codex compresses one older than a
-# week to .jsonl.zst, which Python 3.14's compression.zstd reads; an older
-# Python counts those and reads none. Codex calls the format "not a stable
-# interface": a record type not known here is counted, never an error.
+# read for `inspect --agent codex`, `usage` and the doctor's Codex line.
+# A rollout is one chat, CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl,
+# a JSON record a line: {type, timestamp, ordinal, payload}. Codex
+# compresses one older than a week to .jsonl.zst, which Python 3.14's
+# compression.zstd reads; an older Python counts those and reads none.
+# Codex calls the format "not a stable interface": a record type not known
+# here is counted, never an error.
 # Read from the owner's 21 rollouts (the 0.146 to 0.154 alphas, P1) and
-# Codex's source at eec8bde, structure only. Under CODEX_HOME only
-# sessions/ is read: never auth.json or any other file there.
+# Codex's source at eec8bde, structure only. Under CODEX_HOME (and the
+# doctor's ~/.codex) only sessions/ is read: never auth.json or any other
+# file there.
 
 try:
     from compression import zstd
@@ -2956,7 +2958,8 @@ def codex_usage_line(reading, now: float):
 
 CODEX_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,79}")  # a model's, tool's, server's or type's name, as written
 CODEX_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")  # a thread's id, or the start of one, as `inspect` takes it
-CODEX_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,39}")
+# A version as Codex writes one, 0.164.0 or 0.146.0-alpha.3.1 (P1), no longer: anything else is not shown.
+CODEX_VERSION = re.compile(r"\d{1,5}\.\d{1,5}\.\d{1,5}(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,22})?")
 CODEX_FILE = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([A-Za-z0-9_-]+)\.jsonl(\.zst)?")
 CODEX_RECORDS = ("session_meta", "turn_context", "token_usage_record", "event_msg", "response_item", "compacted",
                  "world_state")  # the record types read or passed over knowingly; any other is counted by name
@@ -12590,7 +12593,9 @@ def uninstall(opts) -> int:
 # nothing, so the shim runs it from a chat as it runs status. Of other
 # processes it reads, with ps and lsof, only what a chat is (its program
 # and its own flags, never printed), its folder, and its CLAUDE_CONFIG_DIR,
-# never another variable. It names accounts, never their emails.
+# never another variable. It names accounts, never their emails. Of
+# Codex's folders (X3) it lists sessions/ alone, and of the chats there it
+# reads the newest one's first record, for its version and where it ran.
 #
 # The first chat after an install or an update (the plugin's version is
 # not the one LONGHAUL_HOME/seen.json records) is told, by the guard's
@@ -12606,7 +12611,8 @@ DOCTOR_RANK = {"ok": 0, "warn": 1, "bad": 2}
 DOCTOR_CHECKS = (("Plugin", "doctor_plugin"), ("Terminal command", "doctor_command"), ("Claude Code", "doctor_claude"),
                  ("Updates", "doctor_updates"), ("Status line", "doctor_statusline"),
                  ("VS Code panel", "doctor_vscode"), ("Accounts", "doctor_accounts"),
-                 ("Chats running now", "doctor_chats"), ("Code maps", "doctor_maps"), ("Features", "doctor_features"))
+                 ("Chats running now", "doctor_chats"), ("Code maps", "doctor_maps"), ("Features", "doctor_features"),
+                 ("Codex", "doctor_codex"))
 DOCTOR_UPDATE = "`claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`"
 DOCTOR_STATUS_LINE = '"statusLine": {"type": "command", "command": "~/.local/bin/longhaul statusline"}'
 # The first word after the program (`claude auth ...`): a job, not a chat.
@@ -12643,9 +12649,10 @@ def doctor_result(said: str, items=(), mark: str = "ok", step=None) -> dict:
     """One line of the checklist: what it says, its items (mark, text,
     step), its mark, the worst of its own and its items', and its step:
     its own when the line's own mark is the worst, else its first broken
-    item's, else its first half-set-up item's."""
+    item's, else its first half-set-up item's. An item marked None is
+    said and not judged (Codex's version): it counts for neither."""
     items = list(items)
-    worst = max([mark] + [i[0] for i in items], key=DOCTOR_RANK.get)
+    worst = max([mark] + [i[0] for i in items if i[0]], key=DOCTOR_RANK.get)
     if DOCTOR_RANK[mark] < DOCTOR_RANK[worst] or not step:
         step = next((s for want in ("bad", "warn") for m, _, s in items if m == want and s), step)
     return {"mark": worst, "said": said, "items": items, "step": step if worst != "ok" else None}
@@ -13223,6 +13230,132 @@ def doctor_features() -> dict:
     return doctor_result("the switches in force here", items)
 
 
+# The Codex program, run for its version alone; tests put a fake on PATH.
+CODEX = "codex"
+
+
+def codex_version():
+    """`codex --version`'s version, 0.164.0 from "codex-cli 0.164.0": the
+    last word it prints, when that is a plain version (CODEX_VERSION); else
+    None. Never raises."""
+    try:
+        out = subprocess.run([CODEX, "--version"], capture_output=True, text=True, errors="replace", timeout=15,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    words = out.stdout.split() if out.returncode == 0 else []
+    return words[-1] if words and CODEX_VERSION.fullmatch(words[-1]) else None
+
+
+def codex_elsewhere() -> bool:
+    """Whether CODEX_HOME is another folder than ~/.codex, Codex's default."""
+    return os.path.realpath(CODEX_HOME) != os.path.realpath(HOME / ".codex")
+
+
+def codex_folders(quick: bool = False) -> list:
+    """The Codex folders here that exist: CODEX_HOME, then ~/.codex when
+    CODEX_HOME is another folder (a Codex started from an editor or the app
+    may not see the shell's CODEX_HOME). Quick, CODEX_HOME's alone: the
+    startup hook counts in every first chat, and its HOME can be the
+    machine's where the suite has pointed CODEX_HOME at its own."""
+    folders = [CODEX_HOME] + ([HOME / ".codex"] if not quick and codex_elsewhere() else [])
+    return [folder for folder in folders if os.path.isdir(folder)]
+
+
+def codex_folder_said(home: Path, chats: int, compressed: int) -> str:
+    """A Codex folder's item: where it is, CODEX_HOME's named when there
+    can be two, and its chats; ~/.codex beside another CODEX_HOME is not
+    read by `inspect` and `usage`, which say so."""
+    where = home_path(str(home)) + (" (CODEX_HOME)" if home == CODEX_HOME and codex_elsewhere() else "")
+    if not chats:
+        count = "no chats yet"
+    elif chats == 1:
+        count = "1 chat" + (", compressed" if compressed else "")
+    else:
+        count = f"{chats:,} chats" + (f", {compressed:,} of them compressed" if compressed else "")
+    if home != CODEX_HOME:
+        count += (", not read by `inspect --agent codex` or `usage`, which read CODEX_HOME's "
+                  f"({home_path(str(CODEX_HOME))})")
+    return f"{where}: {count}"
+
+
+def rollout_version(path: Path) -> tuple:
+    """(version, source) of the chat in a rollout, from its session_meta,
+    its first record: each None unless a plain version (CODEX_VERSION) or a
+    plain name (CODEX_NAME, such as vscode or cli); nothing else is kept."""
+    first = rollout_first(path)
+    meta = dict_at(first, "payload") if isinstance(first, dict) and first.get("type") == "session_meta" else {}
+    version, source = meta.get("cli_version"), meta.get("source")
+    return (version if isinstance(version, str) and CODEX_VERSION.fullmatch(version) else None,
+            source if isinstance(source, str) and CODEX_NAME.fullmatch(source) else None)
+
+
+def codex_version_said(quick: bool, newest: list) -> str:
+    """The version item: `codex --version`'s when codex is on PATH and names
+    one, else, and always quick (no program run), the one the newest of the
+    chats in `newest` wrote, with where it was started; or why there is none."""
+    program = ""
+    if not quick and not shutil.which(CODEX):
+        program = "`codex` is not on PATH"
+    elif not quick:
+        version = codex_version()
+        if version:
+            return f"version {version}, from `codex --version`"
+        program = "`codex --version` gave none"
+
+    def written(path):
+        try:
+            return path.stat().st_mtime
+        except OSError:  # gone since it was listed
+            return 0.0
+
+    version, source = rollout_version(max(newest, key=written)) if newest else (None, None)
+    if version:
+        return (f"version {version}, as the newest chat wrote it" + (f" (started from {source})" if source else "")
+                + (f"; {program}" if program else ""))
+    why = "the newest chat names none" if newest else "there is no chat to read it from"
+    return "version not known: " + (f"{program}, and " if program else "") + why
+
+
+def doctor_codex(quick: bool = False):
+    """11. Codex (docs plans/2026-10-27-codex.md, X3): what Longhaul reads of
+    it in Phase 1, its chats, for `inspect --agent codex` and `usage`;
+    nothing is installed in Codex and no hook runs there yet. An item per
+    Codex folder (codex_folders()) with its chats and how many are
+    compressed; the version, unmarked, since no Codex range is checked yet
+    (codex_version_said()); and a ⚠ for CODEX_HOME's compressed chats, a
+    week old and more, that this Python cannot read. None (not shown, not
+    counted) with no Codex folder. Of a folder only sessions/ is listed; of
+    the chats only the newest one's first record is read, and that only
+    without a version from `codex --version`."""
+    folders = codex_folders(quick)
+    if not folders:
+        return None
+    items, newest, unread = [], [], 0
+    for home in folders:
+        try:
+            paths, packed = rollout_files(home)
+        except OSError as e:  # a sessions folder that cannot be walked
+            where = home_path(str(home))
+            items.append(("warn", f"{where}: its chats could not be listed ({e.strerror or type(e).__name__})",
+                          f"check that you can open {where}/sessions"))
+            continue
+        unread += packed if home == CODEX_HOME else 0  # the ones inspect and usage miss: they read no other folder
+        newest += paths[:1]
+        compressed = packed + sum(path.name.endswith(".zst") for path in paths)
+        items.append(("ok", codex_folder_said(home, len(paths) + packed, compressed), None))
+    items.append((None, codex_version_said(quick, newest), None))
+    if unread:
+        them = "it" if unread == 1 else "them"
+        items.append(("warn", f"{unread:,} compressed chat{'s' * (unread != 1)} (a week old and more) that this "
+                              f"Python ({sys.version.split()[0]}) cannot read: `inspect --agent codex` and `usage` "
+                              "see only the newer ones",
+                      f"Python 3.14 or later reads {them} when it is the `python3` on PATH (`longhaul` and the in-chat "
+                      "`bin/longhaul` run `python3`); Longhaul installs nothing"))
+    return doctor_result("Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and installs nothing "
+                         "in Codex yet", items)
+
+
 def doctor_checks(quick: bool = False, processes=None) -> list:
     """The checklist's lines in order, each named; quick, the ones that run
     no program, list no process and ask no network (the first-chat line's).
@@ -13231,7 +13364,7 @@ def doctor_checks(quick: bool = False, processes=None) -> list:
     for name, function in DOCTOR_CHECKS:
         check = globals()[function]
         try:
-            if function in ("doctor_claude", "doctor_updates"):
+            if function in ("doctor_claude", "doctor_updates", "doctor_codex"):
                 result = check(quick)
             elif function == "doctor_chats":
                 result = None if quick else check(doctor_processes() if processes is None else processes)
@@ -13267,7 +13400,7 @@ def doctor_lines(checks: list) -> list:
              "The doctor only reads; it changes nothing."]
     for c in checks:
         lines.append(f"{marks[c['mark']]} {c['name']}: {c['said']}")
-        lines.extend(f"    {marks[mark]} {text}" for mark, text, _ in c["items"])
+        lines.extend(f"    {marks.get(mark, ' ' * len(marks['ok']))} {text}" for mark, text, _ in c["items"])
         if c["step"]:
             lines.append(f"    Next: {c['step']}")
     n, m = doctor_count(checks)
