@@ -8569,6 +8569,10 @@ class Reminder(unittest.TestCase):
         path = self.home / "longhaul.log"
         return path.read_text() if path.exists() else ""
 
+    def checks(self):
+        """The prompt hook's check lines (Sprint 11, I5), without their time."""
+        return [entry.split(" ", 2)[2] for entry in self.log().splitlines() if " reminder check: " in entry]
+
     def test_nothing_is_said_below_the_threshold(self):
         self.assertEqual(self.remind(), "", "a transcript with no response yet")
         for size in (1_000, 150_000, 199_999):
@@ -8646,7 +8650,8 @@ class Reminder(unittest.TestCase):
         for off in ("off", "OFF", "Off"):
             self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=off), "", off)
         self.assertIsNone(self.record(), "off writes nothing")
-        self.assertEqual(self.log(), "")
+        self.assertEqual(self.log().count("\n"), 3, "but the check's line (Sprint 11, I5)")
+        self.assertEqual(self.checks(), ["reminder check: s1 context=- threshold=off told=- off"] * 3)
         self.grow(150_000)  # a compaction's drop, as far as the hook can tell
         own = {"LONGHAUL_CHECKPOINT_AT": "100000"}
         self.assertEqual(self.remind(**own), self.reminded(150))
@@ -8967,6 +8972,91 @@ class Reminder(unittest.TestCase):
         for path in self.home.rglob("*"):
             if path.is_file():
                 self.assertNotIn(self.S.encode(), path.read_bytes(), path)
+
+    # The check's line (Sprint 11, I5, the owner's decision 14): in the
+    # owner's long chat the reminder said nothing from 17:35 on 2026-10-26
+    # while the context grew from 238k to 278k, and nothing recorded why.
+    # Each call of the prompt's hook now logs one line: the session, the
+    # context it read, the threshold, the highest multiple told, and fired or
+    # the reason it said nothing; numbers and codes alone.
+
+    def test_each_prompt_logs_one_check_line_with_fired_or_why_not(self):
+        self.remind()
+        self.grow(150_000)
+        self.remind()
+        self.grow(205_400)
+        self.remind()
+        self.remind()
+        self.assertEqual(self.checks(), [
+            "reminder check: s1 context=- threshold=200000 told=- no-reading",
+            "reminder check: s1 context=150000 threshold=200000 told=0 below-threshold",
+            "reminder check: s1 context=205400 threshold=200000 told=0 fired",
+            "reminder check: s1 context=205400 threshold=200000 told=200000 already-reminded"])
+        self.assertEqual(len(self.log().splitlines()), 5, "the four checks and the reminder's own line")
+
+    def test_the_check_line_shows_the_quiet_after_a_compaction_from_the_first_multiple(self):
+        # The owner's case, from Longhaul's log (the lead, 2026-10-27): told at
+        # 200k, compacted, and told next at 400k. A compaction to 163k is not
+        # under half the threshold, so 200k stays told (reminder_fell(), which
+        # this does not change): the check says so, with the multiple told.
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+        self.grow(self.compaction(212_000, 163_000), 163_000)
+        self.assertEqual(self.remind(), "")
+        for size in (238_000, 278_000):
+            self.grow(size)
+            self.assertEqual(self.remind(), "", size)
+        self.assertEqual(self.checks()[1:], [
+            "reminder check: s1 context=163000 threshold=200000 told=200000 below-threshold",
+            "reminder check: s1 context=238000 threshold=200000 told=200000 already-reminded",
+            "reminder check: s1 context=278000 threshold=200000 told=200000 already-reminded"])
+        # Under half the threshold the mark is forgotten: the check says reset.
+        self.grow(self.compaction(280_000, 42_000), 42_000)
+        self.assertEqual(self.remind(), "")
+        self.grow(201_000)
+        self.assertEqual(self.remind(), self.reminded(201))
+        self.assertEqual(self.checks()[4:], [
+            "reminder check: s1 context=42000 threshold=200000 told=200000 reset",
+            "reminder check: s1 context=201000 threshold=200000 told=0 fired"])
+
+    def test_each_skip_has_its_code(self):
+        self.grow(205_000)
+        self.remind(LONGHAUL_CHECKPOINT_AT="off")
+        self.remind(self.ask(agent_id="a1", agent_type="Explore"))
+        for data in (self.ask(session_id="../s1"), json.dumps(self.ask(session_id=None)), "[1]", ""):
+            self.remind(data)
+        with mock.patch.object(longhaul, "trial_current", return_value={"kind": "checkpoint"}), \
+                mock.patch.object(longhaul, "trial_arm", return_value="usual"):
+            self.assertEqual(self.remind(), "", "the checkpoint trial's usual arm")
+        self.remind(self.ask(text=self.S * 60_000))
+        with mock.patch.object(longhaul, "reminder_size", side_effect=RuntimeError(self.S)):
+            self.remind()
+        self.remind(json.dumps(self.ask())[:-1])
+        self.remind(LONGHAUL_CHECKPOINT_AT="100000")
+        self.assertEqual(self.checks(), [
+            "reminder check: s1 context=- threshold=off told=- off",
+            "reminder check: s1 context=- threshold=200000 told=- subagent",
+            *["reminder check: ? context=- threshold=200000 told=- no-session"] * 4,
+            "reminder check: s1 context=205000 threshold=200000 told=0 trial-arm",
+            "reminder check: ? context=- threshold=- told=- too-big",
+            "reminder check: s1 context=- threshold=- told=- error",
+            "reminder check: ? context=- threshold=- told=- error",
+            "reminder check: s1 context=205000 threshold=100000 told=0 fired"])
+        self.assertNotIn(self.S, self.log())
+
+    def test_the_guards_path_logs_no_check_line_and_the_hook_its_line_in_its_own_process(self):
+        self.grow(205_000)
+        self.assertEqual(self.ls(), self.told(205))
+        self.assertEqual(self.checks(), [], "a Read or a Bash call is not a prompt")
+        out = self.run_hook(self.hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertEqual(self.checks(), ["reminder check: s1 context=205000 threshold=200000 told=200000 already-reminded"])
+        # A log that cannot be written costs the prompt nothing.
+        (self.home / "longhaul.log").unlink()
+        (self.home / "longhaul.log").mkdir()
+        self.grow(401_000)
+        out = self.run_hook(self.hook(), self.ask())
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.reminded(401), ""))
 
     # A subagent's own context (the owner's decision of 2026-10-25, "A
     # reminder for long subagent runs"): subagents were most of the cost on

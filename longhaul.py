@@ -187,7 +187,9 @@ Usage:
                           whose own context passes LONGHAUL_SUBAGENT_AT tokens
                           (150000 unless set; off turns it off), and each multiple,
                           is told by the guard's hook to finish its step and
-                          report back what is done and what is left
+                          report back what is done and what is left. Each prompt
+                          logs one "reminder check" line: the context, the
+                          threshold, the multiple told, and fired or why not
   longhaul account-check        the plugin's UserPromptSubmit hook: in a folder the
                           "repositories" in accounts.json keep for some accounts,
                           refuses each prompt of a chat on any other account (by
@@ -6447,6 +6449,14 @@ def advisor(opts) -> int:
 # one. Its size is read from its own transcript (subagent_transcript()),
 # the multiple said is kept in its own guard record (subagent_reminder),
 # and nothing is said to the user or to the main conversation.
+#
+# Each call of the prompt's hook logs one check line (Sprint 11, I5, the
+# owner's decision 14: in a long chat of the owner's the reminder said nothing from
+# 17:35 on 2026-10-26 while the context grew from 238k to 278k, and nothing
+# recorded why): the session, the context read, the threshold, the highest
+# multiple told and fired or the reason it said nothing (REMINDER_CODES),
+# numbers and codes alone, in longhaul.log under its cap. The guard's path
+# logs none: a Read or a Bash call is no prompt, and there are hundreds.
 
 REMINDER_AT = 200_000  # tokens: the default threshold
 SUBAGENT_AT = 150_000  # tokens: the default threshold of a subagent's own context
@@ -6519,44 +6529,59 @@ def reminder_fell(said: dict, size: int, at: int) -> bool:
     return bool(told) and size < max(told - at, at // 2)
 
 
-def reminder_due(data: dict):
-    """The context's size when it has crossed a multiple of the threshold
-    above the highest this session was told of since its last compaction,
-    which is recorded; else None. A subagent's input is never given this
+REMINDER_CODES = ("fired", "already-reminded", "below-threshold", "reset", "trial-arm", "no-reading", "no-session",
+                  "subagent", "off", "too-big", "error")  # the check line's last word (Sprint 11, I5)
+
+
+def reminder_check(data: dict) -> dict:
+    """What the context reminder made of one input: "code", one of
+    REMINDER_CODES, with what it read on the way: "at", the threshold;
+    "size", the context; "told", the highest multiple this session was
+    told of before this call. "fired" when the context has crossed a
+    multiple of the threshold above the highest told since its last
+    compaction, which is recorded. A subagent's input is never given this
     reminder: its context is not the conversation's (it has its own,
     subagent_due()), and neither is a session in the trial's usual arm
     (trial_arm()), which records nothing either. A threshold that is
-    neither a number nor off is logged once per session and kind."""
+    neither a number nor off is logged once per session and kind. Below
+    the threshold, a context more than a step under the highest told is a
+    compaction (reminder_fell()), after which the mark is forgotten:
+    "reset"."""
     at, junk = reminder_threshold()
-    if at is None or data.get("agent_id") is not None:
-        return None
+    if at is None:
+        return {"code": "off"}
+    if data.get("agent_id") is not None:
+        return {"at": at, "code": "subagent"}
     record = guard_record_path({"session_id": data.get("session_id")})
     if record is None:
-        return None
+        return {"at": at, "code": "no-session"}
     size = reminder_size(advisor_tail(data.get("transcript_path")))
     if size is None:
-        return None
+        return {"at": at, "code": "no-reading"}
     crossed = size // at * at
-    if not crossed and not junk:
-        # Nothing to say; but after a compaction, forget the highest multiple
-        # told, so the next is said. Read without the lock, which only a write takes.
-        kept = read_json(record) if record.exists() else None
-        if not (isinstance(kept, dict) and reminder_fell(dict_at(kept, "reminder"), size, at)):
-            return None
+    # Read without the lock, which only a write takes: the highest told, and
+    # below the threshold whether a compaction has made it one to forget.
+    kept = read_json(record) if record.exists() else None
+    said = dict_at(kept, "reminder")
+    found = {"at": at, "size": size, "told": as_int(said.get("at"))}
+    if not crossed and not junk and not reminder_fell(said, size, at):
+        return {**found, "code": "below-threshold"}
     trial = trial_current()
     if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
-        return None  # the checkpoint A/B's usual arm hears none (the trial section); a models trial's does
+        return {**found, "code": "trial-arm"}  # the checkpoint A/B's usual arm hears none (the trial section); a models trial's does
     with locked("guard"):  # the guard's record, written by its hook at the same moments
         kept = read_json(record)
         kept = kept if isinstance(kept, dict) else {}
         said = dict_at(kept, "reminder")
         before = dict(said)
+        found["told"] = as_int(said.get("at"))
         logged = said.get("junk") if isinstance(said.get("junk"), list) else []
         if junk and junk not in logged:
             log(f"reminder: LONGHAUL_CHECKPOINT_AT is {junk}, so the default, {REMINDER_AT:,} tokens, is used "
                 f"({record.stem})")
             said["junk"] = [*logged, junk]
-        if reminder_fell(said, size, at):
+        fell = reminder_fell(said, size, at)
+        if fell:
             said.pop("at")
         due = crossed > as_int(said.get("at"))
         if due:
@@ -6565,7 +6590,30 @@ def reminder_due(data: dict):
             write_json(record, {**kept, "reminder": said})
     if due:
         log(f"reminder: {record.stem} reminded at {crossed:,} tokens (the context is {size:,})")
-    return size if due else None
+        return {**found, "code": "fired"}
+    return {**found, "code": "already-reminded" if crossed else "reset" if fell else "below-threshold"}
+
+
+def reminder_due(data: dict):
+    """The context's size when the reminder is due for this input
+    (reminder_check() says fired), which is recorded; else None. The
+    guard's PreToolUse hook asks this, and logs no check line."""
+    found = reminder_check(data)
+    return found["size"] if found["code"] == "fired" else None
+
+
+def reminder_check_line(sid, found: dict) -> str:
+    """The prompt hook's one line per call (Sprint 11, I5): the session (?
+    for none of the session-id shape), the context, the threshold, the
+    highest multiple told, as whole numbers (- where none was read), and
+    the code. Numbers and codes alone: never the prompt's text."""
+    def number(value):
+        return str(value) if isinstance(value, int) and not isinstance(value, bool) else "-"
+    sid = sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) else "?"
+    code = found.get("code") if found.get("code") in REMINDER_CODES else "error"
+    threshold = "off" if code == "off" else number(found.get("at"))
+    return (f"reminder check: {sid} context={number(found.get('size'))} threshold={threshold} "
+            f"told={number(found.get('told'))} {code}")
 
 
 def subagent_transcript(data: dict):
@@ -6705,19 +6753,32 @@ def reminder_join(data, answer):
 def reminder(_opts) -> int:
     """The UserPromptSubmit hook command: stdin in, the reminder's JSON or
     nothing out, exit 0 always. An error prints nothing and is logged by
-    its kind alone, as advisor_note() does."""
+    its kind alone, as advisor_note() does. Each call, whatever happens,
+    logs one check line (reminder_check_line()): in a long chat of the owner's
+    the reminder said nothing for hours and nothing recorded why."""
+    sid, found = None, {"code": "error"}
     try:
         raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
         if len(raw) > ADVISOR_STDIN_MAX:
             log(f"reminder hook: no reminder (over {ADVISOR_STDIN_MAX:,} characters)")
+            found = {"code": "too-big"}
             return 0
         data = json.loads(raw) if raw.strip() else {}
-        size = reminder_due(data if isinstance(data, dict) else {})
-        if size is not None:
+        data = data if isinstance(data, dict) else {}
+        sid = data.get("session_id")
+        found = reminder_check(data)
+        if found["code"] == "fired":
+            size = found["size"]
             print(json.dumps({"systemMessage": REMINDER_USER.format(k=size // 1000), "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit", "additionalContext": REMINDER_MODEL.format(k=size // 1000)}}))
     except Exception as e:
         log(f"reminder hook: no reminder ({type(e).__name__})")
+        found = {**found, "code": "error"}
+    finally:
+        try:
+            log(reminder_check_line(sid, found))
+        except Exception:  # the line is a diagnosis: it never costs the prompt anything
+            pass
     return 0
 
 
