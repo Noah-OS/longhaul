@@ -7646,9 +7646,9 @@ class Advisor(unittest.TestCase):
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 13,
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 14,
                          "the plugin's seventh hook, the reminder's, the account check's, the stops' two, "
-                         "SessionEnd's (Sprint 10) and PreCompact's (Sprint 11)")
+                         "SessionEnd's (Sprint 10), PreCompact's (Sprint 11) and the output filter's (token layer)")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -9731,9 +9731,9 @@ class Reminder(unittest.TestCase):
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]),
                          (5, "Checking the context's size (longhaul checkpoint)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 13,
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 14,
                          "the plugin's eighth hook, the account check's (2026-10-25), the stops' two, "
-                         "SessionEnd's (Sprint 10) and PreCompact's (Sprint 11)")
+                         "SessionEnd's (Sprint 10), PreCompact's (Sprint 11) and the output filter's (token layer)")
         # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
         # does, BaseException included, the wrapper exits 0.
         wrapper = handler["args"][2]
@@ -15492,7 +15492,7 @@ class PreCompact(unittest.TestCase):
         # Unusable: a file the SessionStart hook would not put back.
         kept = json.loads(path.read_text())
         for name, text in (("half-written", path.read_text()[:40]), ("another session's", json.dumps(
-                {**kept, "session_id": self.OTHER})), ("a later schema", json.dumps({**kept, "schema_version": 2})),
+                {**kept, "session_id": self.OTHER})), ("a later schema", json.dumps({**kept, "schema_version": 3})),  # 2 is Checkpoint 2's
                 ("too big", json.dumps({**kept, "pad": " " * longhaul.CHECKPOINT_FILE_MAX})),
                 ("no goal", json.dumps({k: v for k, v in kept.items() if k != "goal"}))):
             path.write_text(text)
