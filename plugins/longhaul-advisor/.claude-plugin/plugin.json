@@ -1,6 +1,6 @@
 {
   "name": "longhaul-advisor",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "Longhaul's Advisor experiment: the /longhaul-advisor:advise skill and the read-only advisor agent it consults. Needs the longhaul plugin, whose hook checks, caps and traces every consultation. Off unless the owner enables the experiment.",
   "author": {
     "name": "Amr Adel"
@@ -10,6 +10,6 @@
   "repository": "https://github.com/Noah-OS/longhaul",
   "keywords": ["advisor", "review", "experiment"],
   "dependencies": [
-    {"name": "longhaul", "version": ">=0.2.9"}
+    {"name": "longhaul", "version": ">=0.3.0"}
   ]
 }

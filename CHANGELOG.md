@@ -2,6 +2,42 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.0 - 2026-10-27
+
+The token layer: where a session's context costs more than its size, a checkpoint that keeps the thread, and an output filter measured before it cuts anything.
+
+### Added
+
+- **The output filter, in shadow.** A `PostToolUse` hook on Bash can hand Claude a shorter output. `LONGHAUL_FILTERS` sets how far it goes:
+  - `shadow`, the default: it changes nothing, and logs by size alone what each level would cut;
+  - `lossless`: colour codes, progress redraws and repeated lines go, and grep's matches are grouped by file. Nothing is lost;
+  - `on`: it also leaves out passed tests, install and build progress, and the middle of a long output. The whole output is saved first under `~/.longhaul/outputs` (private, for 7 days), and one line says where;
+  - `off`.
+
+  Files Claude asked to read, diffs, and a format the user chose are never touched. It steps aside when RTK's own hook is installed. After a Bash call with 1,500 characters of output or more, the hook adds about 90 ms on a quiet Mac; shorter output costs a Python start only. `/longhaul:inspect` replays a chat's Bash output through both levels. On the author's two largest chats, `lossless` would cut 0.6% of Bash output and `on` about 1%. After about a fifth of the outputs `on` would have cut, Claude's next calls needed what it left out, so `on` stays off. Its rules are learned from RTK and caveman, and rebuilt in Python.
+- **Checkpoint 2.** Four more lists: the user's own words (`owner_said`), the facts found (`facts`), what failed (`tried_failed`), and the files and lines the next step needs (`working_set`).
+  - A checkpoint can be 16,000 bytes. About 9,000 characters come back after a compaction, most needed first, with a line naming what stayed in the file.
+  - A fact or a working-set entry naming a file that changed since is marked.
+  - The save says how many of the last checkpoint's own words and facts are missing, so they are carried over, not lost.
+- **`/longhaul:inspect` shows where the context cost more than its size:**
+  - the input cost after caching;
+  - the cache written again, and why: a tool call or idle time past the cache's lifetime, a message after it, or a changed prefix;
+  - large cache writes;
+  - files read again after a compaction, by `Read`, or by `cat`, `head`, `tail`, `nl` or `sed` in Bash;
+  - the text hooks added;
+  - the size of MEMORY.md and the CLAUDE.md files, and the paths they name that are gone;
+  - the output filter's replay and log.
+- **Advice for a subagent that waits too long.** A subagent's prompt cache lasts 5 minutes. The guard tells a subagent whose Bash call could outlast it (a timeout over 270 s, or a long sleep or wait loop) to run it in the background and check back. This is advice only, in block mode too.
+
+### Changed
+
+- **A checkpoint that uses the new lists is saved as `schema_version` 2.** A Longhaul before 0.3.0, such as another account's older copy, does not put it back, and logs why. A checkpoint with only the old lists is saved as before.
+- **Longhaul adds about 400 tokens to every session**, up from about 377: the checkpoint skill's description names the new lists.
+
+### Fixed
+
+- **A failed hook could write a tool's output into the log.** The log kept the error's text, which can hold the hook's input. It now keeps the error's type alone.
+
 ## 0.2.9 - 2026-10-27
 
 One install, and the reminder that keeps the thread fires after every compaction.
