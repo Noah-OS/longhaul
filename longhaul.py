@@ -4282,6 +4282,11 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     if data.get("hook_event_name") == "SessionStart":
         if data.get("source") == "startup":
             return guard_startup(data, mode, index)
+        if data.get("source") == "compact":
+            try:  # in any mode: LONGHAUL_GUARD stops the rules, not the reminder
+                reminder_forget(data)
+            except Exception as e:
+                log(f"reminder: nothing forgotten at a compaction ({type(e).__name__})")
         if mode != "off" and data.get("source") in ("compact", "clear"):
             guard_forget(data)
         return None
@@ -6427,7 +6432,10 @@ def advisor(opts) -> int:
 # after a compaction, when the context has fallen more than a step below
 # it or under half the threshold, it is forgotten and the count starts again (reminder_fell(), the
 # owner's decision of 2026-10-25: before, a conversation told at 800k and
-# compacted near 968k was never told again). The guard's PreToolUse hook on Read and Bash says it too
+# compacted near 968k was never told again). Since Sprint 11 (I8) the
+# guard's SessionStart hook forgets it at every compaction too
+# (reminder_forget()): a compaction that left 163k, above that floor, had
+# kept 200k told, and the next reminder came at 400k. The guard's PreToolUse hook on Read and Bash says it too
 # (reminder_join(), the owner's second decision of 2026-10-23), so an
 # unattended run with no prompts hears it as well; the one record serves
 # both, so a multiple is said once wherever it is crossed first. Of the
@@ -6498,8 +6506,19 @@ def reminder_size(tail: list, sidechain: bool = False):
     write and cache read, as inspect's context figures count it (no
     subagent's line, no API error, none of the engine's own, none
     without them); or None. With `sidechain`, for a subagent's own
-    transcript, every line of which is one, its last response's."""
+    transcript, every line of which is one, its last response's. None
+    from before the last compaction (its compact_boundary line): right
+    after one, the last response in the transcript is still the one before
+    it, whose size is no longer the context's (Sprint 11, I8)."""
     for raw in reversed(tail):
+        if b'"compact_boundary"' in raw:
+            try:
+                entry = json.loads(raw)
+            except (ValueError, RecursionError):
+                entry = None
+            if isinstance(entry, dict) and entry.get("type") == "system" \
+                    and entry.get("subtype") == "compact_boundary" and (sidechain or not entry.get("isSidechain")):
+                return None
         if b'"assistant"' not in raw or b'"usage"' not in raw:
             continue
         try:
@@ -6600,6 +6619,31 @@ def reminder_due(data: dict):
     guard's PreToolUse hook asks this, and logs no check line."""
     found = reminder_check(data)
     return found["size"] if found["code"] == "fired" else None
+
+
+def reminder_forget(data: dict) -> None:
+    """After a compaction (the guard's SessionStart hook, source compact;
+    Sprint 11, I8): the highest multiple the conversation was told of is
+    forgotten, under the guard's lock, whoever compacted, so the next
+    crossing of the threshold reminds again. Before, only a reading under
+    reminder_fell()'s floor forgot it: a context compacted from just past
+    200k to 163k was told next at 400k. A reading from before the compaction
+    cannot say it at once: reminder_size() stops at the compaction's line.
+    A subagent's start, and its own record, are left alone. One line is
+    logged when there was a multiple to forget."""
+    if data.get("agent_id") is not None:
+        return
+    record = guard_record_path({"session_id": data.get("session_id")})
+    if record is None or not record.is_file():
+        return
+    with locked("guard"):
+        kept = read_json(record)
+        said = dict_at(kept, "reminder")
+        if "at" not in said:
+            return
+        told = as_int(said.pop("at"))
+        write_json(record, {**kept, "reminder": said})
+    log(f"reminder: {record.stem} forgot the {told:,} tokens told, at a compaction")
 
 
 def reminder_check_line(sid, found: dict) -> str:

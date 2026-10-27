@@ -8936,8 +8936,9 @@ class Reminder(unittest.TestCase):
 
     def test_the_guards_own_writes_keep_what_was_said(self):
         # The record is the guard's too: its PreToolUse hook rewrites it at
-        # each whole read, and a compaction empties its reads. Neither may
-        # take the multiple said with it, or a session would be told again.
+        # each whole read, and a compaction empties its reads. A read may not
+        # take the multiple said with it, or a session would be told again;
+        # a compaction forgets it on purpose (Sprint 11, I8).
         small = self.tmp / "small.py"
         small.write_text("y" * 300)
         self.grow(205_000)
@@ -8949,10 +8950,10 @@ class Reminder(unittest.TestCase):
         self.assertIn(str(small), self.record()["reads"])
         self.assertEqual(self.record()["reminder"], {"at": 200_000}, "kept through the guard's write")
         longhaul.guard_check({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"}, "warn")
-        self.assertEqual((self.record()["reads"], self.record()["reminder"]), ({}, {"at": 200_000}),
-                         "kept through a compaction")
+        self.assertEqual((self.record()["reads"], self.record()["reminder"]), ({}, {}),
+                         "a compaction forgets both")
         self.grow(self.compaction(206_000, 30_000), 250_000)
-        self.assertEqual(self.remind(), "")
+        self.assertEqual(self.remind(), self.reminded(250), "the next crossing reminds again")
         self.assertEqual(longhaul.guard_counts("s1")["repeat"], 0, "the guard's record, now it has one")
 
     def test_the_prompts_text_is_written_nowhere(self):
@@ -9057,6 +9058,79 @@ class Reminder(unittest.TestCase):
         self.grow(401_000)
         out = self.run_hook(self.hook(), self.ask())
         self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.reminded(401), ""))
+
+    # A compaction forgets the multiple told (Sprint 11, I8, the lead,
+    # 2026-10-27): in the owner's chat a session told at 200k at 17:58 and
+    # compacted at 18:11 was next told only at 400k, at 22:40. The
+    # compaction left it at 163k, not under reminder_fell()'s floor, so 200k
+    # stayed told. The guard's SessionStart hook for a compaction now forgets
+    # it, whoever compacted, and the next crossing reminds again.
+
+    def compacted(self, **fields):
+        """The guard's SessionStart hook after a compaction, as hooks.json runs it for `compact`."""
+        return self.guard({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact",
+                           "transcript_path": str(self.transcript), "cwd": str(self.tmp), **fields})
+
+    def test_a_compaction_forgets_the_multiple_told_so_the_next_crossing_reminds_again(self):
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+        self.grow(self.compaction(212_000, 163_000))
+        self.assertIsNone(self.compacted(), "the hook says nothing")
+        self.assertEqual(self.record(), {"reminder": {}}, "200k is forgotten")
+        self.assertIn("reminder: s1 forgot the 200,000 tokens told, at a compaction", self.log())
+        self.assertEqual(self.remind(), "", "no reading since the compaction")
+        self.grow(163_000)
+        self.assertEqual(self.remind(), "")
+        self.grow(238_000)
+        self.assertEqual(self.remind(), self.reminded(238), "200k of the compacted context")
+        self.assertEqual(self.checks()[1:], [
+            "reminder check: s1 context=- threshold=200000 told=- no-reading",
+            "reminder check: s1 context=163000 threshold=200000 told=0 below-threshold",
+            "reminder check: s1 context=238000 threshold=200000 told=0 fired"])
+        # In any mode of the guard, and whatever its own record held.
+        self.grow(self.compaction(240_000, 150_000), 205_000)
+        self.assertIsNone(self.guard({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"},
+                                     LONGHAUL_GUARD="off"), "LONGHAUL_GUARD=off stops the rules, not the reminder")
+        self.assertEqual(self.remind(), self.reminded(205))
+
+    def test_a_reading_from_before_the_compaction_says_nothing_after_it(self):
+        self.files()
+        self.grow(412_000)
+        self.assertEqual(self.remind(), self.reminded(412))
+        # The transcript's last response is still the one before the compaction.
+        self.grow(self.compaction(412_000, 60_000), {"type": "user", "isCompactSummary": True,
+                                                     "message": {"role": "user", "content": "the summary"}})
+        self.compacted()
+        self.assertEqual(self.remind(), "", "412k is the context before the compaction")
+        self.assertIsNone(self.ls(), "nor the guard's hook")
+        self.assertIsNone(self.read(self.small))
+        self.assertEqual(self.record()["reminder"], {}, "nothing told, nothing recorded")
+        self.grow(60_000)
+        self.assertEqual(self.remind(), "")
+        self.grow(201_000)
+        self.assertEqual(self.ls(), self.told(201), "the first crossing after it")
+        # A line that only names a compaction is no compaction: the reading stands.
+        self.grow(401_000, {"type": "user", "message": {"role": "user", "content": "compact_boundary"}})
+        self.assertEqual(self.remind(), self.reminded(401))
+
+    def test_a_compaction_forgets_nothing_of_a_subagents_nor_at_another_start(self):
+        self.sub_grow(160_000)
+        self.assertEqual(self.sub_ls(), self.sub_told(160))
+        self.grow(205_000)
+        self.assertEqual(self.remind(), self.reminded(205))
+        for source in ("startup", "clear", "resume"):
+            self.guard({"session_id": "s1", "hook_event_name": "SessionStart", "source": source,
+                        "transcript_path": str(self.transcript), "cwd": str(self.tmp)})
+            self.assertEqual(self.record()["reminder"], {"at": 200_000}, source)
+        self.compacted(agent_id="a1", agent_type="Explore")
+        self.assertEqual(self.record()["reminder"], {"at": 200_000}, "a subagent's start is not the conversation's")
+        self.compacted()
+        self.assertEqual(self.record()["reminder"], {})
+        self.assertEqual(self.record("s1+a1"), {"subagent_reminder": {"at": 150_000}}, "the subagent's own, untouched")
+        self.compacted()
+        self.assertEqual(self.log().count("forgot the"), 1, "nothing told: nothing to forget, no line")
+        self.assertIsNone(self.compacted(session_id="s9"), "a session with no record")
+        self.assertFalse((self.home / "guard" / "s9.json").exists())
 
     # A subagent's own context (the owner's decision of 2026-10-25, "A
     # reminder for long subagent runs"): subagents were most of the cost on
