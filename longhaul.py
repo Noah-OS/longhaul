@@ -4897,12 +4897,23 @@ def session_end_reason(sid, since: float):
 
 CHECKPOINT_TEXTS = ("goal", "next_action")  # texts, required
 CHECKPOINT_LISTS = ("decisions", "done", "in_progress", "blocked", "changed_files", "verification")  # lists of texts
+# Checkpoint 2's lists (docs/plans/2026-10-26-checkpoint-2.md): a state that
+# uses them is saved as schema 2, which a Longhaul before them refuses by its
+# version; one that does not stays schema 1, with schema 1's keys alone.
+CHECKPOINT_MORE = ("owner_said", "facts", "tried_failed", "working_set")
+# The put-back's order: what the next turn needs most first.
+CHECKPOINT_ORDER = ("goal", "next_action", "owner_said", "facts", "decisions", "tried_failed", "working_set",
+                    "in_progress", "blocked", "changed_files", "done", "verification")
 CHECKPOINT_TEXT_MAX = 1_000  # characters per text
 CHECKPOINT_ITEMS_MAX = 20  # per list
 # The whole file. The engine caps a hook's additionalContext at 10,000
 # characters, past which the model gets a file path and a preview instead
-# of the text; the largest file this takes comes back as under 10,000.
-CHECKPOINT_BYTES_MAX = 8_000
+# of the text. So a put-back is at most CHECKPOINT_PUTBACK_MAX characters,
+# room left for a /clear's line before it and Auto Model's guide after it:
+# whole entries in CHECKPOINT_ORDER, then a line naming what is left in the
+# file (checkpoint_text).
+CHECKPOINT_BYTES_MAX = 16_000
+CHECKPOINT_PUTBACK_MAX = 9_000
 CHECKPOINT_FILE_MAX = 4 * CHECKPOINT_BYTES_MAX  # what the hook will read of a file: a save never writes more than the cap
 CHECKPOINT_SECRET_SHAPES = ("sk-ant-", "AKIA", "-----BEGIN", "ghp_")  # the start of a known kind of credential
 CHECKPOINT_CLI = ("schema_version", "session_id", "written_at", "cwd")  # set by the CLI, never by the model
@@ -4925,9 +4936,10 @@ def checkpoint_path(sid: str | None):
 
 
 def checkpoint_validate(state):
-    """The model's part of a checkpoint against schema v1: (the state,
-    cleaned, with every list present, None, None), or (None, why not,
-    why not for the log). The reason names a key and a length and never
+    """The model's part of a checkpoint against schema v1 and Checkpoint
+    2's lists: (the state, cleaned, with every list present, None, None),
+    or (None, why not, why not for the log). The reason names a key and a
+    length and never
     a value: it is printed, logged and read by the model. An unknown
     key's name is the model's text too: the line printed names it when
     it is not shaped like a credential, the line logged never does.
@@ -4936,7 +4948,7 @@ def checkpoint_validate(state):
     if not isinstance(state, dict):
         return None, "the state is not a JSON object", "the state is not a JSON object"
     for key in state:
-        if key not in CHECKPOINT_TEXTS + CHECKPOINT_LISTS:
+        if key not in CHECKPOINT_TEXTS + CHECKPOINT_LISTS + CHECKPOINT_MORE:
             name = ("(looks like a credential)" if any(shape in key for shape in CHECKPOINT_SECRET_SHAPES)
                     else repr(shown(key, 60)))
             return None, f"unknown key {name}", f"unknown key ({len(key)} characters)"
@@ -4960,7 +4972,7 @@ def checkpoint_validate(state):
         if why:
             return None, why, why
         clean[key] = shown(state[key], CHECKPOINT_TEXT_MAX)
-    for key in CHECKPOINT_LISTS:
+    for key in CHECKPOINT_LISTS + CHECKPOINT_MORE:
         items = state.get(key, [])
         if not isinstance(items, list):
             return None, f"{key} is not a list", f"{key} is not a list"
@@ -5060,8 +5072,11 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
             state, problem, logged = checkpoint_validate(json.loads(raw))
         except json.JSONDecodeError as e:
             problem = f"not JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    dropped = ""
     if state is not None:
-        record = {"schema_version": 1, "session_id": sid, "written_at": time.time(), "cwd": cwd, **state}
+        more = any(state[key] for key in CHECKPOINT_MORE)
+        body = state if more else {k: v for k, v in state.items() if k not in CHECKPOINT_MORE}
+        record = {"schema_version": 2 if more else 1, "session_id": sid, "written_at": time.time(), "cwd": cwd, **body}
         size = len(json.dumps(record, indent=2)) + 1  # what write_json writes: ASCII, so characters are bytes
         if size > CHECKPOINT_BYTES_MAX:
             problem = f"{size:,} bytes in all; the cap is {CHECKPOINT_BYTES_MAX:,}"
@@ -5074,6 +5089,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
                     # in the skill's flow) is the user's and keeps its mode.
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.parent.chmod(0o700)
+                dropped = checkpoint_dropped(path, sid, state)  # the last checkpoint, before this one replaces it
                 write_json(path, record)
             except OSError as e:  # a full disk, a home that is not a writable folder
                 problem = f"could not write the file: {e.strerror or e}"
@@ -5090,9 +5106,31 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     log(f"checkpoint for {sid} saved ({size:,} bytes)")
     hours = checkpoint_carry_hours() if recorded else 0  # the window as it is now; the hook reads it when it runs
     print(f"longhaul checkpoint: saved for {sid} ({size:,} bytes); it comes back after a compaction or a resume"
-          f"{f', and once after a /clear in this folder within {hours:g} h' if hours else ''}"
+          f"{f', and once after a /clear in this folder within {hours:g} h' if hours else ''}{dropped}"
           f"{'; the state file could not be removed' if removed is False else ''}")
     return 0
+
+
+def checkpoint_dropped(path: Path, sid: str, state: dict) -> str:
+    """The save line's note when the session's last checkpoint holds
+    owner_said or facts entries the new state leaves out, word for word:
+    how many, by count alone. Each checkpoint is written from the last,
+    keeping what still holds (Checkpoint 2: facts from before the previous
+    compaction survived about 40% of the time); a fact that changed names
+    what it replaces, which the skill asks for. Empty when nothing was
+    left out, or there is no last checkpoint of this session to read."""
+    try:
+        with path.open("rb") as f:
+            last = json.loads(f.read(CHECKPOINT_FILE_MAX + 1))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    if not isinstance(last, dict) or last.get("session_id") != sid:
+        return ""
+    old = [x for key in ("owner_said", "facts") if isinstance(last.get(key), list) for x in last[key] if isinstance(x, str)]
+    kept = set(state["owner_said"] + state["facts"])
+    gone = sum(x not in kept for x in old)
+    return (f"; {gone} of the last checkpoint's {len(old)} owner_said and facts entries are not in this one word for "
+            f"word: if any still holds, add it back and save again") if gone else ""
 
 
 def checkpoint_load(raw: bytes, sid: str, now: float):
@@ -5109,8 +5147,8 @@ def checkpoint_load(raw: bytes, sid: str, now: float):
         return None, f"not JSON ({len(raw)} bytes)"
     if not isinstance(kept, dict):
         return None, "not an object"
-    if as_int(kept.get("schema_version")) != 1:
-        return None, "schema_version is not 1"
+    if as_int(kept.get("schema_version")) not in (1, 2):
+        return None, "schema_version is not 1 or 2"
     if kept.get("session_id") != sid:
         return None, "the session_id inside is another session's"
     at = as_number(kept.get("written_at"))
@@ -5127,19 +5165,42 @@ def checkpoint_load(raw: bytes, sid: str, now: float):
     return {**kept, **state, "written_at": at}, None
 
 
+CHECKPOINT_NAMED = re.compile(r"(?:~/|/)?[\w.-]+(?:/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,7}")  # a.py, src/x.py, ~/n.md
+
+
+def checkpoint_marked(item: str, cwd: str, at: float) -> str:
+    """A facts or working_set entry, marked with the files it names that
+    changed since `at`, as changed_files are: what it says of them may be
+    out of date (Checkpoint 2's staleness). A word that is not a file
+    here is no name."""
+    names = []
+    for word in dict.fromkeys(CHECKPOINT_NAMED.findall(item)[:20]):
+        try:
+            if os.stat(str(HOME / word[2:]) if word.startswith("~/") else os.path.join(cwd, word)).st_mtime > at:
+                names.append(word)
+        except (OSError, ValueError):
+            continue
+    return f"{item} (changed since: {', '.join(names)})" if names else item
+
+
 def checkpoint_text(kept: dict, now: float) -> str:
     """What the model reads after a compaction or a resume: when and
     where the checkpoint was written, each field by its name in the
     schema, and which of the files it names changed (an mtime after
     written_at) or went since. Staleness is shown, not withheld: there
-    is no age cutoff."""
+    is no age cutoff. A checkpoint with schema 1's lists alone comes back
+    as before when that fits; one with Checkpoint 2's comes back in
+    CHECKPOINT_ORDER, a facts or working_set entry marked when a file it
+    names changed since (checkpoint_marked). Past CHECKPOINT_PUTBACK_MAX
+    characters, the whole entries that fit, in that order, then a line
+    naming by field and count what is left in the file."""
     at, cwd = kept["written_at"], kept["cwd"]
     when = dt.datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M")
     lines = [f"longhaul checkpoint, written {when} ({ago_text(now - at)}) in {home_path(cwd)}:"]
-    for key in CHECKPOINT_TEXTS:
-        lines.append(f"{key}: {kept[key]}")
-    for key in CHECKPOINT_LISTS:
-        lines.append(f"{key}:" + ("".join(f"\n- {item}" for item in kept[key]) if kept[key] else " (none)"))
+
+    def listed(key, items):
+        return f"{key}:" + ("".join(f"\n- {item}" for item in items) if items else " (none)")
+
     changed = []
     for name in kept["changed_files"]:
         try:
@@ -5149,13 +5210,44 @@ def checkpoint_text(kept: dict, now: float) -> str:
             changed.append(f"{name} (gone)")
         except OSError:
             changed.append(f"{name} (could not be checked)")
+    n = len(kept["changed_files"])
     if changed:
-        lines.append("Changed since the checkpoint: " + ", ".join(changed) + "; check them before trusting this.")
-    elif kept["changed_files"]:
-        n = len(kept["changed_files"])
-        lines.append(f"Changed since the checkpoint: none of the {n} file{'s' if n != 1 else ''} named.")
+        tail = "Changed since the checkpoint: " + ", ".join(changed) + "; check them before trusting this."
+        if len(tail) > 2_000:  # long names: they are in the file, and changed_files above
+            tail = f"Changed since the checkpoint: {len(changed)} of the {n} files named; check them before trusting this."
+    elif n:
+        tail = f"Changed since the checkpoint: none of the {n} file{'s' if n != 1 else ''} named."
     else:
-        lines.append("Changed since the checkpoint: no files were named.")
+        tail = "Changed since the checkpoint: no files were named."
+    if not any(kept.get(key) for key in CHECKPOINT_MORE):
+        text = "\n".join(lines + [f"{key}: {kept[key]}" for key in CHECKPOINT_TEXTS]
+                         + [listed(key, kept[key]) for key in CHECKPOINT_LISTS] + [tail])
+        if len(text) <= CHECKPOINT_PUTBACK_MAX:
+            return text
+    file = home_path(str(checkpoint_path(kept["session_id"])))
+    room = CHECKPOINT_PUTBACK_MAX - len(tail) - len(file) - 300  # the tail, and the line naming what is left
+    size, left = len(lines[0]), {}
+    for key in CHECKPOINT_ORDER:
+        if key in CHECKPOINT_TEXTS:  # 1,000 characters each at most: always within room
+            lines.append(f"{key}: {kept[key]}")
+            size += 1 + len(lines[-1])
+            continue
+        items = [checkpoint_marked(i, cwd, at) if key in ("facts", "working_set") else i for i in kept[key]]
+        taken, end = [], size + 1 + len(listed(key, []))
+        for item in items:
+            if left or end + 3 + len(item) > room:
+                left[key] = len(items) - len(taken)
+                break
+            taken.append(item)
+            end += 3 + len(item)
+        if taken or (not items and not left and end <= room):
+            lines.append(listed(key, taken))
+            size += 1 + len(lines[-1])
+    lines.append(tail)
+    if left:
+        more = sum(left.values())
+        lines.append(f"{more} more entr{'ies' if more != 1 else 'y'} ({', '.join(f'{k} {v}' for k, v in left.items())}) "
+                     f"{'are' if more != 1 else 'is'} in {file}; read it before relying on memory for them.")
     return "\n".join(lines)
 
 
@@ -5284,7 +5376,7 @@ def checkpoint_check(data, now: float | None = None):
     """The hook's answer for one input: the JSON that puts the session's
     checkpoint back, or None. Only a SessionStart for compact, clear or
     resume of a plain session has one (a subagent has no checkpoint),
-    and only from a file that is this session's, schema 1 and whole; a
+    and only from a file that is this session's, schema 1 or 2 and whole; a
     file that is not is one log line naming the reason, never the text.
     No file is the usual session start, and not worth a line."""
     if not isinstance(data, dict) or data.get("hook_event_name") != "SessionStart":

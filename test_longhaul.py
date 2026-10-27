@@ -7505,46 +7505,137 @@ class Checkpoint(unittest.TestCase):
         self.assertIn("checkpoint for s1 put back after resume (", self.log(), "the log says so, by size")
         self.assertNotIn(self.S, self.log())
 
-    def test_the_largest_checkpoint_the_save_takes_comes_back_whole(self):
+    def more(self, **over):
+        """A state with Checkpoint 2's lists too (docs/plans/2026-10-26-checkpoint-2.md)."""
+        return self.state(**{"owner_said": [f"2026-10-27: keep the 5-minute cache {self.S}"],
+                             "facts": [f"the rebuild rule is in a.py:12 {self.S}"],
+                             "tried_failed": [f"a read under 1,024 missed most rebuilds {self.S}"],
+                             "working_set": [f"b.py lines 10-40 {self.S}"], **over})
+
+    def test_the_largest_checkpoint_the_save_takes_comes_back_under_the_hooks_cap_with_the_rest_named(self):
         # Sprint 4 review, A11: the engine caps a hook's additionalContext
         # at 10,000 characters; past it the model gets a file path and a
-        # preview instead of the text. So the file's cap is 8,000 bytes,
-        # and the text of the largest checkpoint the save takes, with every
-        # one of its 20 files changed since, fits with room for the header.
+        # preview instead of the text. Checkpoint 2's file holds up to
+        # 16,000 bytes, so the put-back gives whole entries in the plan's
+        # order up to CHECKPOINT_PUTBACK_MAX characters, says what changed
+        # since, and names what it left in the file, by field and count.
         names = [f"f{i:02}.py" for i in range(20)]
         for name in names:
             (self.work / name).write_text(name)
+        lists = [k for k in longhaul.CHECKPOINT_ORDER if k not in longhaul.CHECKPOINT_TEXTS + ("changed_files",)]
 
         def state(n):
-            lists = {key: ["x" * n] * 20 for key in ("decisions", "done", "in_progress", "blocked", "verification")}
-            return self.state(goal="g" * 1000, next_action="n" * 1000, changed_files=names, **lists)
+            return self.state(goal="g" * 1000, next_action="n" * 1000, changed_files=names,
+                              **{key: [f"{key} " + "x" * n] * 20 for key in lists})
 
         def size(n):  # what the save measures
-            record = {"schema_version": 1, "session_id": "s1", "written_at": time.time(), "cwd": str(self.work), **state(n)}
+            record = {"schema_version": 2, "session_id": "s1", "written_at": time.time(), "cwd": str(self.work), **state(n)}
             return len(json.dumps(record, indent=2)) + 1
 
         n = next(n for n in range(1, 1000) if size(n + 1) > longhaul.CHECKPOINT_BYTES_MAX)
-        self.assertGreater(size(n), longhaul.CHECKPOINT_BYTES_MAX - 200, "just under the cap")
+        self.assertGreater(size(n), longhaul.CHECKPOINT_BYTES_MAX - 300, "just under the cap")
         out = self.save(state(n), "s1")
         self.assertEqual(out.returncode, 0, out.stderr)
         at = json.loads(self.file().read_text())["written_at"]
         for name in names:
             os.utime(self.work / name, (at + 5, at + 5))
         text = self.context(self.check(self.start(), now=at + 10))
-        self.assertEqual(text.count(" (changed)"), 20)
-        self.assertLess(len(text), 10_000, len(text))
+        self.assertLessEqual(len(text), longhaul.CHECKPOINT_PUTBACK_MAX, len(text))
+        self.assertEqual(text.count(" (changed)"), 20, "what changed since is said in full")
+        shown = {key: text.count(f"\n- {key} x") for key in lists}
+        shown["changed_files"] = len(re.findall(r"\n- f\d\d\.py", text))
+        order = [key for key in longhaul.CHECKPOINT_ORDER if key not in longhaul.CHECKPOINT_TEXTS]
+        counts = [shown[key] for key in order]
+        whole = counts.index(next(c for c in counts if c < 20))
+        self.assertEqual(counts[:whole], [20] * whole, "whole fields first, in the plan's order")
+        self.assertEqual(counts[whole + 1:], [0] * (len(order) - whole - 1), "then nothing after the first cut")
+        left = [(key, 20 - shown[key]) for key in order if shown[key] < 20]
+        total = sum(n for _, n in left)
+        *_, said, more = text.split("\n")
+        self.assertTrue(said.startswith("Changed since the checkpoint: f00.py (changed), "), said)
+        self.assertEqual(more, f"{total} more entries ({', '.join(f'{k} {n}' for k, n in left)}) are in "
+                               f"{longhaul.home_path(str(self.file()))}; read it before relying on memory for them.")
+        self.assertNotIn(self.S, self.log())
         # With Auto Model's guide after it, as the hook answers in guide mode
-        # (the owner, 2026-10-25): still under the cap.
+        # (the owner, 2026-10-25), and carried over after a /clear with its
+        # line first and the guide after: still under the engine's cap.
         with mock.patch.object(longhaul, "CONFIG", self.tmp / "no-config.json"):
             answer = longhaul.models_guide_join(self.start(), self.check(self.start(), now=at + 10),
                                                 longhaul.CHECKPOINT_SOURCES)
-        text = self.context(answer)
-        self.assertTrue(text.endswith("\n\n" + longhaul.MODELS_GUIDE))
-        self.assertLess(len(text), 10_000, len(text))
-        # Carried over after a /clear, its line first: still under the cap.
-        text = self.context(self.check(self.start("clear", "s2", cwd=self.work), now=at + 10))
-        self.assertEqual(text.count(" (changed)"), 20)
-        self.assertLess(len(text), 10_000, len(text))
+            self.assertTrue(self.context(answer).endswith("\n\n" + longhaul.MODELS_GUIDE))
+            self.assertLess(len(self.context(answer)), 10_000)
+            clear = self.start("clear", "s2", cwd=self.work)
+            answer = longhaul.models_guide_join(clear, self.check(clear, now=at + 10), longhaul.CHECKPOINT_SOURCES)
+        self.assertIn("Carried over from the session before /clear", self.context(answer))
+        self.assertLess(len(self.context(answer)), 10_000)
+
+    def test_checkpoint_2s_lists_are_saved_as_schema_2_and_a_state_without_them_stays_schema_1(self):
+        # Checkpoint 2 adds owner_said, facts, tried_failed and working_set.
+        # A state that uses them is schema 2, which a Longhaul before it
+        # refuses whole, by its version; one that does not stays schema 1
+        # with schema 1's keys alone, and reads as before anywhere.
+        out = self.save(self.more(), "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        kept = json.loads(self.file().read_text())
+        self.assertEqual(kept["schema_version"], 2)
+        self.assertEqual(set(kept), {"schema_version", "session_id", "written_at", "cwd", *longhaul.CHECKPOINT_TEXTS,
+                                     *longhaul.CHECKPOINT_LISTS, *longhaul.CHECKPOINT_MORE})
+        self.assertEqual(kept["facts"], [f"the rebuild rule is in a.py:12 {self.S}"])
+        self.assertNotIn(self.S, out.stdout + self.log())
+        out = self.save(self.more(owner_said=[], facts=[], tried_failed=[], working_set=[]), "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        kept = json.loads(self.file().read_text())
+        self.assertEqual(kept["schema_version"], 1)
+        self.assertEqual(set(kept), {"schema_version", "session_id", "written_at", "cwd", *longhaul.CHECKPOINT_TEXTS,
+                                     *longhaul.CHECKPOINT_LISTS})
+        # The new lists are held to the same rules; a refusal names the field alone.
+        for state, reason in ((self.more(facts=self.S), "facts is not a list"),
+                              (self.more(owner_said=[""]), "owner_said[0] is empty"),
+                              (self.more(working_set=[self.S] * 21), "working_set has 21 items; the cap is 20"),
+                              (self.more(tried_failed=["x" * 1_001]), "tried_failed[0] is 1,001 characters; the cap is 1,000"),
+                              (self.more(facts=[f"the key is sk-ant-{self.S}"]), "facts[0] holds what looks like a credential")):
+            out = self.save(state, "s1")
+            self.assertEqual(out.returncode, 2, reason)
+            self.assertIn(reason, out.stderr)
+            self.assertNotIn(self.S, out.stderr + self.log())
+
+    def test_a_checkpoint_2_comes_back_in_the_plans_order_and_marks_entries_about_files_changed_since(self):
+        # The put-back leads with what the next turn needs most; a fact or a
+        # working_set entry naming a file edited since comes back marked, as
+        # changed_files do. One that fits comes back whole.
+        self.assertEqual(self.save(self.more(), "s1").returncode, 0)
+        at = json.loads(self.file().read_text())["written_at"]
+        os.utime(self.work / "a.py", (at + 5, at + 5))
+        text = self.context(self.check(self.start(), now=at + 10))
+        where = [text.index(f"\n{key}:") for key in longhaul.CHECKPOINT_ORDER]
+        self.assertEqual(where, sorted(where))
+        self.assertIn(f"\nowner_said:\n- 2026-10-27: keep the 5-minute cache {self.S}\n", text)
+        self.assertIn(f"\nfacts:\n- the rebuild rule is in a.py:12 {self.S} (changed since: a.py)\n", text)
+        self.assertIn(f"\nworking_set:\n- b.py lines 10-40 {self.S}\n", text, "b.py is as it was")
+        self.assertIn("\nblocked: (none)\n", text)
+        self.assertNotIn("more entr", text)
+        self.assertTrue(text.endswith("\nChanged since the checkpoint: a.py (changed); check them before trusting this."),
+                        text)
+
+    def test_a_save_that_leaves_out_owner_words_or_facts_of_the_last_checkpoint_says_how_many(self):
+        # Facts from before the previous compaction survived about 40% of the
+        # time (the memory test, 2026-10-26), so each checkpoint is written
+        # from the last, keeping what still holds. A save that leaves out some
+        # of the last one's owner_said or facts, word for word, says how many,
+        # by count alone; a fact that changed is replaced and names what it
+        # replaces (the skill's rule, from caveman's supersedes).
+        self.assertEqual(self.save(self.more(facts=[f"f1 {self.S}", f"f2 {self.S}", f"f3 {self.S}"]), "s1").returncode, 0)
+        later = self.more(owner_said=[f"another {self.S}"], facts=[f"f1 {self.S}", f"f4 (replaces: f2) {self.S}"])
+        out = self.save(later, "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.rstrip("\n").endswith(
+            "; 3 of the last checkpoint's 4 owner_said and facts entries are not in this one word for word: "
+            "if any still holds, add it back and save again"), out.stdout)
+        self.assertNotIn(self.S, out.stdout + self.log())
+        out = self.save(later, "s1")
+        self.assertNotIn("word for word", out.stdout, "all kept")
+        out = self.save(self.state(), "s2")
+        self.assertNotIn("word for word", out.stdout, "no checkpoint before")
 
     def test_a_startup_or_a_subagent_gets_nothing_back(self):
         self.assertEqual(self.save(self.state(), "s1").returncode, 0)
@@ -7571,8 +7662,8 @@ class Checkpoint(unittest.TestCase):
             ("[]", "not an object"),
             ("null", "not an object"),
             (json.dumps({**kept, "session_id": "s2"}), "the session_id inside is another session's"),
-            (json.dumps({**kept, "schema_version": 2}), "schema_version is not 1"),
-            (json.dumps({**kept, "schema_version": True}), "schema_version is not 1"),
+            (json.dumps({**kept, "schema_version": 3}), "schema_version is not 1 or 2"),
+            (json.dumps({**kept, "schema_version": True}), "schema_version is not 1 or 2"),
             (json.dumps({k: v for k, v in kept.items() if k != "goal"}), "goal is missing"),
             (json.dumps({**kept, "written_at": "yesterday"}), "written_at is not a number"),
             (json.dumps({**kept, "done": f"not a list {self.S}"}), "done is not a list"),
@@ -7769,7 +7860,7 @@ class Checkpoint(unittest.TestCase):
             (self.state(next_action=f"AKIA{self.S}"), "next_action holds what looks like a credential"),
             (self.state(blocked=[f"-----BEGIN PRIVATE KEY----- {self.S}"]), "blocked[0] holds what looks like a credential"),
             (self.state(goal=f"ghp_{self.S}"), "goal holds what looks like a credential"),
-            (self.state(done=[f"{'d' * 900} {self.S}"] * 20), "bytes in all; the cap is 8,000"),
+            (self.state(done=[f"{'d' * 900} {self.S}"] * 20), "bytes in all; the cap is 16,000"),
             # An unknown key's name is the model's text too (review, A6): the
             # refusal names it only when it is not shaped like a credential.
             (self.state(**{f"sk-ant-{self.S}": "x"}), "unknown key (looks like a credential)"),
@@ -8751,10 +8842,15 @@ class CheckpointSkill(unittest.TestCase):
         self.assertNotIn("CLAUDE_SESSION_ID", body.replace(step, ""), "no id on the command line")
         self.assertNotIn("<<", text, "no heredoc anywhere: the allowed-tools rule does not match one")
         self.assertIn("removed", body, "it says the state file goes once saved")
-        for key in longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS:
-            self.assertIn(f'"{key}"', body, "the schema's eight fields, as the save takes them")
-        for cap in ("1,000 characters", "20 entries", "8,000 bytes"):
+        for key in longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS + longhaul.CHECKPOINT_MORE:
+            self.assertIn(f'"{key}"', body, "the schema's twelve fields, as the save takes them")
+        for cap in ("1,000 characters", "20 entries", "16,000 bytes"):
             self.assertIn(cap, body, "the caps, so the model keeps under them")
+        # Checkpoint 2 (docs/plans/2026-10-26-checkpoint-2.md): written from
+        # the last checkpoint, a decision with its why, filled, and a fact
+        # that changed replacing the old one by name.
+        for rule in ("the last checkpoint", "why", "5,000", "(replaces: "):
+            self.assertIn(rule, body)
         self.assertIn("secret", body.lower())
         self.assertIn("no tabs", body, "a newline or a tab in a text comes back as ? (review, A9)")
         # A subagent shares the session id and would write over the main
@@ -8767,7 +8863,8 @@ class CheckpointSkill(unittest.TestCase):
         example = json.loads(body.split("```json\n", 1)[1].split("```", 1)[0])
         state, problem, _ = longhaul.checkpoint_validate(example)
         self.assertIsNone(problem)
-        self.assertEqual(set(state), set(longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS))
+        self.assertEqual(set(state), set(longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS + longhaul.CHECKPOINT_MORE))
+        self.assertTrue(all(state[key] for key in longhaul.CHECKPOINT_MORE), "the example shows each new list in use")
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/checkpoint/SKILL.md"], cwd=HERE).returncode, 1)
 
