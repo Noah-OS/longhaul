@@ -1872,6 +1872,656 @@ class CodexRollouts(unittest.TestCase):
             list(longhaul.rollout_records(self.day / "rollout-a.jsonl.zst"))
 
 
+class CodexInspect(unittest.TestCase):
+    """`longhaul inspect --agent codex`: where one OpenAI Codex chat's tokens
+    went, from its rollout (docs plans/2026-10-27-codex.md, X1). Two shapes:
+    the 0.146 alphas' on the owner's Mac (P1: no token_usage_record, one
+    token_count, the work in exec cells and the McpToolCall items inside
+    them), and a 0.164 paginated rollout's, from Codex's source (per-request
+    usage, CommandExecution with parsed_cmd, FileChange, a compaction, a
+    sub-agent's rollout). Every text field holds SECRET, which no report
+    may show."""
+
+    MAIN = "019a2b3c-0000-7000-8000-00000000aaaa"
+    CHILD = "019a2b3c-0000-7000-8000-00000000bbbb"
+    OTHER = "019a2b3c-0000-7000-8000-00000000cccc"
+    LONE = "019a2b3c-0000-7000-8000-00000000dddd"
+    # Long, so that not even a program's or a tool's name passes for one (program(), the name pattern).
+    SECRET = "sk-SECRET" + "Q" * 80
+    RESETS = (1793116800, 1793548800)  # the 5-hour and weekly windows' resets_at in limits()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "codex"
+        self.day = self.home / "sessions" / "2026" / "10" / "27"
+        self.day.mkdir(parents=True)
+        patcher = mock.patch.object(longhaul, "CODEX_HOME", self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.second = 0
+
+    # ------------------------------------------------ records, as Codex writes them
+
+    def rec(self, kind, payload, at=None):
+        """One record, a second after the one before unless `at` (seconds after 10:00) says when."""
+        self.second = self.second + 1 if at is None else at
+        when = dt.datetime(2026, 10, 27, 10, 0, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=self.second)
+        return {"type": kind, "timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "ordinal": self.second,
+                "payload": payload}
+
+    def meta(self, thread, version="0.164.0", source="vscode", **more):
+        return self.rec("session_meta", {"id": thread, "session_id": thread, "cli_version": version, "source": source,
+                                         "originator": "codex_vscode", "cwd": "/work/app", "history_mode": "paginated",
+                                         "model_provider": "openai", "context_window": {"window_id": "w0"},
+                                         "base_instructions": {"text": f"You are Codex. {self.SECRET}"}, **more})
+
+    def turn(self, turn_id, model):
+        return self.rec("turn_context", {"turn_id": turn_id, "model": model, "effort": "medium", "cwd": "/work/app",
+                                         "current_date": "2026-10-27", "timezone": "Europe/Istanbul"})
+
+    @staticmethod
+    def six(inp, cached=0, write=0, out=0, reasoning=0):
+        return {"input_tokens": inp, "cached_input_tokens": cached, "cache_write_input_tokens": write,
+                "output_tokens": out, "reasoning_output_tokens": reasoning, "total_tokens": inp + out}
+
+    def usage(self, turn_id, response, thread=None, **six):
+        u = self.six(**six)
+        thread = thread or self.MAIN
+        return self.rec("token_usage_record", {"response_id": response, "turn_id": turn_id, "root_turn_id": turn_id,
+                                               "thread_id": thread, "session_id": thread, "usage": u,
+                                               "turn_token_usage": u, "thread_token_usage": u})
+
+    def count(self, last, total=None, window=258400, limits=None):
+        """A token_count event: the last response's usage, the chat's so far, and the allowance."""
+        info = {"last_token_usage": self.six(last), "total_token_usage": self.six(**(total or {"inp": last})),
+                "model_context_window": window}
+        return self.rec("event_msg", {"type": "token_count", "info": info, "rate_limits": limits})
+
+    def limits(self, used=42.0, week=10.0, reached=None):
+        return {"primary": {"used_percent": used, "window_minutes": 300, "resets_at": self.RESETS[0]},
+                "secondary": {"used_percent": week, "window_minutes": 10080, "resets_at": self.RESETS[1]},
+                "plan_type": "plus", "limit_id": "codex", "limit_name": self.SECRET,
+                "credits": {"balance": self.SECRET, "has_credits": False, "unlimited": False},
+                "individual_limit": None, "rate_limit_reached_type": reached, "spend_control_reached": False}
+
+    def item(self, kind, turn_id="t1", thread=None, **fields):
+        """An item_completed event: a paginated rollout keeps each finished item."""
+        return self.rec("event_msg", {"type": "item_completed", "thread_id": thread or self.MAIN, "turn_id": turn_id,
+                                      "started_at_ms": 1, "completed_at_ms": 2, "item": {"type": kind, **fields}})
+
+    def command(self, cid, script, parsed, output="", exit_code=0, status="completed"):
+        return self.item("CommandExecution", id=cid, command=["/bin/zsh", "-lc", script], cwd="/work/app",
+                         parsed_cmd=parsed, source="agent", status=status, aggregated_output=output,
+                         exit_code=exit_code, duration={"secs": 0, "nanos": 5000000})
+
+    def reads(self, path="/work/app/a.py"):
+        """parsed_cmd for a read of one file, as Codex parses `cat`."""
+        return [{"type": "read", "cmd": f"cat {self.SECRET}", "name": os.path.basename(path), "path": path}]
+
+    def call(self, name, cid, **args):
+        return self.rec("response_item", {"type": "function_call", "name": name, "arguments": json.dumps(args),
+                                          "call_id": cid})
+
+    def custom(self, name, cid, text):
+        return self.rec("response_item", {"type": "custom_tool_call", "name": name, "input": text, "call_id": cid,
+                                          "status": "completed"})
+
+    def output(self, cid, text, custom=False):
+        return self.rec("response_item", {"type": "custom_tool_call_output" if custom else "function_call_output",
+                                          "call_id": cid, "output": [{"type": "input_text", "text": text}]})
+
+    def said(self, role="user"):
+        return self.rec("response_item", {"type": "message", "role": role, "content": [
+            {"type": "input_text" if role == "user" else "output_text", "text": self.SECRET}]})
+
+    def thought(self):
+        return self.rec("response_item", {"type": "reasoning", "summary": [{"type": "summary_text", "text": self.SECRET}],
+                                          "content": None, "encrypted_content": self.SECRET})
+
+    def mcp(self, cid, status="completed", error=False):
+        return self.item("McpToolCall", id=cid, server="codegraph", tool="codegraph_explore",
+                         arguments={"query": self.SECRET}, status=status, duration={"secs": 1, "nanos": 0},
+                         result={"content": [{"type": "text", "text": self.SECRET}], "isError": error})
+
+    def write(self, thread, records, when=1000, zst=False, stamp="2026-10-27T10-00-00"):
+        path = self.day / (f"rollout-{stamp}-{thread}.jsonl" + (".zst" if zst else ""))
+        text = "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records)
+        if zst:
+            with longhaul.zstd.open(path, "wt", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            path.write_text(text)
+        os.utime(path, (when, when))
+        return path
+
+    # ------------------------------------------------ the two shapes
+
+    def alpha(self, thread=None):
+        """The 0.146 alphas' (P1): messages, a code cell and the MCP tools it
+        called, a wait, one token_count with the allowance, no token_usage_record."""
+        s = self.SECRET
+        return [self.meta(thread or self.MAIN, "0.146.0-alpha.3.1", thread_source="user"),
+                self.rec("world_state", {"cwd": "/work/app", "note": s}),
+                self.rec("event_msg", {"type": "task_started", "turn_id": "t1", "model_context_window": 258400}),
+                self.turn("t1", "gpt-5.6-terra"),
+                self.said(), self.item("UserMessage", id="u1", content=[{"type": "text", "text": s}]),
+                self.thought(),
+                self.custom("exec", "c1", f"const hits = await tools.rg({{pattern: '{s}'}});"),
+                self.mcp("m1"), self.mcp("m2", status="failed"),
+                self.output("c1", "x" * 1200, custom=True),
+                self.call("wait", "w1", cell_id="1", note=s),
+                self.output("w1", "y" * 300),
+                self.said("assistant"), self.item("AgentMessage", id="a1", text=s),
+                self.count(41000, total=dict(inp=50000, cached=30000, write=1000, out=2000, reasoning=500),
+                           limits=self.limits()),
+                self.rec("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": s})]
+
+    def paged(self, thread=None):
+        """A 0.164 paginated rollout: three requests on two models, a search
+        and four reads of one file through the model's exec_command (each
+        with the CommandExecution item it made), an edit of that file, a
+        command the user ran that failed, a compaction, an unknown record
+        type and a line that is not JSON."""
+        s = self.SECRET
+        return [self.meta(thread or self.MAIN),
+                self.turn("t1", "gpt-5.6-terra"), self.said(), self.thought(),
+                self.usage("t1", "r1", inp=10000, cached=8000, write=500, out=300, reasoning=100),
+                self.count(10300),
+                self.call("exec_command", "s1", cmd=f"rg -n {s} src", workdir="/work/app"),
+                self.command("s1", f"rg -n {s} src", [{"type": "search", "cmd": s, "query": s, "path": "src"}], s),
+                self.output("s1", "z" * 700),
+                self.call("exec_command", "s2", cmd="cat a.py"), self.command("s2", "cat a.py", self.reads(), s),
+                self.output("s2", "a" * 400),
+                self.usage("t1", "r2", inp=12000, cached=10000, out=200),
+                self.count(12200),
+                self.call("exec_command", "s3", cmd="cat a.py"), self.command("s3", "cat a.py", self.reads(), s),
+                self.output("s3", "a" * 400),  # read again, unchanged: a repeat
+                self.custom("apply_patch", "p1", f"*** Begin Patch\n{s}"),
+                self.item("FileChange", id="p1", changes={"/work/app/a.py": {"type": "update", "unified_diff": s}},
+                          status="completed"),
+                self.output("p1", "done", custom=True),
+                self.call("exec_command", "s4", cmd="cat a.py"), self.command("s4", "cat a.py", self.reads(), s),
+                self.output("s4", "a" * 400),  # after the edit: no repeat
+                self.command("u1", f"make test {s}", [{"type": "unknown", "cmd": s}], s * 3, exit_code=2,
+                             status="failed"),  # the user's: no call of the model's
+                self.rec("compacted", {"message": s, "replacement_history": [self.said()["payload"]],
+                                       "window_number": 1, "previous_window_id": "w0"}),
+                self.item("ContextCompaction", id="k1"),
+                self.turn("t2", "gpt-5.6-sol"),
+                self.usage("t2", "r3", inp=5000, write=5000, out=100, reasoning=20),
+                self.count(5100, limits=self.limits(used=42.5)),
+                self.call("exec_command", "s5", cmd="cat a.py"), self.command("s5", "cat a.py", self.reads(), s),
+                self.output("s5", "a" * 400),  # after the compaction: no repeat
+                self.rec("future_record", {"text": s}),
+                f"not json {s}",
+                self.rec("event_msg", {"type": "task_complete", "turn_id": "t2", "last_agent_message": s})]
+
+    def child(self, thread=None, parent=None, depth=1):
+        """A sub-agent's rollout: its session_meta names its parent."""
+        thread, parent = thread or self.CHILD, parent or self.MAIN
+        spawn = {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": depth, "agent_role": "explorer"}}}
+        return [self.meta(thread, source=spawn, parent_thread_id=parent, thread_source="subagent"),
+                self.turn("ct1", "gpt-5.6-terra"), self.said(),
+                self.usage("ct1", f"cr-{thread}", thread=thread, inp=3000, cached=1000, out=200, reasoning=50),
+                self.count(3200),
+                self.call("exec_command", "cs1", cmd="cat b.py"),
+                self.item("CommandExecution", thread=thread, id="cs1", command=["/bin/zsh", "-lc", "cat b.py"],
+                          cwd="/work/app", parsed_cmd=self.reads("/work/app/b.py"), status="completed",
+                          aggregated_output=self.SECRET, exit_code=0),
+                self.output("cs1", "b" * 5000)]
+
+    def chat(self):
+        """The paginated chat, its sub-agent, and another chat beside them."""
+        main = self.write(self.MAIN, self.paged(), when=3000)
+        self.write(self.CHILD, self.child(), when=2000, stamp="2026-10-27T10-05-00")
+        self.write(self.OTHER, [self.meta(self.OTHER), self.turn("o1", "gpt-5.6-sol"),
+                                self.usage("o1", "or1", thread=self.OTHER, inp=99999, out=9)], when=1000)
+        return main
+
+    def cli(self, *args, agent="codex"):
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "inspect",
+                               *(["--agent", agent] if agent else []), *args], capture_output=True, text=True,
+                              timeout=60, env=dict(os.environ, CODEX_HOME=str(self.home),
+                                                   LONGHAUL_HOME=str(self.tmp / "relay"),
+                                                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude")))
+
+    def here(self, *argv):
+        """`longhaul inspect` in this process, as main() runs it: (exit code, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = longhaul.main(["inspect", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def section(self, lines, head):
+        """The lines under the heading that starts with `head`, up to the next heading."""
+        start = next(i for i, l in enumerate(lines) if l.startswith(head))
+        rest = lines[start + 1:]
+        return [lines[start]] + rest[:next((i for i, l in enumerate(rest) if not l.startswith(" ")), len(rest))]
+
+    # ------------------------------------------------ the 0.146 alphas
+
+    def test_a_rollout_with_no_per_request_usage_says_so_and_totals_from_its_last_token_count(self):
+        r = longhaul.inspect_rollout(self.write(self.MAIN, self.alpha()))
+        self.assertEqual(r["requests"], {"main": 0, "subagents": 0})
+        self.assertEqual(r["unrecorded"], {"main": 1, "subagents": 0})
+        self.assertEqual(r["tokens"]["main"], {"new_input": 20000, "cache_read": 30000, "cache_write": 1000,
+                                               "output": 2000, "reasoning": 500})
+        self.assertEqual((r["models"], r["turn_models"], r["model_tokens"]), ({}, {"gpt-5.6-terra": 1}, []))
+        out = longhaul.rollout_lines(r)
+        requests = self.section(out, "Requests [rollout")
+        self.assertIn("  main: no per-request usage written", requests)
+        self.assertIn("  models by turn: gpt-5.6-terra 1", requests)
+        tokens = self.section(out, "Tokens [rollout")
+        self.assertIn("no per-request usage written", tokens[0])
+        self.assertIn("  main: no per-request usage written; its total is the last token_count's total_token_usage",
+                      tokens)
+        self.assertEqual(next(l for l in tokens if l.startswith("  main ")).split(),
+                         ["main", "20,000", "30,000", "1,000", "2,000", "500"])
+        self.assertEqual(self.section(out, "Tokens by model")[1:],
+                         ["  none: no per-request usage written; the models by turn are under Requests"])
+
+    def test_code_cells_say_that_the_searches_and_reads_inside_them_are_not_recorded(self):
+        r = longhaul.inspect_rollout(self.write(self.MAIN, self.alpha()))
+        self.assertEqual(r["search"]["code_cells"], 1)
+        self.assertEqual(r["search"]["commands"], 0)
+        search = self.section(longhaul.rollout_lines(r), "Search and reads")
+        self.assertEqual(search[1:], ["  searches and reads inside code cells (exec) are not recorded in the "
+                                      "rollout: 1 code cell"])
+        self.assertFalse(any("0 searches" in l for l in search), "not 0, as if it were measured")
+        self.assertEqual(self.section(longhaul.rollout_lines(r), "Read again")[1:],
+                         ["  reads inside code cells (exec) are not recorded in the rollout, so none are seen here"],
+                         "nor a bare none")
+        records = longhaul.rollout_metrics(r)
+        self.assertNotIn("searches", {x["metric"] for x in records}, "not 0 in --json either")
+        self.assertIn(("code_cells", 1), {(x["metric"], x["value"]) for x in records})
+
+    def test_the_alphas_tools_are_counted_by_name_and_mcp_items_by_server_and_tool(self):
+        r = longhaul.inspect_rollout(self.write(self.MAIN, self.alpha()))
+        mcp = "mcp codegraph/codegraph_explore"
+        self.assertEqual(r["by_tool"], [{"tool": "exec", "calls": 1, "chars": 1200, "scope": "main"},
+                                        {"tool": "wait", "calls": 1, "chars": 300, "scope": "main"},
+                                        {"tool": mcp, "calls": 2, "chars": 2 * len(self.SECRET), "scope": "main"}])
+        self.assertEqual(r["tool_errors"], {mcp: 1})
+        self.assertEqual(r["items"], {"UserMessage": 1, "McpToolCall": 2, "AgentMessage": 1})
+        self.assertEqual(r["context"], {"first": 41000, "peak": 41000, "last": 41000, "window": 258400})
+        self.assertEqual((r["unknown"], r["unreadable"], r["compactions"]), ({}, 0, []))
+        self.assertEqual((r["cli_version"], r["source"], r["subagents"]), ("0.146.0-alpha.3.1", "vscode", 0))
+
+    # ------------------------------------------------ the 0.164 paginated shape
+
+    def test_tokens_split_new_input_from_the_cache_and_keep_reasoning_apart(self):
+        # Codex's input_tokens includes the cached ones: new input is input
+        # less cached; cache write is shown as written, part of the input;
+        # output includes reasoning, shown beside it.
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["tokens"], {
+            "main": {"new_input": 9000, "cache_read": 18000, "cache_write": 5500, "output": 600, "reasoning": 120},
+            "subagents": {"new_input": 2000, "cache_read": 1000, "cache_write": 0, "output": 200, "reasoning": 50}})
+        self.assertEqual(r["unrecorded"], {"main": 0, "subagents": 0})
+        tokens = self.section(longhaul.rollout_lines(r), "Tokens [rollout")
+        self.assertEqual(tokens[0], "Tokens [rollout, measured: Codex's own counts per request (token_usage_record)]")
+        self.assertIn("input less cache read", tokens[1])
+        self.assertEqual([l.split() for l in tokens[2:]], [
+            ["new", "input", "cache", "read", "cache", "write", "output", "reasoning"],
+            ["main", "9,000", "18,000", "5,500", "600", "120"],
+            ["sub-agents", "2,000", "1,000", "0", "200", "50"],
+            ["total", "11,000", "19,000", "5,500", "800", "170"]])
+
+    def test_requests_are_counted_by_model_through_their_turn(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["requests"], {"main": 3, "subagents": 1})
+        self.assertEqual(r["turns"], {"main": 2, "subagents": 1})
+        self.assertEqual(r["models"], {"gpt-5.6-terra": 3, "gpt-5.6-sol": 1})
+        # Main first; in each scope the model with the most tokens first: new
+        # input, cache read and output (cache write and reasoning are inside them).
+        self.assertEqual(r["model_tokens"], [
+            {"model": "gpt-5.6-terra", "scope": "main", "new_input": 4000, "cache_read": 18000, "cache_write": 500,
+             "output": 500, "reasoning": 100},
+            {"model": "gpt-5.6-sol", "scope": "main", "new_input": 5000, "cache_read": 0, "cache_write": 5000,
+             "output": 100, "reasoning": 20},
+            {"model": "gpt-5.6-terra", "scope": "subagents", "new_input": 2000, "cache_read": 1000, "cache_write": 0,
+             "output": 200, "reasoning": 50}])
+        out = longhaul.rollout_lines(r)
+        self.assertIn("  main 3, sub-agents 1", self.section(out, "Requests [rollout"))
+        self.assertIn("  gpt-5.6-terra 3, gpt-5.6-sol 1", self.section(out, "Requests [rollout"))
+        self.assertEqual([l.split()[:3] for l in self.section(out, "Tokens by model")[2:]],
+                         [["main", "gpt-5.6-terra", "4,000"], ["main", "gpt-5.6-sol", "5,000"],
+                          ["sub-agents", "gpt-5.6-terra", "2,000"]])
+
+    def test_a_response_written_twice_is_counted_once(self):
+        records = self.paged()
+        records.insert(6, dict(records[4]))  # r1's record again
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual((r["requests"]["main"], r["tokens"]["main"]["cache_read"]), (3, 18000))
+
+    def test_a_sub_agents_rollout_counts_under_sub_agents_and_another_chat_does_not(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["subagents"], 1)
+        self.assertNotIn(99999, [t["new_input"] for t in r["model_tokens"]], "the other chat's tokens")
+        self.assertEqual(longhaul.rollout_lines(r)[0],
+                         f"Codex chat {self.MAIN} ({longhaul.home_path(str(self.day / f'rollout-2026-10-27T10-00-00-{self.MAIN}.jsonl'))}), "
+                         "Codex 0.164.0, source vscode, and 1 sub-agent rollout")
+
+    def test_a_sub_agents_own_sub_agent_counts_too_and_its_header_names_its_role(self):
+        self.write(self.MAIN, self.paged(), when=3000)
+        self.write(self.CHILD, self.child(), when=2000, stamp="2026-10-27T10-05-00")
+        grand = self.write(self.OTHER, self.child(self.OTHER, self.CHILD, depth=2), when=2500,
+                           stamp="2026-10-27T10-06-00")
+        r = longhaul.inspect_rollout(self.day / f"rollout-2026-10-27T10-00-00-{self.MAIN}.jsonl")
+        self.assertEqual((r["subagents"], r["requests"]["subagents"]), (2, 2))
+        r = longhaul.inspect_rollout(grand)
+        self.assertEqual((r["session"], r["source"], r["subagents"]), (self.OTHER, "sub-agent (explorer, depth 2)", 0))
+
+    def test_context_first_peak_and_last_and_a_compaction_from_the_token_counts_around_it(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["context"], {"first": 10300, "peak": 12200, "last": 5100, "window": 258400})
+        self.assertEqual(r["compactions"], [{"before": 12200, "after": 5100, "scope": "main"}])
+        context = self.section(longhaul.rollout_lines(r), "Context, main chat")
+        self.assertEqual(context[1:], ["  first 10,300, peak 12,200, last 5,100 tokens, of a 258,400-token window",
+                                       "  compacted: 12,200 -> 5,100 tokens"])
+
+    def test_a_compaction_with_no_token_count_after_it_shows_what_is_not_known(self):
+        records = [self.meta(self.MAIN), self.count(9000),
+                   self.rec("compacted", {"message": self.SECRET, "window_number": 1})]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual(r["compactions"], [{"before": 9000, "after": None, "scope": "main"}])
+        self.assertIn("  compacted: 9,000 -> ? tokens", longhaul.rollout_lines(r))
+
+    def test_tool_calls_are_named_as_the_model_called_them_and_items_with_no_call_by_kind(self):
+        # One call, one row: s1's function_call, its CommandExecution item and
+        # its output are one call of exec_command. u1 ran with no call of the
+        # model's: a shell, counted with what it returned.
+        records = self.paged() + [self.item("FileChange", id="e1", changes={"/work/app/c.py": {"type": "add"}},
+                                            status="completed")]
+        self.write(self.CHILD, self.child(), stamp="2026-10-27T10-05-00")
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual(r["by_tool"], [
+            {"tool": "exec_command", "calls": 1, "chars": 5000, "scope": "subagents"},
+            {"tool": "exec_command", "calls": 5, "chars": 2300, "scope": "main"},
+            {"tool": "shell", "calls": 1, "chars": 3 * len(self.SECRET), "scope": "main"},
+            {"tool": "apply_patch", "calls": 1, "chars": 4, "scope": "main"},
+            {"tool": "edit", "calls": 1, "chars": 0, "scope": "main"}])
+        self.assertEqual(r["tool_errors"], {"shell": 1})
+        self.assertEqual(self.section(longhaul.rollout_lines(r), "Tool calls [rollout")[1:3],
+                         ["  exec_command: 1 call, 5,000 chars  (a sub-agent)", "  exec_command: 5 calls, 2,300 chars"])
+
+    def test_the_largest_outputs_name_a_reads_path_or_the_program(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["outputs"][:3], [
+            {"tool": "exec_command", "what": "/work/app/b.py", "chars": 5000, "scope": "subagents"},
+            {"tool": "exec_command", "what": "rg", "chars": 700, "scope": "main"},
+            {"tool": "exec_command", "what": "/work/app/a.py", "chars": 400, "scope": "main"}])
+        largest = self.section(longhaul.rollout_lines(r), "Largest tool outputs")
+        self.assertEqual(largest[1].split(), ["5,000", "chars", "≈1,250", "tokens", "exec_command", "/work/app/b.py",
+                                              "(a", "sub-agent)"])
+
+    def test_searches_and_reads_come_from_codexs_own_parse(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["search"], {"commands": 7, "searches": 1, "reads": 5, "lists": 0, "other": 1,
+                                       "chars": 700, "code_cells": 0})
+        self.assertEqual(self.section(longhaul.rollout_lines(r), "Search and reads")[1:],
+                         ["  1 search, 5 reads, 0 file listings, 1 other, in 7 shell commands; "
+                          "the searches' output 700 chars"])
+
+    def test_shell_calls_without_a_parse_are_classified_by_program(self):
+        # A legacy rollout keeps no command's end: the call's own arguments,
+        # a list or a string, by SEARCH_PROGRAMS and bash_reads().
+        records = [self.meta(self.MAIN, history_mode="legacy"),
+                   self.call("shell", "l1", command=["bash", "-lc", "cat notes.md"], workdir="/work/app"),
+                   self.output("l1", "n" * 90),
+                   self.call("shell", "l2", command=["bash", "-lc", f"grep -rn {self.SECRET} ."], workdir="/work/app"),
+                   self.output("l2", "g" * 30),
+                   self.call("exec_command", "l3", cmd="ls -la", workdir="/work/app"),
+                   self.call("exec_command", "l4", cmd=f"make {self.SECRET}"),
+                   self.call("shell", "l5", command=["bash", "-lc", "cat notes.md"], workdir="/work/app"),
+                   self.output("l5", "n" * 90)]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual(r["search"], {"commands": 5, "searches": 1, "reads": 2, "lists": 1, "other": 1,
+                                       "chars": 30, "code_cells": 0})
+        self.assertEqual(r["rereads"], [{"path": "/work/app/notes.md", "repeats": 1, "chars": 90, "scope": "main"}])
+        self.assertEqual([o["what"] for o in r["outputs"][:2]], ["/work/app/notes.md", "/work/app/notes.md"])
+
+    def test_a_file_read_again_with_no_edit_or_compaction_between_is_a_repeat(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual(r["rereads"], [{"path": "/work/app/a.py", "repeats": 1, "chars": 400, "scope": "main"}])
+        again = self.section(longhaul.rollout_lines(r), "Read again")
+        self.assertIn("inferred", again[0])
+        self.assertEqual(again[1:], ["  /work/app/a.py: 1 more time, 400 chars"])
+
+    def test_a_sub_agents_edit_between_two_reads_makes_the_second_no_repeat(self):
+        main = [self.meta(self.MAIN),
+                self.call("exec_command", "s1", cmd="cat b.py"), self.command("s1", "cat b.py", self.reads("/w/b.py")),
+                self.output("s1", "b" * 10)]
+        self.second = 29  # the main chat's second read, at 10:00:30
+        main += [self.call("exec_command", "s2", cmd="cat b.py"),
+                 self.command("s2", "cat b.py", self.reads("/w/b.py")), self.output("s2", "b" * 10)]
+        self.second = 9  # the sub-agent's edit, at 10:00:11, between them
+        edit = [self.meta(self.CHILD, parent_thread_id=self.MAIN),
+                self.item("FileChange", thread=self.CHILD, id="e1", changes={"/w/b.py": {"type": "update"}})]
+        self.write(self.CHILD, edit, stamp="2026-10-27T10-05-00")
+        r = longhaul.inspect_rollout(self.write(self.MAIN, main))
+        self.assertEqual((r["subagents"], r["rereads"]), (1, []))
+
+    def test_a_failed_read_is_neither_a_repeat_nor_repeated(self):
+        main = [self.meta(self.MAIN),
+                self.command("s1", "cat a.py", self.reads(), exit_code=1, status="failed"),
+                self.command("s2", "cat a.py", self.reads()), self.command("s3", "cat a.py", self.reads(), exit_code=1),
+                self.command("s4", "cat a.py", self.reads())]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, main))
+        self.assertEqual([x["repeats"] for x in r["rereads"]], [1])
+        self.assertEqual(r["tool_errors"], {"shell": 2})
+
+    def test_the_allowance_is_the_last_rate_limits_reading(self):
+        r = longhaul.inspect_rollout(self.chat())
+        a = r["allowance"]
+        self.assertEqual(a["windows"], [
+            {"window": "primary", "label": "5h", "minutes": 300, "used": 42.5, "resets": self.RESETS[0]},
+            {"window": "secondary", "label": "week", "minutes": 10080, "used": 10.0, "resets": self.RESETS[1]}])
+        self.assertEqual((a["plan"], a["reached"], a["spend_control"]), ("plus", None, False))
+        allowance = self.section(longhaul.rollout_lines(r), "Allowance")
+        self.assertEqual(allowance[0], f"Allowance [rollout, measured: the last rate_limits reading, {longhaul.clock(a['at'])}]")
+        self.assertEqual(allowance[1:], [f"  5h: 42.5% used, resets {longhaul.clock(self.RESETS[0])}",
+                                         f"  week: 10% used, resets {longhaul.clock(self.RESETS[1])}",
+                                         "  plan: plus"])
+
+    def test_a_limit_reached_is_named_and_a_window_label_reads_as_its_length(self):
+        records = [self.meta(self.MAIN), self.count(100, limits={**self.limits(used=100.0, reached="primary"),
+                                                                 "secondary": None, "spend_control_reached": True})]
+        allowance = self.section(longhaul.rollout_lines(longhaul.inspect_rollout(self.write(self.MAIN, records))),
+                                 "Allowance")
+        self.assertEqual(allowance[1:], [f"  5h: 100% used, resets {longhaul.clock(self.RESETS[0])}",
+                                         "  plan: plus", "  limit reached: primary", "  spend control reached"])
+        self.assertEqual([longhaul.rollout_window(m) for m in (300, 10080, 60, 1440, 45, 90, None, -5)],
+                         ["5h", "week", "1h", "24h", "45 min", "90 min", "?", "?"])
+
+    def test_failures_count_bad_lines_unknown_record_types_and_tool_errors(self):
+        r = longhaul.inspect_rollout(self.chat())
+        self.assertEqual((r["unreadable"], r["unknown"], r["tool_errors"]), (1, {"future_record": 1}, {"shell": 1}))
+        self.assertEqual(self.section(longhaul.rollout_lines(r), "Failures")[1:], [
+            "  tool errors: shell 1", "  record types not known here: future_record 1",
+            "  1 rollout line could not be read and is not counted"])
+
+    def test_names_that_are_not_plain_are_not_shown_as_written(self):
+        records = [self.meta(self.MAIN, source=self.SECRET), self.turn("t1", "gpt\x1b]0;x\x07"),
+                   self.usage("t1", "r1", inp=10), self.call(self.SECRET, "c1"), self.call("bad name", "c2"),
+                   self.item("McpToolCall", id="m1", server=self.SECRET, tool="ok"),
+                   self.rec("weird type!", {}), self.rec(self.SECRET, {})]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, records))
+        self.assertEqual((r["source"], r["models"]), ("other", {"other": 1}))
+        self.assertEqual(sorted((t["tool"], t["calls"]) for t in r["by_tool"]), [("mcp other/ok", 1), ("other", 2)])
+        self.assertEqual(r["unknown"], {"other": 2})
+
+    def test_each_heading_names_the_rollout_and_how_sure_it_is(self):
+        for records in (self.paged(), self.alpha()):
+            out = longhaul.rollout_lines(longhaul.inspect_rollout(self.write(self.MAIN, records)))
+            heads = [l for l in out[1:] if l.strip() and not l.startswith(" ")]
+            self.assertGreaterEqual(len(heads), 10, out)
+            for head in heads:
+                self.assertRegex(head, r"\[rollout, (measured|counted|inferred)[^\]]*\]$", head)
+
+    def test_json_gives_every_number_its_source_and_confidence_in_claudes_shape(self):
+        self.chat()
+        out = self.cli(self.MAIN, "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        records = [json.loads(l) for l in out.stdout.splitlines()]
+        allowed = {("rollout", "measured"), ("rollout", "counted"), ("rollout", "inferred"), ("estimate", "estimated")}
+        for x in records:
+            self.assertEqual(set(x), {"session", "metric", "scope", "item", "kind", "value", "unit", "source",
+                                      "confidence"}, x)
+            self.assertIn((x["source"], x["confidence"]), allowed, x)
+            self.assertIsInstance(x["value"], (int, float), x)
+            self.assertEqual(x["session"], self.MAIN)
+        got = {(x["metric"], x["scope"], x["item"], x["kind"]): (x["value"], x["confidence"]) for x in records}
+        self.assertEqual(got[("requests", "main", None, None)], (3, "counted"))
+        self.assertEqual(got[("new_input_tokens", "main", None, None)], (9000, "measured"))
+        self.assertEqual(got[("reasoning_tokens", "subagents", None, None)], (50, "measured"))
+        self.assertEqual(got[("model_tokens", "main", "gpt-5.6-sol", "cache_write")], (5000, "measured"))
+        self.assertEqual(got[("context_peak", "main", None, None)], (12200, "measured"))
+        self.assertEqual(got[("compaction_before", "main", "1", None)], (12200, "measured"))
+        self.assertEqual(got[("tool_calls", "main", "exec_command", None)], (5, "counted"))
+        self.assertEqual(got[("tool_output_chars", "subagents", "exec_command /work/app/b.py", None)], (5000, "counted"))
+        self.assertEqual(got[("searches", "all", None, None)], (1, "counted"))
+        self.assertEqual(got[("repeated_reads", "main", "/work/app/a.py", None)], (1, "inferred"))
+        self.assertEqual(got[("allowance_used_percent", "all", "5h", None)], (42.5, "measured"))
+        self.assertEqual(got[("tool_errors", "all", "shell", None)], (1, "counted"))
+        self.assertEqual(got[("unknown_records", "all", "future_record", None)], (1, "counted"))
+        self.assertEqual(got[("unreadable_lines", "all", None, None)], (1, "counted"))
+        self.assertEqual(got[("subagent_rollouts", "subagents", None, None)], (1, "counted"))
+        # No totals, as Claude's: each metric's scopes add up once.
+        self.assertEqual(sum(x["value"] for x in records if x["metric"] == "output_tokens"), 800)
+
+    def test_no_text_from_a_rollout_reaches_the_report_or_the_json(self):
+        # Messages, reasoning, a cell's code, commands, MCP arguments and
+        # results, outputs, the instructions, the compaction's summary, the
+        # allowance's labels, an unreadable line and an unknown record: each
+        # holds SECRET; both shapes, and a sub-agent's rollout.
+        self.chat()
+        self.write(self.LONE, self.alpha(self.LONE), stamp="2026-10-27T11-00-00", when=4000)
+        for target, tool in ((self.MAIN, "exec_command"), (self.LONE, "mcp codegraph/codegraph_explore")):
+            out, records = self.cli(target), self.cli(target, "--json")
+            self.assertEqual((out.returncode, records.returncode), (0, 0), out.stderr + records.stderr)
+            self.assertIn(f"  {tool}: ", out.stdout, "the report ran over the tools")
+            self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)
+        self.assertIn("rg", self.cli(self.MAIN).stdout, "a command's program, which the report may name")
+
+    # ------------------------------------------------ the command line
+
+    def test_the_cli_finds_a_rollout_by_its_id_the_start_of_one_its_path_or_the_newest(self):
+        main = self.chat()
+        for args in ([self.MAIN], ["019a2b3c-0000-7000-8000-00000000aa"], [str(main)], []):
+            out = self.cli(*args)
+            self.assertEqual(out.returncode, 0, (args, out.stderr))
+            self.assertTrue(out.stdout.startswith(f"Codex chat {self.MAIN} "), (args, out.stdout[:200]))
+
+    def test_an_ambiguous_start_no_rollout_or_no_file_is_an_error_not_an_empty_report(self):
+        self.chat()
+        out = self.cli("019a2b3c")
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("3 Codex rollouts start with 019a2b3c; give more of the id.", out.stderr)
+        for args, said in ((["019a2b3c-ffff"], "no Codex rollout found for 019a2b3c-ffff"),
+                           ([str(self.tmp / "nowhere.jsonl")], "there is no file"),
+                           (["a b"], "is neither a Codex rollout's id nor its path")):
+            out = self.cli(*args)
+            self.assertEqual((out.returncode, out.stdout), (1, ""), args)
+            self.assertIn(said, out.stderr, args)
+        shutil.rmtree(self.home / "sessions")
+        out = self.cli()
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("no Codex rollouts under", out.stderr)
+
+    def test_a_file_that_is_empty_or_not_a_rollout_is_an_error(self):
+        empty = self.day / f"rollout-2026-10-27T10-00-00-{self.MAIN}.jsonl"
+        empty.write_text("")
+        claude = self.tmp / "s1.jsonl"
+        claude.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+        for path in (empty, claude):
+            out = self.cli(str(path))
+            self.assertEqual((out.returncode, out.stdout), (1, ""), path)
+            self.assertIn("it is empty, or not a Codex rollout", out.stderr)
+
+    def test_a_rollout_that_cannot_be_read_is_an_error(self):
+        main = self.write(self.MAIN, self.paged())
+        main.chmod(0)
+        self.addCleanup(main.chmod, 0o600)
+        if os.access(main, os.R_OK):
+            self.skipTest("this user reads any file")
+        out = self.cli(str(main))
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("could not read", out.stderr)
+
+    def test_a_rollouts_path_with_no_agent_is_read_as_codex_and_an_id_as_claudes(self):
+        main = self.chat()
+        out = self.cli(str(main), agent=None)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.startswith(f"Codex chat {self.MAIN} "), out.stdout[:200])
+        out = self.cli(self.MAIN, agent=None)  # Claude Code's lookup, as before: no such conversation
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("no transcript found for conversation", out.stderr)
+        out = self.cli(str(main), agent="claude")  # asked for Claude Code: read as its transcript, which it is not
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("no transcript lines", out.stderr)
+
+    def test_the_help_names_the_agent(self):
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "inspect", "-h"], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--agent {claude,codex}", out.stdout)
+        self.assertIn("longhaul inspect --agent codex [ID|PATH] [--json]", longhaul.__doc__)
+
+    # ------------------------------------------------ compressed rollouts
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_a_compressed_rollout_and_a_compressed_sub_agent_read_as_plain_ones(self):
+        main = self.write(self.MAIN, self.paged(), zst=True, when=3000)
+        self.write(self.CHILD, self.child(), zst=True, stamp="2026-10-27T10-05-00")
+        r = longhaul.inspect_rollout(main)
+        self.assertEqual((r["subagents"], r["requests"], r["tokens"]["main"]["new_input"]),
+                         (1, {"main": 3, "subagents": 1}, 9000))
+        for args in ([self.MAIN], [str(main)], []):
+            out = self.cli(*args, agent=None if args and "/" in args[0] else "codex")
+            self.assertEqual(out.returncode, 0, (args, out.stderr))
+            self.assertTrue(out.stdout.startswith(f"Codex chat {self.MAIN} "), args)
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_a_damaged_compressed_rollout_is_an_error_and_a_damaged_sub_agent_is_counted(self):
+        bad = self.day / f"rollout-2026-10-27T10-00-00-{self.MAIN}.jsonl.zst"
+        bad.write_bytes(b"not zstd at all")
+        out = self.cli(self.MAIN)
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("could not read", out.stderr)
+        bad.unlink()
+        main = self.write(self.MAIN, self.paged())
+        # A sub-agent's whose first record reads and whose rest is damaged: a good frame, then one cut short
+        # (junk after a good frame is passed over by zstd's reader; a frame cut short is an EOFError).
+        lines = [json.dumps(r) + "\n" for r in self.child()]
+        rest = longhaul.zstd.compress("".join(lines[1:]).encode())
+        (self.day / f"rollout-2026-10-27T10-05-00-{self.CHILD}.jsonl.zst").write_bytes(
+            longhaul.zstd.compress(lines[0].encode()) + rest[:len(rest) // 2])
+        r = longhaul.inspect_rollout(main)
+        self.assertEqual((r["subagents"], r["subagent_errors"]), (1, 1))
+        failures = self.section(longhaul.rollout_lines(r), "Failures")
+        self.assertTrue(any(l.startswith("  1 sub-agent rollout could not be read through") for l in failures), failures)
+
+    def test_without_zstd_a_compressed_rollout_is_an_error_naming_the_python_that_reads_it(self):
+        packed = self.day / f"rollout-2026-10-27T10-00-00-{self.MAIN}.jsonl.zst"
+        packed.write_bytes(b"\x28\xb5\x2f\xfd")
+        with mock.patch.object(longhaul, "zstd", None):
+            for argv in (["--agent", "codex", self.MAIN], ["--agent", "codex", "019a2b3c"], [str(packed)]):
+                code, out, err = self.here(*argv)
+                self.assertEqual((code, out), (1, ""), argv)
+                self.assertIn("is compressed", err, argv)
+                self.assertIn("Python 3.14", err, argv)
+            code, out, err = self.here("--agent", "codex")
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("1 compressed one this Python cannot read: Python 3.14 and later read it", err)
+            # A plain chat beside a compressed rollout: the sub-agents it cannot look in are said.
+            self.write(self.OTHER, self.paged(self.OTHER), stamp="2026-10-27T11-00-00")
+            code, out, err = self.here("--agent", "codex", self.OTHER)
+            self.assertEqual(code, 0, err)
+            self.assertIn("  1 compressed rollout under CODEX_HOME not looked in (Python 3.14 and later read it): "
+                          "a sub-agent's there is not counted", out.splitlines())
+
+
 class Inspect(unittest.TestCase):
     """`longhaul inspect`: where one conversation's usage went. The transcript
     lines are shaped as Claude Code 2.1.304 writes them."""

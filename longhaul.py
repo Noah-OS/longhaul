@@ -112,6 +112,10 @@ Usage:
                           where one conversation's usage went (numbers only;
                           default: the latest conversation in the ledger);
                           --json gives one record per number, with its source
+  longhaul inspect --agent codex [ID|PATH] [--json]
+                          the same for an OpenAI Codex chat, from its rollout
+                          (CODEX_HOME/sessions; default: the newest one); a
+                          rollout's path is read as Codex's without --agent
   longhaul statusline           the status line command (set in ~/.claude/settings.json)
   longhaul statusline install|uninstall [--yes]
                           install sets Claude Code's status line to
@@ -2911,6 +2915,785 @@ def codex_usage_line(reading, now: float):
     return f"  {'codex':<5} {'   '.join(parts)}   [read {ago} min ago]"
 
 
+# --------------------------------------------------------- inspect codex
+#
+# `longhaul inspect --agent codex [ID|PATH]` (X1): where one Codex chat's
+# tokens went, from its rollout and its sub-agents' (the rollouts under the
+# same CODEX_HOME whose session_meta names it, or one of them, as their
+# parent_thread_id). Read from Codex's source at eec8bde and the owner's
+# rollouts (P1), structure only:
+# - a token_usage_record per model response holds Codex's own counts, in
+#   which input_tokens includes the cached tokens (Codex's non-cached input
+#   is input less cached) and output_tokens the reasoning. The 0.146
+#   alphas wrote none: a rollout's last token_count total is then its total;
+# - the model is per turn, in turn_context; the context per response is
+#   each token_count's info.last_token_usage.total_tokens (Codex's own
+#   tokens_in_context_window); a compaction is a `compacted` record with no
+#   counts, so the token_counts on either side of it give them;
+# - the model's tool calls are response items (function_call,
+#   custom_tool_call, their outputs by call_id) and, in a paginated
+#   rollout, each finished item: a CommandExecution with Codex's own parse
+#   of the command (parsed_cmd), a FileChange keyed by path, an McpToolCall.
+#   An item's id is its call's when a call of the model's ran it; one with
+#   no such call ran inside a code cell or for the user. Code mode's `exec`
+#   runs a cell of JavaScript that calls tools inside it, and what a cell
+#   searched or read is not recorded.
+# Numbers, model names, tool names and paths only: never a message, the
+# reasoning, a cell's code, a command (its program alone, as tool_target()
+# gives Bash's), an MCP call's arguments or result, an output, the
+# instructions or a compaction's summary. A name is shown when it is a
+# plain one (CODEX_NAME), else as "other".
+
+CODEX_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,79}")  # a model's, tool's, server's or type's name, as written
+CODEX_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")  # a thread's id, or the start of one, as `inspect` takes it
+CODEX_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,39}")
+CODEX_FILE = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([A-Za-z0-9_-]+)\.jsonl(\.zst)?")
+CODEX_RECORDS = ("session_meta", "turn_context", "token_usage_record", "event_msg", "response_item", "compacted",
+                 "world_state")  # the record types read or passed over knowingly; any other is counted by name
+# The response items known (Codex's ResponseItem): another may be a tool
+# call this reader does not see, so it is counted. An event_msg of a type
+# not read here is not: Codex has many, and each is its own, not a call.
+CODEX_ITEMS = ("message", "reasoning", "function_call", "function_call_output", "custom_tool_call",
+               "custom_tool_call_output", "local_shell_call", "web_search_call", "image_generation_call",
+               "tool_search_call", "tool_search_output", "compaction", "compaction_summary", "ghost_snapshot", "other")
+# The calls whose arguments hold a command (`command`, a list or a string, or `cmd`).
+CODEX_SHELLS = ("shell", "exec_command", "local_shell", "shell_command", "container.exec")
+CODEX_CELLS = ("exec",)  # code mode's tool: a cell of JavaScript that calls tools inside it (P1)
+CODEX_TOKEN_KINDS = ("new_input", "cache_read", "cache_write", "output", "reasoning")
+CODEX_WINDOWS = {300: "5h", 10080: "week"}  # an allowance window's minutes, as the status line names Claude's
+
+
+def codex_name(value) -> str:
+    """A name from a rollout as the report shows it: as written when it is a
+    plain name, else "other"; "?" for none."""
+    if not isinstance(value, str) or not value:
+        return "?"
+    return shown(value, 80) if CODEX_NAME.fullmatch(value) else "other"
+
+
+def codex_tokens(usage: dict) -> dict:
+    """One of Codex's usage blocks by the report's kinds. Codex's
+    input_tokens includes the cached ones, so new input is input less
+    cached; its cache write is part of the input and is kept as Codex
+    reports it, not added on; output includes the reasoning, kept beside it."""
+    given, cached = as_int(usage.get("input_tokens")), as_int(usage.get("cached_input_tokens"))
+    return {"new_input": max(given - cached, 0), "cache_read": cached,
+            "cache_write": as_int(usage.get("cache_write_input_tokens")), "output": as_int(usage.get("output_tokens")),
+            "reasoning": as_int(usage.get("reasoning_output_tokens"))}
+
+
+def rollout_source(source) -> str:
+    """Where a chat ran, from its session_meta's source: a name ("vscode",
+    "cli"), or for a sub-agent "sub-agent" with its role and depth where
+    written ({"subagent": {"thread_spawn": {...}}}, or a name of Codex's
+    own such as "review")."""
+    if isinstance(source, str):
+        return codex_name(source)
+    sub = source.get("subagent") if isinstance(source, dict) else None
+    if isinstance(sub, str):
+        return f"sub-agent ({codex_name(sub)})"
+    if not isinstance(sub, dict):
+        return "?"
+    spawn = dict_at(sub, "thread_spawn")
+    if not spawn:
+        return f"sub-agent ({codex_name(next(iter(sub)))})" if sub else "sub-agent"
+    role, depth = spawn.get("agent_role"), as_int(spawn.get("depth"))
+    parts = ([codex_name(role)] if isinstance(role, str) else []) + ([f"depth {depth}"] if depth else [])
+    return f"sub-agent ({', '.join(parts)})" if parts else "sub-agent"
+
+
+def rollout_window(minutes) -> str:
+    """An allowance window's name from its length: 5h and week as Codex's
+    two are, else its hours or minutes; "?" for none."""
+    m = as_number(minutes)
+    if m is None or m <= 0:
+        return "?"
+    if m in CODEX_WINDOWS:
+        return CODEX_WINDOWS[m]
+    return f"{m // 60:g}h" if m % 60 == 0 else f"{m:g} min"
+
+
+def rollout_output_chars(output) -> int:
+    """The characters of text a tool's output holds: a string, or the sum of
+    its parts' text (a list of {type, text}, the types Codex's own, such as
+    input_text), or an object's content, as some versions write it."""
+    if isinstance(output, dict):
+        output = output.get("content")
+    if isinstance(output, str):
+        return len(output)
+    if isinstance(output, list):
+        return sum(len(p["text"]) for p in output if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return 0
+
+
+def rollout_command(command) -> str:
+    """A command from a rollout as one shell line, to classify and never to
+    show: the script a shell's -c or -lc runs ([zsh, -lc, script], as
+    Codex runs one), else the words joined as the shell would split them."""
+    if isinstance(command, str):
+        return command
+    if not (isinstance(command, list) and command and all(isinstance(w, str) for w in command)):
+        return ""
+    if len(command) == 3 and command[0].rsplit("/", 1)[-1] in ("bash", "zsh", "sh") and command[1] in ("-c", "-lc"):
+        return command[2]
+    return shlex.join(command)
+
+
+def rollout_arguments(raw) -> dict:
+    """A function call's arguments: Codex writes them as a JSON string."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, RecursionError):
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def rollout_home(path: Path) -> Path:
+    """The CODEX_HOME a rollout is under, the folder above its sessions/;
+    for a rollout elsewhere, CODEX_HOME."""
+    return next((parent.parent for parent in path.parents if parent.name == "sessions"), CODEX_HOME)
+
+
+def rollout_first(path: Path):
+    """A rollout's first record, None when it cannot be read or is not an
+    object. Only that line is read, of a compressed one too."""
+    records = rollout_records(path)
+    try:
+        return next(records, None)
+    except ROLLOUT_ERRORS:
+        return None
+    finally:
+        records.close()
+
+
+def rollout_children(thread: str, home: Path) -> tuple[list[Path], int]:
+    """The rollouts of the sub-agents a chat started, and of theirs in turn,
+    under home: those whose session_meta names one of them as its parent
+    (parent_thread_id, or its source's thread_spawn's), oldest name first;
+    of each rollout only its first record is read. And how many compressed
+    rollouts this Python could not look in (rollout_files())."""
+    paths, packed = rollout_files(home)
+    parent_of: dict = {}  # thread id -> (its parent's, its rollout), the newest rollout of each thread
+    for path in paths:
+        first = rollout_first(path)
+        meta = dict_at(first, "payload") if isinstance(first, dict) and first.get("type") == "session_meta" else {}
+        tid, parent = meta.get("id"), meta.get("parent_thread_id")
+        if not isinstance(parent, str):
+            parent = dict_at(dict_at(dict_at(meta, "source"), "subagent"), "thread_spawn").get("parent_thread_id")
+        if isinstance(tid, str) and isinstance(parent, str) and tid != thread:
+            parent_of.setdefault(tid, (parent, path))
+    family, kids, grew = {thread}, [], True
+    while grew:  # a sub-agent's own sub-agents: their work is the chat's too
+        grew = False
+        for tid, (parent, path) in parent_of.items():
+            if parent in family and tid not in family:
+                family.add(tid)
+                kids.append(path)
+                grew = True
+    return sorted(kids, key=lambda p: p.name), packed
+
+
+def inspect_rollout(path: Path, home: Path | None = None) -> dict:
+    """The numbers `longhaul inspect --agent codex` shows for the chat in the
+    rollout at `path`, its sub-agents' included (rollout_children(), under
+    `home`: by default the CODEX_HOME the rollout is under). Raises one of
+    ROLLOUT_ERRORS when the chat's own rollout cannot be read through; a
+    sub-agent's that cannot is counted, with what it held before the damage."""
+    scopes = ("main", "subagents")
+    head: dict = {}  # the chat's own session_meta: its id, version and source, nothing else of it
+    lines, unreadable, cells = 0, 0, 0
+    unknown, items = collections.Counter(), collections.Counter()
+    requests, turns, unrecorded, bare = (collections.Counter() for _ in range(4))
+    tokens = {s: dict.fromkeys(CODEX_TOKEN_KINDS, 0) for s in scopes}
+    by_model: dict = {}  # (scope, model) -> {kind: tokens}
+    models, turn_models, answered = collections.Counter(), collections.Counter(), set()
+    context, window, compactions, reading = [], None, [], None  # reading: (time, rate_limits), the latest
+    calls: dict = {}  # (file, call id) -> the model's call: {name, scope, command (shells), cwd}
+    done: dict = {}   # (file, item id) -> a finished item: {kind, scope, chars, ok; a command's parsed, command, cwd}
+    outs: dict = {}   # (file, call id) -> the characters of the output the model was given
+    events = []       # per file, in its order: (time, file, "call" | "command" | "edit" | "compact", key or paths)
+
+    def read(n: int, file: Path, scope: str):
+        nonlocal lines, unreadable, cells, window, reading
+        when, cwd, model_of, last_model = 0.0, None, {}, None
+        recorded, total, size, waiting = 0, None, None, None
+        events.append([])
+        for record in rollout_records(file):
+            if record is None:
+                unreadable += 1
+                continue
+            kind, payload = record.get("type"), dict_at(record, "payload")
+            if kind not in CODEX_RECORDS:
+                unknown[codex_name(kind)] += 1
+                continue
+            lines += 1
+            when = parse_ts(record.get("timestamp")) or when  # a record with none keeps the one before's
+            sub = payload.get("type")
+            if kind == "session_meta":
+                if not n and not head:
+                    head.update({k: payload.get(k) for k in ("id", "cli_version", "source")})
+                cwd = cwd or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
+            elif kind == "turn_context":
+                name, turn = codex_name(payload.get("model")), payload.get("turn_id")
+                if not isinstance(turn, str) or turn not in model_of:
+                    turns[scope] += 1
+                    turn_models[name] += 1
+                if isinstance(turn, str):
+                    model_of[turn] = name
+                last_model = name
+                cwd = payload["cwd"] if isinstance(payload.get("cwd"), str) else cwd
+            elif kind == "token_usage_record":
+                response = payload.get("response_id")
+                if isinstance(response, str):
+                    if response in answered:
+                        continue  # a response written twice, counted once
+                    answered.add(response)
+                turn = payload.get("turn_id")
+                model = (model_of.get(turn) if isinstance(turn, str) else None) or last_model or "?"
+                recorded += 1
+                requests[scope] += 1
+                models[model] += 1
+                row = by_model.setdefault((scope, model), dict.fromkeys(CODEX_TOKEN_KINDS, 0))
+                for k, v in codex_tokens(dict_at(payload, "usage")).items():
+                    tokens[scope][k] += v
+                    row[k] += v
+            elif kind == "compacted":
+                waiting = {"before": size, "after": None, "scope": scope}
+                compactions.append(waiting)
+                events[n].append((when, n, "compact", None))
+            elif kind == "event_msg" and sub == "token_count":
+                info = dict_at(payload, "info")
+                total = dict_at(info, "total_token_usage") or total
+                now = as_int(dict_at(info, "last_token_usage").get("total_tokens"))
+                if now:
+                    size = now
+                    if scope == "main":
+                        context.append(now)
+                    if waiting is not None:
+                        waiting["after"], waiting = now, None
+                if scope == "main" and as_int(info.get("model_context_window")):
+                    window = info["model_context_window"]
+                limits = payload.get("rate_limits")
+                if isinstance(limits, dict) and (reading is None or when >= reading[0]):
+                    reading = (when, limits)
+            elif kind == "event_msg" and sub in ("item_completed", "mcp_tool_call_end", "patch_apply_end"):
+                item = dict_at(payload, "item") if sub == "item_completed" else payload
+                what = item.get("type") if sub == "item_completed" else None
+                if sub == "item_completed":
+                    items[codex_name(what)] += 1
+                tid = item.get("id") if sub == "item_completed" else item.get("call_id")
+                key = (n, tid) if isinstance(tid, str) else (n, len(done), None)
+                if what == "CommandExecution":
+                    parsed = item.get("parsed_cmd") if isinstance(item.get("parsed_cmd"), list) else []
+                    code, printed = item.get("exit_code"), item.get("aggregated_output")
+                    done[key] = {"kind": "shell", "scope": scope,
+                                 "chars": len(printed) if isinstance(printed, str) else 0,
+                                 "ok": as_int(code) == 0 and item.get("status") != "failed",
+                                 "parsed": [p for p in parsed if isinstance(p, dict)],
+                                 "command": rollout_command(item.get("command")),
+                                 "cwd": item["cwd"] if isinstance(item.get("cwd"), str) else cwd}
+                    events[n].append((when, n, "command", key))
+                elif what == "FileChange" or sub == "patch_apply_end":
+                    changes = item.get("changes")
+                    paths = ([p for p in changes if isinstance(p, str)] if isinstance(changes, dict)
+                             else [c["path"] for c in changes if isinstance(c, dict) and isinstance(c.get("path"), str)]
+                             if isinstance(changes, list) else [])
+                    done[key] = {"kind": "edit", "scope": scope, "chars": 0, "ok": True}
+                    events[n].append((when, n, "edit", [os.path.normpath(p) for p in paths]))
+                elif what == "McpToolCall" or sub == "mcp_tool_call_end":
+                    # A legacy rollout's end event holds {invocation: {server, tool}, result: {Ok | Err}}.
+                    called = item if what else dict_at(item, "invocation")
+                    result = item.get("result")
+                    got = dict_at(result, "Ok") if sub == "mcp_tool_call_end" else dict_at(item, "result")
+                    done[key] = {"kind": f"mcp {codex_name(called.get('server'))}/{codex_name(called.get('tool'))}",
+                                 "scope": scope, "chars": rollout_output_chars(got.get("content")),
+                                 "ok": (item.get("status") != "failed" and got.get("isError") is not True
+                                        and not (isinstance(result, dict) and "Err" in result))}
+            elif kind == "response_item":
+                cid = payload.get("call_id")
+                if sub in ("function_call", "custom_tool_call", "local_shell_call"):
+                    key = (n, cid) if isinstance(cid, str) else (n, len(calls), None)
+                    name, command, folder = codex_name(payload.get("name")), None, None
+                    if sub == "local_shell_call":
+                        action = dict_at(payload, "action")
+                        name, command, folder = "local_shell", rollout_command(action.get("command")), \
+                            action.get("working_directory")
+                    elif sub == "function_call" and name in CODEX_SHELLS:
+                        args = rollout_arguments(payload.get("arguments"))
+                        command = rollout_command(args.get("command", args.get("cmd")))
+                        folder = args.get("workdir") or args.get("cwd")
+                    calls.setdefault(key, {"name": name, "scope": scope, "command": command,
+                                           "cwd": folder if isinstance(folder, str) else cwd})
+                    if command is not None:
+                        events[n].append((when, n, "call", key))
+                    if name in CODEX_CELLS:
+                        cells += 1
+                elif sub in ("function_call_output", "custom_tool_call_output") and isinstance(cid, str):
+                    outs[(n, cid)] = rollout_output_chars(payload.get("output"))
+                elif sub not in CODEX_ITEMS:
+                    unknown[f"response_item:{codex_name(sub)}"] += 1
+        if not recorded:  # no per-request usage written: the rollout's total is its last token_count's
+            unrecorded[scope] += 1
+            if total:
+                for k, v in codex_tokens(total).items():
+                    tokens[scope][k] += v
+            else:
+                bare[scope] += 1
+
+    read(0, path, "main")
+    sid = head.get("id")
+    if not (isinstance(sid, str) and CODEX_ID.fullmatch(sid)):
+        named = CODEX_FILE.fullmatch(path.name)
+        sid = named.group(1) if named else "?"
+    sid = shown(sid, 100)  # a plain id: shown() changes nothing, and every string printed goes through it
+    kids, packed = rollout_children(sid, home or rollout_home(path)) if sid != "?" else ([], 0)
+    damaged = 0
+    for n, kid in enumerate(kids, 1):
+        try:
+            read(n, kid, "subagents")
+        except ROLLOUT_ERRORS:
+            damaged += 1
+
+    def chars_of(key) -> int:
+        """What a call put into the context: its output, else what its item returned."""
+        return outs[key] if key in outs else done[key]["chars"] if key in done else 0
+
+    # Each shell command once: by Codex's own parse where its item was
+    # written, else, for a call with no item (a legacy rollout's), by its
+    # program and the files bash_reads() finds it printing (inferred).
+    search = {"commands": 0, "searches": 0, "reads": 0, "lists": 0, "other": 0, "chars": 0, "code_cells": cells}
+    printed: dict = {}  # shell key -> (the files it printed, whether it ran without an error)
+    shells = [k for k, d in done.items() if d["kind"] == "shell"]
+    shells += [k for k, c in calls.items() if c["command"] is not None and k not in done]
+    for key in shells:
+        found, searched = [], False
+        if key in done:
+            folder = done[key]["cwd"]
+            for part in done[key]["parsed"]:
+                kind = part.get("type")
+                if kind == "read":
+                    file = part.get("path") if isinstance(part.get("path"), str) else part.get("name")
+                    if isinstance(file, str) and file:
+                        if not os.path.isabs(file) and isinstance(folder, str) and os.path.isabs(folder):
+                            file = os.path.join(folder, file)
+                        found.append(os.path.normpath(file))
+                    search["reads"] += 1
+                elif kind == "search":
+                    search["searches"] += 1
+                    searched = True
+                elif kind == "list_files":
+                    search["lists"] += 1
+                else:
+                    search["other"] += 1
+        else:
+            command, folder = calls[key]["command"], calls[key]["cwd"]
+            name = program(command)
+            found = [] if name in SEARCH_PROGRAMS else bash_reads(command, folder)
+            if name in SEARCH_PROGRAMS:
+                search["searches"] += 1
+                searched = True
+            elif found:
+                search["reads"] += len(found)
+            elif name == "ls":
+                search["lists"] += 1
+            else:
+                search["other"] += 1
+        search["commands"] += 1
+        if searched:
+            search["chars"] += chars_of(key)
+        printed[key] = (found, done[key]["ok"] if key in done else True)
+
+    # Read again: the same file printed again in the same context, with no
+    # FileChange of it in any context (a sub-agent edits what the chat
+    # reads) and no compaction of that context between; a command that
+    # failed is neither. Contexts are replayed in time order. A command's
+    # output is shared among the files it printed.
+    seen = collections.defaultdict(set)  # context (a rollout, by its place) -> the files read since its last compaction
+    again: dict = {}
+    for _, ctx, what, data in heapq.merge(*events, key=lambda e: e[0]):
+        if what == "compact":
+            seen[ctx] = set()
+        elif what == "edit":
+            for c in seen:
+                seen[c] -= set(data)
+        elif what == "command" or data not in done:  # a call whose item was written is read through the item
+            files, ok = printed.get(data, ([], False))
+            for file in files if ok else ():
+                if file in seen[ctx]:
+                    scope = "main" if not ctx else "subagents"
+                    shown_path = home_path(file)
+                    row = again.setdefault((scope, shown_path), {"path": shown_path, "repeats": 0, "chars": 0,
+                                                                 "scope": scope})
+                    row["repeats"] += 1
+                    row["chars"] += chars_of(data) // len(files)
+                seen[ctx].add(file)
+
+    # Each call once, named as the model called it; an item no call of the
+    # model's ran, by its kind; an output with neither, "?".
+    tool_calls, tool_chars, failed, rows = collections.Counter(), collections.Counter(), collections.Counter(), []
+    for key in (list(calls) + [k for k in done if k not in calls]
+                + [k for k in outs if k not in calls and k not in done]):
+        entry = calls.get(key) or done.get(key) or {"name": "?", "scope": "main" if not key[0] else "subagents"}
+        name, scope, chars = entry.get("name") or entry.get("kind"), entry["scope"], chars_of(key)
+        tool_calls[(scope, name)] += 1
+        tool_chars[(scope, name)] += chars
+        if key in done and not done[key]["ok"]:
+            failed[name] += 1
+        files = printed.get(key, ([],))[0]
+        command = done[key].get("command") if key in done else calls[key]["command"] if key in calls else None
+        what = home_path(files[0]) if len(files) == 1 else shown(program(command)) if command is not None else ""
+        if chars:
+            rows.append({"tool": name, "what": what, "chars": chars, "scope": scope})
+    by_tool = sorted(set(tool_calls), key=lambda k: (-tool_chars[k], -tool_calls[k], k))
+
+    allowance = None
+    if reading is not None:
+        at, limits = reading
+        windows = []
+        for name in ("primary", "secondary"):
+            w = dict_at(limits, name)
+            if not w:
+                continue
+            resets = as_number(w.get("resets_at"))
+            if resets is None and as_number(w.get("resets_in_seconds")) is not None and at:
+                resets = at + w["resets_in_seconds"]  # the older field
+            windows.append({"window": name, "label": rollout_window(w.get("window_minutes")),
+                            "minutes": as_number(w.get("window_minutes")), "used": as_number(w.get("used_percent")),
+                            "resets": resets})
+        plan, reached = limits.get("plan_type"), limits.get("rate_limit_reached_type")
+        reached = reached.get("type") if isinstance(reached, dict) else reached
+        allowance = {"at": at, "windows": windows, "plan": codex_name(plan) if isinstance(plan, str) else None,
+                     "reached": codex_name(reached) if isinstance(reached, str) and reached else None,
+                     "spend_control": limits.get("spend_control_reached") is True}
+
+    def total(t):  # a row's tokens for ordering: cache write and reasoning are inside input and output
+        return t["new_input"] + t["cache_read"] + t["output"]
+
+    version = head.get("cli_version")
+    return {
+        "session": sid, "path": str(path), "subagents": len(kids), "packed": packed, "subagent_errors": damaged,
+        "cli_version": shown(version, 40) if isinstance(version, str) and CODEX_VERSION.fullmatch(version) else "?",
+        "source": rollout_source(head.get("source")), "lines": lines, "unreadable": unreadable,
+        "requests": {s: requests[s] for s in scopes}, "turns": {s: turns[s] for s in scopes},
+        "unrecorded": {s: unrecorded[s] for s in scopes}, "bare": {s: bare[s] for s in scopes},
+        "models": dict(models.most_common()), "turn_models": dict(turn_models.most_common()),
+        "items": dict(items.most_common()), "tokens": tokens,
+        "model_tokens": [{"model": m, "scope": s, **t} for (s, m), t in
+                         sorted(by_model.items(), key=lambda kv: (kv[0][0] != "main", -total(kv[1]), kv[0][1]))],
+        "context": ({"first": context[0], "peak": max(context), "last": context[-1], "window": window}
+                    if context else None),
+        "compactions": compactions,
+        "by_tool": [{"tool": k[1], "calls": tool_calls[k], "chars": tool_chars[k], "scope": k[0]} for k in by_tool],
+        "outputs": sorted(rows, key=lambda x: -x["chars"])[:5],
+        "search": search,
+        "rereads": sorted(again.values(), key=lambda x: (-x["chars"], -x["repeats"], x["path"])),
+        "allowance": allowance,
+        "tool_errors": dict(failed.most_common()),
+        "unknown": dict(unknown.most_common()),
+    }
+
+
+def rollout_lines(r: dict) -> list[str]:
+    """The report as text. Each heading names where its numbers came from
+    and how sure they are, as inspect_lines() does for Claude Code's."""
+    def where(item):
+        return "  (a sub-agent)" if item["scope"] != "main" else ""
+
+    def plural(n, word, many=None):
+        return f"{n:,} {word if n == 1 else many or word + 's'}"
+
+    def section(head, rows):
+        out.append(head)
+        out.extend(rows or ["  none"])
+
+    kids = r["subagents"]
+    out = [f"Codex chat {r['session']} ({home_path(r['path'])}), Codex {r['cli_version']}, source {r['source']}"
+           + (f", and {plural(kids, 'sub-agent rollout')}" if kids else "")]
+    if r["packed"]:
+        them = "it" if r["packed"] == 1 else "them"
+        out.append(f"  {plural(r['packed'], 'compressed rollout')} under CODEX_HOME not looked in (Python 3.14 and "
+                   f"later read {them}): a sub-agent's there is not counted")
+
+    none = "no per-request usage written"
+    lost = r["unrecorded"]["subagents"]
+    subs = f"sub-agents {r['requests']['subagents']:,}" + (
+        f" ({lost} of their {plural(kids, 'rollout')} with {none})" if lost and lost < kids
+        else f": {none}" if lost else "")
+    rows = ([f"  main {r['requests']['main']:,}, {subs}"] if not r["unrecorded"]["main"]
+            else [f"  main: {none}"] + ([f"  {subs}"] if kids else []))
+    if r["models"]:
+        rows.append("  " + ", ".join(f"{m} {c:,}" for m, c in r["models"].items()))
+    elif r["turn_models"]:
+        rows.append("  models by turn: " + ", ".join(f"{m} {c:,}" for m, c in r["turn_models"].items()))
+    rows.append(f"  turns: main {r['turns']['main']:,}" + (f", sub-agents {r['turns']['subagents']:,}" if kids else ""))
+    if r["items"]:
+        rows.append("  completed items: " + ", ".join(f"{k} {c:,}" for k, c in r["items"].items()))
+    section("Requests [rollout, counted: token_usage_record, one per model response]", rows)
+
+    def table(rows, label):
+        """Tokens by kind, a row each, named by label(row)."""
+        width = max([len(label(t)) for t in rows] + [10])
+        return ([f"  {'':<{width}}{'new input':>13}{'cache read':>13}{'cache write':>13}{'output':>13}"
+                 f"{'reasoning':>13}"]
+                + [f"  {label(t):<{width}}{t['new_input']:>13,}{t['cache_read']:>13,}{t['cache_write']:>13,}"
+                   f"{t['output']:>13,}{t['reasoning']:>13,}" for t in rows])
+
+    names = {"main": "main", "subagents": "sub-agents"}
+    if not any(r["unrecorded"].values()):
+        out.append("Tokens [rollout, measured: Codex's own counts per request (token_usage_record)]")
+    else:
+        out.append(f"Tokens [rollout, measured: Codex's own counts; with {none}, a rollout's total is its last "
+                   "token_count's]")
+    out.append("  new input: input less cache read (Codex's input includes the cached tokens); cache write is part "
+               "of the input, as Codex reports it; output includes reasoning")
+    for scope in ("main", "subagents"):  # the rollouts with no per-request usage: those with a total, those without
+        n, empty = r["unrecorded"][scope], r["bare"][scope]
+        who = "main" if scope == "main" else plural(n - empty, "sub-agent rollout")
+        if n > empty:
+            out.append(f"  {who}: {none}; {'its total is' if n - empty == 1 else 'their totals are'} the last "
+                       "token_count's total_token_usage")
+        if empty:
+            out.append(f"  {'main' if scope == 'main' else plural(empty, 'sub-agent rollout')}: "
+                       "no usage written at all")
+    total = {k: r["tokens"]["main"][k] + r["tokens"]["subagents"][k] for k in CODEX_TOKEN_KINDS}
+    rows = [{"name": names[s], **r["tokens"][s]} for s in ("main", "subagents")] + [{"name": "total", **total}]
+    out.extend(table(rows, lambda t: t["name"]))
+
+    if r["model_tokens"]:
+        rows = table(r["model_tokens"], lambda t: f"{names[t['scope']]:<11}{t['model']}")
+        if any(r["unrecorded"].values()):
+            rows.append(f"  not by model: the totals of the rollouts with {none}")
+    else:
+        rows = [f"  none: {none}; the models by turn are under Requests"] if any(r["unrecorded"].values()) else []
+    section("Tokens by model [rollout, measured: Codex's own counts per request, each by its turn's model]", rows)
+
+    c = r["context"]
+    rows = ([f"  first {c['first']:,}, peak {c['peak']:,}, last {c['last']:,} tokens"
+             + (f", of a {c['window']:,}-token window" if c["window"] else "")] if c
+            else ["  no token_count with usage written"])
+    for k in r["compactions"]:
+        rows.append(f"  compacted: {'?' if k['before'] is None else format(k['before'], ',')} -> "
+                    f"{'?' if k['after'] is None else format(k['after'], ',')} tokens{where(k)}")
+    section("Context, main chat [rollout, measured: each token_count's last_token_usage.total_tokens; a compaction "
+            "from the token_counts on either side of it]", rows)
+
+    section("Largest tool outputs [rollout, counted: characters; ≈ tokens estimated as characters / 4]",
+            [f"  {o['chars']:>10,} chars {'≈' + format(o['chars'] // 4, ','):>9} tokens  {o['tool']} {o['what']}"
+             .rstrip() + where(o) for o in r["outputs"]])
+    section("Tool calls [rollout, counted: the model's calls by name, with their output's characters; a tool that "
+            "ran with no call of the model's (in a code cell, or the user's) by kind: shell, edit, "
+            "mcp <server>/<tool>]",
+            [f"  {t['tool']}: {plural(t['calls'], 'call')}, {t['chars']:,} chars{where(t)}" for t in r["by_tool"]])
+
+    # Code cells and no command item (P1: the owner's chats): what the cells
+    # searched and read is not in the rollout, so it is said, never shown as 0.
+    s, rows = r["search"], []
+    unseen = s["code_cells"] and not r["items"].get("CommandExecution")
+    if s["commands"]:
+        rows.append(f"  {plural(s['searches'], 'search', 'searches')}, {plural(s['reads'], 'read')}, "
+                    f"{plural(s['lists'], 'file listing')}, {s['other']:,} other, in "
+                    f"{plural(s['commands'], 'shell command')}; the searches' output {s['chars']:,} chars")
+    if unseen:
+        rows.append("  searches and reads inside code cells (exec) are not recorded in the rollout: "
+                    + plural(s["code_cells"], "code cell"))
+    section(f"Search and reads [rollout, counted: Codex's own parse of each shell command (parsed_cmd); a shell "
+            f"call with none, by program: {', '.join(SEARCH_PROGRAMS)}, and cat, head, tail, nl or sed]", rows)
+    section("Read again, with no edit or compaction in between [rollout, inferred: the files Codex parsed as read, "
+            "or cat, head, tail, nl or sed printed; files changed through the shell are not seen]",
+            [f"  {x['path']}: {plural(x['repeats'], 'more time')}, {x['chars']:,} chars{where(x)}"
+             for x in r["rereads"]]
+            + (["  reads inside code cells (exec) are not recorded in the rollout, so none are seen here"]
+               if unseen else []))
+
+    a = r["allowance"]
+    if a is None:
+        section("Allowance [rollout, measured]", ["  no rate_limits reading written"])
+    else:
+        rows = [f"  {w['label']}: " + (f"{w['used']:g}% used" if w["used"] is not None else "used not written")
+                + (f", resets {clock(w['resets'])}" if w["resets"] else "") for w in a["windows"]]
+        rows += [f"  plan: {a['plan']}"] if a["plan"] else []
+        rows += [f"  limit reached: {a['reached']}"] if a["reached"] else []
+        rows += ["  spend control reached"] if a["spend_control"] else []
+        section("Allowance [rollout, measured: the last rate_limits reading"
+                + (f", {clock(a['at'])}]" if a["at"] else "]"), rows)
+
+    out.append("Failures [rollout, counted]")
+    out.append("  tool errors: " + (", ".join(f"{t} {c:,}" for t, c in r["tool_errors"].items()) or "none"))
+    out.append("  record types not known here: " + (", ".join(f"{t} {c:,}" for t, c in r["unknown"].items()) or "none"))
+    if r["unreadable"]:
+        out.append(f"  {plural(r['unreadable'], 'rollout line')} could not be read and "
+                   f"{'is' if r['unreadable'] == 1 else 'are'} not counted")
+    if r["subagent_errors"]:
+        n = r["subagent_errors"]
+        out.append(f"  {plural(n, 'sub-agent rollout')} could not be read through: what "
+                   f"{'it holds' if n == 1 else 'they hold'} past the damage is not counted")
+    return out
+
+
+def rollout_metrics(r: dict) -> list[dict]:
+    """The same numbers as flat records, shaped as inspect_records()'s: one
+    number each, with the chat's id as its session, what it is of (`item`,
+    `kind`), where it came from (the rollout, or an estimate) and how sure it
+    is. No totals, and no search counts where the rollout recorded none."""
+    out = []
+
+    def add(metric, value, unit, scope, confidence, item=None, kind=None, source="rollout"):
+        if as_number(value) is not None:  # a number not written (a compaction's after) is left out
+            out.append({"session": r["session"], "metric": metric, "scope": scope, "item": item, "kind": kind,
+                        "value": value, "unit": unit, "source": source, "confidence": confidence})
+
+    add("subagent_rollouts", r["subagents"], "files", "subagents", "counted")
+    for scope, n in r["requests"].items():
+        add("requests", n, "requests", scope, "counted")
+    for scope, n in r["unrecorded"].items():
+        add("rollouts_without_request_usage", n, "files", scope, "counted")
+    for scope, n in r["turns"].items():
+        add("turns", n, "turns", scope, "counted")
+    for model, n in r["models"].items():
+        add("model_requests", n, "requests", "all", "counted", model)
+    for model, n in r["turn_models"].items():
+        add("model_turns", n, "turns", "all", "counted", model)
+    for name, n in r["items"].items():
+        add("completed_items", n, "items", "all", "counted", name)
+    for scope, kinds in r["tokens"].items():
+        for kind, n in kinds.items():
+            add(f"{kind}_tokens", n, "tokens", scope, "measured")
+    for m in r["model_tokens"]:
+        for kind in CODEX_TOKEN_KINDS:
+            add("model_tokens", m[kind], "tokens", m["scope"], "measured", m["model"], kind)
+    for k, n in (r["context"] or {}).items():
+        add(f"context_{k}", n, "tokens", "main", "measured")
+    for i, c in enumerate(r["compactions"], 1):
+        add("compaction_before", c["before"], "tokens", c["scope"], "measured", str(i))
+        add("compaction_after", c["after"], "tokens", c["scope"], "measured", str(i))
+    for o in r["outputs"]:
+        item = f"{o['tool']} {o['what']}".strip()
+        add("tool_output_chars", o["chars"], "chars", o["scope"], "counted", item)
+        add("tool_output_tokens", o["chars"] // 4, "tokens", o["scope"], "estimated", item, source="estimate")
+    for t in r["by_tool"]:
+        add("tool_calls", t["calls"], "calls", t["scope"], "counted", t["tool"])
+        add("tool_chars", t["chars"], "chars", t["scope"], "counted", t["tool"])
+    s = r["search"]
+    add("code_cells", s["code_cells"], "calls", "all", "counted")
+    if s["commands"]:  # else none was recorded: no 0 that would read as measured
+        for metric, key, unit in (("shell_commands", "commands", "commands"), ("searches", "searches", "commands"),
+                                  ("reads", "reads", "files"), ("file_listings", "lists", "commands"),
+                                  ("other_commands", "other", "commands"), ("search_chars", "chars", "chars")):
+            add(metric, s[key], unit, "all", "counted")
+    for x in r["rereads"]:
+        add("repeated_reads", x["repeats"], "reads", x["scope"], "inferred", x["path"])
+        add("repeated_read_chars", x["chars"], "chars", x["scope"], "inferred", x["path"])
+    for w in (r["allowance"] or {}).get("windows", []):
+        add("allowance_used_percent", w["used"], "percent", "all", "measured", w["label"])
+        add("allowance_resets_at", w["resets"], "epoch_seconds", "all", "measured", w["label"])
+    for tool, n in r["tool_errors"].items():
+        add("tool_errors", n, "errors", "all", "counted", tool)
+    for kind, n in r["unknown"].items():
+        add("unknown_records", n, "records", "all", "counted", kind)
+    add("subagent_unreadable", r["subagent_errors"], "files", "subagents", "counted")
+    add("rollout_lines", r["lines"], "lines", "all", "counted")
+    add("unreadable_lines", r["unreadable"], "lines", "all", "counted")
+    return out
+
+
+def rollout_path_like(target) -> bool:
+    """Whether `inspect`'s target names a file rather than an id, as find_transcript() tells."""
+    return bool(target) and ("/" in target or target.endswith((".jsonl", ".jsonl.zst")))
+
+
+def rollout_given(target) -> bool:
+    """Whether `inspect`'s target, with no --agent, is a Codex rollout's
+    path: a .jsonl.zst (Claude Code writes none), or a file whose first
+    record is Codex's session_meta. Only that line is read. An id is never
+    one, so with no --agent an id stays Claude Code's."""
+    if not rollout_path_like(target):
+        return False
+    path = Path(target).expanduser()
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+    if path.name.endswith(".jsonl.zst"):
+        return True
+    first = rollout_first(path)
+    return isinstance(first, dict) and first.get("type") == "session_meta" and isinstance(first.get("payload"), dict)
+
+
+def rollout_packed(path: Path) -> str:
+    """Why a compressed rollout is not read on this Python."""
+    return (f"{shown(path.name)} is compressed (.jsonl.zst), and this Python ({sys.version.split()[0]}) cannot read "
+            "it: Python 3.14 and later can (compression.zstd).")
+
+
+def find_rollout(target: str | None) -> tuple[Path | None, str]:
+    """The rollout to read, and a note: why there is none. A path (holding a
+    / or ending in .jsonl or .jsonl.zst) is read as given. An id, or the
+    start of one that only one rollout's file name holds, is looked for
+    under CODEX_HOME/sessions. With neither: the newest rollout. A
+    compressed one this Python cannot read is named, with the Python that
+    can."""
+    sessions = CODEX_HOME / "sessions"
+    where = home_path(str(sessions))
+    if rollout_path_like(target):
+        path = Path(target).expanduser()
+        if not path.is_file():
+            return None, f"there is no file {shown(target)}."
+        return (None, rollout_packed(path)) if path.name.endswith(".zst") and zstd is None else (path, "")
+    if target:
+        if not CODEX_ID.fullmatch(target):
+            return None, f"{shown(target, 80)!r} is neither a Codex rollout's id nor its path."
+        found = collections.defaultdict(list)  # id -> its rollouts
+        for path in files_of(sessions.rglob("rollout-*")):
+            named = CODEX_FILE.fullmatch(path.name)
+            if named and named.group(1).startswith(target):
+                found[named.group(1)].append(path)
+        if target not in found and len(found) > 1:
+            return None, f"{len(found)} Codex rollouts start with {target}; give more of the id."
+        if not found:
+            return None, (f"no Codex rollout found for {target} under {where}. Give its id, the start of one only "
+                          "one rollout's has, or its path.")
+        hits = found.get(target) or next(iter(found.values()))
+        readable = [p for p in hits if zstd is not None or not p.name.endswith(".zst")]
+        if not readable:
+            return None, rollout_packed(hits[0])
+        return sorted(readable, key=lambda p: p.name)[-1], ""
+    paths, packed = rollout_files()
+    if paths:
+        return paths[0], ""
+    if packed:
+        return None, (f"no Codex rollout this Python can read under {where}, and {packed} compressed "
+                      f"one{'s' * (packed != 1)} this Python cannot read: Python 3.14 and later read "
+                      f"{'it' if packed == 1 else 'them'} (compression.zstd).")
+    return None, f"no Codex rollouts under {where}."
+
+
+def inspect_codex(opts) -> int:
+    """`longhaul inspect --agent codex`: the report on stdout, or why there
+    is none on stderr and exit 1."""
+    path, note = find_rollout(opts.target)
+    if note:
+        print(f"longhaul inspect: {note}", file=sys.stderr)
+    if not path:
+        return 1
+    try:
+        report = inspect_rollout(path)
+    except ROLLOUT_ERRORS as e:  # the chat's own rollout: a sub-agent's is counted in the report
+        reason = e.strerror if isinstance(e, OSError) and e.strerror else e
+        print(f"longhaul inspect: could not read {home_path(str(path))}: {shown(reason, 200)}", file=sys.stderr)
+        return 1
+    if not report["lines"]:  # an all-zero report would look like a real one
+        print(f"longhaul inspect: no Codex rollout records in {home_path(str(path))}: it is empty, or not a Codex "
+              "rollout.", file=sys.stderr)
+        return 1
+    if opts.json:  # one record per line, as Claude Code's
+        print("\n".join(json.dumps(x) for x in rollout_metrics(report)))
+    else:
+        print("\n".join(rollout_lines(report)))
+    return 0
+
+
 # -------------------------------------------------------------- inspect
 #
 # `longhaul inspect [ID|PATH]`: where one conversation's usage went, from its
@@ -4219,6 +5002,10 @@ def inspect_records(r: dict) -> list[dict]:
 
 
 def inspect(opts) -> int:
+    # Codex's (X1): asked for, or a rollout's path given with no --agent. Else Claude Code's, as it always was.
+    agent = getattr(opts, "agent", None)
+    if agent == "codex" or (agent is None and rollout_given(opts.target)):
+        return inspect_codex(opts)
     path, note = find_transcript(opts.target)
     if note:
         print(f"longhaul inspect: {note}", file=sys.stderr)
@@ -12599,7 +13386,12 @@ def main(argv: list[str]) -> int:
                            help="record-probe: a JSON file naming claude_version and the five checks, all true")
         if cmd == "inspect":
             p.add_argument("target", nargs="?", metavar="ID|PATH",
-                           help="a conversation (default: the latest one in the ledger)")
+                           help="a conversation (default: the latest one in the ledger); with --agent codex, a "
+                                "rollout: its id, the start of one, or its path (default: the newest)")
+            p.add_argument("--agent", choices=["claude", "codex"],
+                           help="claude (the default): a Claude Code conversation; codex: an OpenAI Codex chat, "
+                                "from its rollout under CODEX_HOME/sessions (a rollout's path is read as Codex's "
+                                "without it)")
             p.add_argument("--json", action="store_true",
                            help="one record per number: metric, value, unit, source, confidence")
         if cmd == "trial":
