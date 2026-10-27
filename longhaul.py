@@ -209,6 +209,11 @@ Usage:
                           other) and when, nothing else, so that a non-zero exit
                           after you closed the chat or signed out is no crash
                           to reopen
+  longhaul filter               the plugin's PostToolUse hook on Bash: hands Claude a
+                          shorter output where nothing is lost, or with the whole
+                          output saved and named (LONGHAUL_FILTERS: shadow, the
+                          default, changes nothing and logs what it would cut;
+                          lossless; on; off)
   longhaul autocompact-note SID TOKENS
                           what the plugin's hooks module runs once it has run
                           /compact at the end of the turn in which a chat saved
@@ -2901,6 +2906,23 @@ def output_size(content) -> tuple[int, int]:
             sum(b.get("type") == "image" for b in blocks))
 
 
+def strings_in(value) -> list:
+    """Every string in a JSON value, keys aside, in order."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        value = list(value.values())
+    return [s for v in value for s in strings_in(v)] if isinstance(value, list) else []
+
+
+def output_text(content) -> str:
+    """The text of a tool's output, as output_size() counts it."""
+    if isinstance(content, str):
+        return content
+    blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+    return "".join(b["text"] for b in blocks if b.get("type") == "text" and isinstance(b.get("text"), str))
+
+
 def above(cwd):
     """The absolute path cwd and each of its parents, nearest first, as
     the indexers look for their maps and git for its work tree; nothing
@@ -3235,6 +3257,10 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     order, began, ended, owner, called, answered, heard, told = [], {}, {}, {}, {}, {}, set(), set()
     ran_in: dict = {}  # tool_use id -> the folder its line says it ran in (bash_reads)
     hook_added: dict = {}  # (scope, event) -> [additions, characters] of what hooks put into the context
+    # Phase 3: each Bash output replayed through the filter's levels (filter_replay); after one `on` would cut
+    # lines of, its file's next FILTER_NEXT calls, [words only the cut lines held, calls left, used?], in `pending`.
+    commands, pending = {}, collections.defaultdict(list)
+    replay = {"outputs": 0, "chars": 0, "lossless": 0, "on": 0, "drops": 0, "used": 0}
     for n, file in enumerate(files):
         events.append([])
         order.append([])
@@ -3322,12 +3348,31 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                             ran_in[tid] = line["cwd"]
                         tool_calls[(scope, name)] += 1
                         events[n].append((when, n, "call", (scope, name, args, tid)))
+                        if name == "Bash" and isinstance(args.get("command"), str):
+                            commands[tid] = args["command"]
+                        if pending[n]:
+                            said = "\n".join(strings_in(args))  # the text itself: JSON's \n would hide a word after it
+                            for wait in pending[n]:
+                                if not wait[2] and any(w in said and re.search(rf"(?<!\w){re.escape(w)}(?!\w)", said)
+                                                       for w in wait[0]):
+                                    wait[2] = True
+                                    replay["used"] += 1
+                                wait[1] -= 1
+                            pending[n] = [wait for wait in pending[n] if wait[1] > 0]
                 elif kind == "user":
                     for b in blocks:
                         tid = b.get("tool_use_id")
                         if b.get("type") == "tool_result" and isinstance(tid, str):
                             results[tid] = (*output_size(b.get("content")), b.get("is_error") is True, scope)
                             answered[tid] = when
+                            if tid in commands:
+                                text = output_text(b.get("content"))
+                                lossless, on, words = filter_replay(commands.pop(tid), text)
+                                for k, v in (("outputs", 1), ("chars", len(text)), ("lossless", lossless), ("on", on)):
+                                    replay[k] += v
+                                if words is not None:
+                                    replay["drops"] += 1
+                                    pending[n].append([words, FILTER_NEXT, False])
                     if not any(b.get("type") == "tool_result" for b in blocks):
                         told.add(n)
 
@@ -3566,6 +3611,8 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "api_errors": dict(api_errors.most_common()),
         "unreadable": unreadable,
         "guard": guard_counts(path.stem),
+        "filter_replay": replay,
+        "filter": filter_counts(path.stem),
         "subagent_reminders": subagent_reminders(path.stem),
         "consultations": consulted,
         "stops": stop_counts(path.stem),
@@ -3769,6 +3816,48 @@ def inspect_lines(r: dict) -> list[str]:
                  (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
                  if g[k]]
                 + ([f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []))
+    f = r.get("filter_replay") or {}
+    if f.get("lossless", 0) < f.get("chars", 0) or f.get("on", 0) < f.get("chars", 0):  # else nothing to cut: no section
+        def cut(n):
+            return f"{n:,} chars ({100 * n / f['chars']:.1f}%)"
+
+        on = f"  on would cut {cut(f['chars'] - f['on'])}"
+        if f["drops"]:
+            rate = f["used"] / f["drops"]
+            on += (f", lines of {f['drops']:,} output{'s' * (f['drops'] != 1)} among them; after {f['used']:,} of them "
+                   f"({rate:.0%}), Claude's next {FILTER_NEXT} calls used a word only the cut lines held"
+                   + (": too often" if rate >= FILTER_OFF_AT else ": watch" if rate >= FILTER_WATCH_AT else ""))
+        else:
+            on += ", dropping nothing"
+        section("Output filter [transcript, replayed: this chat's Bash output through `longhaul filter`'s two levels "
+                "as they stand now]",
+                [f"  Bash output: {f['outputs']:,} output{'s' * (f['outputs'] != 1)}, {f['chars']:,} chars",
+                 f"  lossless would cut {cut(f['chars'] - f['lossless'])}, dropping nothing", on])
+    fl = r.get("filter")
+    if fl:  # else the hook logged nothing for this conversation: no section
+        rows = []
+        for mode in ("shadow", "lossless", "on"):
+            m = fl["modes"].get(mode)
+            if not m:
+                continue
+            if mode == "shadow":
+                rows.append(f"  shadow (changes nothing): {m['calls']:,} output{'s' * (m['calls'] != 1)}; lossless would "
+                            f"cut {m['lossless_cut']:,} chars, on {m['on_cut']:,}"
+                            + (f", lines of {m['would_drop']:,} output{'s' * (m['would_drop'] != 1)} among them"
+                               if m.get("would_drop") else ""))
+                continue
+            row = (f"  {mode}: {m.get('applied', 0):,} output{'s' * (m.get('applied', 0) != 1)} shortened, "
+                   f"{m.get('cut', 0):,} chars cut")
+            if mode == "on" and m.get("dropped"):
+                row += f", lines of {m['dropped']:,} among them, read back after {fl['fetched']:,}"
+            if m.get("full"):
+                row += f"; {m['full']:,} left whole, the store of saved outputs being full"
+            rows.append(row)
+        if fl["ms"]:
+            rows.append(f"  the hook's own time: median {fl['ms'][(len(fl['ms']) - 1) // 2]:.1f} ms, "
+                        f"longest {fl['ms'][-1]:.1f} ms")
+        section("Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]",
+                rows)
     s = r.get("subagent_reminders") or {}
     if s.get("subagents"):  # else none was told: no section
         out.append("Subagent reminders [longhaul guard records, counted]")
@@ -3909,6 +3998,12 @@ def inspect_records(r: dict) -> list[dict]:
         add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "guard", "counted", k)
     if (r["guard"] or {}).get("wait"):
         add("guard_fired", r["guard"]["wait"], "calls", "subagents", "guard", "counted", "wait")
+    f = r.get("filter_replay") or {}
+    if f.get("outputs"):
+        for level in ("lossless", "on"):
+            add("filter_replay_cut", f["chars"] - f[level], "chars", "all", "transcript", "inferred", level)
+        add("filter_replay_drops", f["drops"], "outputs", "all", "transcript", "inferred", "on")
+        add("filter_replay_used", f["used"], "outputs", "all", "transcript", "inferred", "on")
     if (r.get("subagent_reminders") or {}).get("subagents"):
         add("subagents_reminded", r["subagent_reminders"]["subagents"], "subagents", "subagents", "guard", "counted")
     c = r["consultations"]
@@ -4846,7 +4941,10 @@ def run_hook(check, name: str) -> int:
         if answer:
             print(json.dumps(answer))
     except Exception as e:
-        log(f"{name} hook: no answer ({e!r}); the engine goes on")
+        # The type alone (and an OS error's reason): an error's text can hold the input, a tool's
+        # whole output among it (review, token layer Phase 3: a UnicodeEncodeError's repr did).
+        why = type(e).__name__ + (f": {e.strerror}" if isinstance(e, OSError) and e.strerror else "")
+        log(f"{name} hook: no answer ({why}); the engine goes on")
     return 0
 
 
@@ -4855,9 +4953,685 @@ def guard(_opts) -> int:
     PreToolUse the reminder joins the answer when it is due, in any mode:
     LONGHAUL_GUARD=off stops the rules, not the reminder. At a startup,
     Auto Model's guide joins it (models_guide_join(); the checkpoint's
-    hook gives it at the other starts), whatever the guard's mode."""
-    return run_hook(lambda data: reminder_join(data, models_guide_join(
-        data, guard_check(data, guard_mode(), index=index_mode()), ("startup",))), "guard")
+    hook gives it at the other starts), whatever the guard's mode. A read
+    of an output the filter saved is counted first (filter_fetch_check()),
+    whatever the mode too."""
+    def check(data):
+        try:
+            filter_fetch_check(data)
+        except Exception as e:  # the count is lost, not the guard's answer
+            log(f"filter: a fetch-back was not counted ({e!r})")
+        return reminder_join(data, models_guide_join(
+            data, guard_check(data, guard_mode(), index=index_mode()), ("startup",)))
+
+    return run_hook(check, "guard")
+
+
+# --------------------------------------------------------------- filter
+#
+# `longhaul filter`: the plugin's PostToolUse hook on Bash, the token
+# layer's Phase 3 (docs/plans/2026-10-26-output-filters.md). It runs after
+# a command, before its output reaches the model, and may hand Claude Code
+# a shorter output in the same shape (updatedToolOutput, Claude Code
+# 2.1.310 on): the command itself is never rewritten. LONGHAUL_FILTERS
+# says how far it goes:
+# - shadow, the default until a week of it is measured: it changes
+#   nothing, and logs by size alone what the two levels below would cut;
+# - lossless: only steps after which nothing Claude could need is gone.
+#   Colour codes, carriage-return redraws and trailing blanks go; three or
+#   more identical lines are said once with their count; grep's matches
+#   go under one line naming their file; a long folder most paths share
+#   is said once;
+# - on: lossless, and the lines of a FILTER_TABLE row (passed tests,
+#   install and build progress) and the middle of an output still over
+#   FILTER_CAP, when FILTER_DROP_MIN or more would go. The whole output
+#   is saved first (LONGHAUL_HOME/outputs/<session>/, private, for
+#   FILTER_KEEP_DAYS; at FILTER_STORE_MAX nothing more is dropped), and
+#   one line names the file, the lines left out and how many of them
+#   mention an error;
+# - off.
+# Left alone: output under FILTER_SMALL characters; a command that prints
+# files (FILTER_PRINTS, git diff, git show), or one the shell could not
+# be split safely; a format the user chose (FILTER_FORMAT); an image, a
+# command in the background, output Claude Code saved to a file itself;
+# a read of a saved output (what Claude fetched back is never cut again);
+# everything while RTK's own hook is in the settings (ADR-0005, rule 3).
+# The output never grows, the line naming the file counted. Each call
+# with something to cut is logged by tool_use_id, by size alone, never
+# the text or the command; the guard counts a later read of a saved file
+# as a fetch-back, and a lossy step fetched back FILTER_OFF_AT of the
+# time, over FILTER_MIN_DROPS drops, stops (inspect says "watch" from
+# FILTER_WATCH_AT). inspect replays a conversation's Bash output through
+# both levels: shadow mode's measure.
+# Learned from RTK (github.com/rtk-ai/rtk, whose CLI is Apache-2.0) and
+# caveman (github.com/juliusbrussee/caveman): their rules, rebuilt here
+# in Python; none of their code.
+
+FILTER_MODES = ("off", "shadow", "lossless", "on")
+FILTER_SMALL = 1_500  # characters: smaller output passes untouched (RTK); hooks.json's prelude checks it first
+FILTER_DROP_MIN = 4_096  # characters: a lossy step leaves out this much, or nothing (caveman)
+FILTER_CAP = 12_000  # characters: in `on`, a longer output after the lossless steps keeps its head and tail
+FILTER_HEAD, FILTER_TAIL = 7_000, 2_000
+FILTER_KEEP_DAYS = 7
+FILTER_STORE_MAX = 200 * 2**20  # bytes of saved outputs; when full, nothing more is cut (caveman: refuse, never evict)
+FILTER_WATCH_AT, FILTER_OFF_AT, FILTER_MIN_DROPS = 0.10, 0.30, 10  # fetch-back rates of a lossy step (RTK's gain)
+FILTER_LOG_MAX = 2 * 2**20  # bytes of one conversation's filter log
+FILTER_NEXT = 3  # calls after a cut that inspect's replay looks at
+FILTER_PRINTS = {"cat", "sed", "head", "tail", "nl", "awk", "gawk", "less", "more", "bat", "xxd", "od", "hexdump"}
+FILTER_DIFFS = {"diff", "colordiff", "delta", "difft", "patch"}  # a diff's every blank and line counts, read from a pipe too
+FILTER_SHELLS = {"bash", "sh", "zsh", "dash", "eval"}
+FILTER_KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "do", "while", "until"}  # before a command's program
+FILTER_GREP = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
+FILTER_LISTS = {"find", "fd", "ls"}
+FILTER_QUIET = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", ":", "echo", "printf", "sleep",
+                "for", "case", "select", "done", "fi", "esac", "}"}
+FILTER_WRAPPERS = {"time", "nice", "nohup", "command", "exec", "env", "stdbuf", "caffeinate", "sudo"}
+FILTER_FORMAT = re.compile(r"--json\b|--format\b|--pretty\b|--porcelain\b|\bjq\b|(?<!\S)-o\s*json\b|--output[= ]json\b"
+                           r"|(?<!\S)-[0z](?!\S)|--null\b|-print0\b")
+FILTER_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+FILTER_ALARM = re.compile(r"(?i)\b(?:errors?|fail(?:s|ed|ures?)?|exception|traceback|fatal|panic(?:ked)?|warn(?:ings?)?)\b")
+# grep -n's path:12:text, the path with no blank and a / or a dot: a log line's time (12:30:05) is no path
+FILTER_MATCH = re.compile(r"^(?P<path>(?=[^\s:]*[/.])[^\s:]+):(?P<rest>\d+[:-].*)$")
+FILTER_FILE = re.compile(r"^(?P<path>(?:\.{0,2}/)?[\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z0-9]+):(?P<rest>.*)$")  # without -n
+FILTER_WORD = re.compile(r"[\w.-]*/[\w./-]+\.\w+|[A-Za-z_][A-Za-z0-9_]{5,}|\b[0-9a-f]{7,40}\b")
+# The noisy tools' rows, `on` only: the lines a row drops, matched with
+# colour codes off, and the tests each row carries (RTK's filters carry
+# theirs): (line, dropped?) and (command, the row's?). The first row
+# whose `when` matches a command that prints is the output's kind.
+FILTER_TABLE = (
+    # A passing test's own output stays under its header: go's === RUN lines are kept, and a run
+    # that prints passing tests' output (pytest -s, cargo --nocapture) is not this row's (review, Phase 3).
+    {"name": "tests", "what": "passed-test lines",
+     "when": r"^(?:python[\d.]*\s+-m\s+)?(?:pytest|py\.test)\b|^(?:npx\s+|bunx\s+)?(?:jest|vitest|mocha)\b"
+             r"|^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|^go\s+test\b|^cargo\s+(?:test|nextest)\b",
+     "unless": r"(?<!\S)(?:-s|--capture[= ]no|--nocapture|--show-output|--no-capture)(?!\S)",
+     "drop": r"::\S+ PASSED(?:\s+\[\s*\d+%\])?\s*$|^PASSED \S+::|^\s*[✓✔√]\s|^\s*--- PASS: |^ok\s+\S+\s+[\d.]+s$"
+             r"|^test \S+ \.\.\. ok$|^PASS\s+\S",
+     "lines": (("tests/test_a.py::test_one PASSED  [ 10%]", True), ("tests/test_a.py::test_two FAILED", False),
+               ("E   AssertionError: status was PASSED but expected FAILED", False),
+               ("--- PASS: TestParse (0.00s)", True), ("--- FAIL: TestLoad (0.01s)", False),
+               ("=== RUN   TestParse", False), ("ok  	example.com/pkg	0.012s", True),
+               ("test parse::empty ... ok", True), ("test parse::bad ... FAILED", False),
+               ("  ✓ renders the list (3 ms)", True), ("  ✕ breaks (2 ms)", False),
+               ("PASS src/app.test.ts", True), ("FAIL src/api.test.ts", False)),
+     "runs": (("pytest -v tests", True), ("python3 -m pytest -q", True), ("npx vitest run", True),
+              ("npm test", True), ("pnpm run test", True), ("go test ./...", True), ("cargo test", True),
+              ("python3 -m unittest", False), ("npm run build", False), ("pytest -s -v", False),
+              ("cargo test -- --nocapture", False))},
+    {"name": "pip", "what": "progress and already-installed lines",
+     "when": r"^(?:python[\d.]*\s+-m\s+)?pip[\d.]*\s+install\b|^uv\s+pip\s+install\b",
+     "drop": r"^(?:Requirement already satisfied: |Collecting |\s*Downloading \S|\s*Using cached |\s*Obtaining "
+             r"|\s*Preparing metadata |\s*Getting requirements |\s*Installing build dependencies|\s*Building wheel for "
+             r"|\s*Created wheel for |\s*Stored in directory: |\s*━)",
+     "lines": (("Requirement already satisfied: six in ./venv/lib", True), ("Collecting requests==2.31.0", True),
+               ("  Downloading requests-2.31.0-py3-none-any.whl (62 kB)", True),
+               ("     ━━━━━━━━━━━━━━━━━━━━━━━━ 62.6/62.6 kB 3.1 MB/s eta 0:00:00", True),
+               ("ERROR: No matching distribution found for nothere", False),
+               ("Successfully installed requests-2.31.0", False)),
+     "runs": (("pip install -r requirements.txt", True), ("python3 -m pip install x", True),
+              ("uv pip install x", True), ("pip list", False))},
+    {"name": "node install", "what": "progress lines",
+     "when": r"^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci|add)\b",
+     "drop": r"^(?:npm notice |Progress: resolved |\[\d+/\d+\] |info fetch|Downloading |Resolving: total )",
+     "lines": (("npm notice New minor version of npm available!", True),
+               ("Progress: resolved 412, reused 400, downloaded 12, added 0", True),
+               ("[2/4] Fetching packages...", True), ("npm ERR! code ERESOLVE", False),
+               ("npm WARN deprecated inflight@1.0.6", False), ("added 312 packages in 9s", False)),
+     "runs": (("npm install", True), ("pnpm i", True), ("yarn add left-pad", True), ("npm ci", True),
+              ("npm run build", False))},
+    {"name": "cargo", "what": "compile-progress lines",
+     "when": r"^cargo\s+(?:build|check|run|clippy|install|b|c|r)\b",
+     "drop": r"^\s*(?:Compiling|Checking|Downloaded|Downloading|Fresh|Locking|Adding|Updating|Blocking waiting)\s",
+     "lines": (("   Compiling serde v1.0.190", True), ("  Downloaded tokio v1.33.0", True),
+               ("error[E0432]: unresolved import `crate::x`", False), ("warning: unused variable: `y`", False),
+               ("    Finished dev [unoptimized + debuginfo] target(s) in 4.20s", False)),
+     "runs": (("cargo build --release", True), ("cargo clippy", True), ("cargo test", False), ("cargo fmt", False))},
+    {"name": "go", "what": "download lines",
+     "when": r"^go\s+(?:build|get|install|mod\s+(?:download|tidy)|run|vet)\b",
+     "drop": r"^go: (?:downloading|finding|extracting) ",
+     "lines": (("go: downloading golang.org/x/sys v0.13.0", True), ("main.go:12:2: undefined: Foo", False)),
+     "runs": (("go build ./...", True), ("go mod tidy", True), ("go test ./...", False))},
+    {"name": "docker", "what": "layer-progress lines",
+     "when": r"^docker(?:-compose|\s+compose)?\s+(?:build|pull|push|up)\b|^docker\s+buildx\s+build\b",
+     "drop": r"^#\d+ (?:sha256:\S+ [\d.]+\w?B / |\[internal\] |DONE |CACHED$|resolve |extracting |transferring )"
+             r"|^[0-9a-f]{12}: (?:Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting"
+             r"|Pull complete|Already exists|Pushing|Pushed|Layer already exists|Preparing)",
+     "lines": (("#5 sha256:1a2b 12.58MB / 29.15MB 1.2s", True), ("#7 DONE 0.4s", True), ("#4 CACHED", True),
+               ("3f4ca61aafcd: Pull complete", True), ("#9 ERROR: process \"/bin/sh -c make\" did not complete", False),
+               ("Status: Downloaded newer image for redis:7", False)),
+     "runs": (("docker build -t app .", True), ("docker compose up -d", True), ("docker ps", False))},
+    {"name": "brew", "what": "download lines",
+     "when": r"^brew\s+(?:install|upgrade|update|reinstall)\b",
+     "drop": r"^(?:==> (?:Downloading|Fetching|Pouring|Verifying)|#{3,}|Already downloaded: |-=#=- )",
+     "lines": (("==> Downloading https://ghcr.io/v2/homebrew/core/jq/manifests/1.7.1", True),
+               ("######################################################################## 100.0%", True),
+               ("Error: No formulae found for nothere", False), ("==> Caveats", False)),
+     "runs": (("brew install jq", True), ("brew list", False))},
+)
+
+
+def filter_mode() -> str:
+    mode = os.environ.get("LONGHAUL_FILTERS") or "shadow"
+    return mode if mode in FILTER_MODES else "shadow"
+
+
+def filter_commands(command):
+    """The simple commands of a shell line, each as its program and its
+    words, the variable settings and the wrappers (time, env, timeout
+    60 ...) before it taken off, with whether it reads a pipe:
+    [(words, piped)]. None when the line cannot be split safely: a quote
+    left open, a heredoc, a subshell or a command substitution. A
+    redirection's file is not a word."""
+    text = str(command)
+    if "<<" in text or "`" in text or "$(" in text:
+        return None
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace, lex.whitespace_split = " \t\r", True
+        lex.commenters = ""  # a # inside a word (a URL's) is no comment; a comment's words are skipped below
+        words = list(lex)
+    except ValueError:
+        return None
+    found, current, piped, redirected = [], [], False, False
+    for word in words + [";"]:
+        if word and set(word) <= set("();<>|&\n"):
+            if "(" in word or ")" in word:
+                return None
+            if "<" in word or ">" in word:
+                redirected = True
+                continue
+            if current:
+                found.append((current, piped))
+            current, piped = [], word in ("|", "|&")
+        elif redirected:
+            redirected = False
+        else:
+            current.append(word)
+    commands = []
+    for words, piped in found:
+        i = 0
+        while i < len(words):
+            name = words[i].rsplit("/", 1)[-1]
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[i]) or words[i] in FILTER_KEYWORDS:
+                i += 1
+            elif name in FILTER_WRAPPERS or name == "timeout":
+                # A wrapper's options can take values (sudo -u www, nice -n 10): a program that
+                # prints files anywhere after it is the one; else what follows its options.
+                printer = next((j for j in range(i + 1, len(words))
+                                if words[j].rsplit("/", 1)[-1] in FILTER_PRINTS | FILTER_DIFFS), None)
+                if printer is not None:
+                    i = printer
+                    break
+                i += 1
+                while i < len(words) and words[i].startswith("-"):
+                    i += 1
+                i += name == "timeout"  # its duration
+            else:
+                break
+        if i < len(words) and not words[i].startswith("#"):  # a comment prints nothing
+            commands.append(([words[i].rsplit("/", 1)[-1]] + words[i + 1:], piped))
+    return commands
+
+
+def filter_git(words) -> str:
+    """git's subcommand, past its own options (-C and -c take a value)."""
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in ("-C", "-c") else 1
+    return words[i] if i < len(words) else ""
+
+
+def filter_kind(command) -> str:
+    """What a command's output is, for the filter, from the programs that
+    print it (each one not reading a pipe): "prints" when one prints
+    files, "grep" or "list" when all of them search or list, else the
+    first FILTER_TABLE row one of them matches, else "other"; "?" when the
+    line could not be split. "prints" and "?" are left alone."""
+    commands = filter_commands(command)
+    if commands is None:
+        return "?"
+    for words, piped in commands:  # piped ones too, for a diff or `ls | xargs cat`; `grep | head` is grep's
+        git = filter_git(words) if words[0] == "git" else ""
+        if (words[0] in FILTER_PRINTS and not piped) or words[0] in FILTER_DIFFS or git in ("diff", "show", "blame", "cat-file", "format-patch", "range-diff") \
+                or (git in ("log", "stash") and any(re.fullmatch(r"-p|--patch|-u|-U\d*|--unified(=\d+)?|show", w)
+                                                    for w in words[2:])) \
+                or (words[0] not in FILTER_GREP | FILTER_LISTS | FILTER_QUIET
+                    and any(w in ("diff", "cat") for w in words[1:3])) \
+                or (words[0] in ("xargs", "find") and any(w.rsplit("/", 1)[-1] in FILTER_PRINTS for w in words[1:])):
+            return "prints"
+        if words[0] in FILTER_SHELLS:  # bash -c '...': the inner line's kind, if it prints or cannot be told
+            inner = next((words[j + 1] for j in range(1, len(words) - 1) if words[j] == "-c"), None)
+            if inner is None or filter_kind(inner) in ("prints", "?"):
+                return "?"
+    heads = [words for words, piped in commands if not piped and words[0] not in FILTER_QUIET]
+    if not heads:
+        return "other"
+    if all(words[0] in FILTER_GREP or (words[0] == "git" and filter_git(words) == "grep") for words in heads):
+        return "grep"
+    if all(words[0] in FILTER_LISTS for words in heads):
+        return "list"
+    for row in FILTER_TABLE:
+        if any(re.search(row["when"], " ".join(words)) and not re.search(row.get("unless", "$^"), " ".join(words))
+               for words in heads):
+            return row["name"]
+    return "other"
+
+
+def filter_clean(text: str) -> str:
+    """Colour codes off; a carriage-return redraw (a line written over
+    with more of the same, a progress bar's) as its last state; three or
+    more identical lines as one with their count, where that is shorter.
+    Trailing blanks and tabs stay: a diff's change or a table's empty
+    column can be just that (review, Phase 3)."""
+    lines = []
+    for line in FILTER_ANSI.sub("", text).split("\n"):
+        if "\r" in line:
+            parts = [p for p in line.split("\r") if p.strip()]
+            if len(parts) <= 1:  # a line ending \r\n, or one cleared to blanks
+                line = parts[0] if parts else ""
+            elif len(os.path.commonprefix(parts)) >= 4:  # the same text, written over
+                line = parts[-1]
+        lines.append(line)
+    out, i = [], 0
+    while i < len(lines):
+        j = i
+        while j + 1 < len(lines) and lines[j + 1] == lines[i]:
+            j += 1
+        said = f"{lines[i]}  [×{j - i + 1}]"
+        if j - i >= 2 and lines[i] and len(said) < (j - i + 1) * (len(lines[i]) + 1) - 1:
+            out.append(said)
+        else:
+            out.extend(lines[i:j + 1])
+        i = j + 1
+    return "\n".join(out)
+
+
+def filter_grouped(text: str) -> str:
+    """grep's lines, those of one file in a row under one line naming it:
+    path:12:text and path-13-text (a context line, of a file a match
+    names) become "  12:text" and "  13-text" under "path"; path:text
+    (no -n) becomes "  text"."""
+    lines = text.split("\n")
+    known = {m.group("path") for m in map(FILTER_MATCH.match, lines) if m}
+    longest = max(map(len, known), default=0)
+    rows = []
+    for line in lines:
+        m = FILTER_MATCH.match(line)
+        path, rest = (m.group("path"), m.group("rest")) if m else (None, None)
+        if path is None:
+            for cut in re.finditer(r"-(?=\d+-)", line):
+                if cut.start() > longest:  # no known path is that long: stop (a long line costs no more)
+                    break
+                if line[:cut.start()] in known:
+                    path, rest = line[:cut.start()], line[cut.end():]
+                    break
+        if path is None:
+            m = FILTER_FILE.match(line)
+            path, rest = (m.group("path"), m.group("rest")) if m else (None, None)
+        rows.append((path, rest, line))
+    out, i = [], 0
+    while i < len(rows):
+        path, j = rows[i][0], i
+        while path and j + 1 < len(rows) and rows[j + 1][0] == path:
+            j += 1
+        if j > i:
+            out.append(path)
+            out.extend("  " + rest for _, rest, _ in rows[i:j + 1])
+        else:
+            out.append(rows[i][2])
+        i = j + 1
+    return "\n".join(out)
+
+
+def filter_prefixed(text: str) -> str:
+    """A long folder that the paths starting the lines share, said once
+    at the top. Only when every line that does not start with a space
+    (or is "--") starts with "/", so that a path left relative can only
+    be one under that folder."""
+    lines = text.split("\n")
+    heads = [line.split(":", 1)[0] for line in lines if line and not line[0].isspace() and line != "--"]
+    if len(heads) < 5 or not all(re.fullmatch(r"/[^\s]+", h) for h in heads):
+        return text
+    folder = os.path.commonpath(heads)
+    if len(folder) < 15:
+        return text
+    folder = folder.rstrip("/") + "/"
+    return f"[paths below are under {folder}]\n" + "\n".join(
+        line[len(folder):] if line.startswith(folder) else line for line in lines)
+
+
+def filter_lossless(text: str, kind: str) -> str:
+    text = filter_clean(text)
+    if kind == "grep":
+        text = filter_grouped(text)
+    if kind in ("grep", "list"):
+        text = filter_prefixed(text)
+    return text
+
+
+def filter_cut(text: str, kind: str, saved: str, stopped=()):
+    """`on`'s lossy steps over a whole output: the lines of kind's
+    FILTER_TABLE row, then, when what is left is still over FILTER_CAP
+    after the lossless steps, all but its head and tail. (what is shown,
+    the steps taken, the characters left out), or None when under
+    FILTER_DROP_MIN would go. The line naming `saved` stands where the
+    middle was, else at the end; its line numbers are the saved file's.
+    `stopped` holds the steps fetched back too often."""
+    lines = text.split("\n")
+    keep, steps, whats = list(range(len(lines))), [], []
+    row = next((r for r in FILTER_TABLE if r["name"] == kind and kind not in stopped), None)
+    if row:
+        drop = re.compile(row["drop"])
+        kept = [i for i in keep if not drop.search(FILTER_ANSI.sub("", lines[i]))]
+        if len(kept) < len(keep):
+            keep, steps, whats = kept, [row["name"]], [row["what"]]
+    gap = None
+    if "cap" not in stopped and len(filter_lossless("\n".join(lines[i] for i in keep), kind)) > FILTER_CAP:
+        head, size = [], 0
+        for i in keep:
+            size += len(lines[i]) + 1
+            if size > FILTER_HEAD:
+                break
+            head.append(i)
+        tail, size = [], 0
+        for i in reversed(keep[len(head):]):
+            size += len(lines[i]) + 1
+            if size > FILTER_TAIL:
+                break
+            tail.insert(0, i)
+        if head and tail and len(head) + len(tail) < len(keep):
+            keep, gap = head + tail, len(head)
+            steps.append("cap")
+            whats.append("the middle")
+    kept = set(keep)
+    dropped = [i for i in range(len(lines)) if i not in kept]
+    gone = sum(len(lines[i]) + 1 for i in dropped)
+    if not dropped or gone < FILTER_DROP_MIN:
+        return None
+    alarm = sum(1 for i in dropped if FILTER_ALARM.search(lines[i]))
+    hint = (f"[longhaul: {len(dropped):,} of {len(lines):,} lines not shown ({gone:,} characters, "
+            f"{' and '.join(whats)})")
+    if alarm:
+        hint += f"; {alarm:,} of them mention{'s' * (alarm == 1)} an error, a failure or a warning"
+    # caveman's line. The path comes last, quoted for the shell, with nothing stuck to it.
+    hint += ". Answer from this view; read the rest only if you need it"
+    a, b = dropped[0] + 1, dropped[-1] + 1
+    if b - a + 1 == len(dropped):  # one run of lines: say which
+        hint += f": sed -n '{a},{b}p' {shlex.quote(saved)} ]"
+    else:
+        hint += f", from the whole output: {shlex.quote(saved)} ]"
+    gap = len(keep) if gap is None else gap
+    parts = [filter_lossless("\n".join(lines[i] for i in part), kind)
+             for part in (keep[:gap], keep[gap:])]
+    shown = "\n".join(([parts[0]] if keep[:gap] else []) + [hint] + ([parts[1]] if keep[gap:] else []))
+    return shown, steps, gone
+
+
+def filter_output(command, text: str, level: str, saved: str = "the saved file", stopped=()) -> tuple:
+    """What Claude is shown of one stream of a Bash command's output at
+    `level` ("lossless" or "on"), and what was done: {"kind", "steps",
+    "dropped" (characters a lossy step left out)}. `saved` is where the
+    whole output will be; `stopped`, the lossy steps that stopped. The
+    text as it came when nothing applies, or when the result would not
+    be shorter."""
+    kind = filter_kind(command) if isinstance(command, str) else "?"
+    done = {"kind": kind, "steps": [], "dropped": 0}
+    if len(text) < FILTER_SMALL or kind in ("prints", "?") or FILTER_FORMAT.search(command):
+        return text, done
+    shown = filter_lossless(text, kind)
+    if shown != text:
+        done["steps"].append("lossless")
+    if level == "on":
+        cut = filter_cut(text, kind, saved, stopped)
+        if cut is not None and len(cut[0]) < len(shown):
+            shown, done["dropped"] = cut[0], cut[2]
+            done["steps"] += cut[1]
+    if len(shown) >= len(text):
+        return text, {"kind": kind, "steps": [], "dropped": 0}
+    return shown, done
+
+
+def filter_words(text: str) -> set:
+    """The code-like words of a text: paths, names of six characters or
+    more with an underscore, a dot or a capital inside, and hashes
+    (the token layer's replay, 2026-10-26)."""
+    found = set()
+    for word in (w for token in text.split() if len(token) <= 300 for w in FILTER_WORD.findall(token)):
+        if re.fullmatch(r"[0-9a-f]{7,40}", word):
+            if re.search(r"\d", word) and re.search(r"[a-f]", word):
+                found.add(word)
+        elif "_" in word or "." in word or "/" in word or re.search(r"[a-z][A-Z]", word) \
+                or (word.isupper() and len(word) >= 4):
+            found.add(word)
+    return found
+
+
+def filter_replay(command, text: str) -> tuple:
+    """inspect's replay of one Bash output: its length after the lossless
+    steps and after `on`'s, and the code-like words only the part `on`
+    leaves out held (an empty set when it leaves out nothing), or None
+    for the words when nothing is left out."""
+    lossless = filter_output(command, text, "lossless")[0]
+    on, done = filter_output(command, text, "on")
+    if not done["dropped"]:
+        return len(lossless), len(on), None
+    return len(lossless), len(on), filter_words(text) - filter_words(on) - filter_words(str(command))
+
+
+def filter_rtk(cwd) -> bool:
+    """Whether RTK's own hook is in Claude Code's settings, the user's or
+    this project's: then RTK filters, and Longhaul steps aside."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or DEFAULT_CONFIG)
+    files = [config / "settings.json", config / "settings.local.json"]
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        files += [Path(cwd) / ".claude" / "settings.json", Path(cwd) / ".claude" / "settings.local.json"]
+    return any(re.search(r"(?<![\w.-])rtk(?![\w.-])", json.dumps(dict_at(read_json(f), "hooks"))) for f in files)
+
+
+def filter_roots() -> list:
+    """The saved outputs' folder, as a path to it is written: absolute, and from ~ when it is under it."""
+    root = str(LONGHAUL_HOME / "outputs") + "/"
+    home = str(HOME) + "/"
+    return [root] + (["~/" + root[len(home):]] if root.startswith(home) else [])
+
+
+def filter_stopped() -> set:
+    """The lossy steps fetched back FILTER_OFF_AT of the time or more,
+    once they have dropped FILTER_MIN_DROPS times: they stop."""
+    stats = read_json(LONGHAUL_HOME / "filters" / "stats.json")
+    return {step for step, s in (stats.items() if isinstance(stats, dict) else ())
+            if as_int(dict_at(stats, step).get("drops")) >= FILTER_MIN_DROPS
+            and as_int(dict_at(stats, step).get("fetched")) >= FILTER_OFF_AT * as_int(dict_at(stats, step).get("drops"))}
+
+
+def filter_store(sid: str, texts: dict):
+    """Save each whole output ({path: text}) under LONGHAUL_HOME/outputs/,
+    private, and remove those saved more than FILTER_KEEP_DAYS ago. False
+    when the store would pass FILTER_STORE_MAX: then nothing is saved,
+    and nothing cut (caveman: refuse, never evict)."""
+    root = LONGHAUL_HOME / "outputs"
+    with locked("filter-store", wait=1):
+        used, old = 0, time.time() - FILTER_KEEP_DAYS * 86400
+        for folder in (root.iterdir() if root.is_dir() else ()):
+            for file in (folder.iterdir() if folder.is_dir() else ()):
+                st = file.stat()
+                if st.st_mtime < old:
+                    file.unlink()
+                else:
+                    used += st.st_size
+            with contextlib.suppress(OSError):
+                folder.rmdir()  # only when empty
+        if used + sum(len(t.encode()) for t in texts.values()) > FILTER_STORE_MAX:
+            return False
+        for folder in (root, root / sid):
+            folder.mkdir(mode=0o700, exist_ok=True)
+        for path, text in texts.items():
+            write_whole(path, text)
+    return True
+
+
+def filter_check(data, mode: str, notes: list):
+    """The hook's answer to one PostToolUse input: Bash's output with each
+    stream filtered at `mode`'s level, in the shape it came in, or None
+    to keep it as it is. What was done goes into `notes`, to log after
+    the answer is out."""
+    started = time.perf_counter()
+    if mode == "off" or not isinstance(data, dict) or data.get("hook_event_name") != "PostToolUse" \
+            or data.get("tool_name") != "Bash":
+        return None
+    args, out = dict_at(data, "tool_input"), dict_at(data, "tool_response")
+    command, sid, tid = args.get("command"), data.get("session_id"), data.get("tool_use_id")
+    if not isinstance(command, str) or not all(isinstance(x, str) and re.fullmatch(GUARD_ID, x) for x in (sid, tid)):
+        return None
+    if args.get("run_in_background") is True or any(out.get(k) for k in ("isImage", "backgroundTaskId",
+                                                                         "persistedOutputPath")):
+        return None
+    streams = {k: out[k] for k in ("stdout", "stderr") if isinstance(out.get(k), str)}
+    if not any(len(t) >= FILTER_SMALL for t in streams.values()) or any(root in command for root in filter_roots()) \
+            or filter_rtk(data.get("cwd")):
+        return None
+    try:  # a lone surrogate (an emoji cut in half) cannot be saved or logged safely: leave it be
+        for text in streams.values():
+            text.encode()
+    except UnicodeEncodeError:
+        return None
+    stopped = filter_stopped()
+    folder = LONGHAUL_HOME / "outputs" / sid
+    saved = {k: folder / f"{tid}{'' if k == 'stdout' else '.' + k}.txt" for k in streams}
+    lossless = {k: filter_output(command, t, "lossless")[0] for k, t in streams.items()}
+    on = {k: filter_output(command, t, "on", str(saved[k]), stopped) for k, t in streams.items()}
+    chars = sum(map(len, streams.values()))
+    note = {"at": round(time.time(), 3), "id": tid, "agent": data.get("agent_id") is not None, "mode": mode,
+            "kind": filter_kind(command), "chars": chars, "lossless": sum(map(len, lossless.values())),
+            "on": sum(len(s) for s, _ in on.values()), "dropped": sum(d["dropped"] for _, d in on.values()),
+            "steps": sorted({s for _, d in on.values() for s in d["steps"]} - {"lossless"})}
+    shown = dict(lossless) if mode == "lossless" else {k: s for k, (s, _) in on.items()} if mode == "on" else streams
+    cut = [k for k, (_, d) in on.items() if d["dropped"]] if mode == "on" else []
+    if cut and not filter_store(sid, {saved[k]: streams[k] for k in cut}):
+        shown.update({k: lossless[k] for k in cut})
+        note["full"], cut = True, []
+    note.update(shown=sum(map(len, shown.values())), applied=shown != streams,
+                ms=round((time.perf_counter() - started) * 1000, 1))
+    if note["lossless"] < chars or note["on"] < chars:
+        notes.append({"log": sid, "note": note, "drops": sorted({s for k in cut for s in on[k][1]["steps"]}
+                                                                 - {"lossless"})})
+    if shown == streams:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {**out, **shown}}}
+
+
+def filter_logged(notes: list) -> None:
+    """Write what filter_check() noted: the conversation's log line, and
+    each lossy step's drop counted in the stats."""
+    for n in notes:
+        append(LONGHAUL_HOME / "filters" / f"{n['log']}.jsonl", json.dumps(n["note"]) + "\n", FILTER_LOG_MAX)
+        if n["drops"]:
+            filter_counted(n["drops"], "drops")
+        if n["note"].get("full"):
+            log(f"filter: the store of saved outputs is full ({FILTER_STORE_MAX:,} bytes), so nothing was cut")
+
+
+def filter_counted(steps, key: str) -> None:
+    """Add one to `key` (drops or fetched) of each step in the stats."""
+    path = LONGHAUL_HOME / "filters" / "stats.json"
+    with locked("filter", wait=1):
+        stats = read_json(path)
+        stats = stats if isinstance(stats, dict) else {}
+        for step in steps:
+            row = dict_at(stats, step)
+            stats[step] = {"drops": as_int(row.get("drops")), "fetched": as_int(row.get("fetched"))}
+            stats[step][key] += 1
+        write_json(path, stats)
+
+
+def filter_fetch_check(data) -> None:
+    """A Read, or a Bash command, about to read an output the filter
+    saved: the first time for that output, a fetch-back of each lossy
+    step that cut it (its conversation's filter log says which), logged
+    and counted in the stats. Never an answer."""
+    if not isinstance(data, dict) or data.get("hook_event_name") != "PreToolUse":
+        return None
+    args = dict_at(data, "tool_input")
+    text = args.get("file_path") if data.get("tool_name") == "Read" else \
+        args.get("command") if data.get("tool_name") == "Bash" else None
+    if not isinstance(text, str) or not any(root in text for root in filter_roots()):
+        return None
+    read = {m for root in filter_roots()
+            for m in re.findall(re.escape(root) + f"({GUARD_ID})/({GUARD_ID})(?:\\.stderr)?\\.txt", text)}
+    for sid, tid in sorted(read):
+        path = LONGHAUL_HOME / "filters" / f"{sid}.jsonl"
+        with locked("filter", wait=1):  # two reads at once (stdout's and stderr's file) count once
+            try:
+                lines = path.read_text().splitlines()
+            except OSError:
+                continue
+            notes = [n for n in (json_or_none(l) for l in lines) if isinstance(n, dict)]
+            steps = next((n.get("steps") for n in notes if n.get("id") == tid and n.get("applied")), None)
+            steps = [s for s in steps if isinstance(s, str)] if isinstance(steps, list) else []
+            if not steps or any(n.get("fetched") == tid for n in notes):
+                continue
+            append(path, json.dumps({"at": round(time.time(), 3), "fetched": tid, "steps": steps}) + "\n",
+                   FILTER_LOG_MAX)
+        filter_counted(steps, "fetched")
+    return None
+
+
+def json_or_none(text: str):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def filter_counts(sid: str):
+    """What the filter's hook logged for a conversation, by mode: calls,
+    characters before and after each level, what was shown, outputs that
+    lost lines, fetch-backs, the store being full, and the hook's own
+    time. None when there is no log."""
+    if not re.fullmatch(GUARD_ID, sid or ""):
+        return None
+    try:
+        lines = (LONGHAUL_HOME / "filters" / f"{sid}.jsonl").read_text().splitlines()
+    except OSError:
+        return None
+    modes, fetched, ms = {}, 0, []
+    for n in map(json_or_none, lines):
+        if not isinstance(n, dict):
+            continue
+        if n.get("fetched"):
+            fetched += 1
+            continue
+        mode = n.get("mode") if n.get("mode") in FILTER_MODES else "?"
+        m = modes.setdefault(mode, collections.Counter())
+        chars = as_int(n.get("chars"))
+        m["calls"] += 1
+        m["lossless_cut"] += chars - as_int(n.get("lossless"))
+        m["on_cut"] += chars - as_int(n.get("on"))
+        m["would_drop"] += as_int(n.get("dropped")) > 0
+        if n.get("applied") is True:
+            m["applied"] += 1
+            m["cut"] += chars - as_int(n.get("shown"))
+            m["dropped"] += as_int(n.get("dropped")) > 0 and as_int(n.get("shown")) == as_int(n.get("on"))
+        m["full"] += n.get("full") is True
+        if as_number(n.get("ms")) is not None:
+            ms.append(n["ms"])
+    if not modes and not fetched:
+        return None
+    return {"modes": {k: dict(v) for k, v in modes.items()}, "fetched": fetched, "ms": sorted(ms)}
+
+
+def filter_cmd(_opts) -> int:
+    """The PostToolUse hook command on Bash: stdin in, JSON or nothing
+    out, exit 0 always. It answers first and logs after (RTK's hook
+    hygiene), so the log never holds the output back."""
+    notes = []
+    code = run_hook(lambda data: filter_check(data, filter_mode(), notes), "filter")
+    sys.stdout.flush()
+    try:
+        filter_logged(notes)
+    except Exception as e:
+        log(f"filter hook: not logged ({e!r})")
+    return code
 
 
 # ---------------------------------------------------------- session end
@@ -11620,7 +12394,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
-                            "vscode", "models", "update", "doctor", "precompact", "uninstall"):
+                            "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -11709,7 +12483,7 @@ def main(argv: list[str]) -> int:
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
-                "quota-note": quota_note, "precompact": precompact,
+                "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall}[cmd](opts)
 
     extra: list[str] = []

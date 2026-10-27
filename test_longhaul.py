@@ -2365,7 +2365,8 @@ class Inspect(unittest.TestCase):
         self.assertGreaterEqual(len(heads), 7, out.stdout)
         self.assertIn(self.CONSULTATIONS, heads)
         for head in heads:
-            self.assertRegex(head, r"\[(transcript|status line|longhaul guard|longhaul advisor trace|files on disk now)"
+            self.assertRegex(head, r"\[(transcript|status line|longhaul guard|longhaul filter|longhaul advisor trace|"
+                                   r"files on disk now)"
                                    r"[^\]]*\]", head)
         for head in heads:
             if head.startswith(("Read again", "The same search")):
@@ -2777,6 +2778,73 @@ class Inspect(unittest.TestCase):
         self.assertEqual(longhaul.memory_health(self.path, str(project))["index"],
                          {"lines": 50, "bytes": 50000, "unloaded": 25})
         self.assertIsNone(longhaul.memory_health(self.tmp / "s2.jsonl", None)["index"])
+
+    # The token layer, Phase 3: what the output filter would cut from this
+    # chat, replayed (shadow mode's measure), and what its hook logged.
+
+    def test_the_filter_replay_shows_what_each_level_would_cut_and_whether_claude_used_what_on_drops(self):
+        grep = "".join(f"/work/project/src/service/mod_{f}.py:{10 + i}:    total_{f}_{i} = compute_value({i})\n"
+                       for f in range(6) for i in range(15))
+        build = "\n".join(f"step {i:04d} of the build: wrote artifact_{i}.o" for i in range(2000)) + "\n"
+        self.write(self.turn("t1", "Bash", grep, command="grep -rn compute_value src")
+                   + self.turn("t2", "Bash", build, command="./build.sh")
+                   # Only the cut middle named it; after a new line (review, Phase 3: JSON's \n hid it).
+                   + self.turn("t3", "Bash", "x", command="cd /w\nartifact_1000.o --check")
+                   + self.turn("t4", "Bash", [{"type": "text", "text": "ok"}], command="ls")
+                   + self.turn("t5", "Bash", build, command="make all")
+                   + self.turn("t6", "Bash", "ok", command="ls") + self.turn("t7", "Bash", "ok", command="ls")
+                   + self.turn("t8", "Bash", "ok", command="ls")
+                   + self.turn("t9", "Read", "x", file_path="/w/artifact_1001.o"))  # its fourth call: too late
+        r = longhaul.inspect_transcript(self.path)
+        lossless = len(longhaul.filter_output("grep -rn compute_value src", grep, "lossless")[0])
+        on = len(longhaul.filter_output("./build.sh", build, "on")[0])
+        chars = len(grep) + 2 * len(build) + 8
+        self.assertEqual(r["filter_replay"], {"outputs": 8, "chars": chars + 1, "lossless": lossless + 2 * len(build) + 9,
+                                              "on": lossless + 2 * on + 9, "drops": 2, "used": 1})
+        out = longhaul.inspect_lines(r)
+        head = ("Output filter [transcript, replayed: this chat's Bash output through `longhaul filter`'s two levels "
+                "as they stand now]")
+        cut, gone = len(grep) - lossless, 2 * (len(build) - on) + len(grep) - lossless
+        chars += 1  # t3's output
+        self.assertEqual(out[out.index(head) + 1:out.index(head) + 4], [
+            f"  Bash output: 8 outputs, {chars:,} chars",
+            f"  lossless would cut {cut:,} chars ({100 * cut / chars:.1f}%), dropping nothing",
+            f"  on would cut {gone:,} chars ({100 * gone / chars:.1f}%), lines of 2 outputs among them; "
+            f"after 1 of them (50%), Claude's next 3 calls used a word only the cut lines held: too often"])
+        records = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"]) for x in longhaul.inspect_records(r)}
+        self.assertEqual(records[("filter_replay_cut", "lossless")], (cut, "chars", "inferred"))
+        self.assertEqual(records[("filter_replay_cut", "on")], (gone, "chars", "inferred"))
+        self.assertEqual(records[("filter_replay_used", "on")], (1, "outputs", "inferred"))
+        self.assertEqual(records[("filter_replay_drops", "on")], (2, "outputs", "inferred"))
+        # No Bash output worth filtering: no section.
+        self.write(self.turn("t1", "Bash", "ok", command="ls"))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["filter_replay"]["outputs"], 1)
+        self.assertFalse(any(l.startswith("Output filter [") for l in longhaul.inspect_lines(r)))
+
+    def test_inspect_shows_what_the_filter_hook_logged(self):
+        self.write(self.reply())
+        log = self.relay / "filters" / "s1.jsonl"
+        log.parent.mkdir(parents=True)
+        notes = [{"mode": "shadow", "chars": 9000, "lossless": 8000, "on": 3000, "shown": 9000, "dropped": 5000,
+                  "applied": False, "ms": 2.0, "id": "a"},
+                 {"mode": "shadow", "chars": 5000, "lossless": 4000, "on": 4000, "shown": 5000, "dropped": 0,
+                  "applied": False, "ms": 4.0, "id": "b"},
+                 {"mode": "on", "chars": 20000, "lossless": 19000, "on": 9000, "shown": 9000, "dropped": 10000,
+                  "applied": True, "ms": 9.0, "id": "c"},
+                 {"mode": "on", "chars": 20000, "lossless": 20000, "on": 9000, "shown": 20000, "dropped": 0,
+                  "applied": False, "full": True, "ms": 1.0, "id": "d"},
+                 {"fetched": "c", "steps": ["cap"]}]
+        log.write_text("".join(json.dumps(n) + "\n" for n in notes) + "not json\n")
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        head = "Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]"
+        self.assertEqual(out[out.index(head) + 1:out.index(head) + 4], [
+            "  shadow (changes nothing): 2 outputs; lossless would cut 2,000 chars, on 7,000, lines of 1 output among them",
+            "  on: 1 output shortened, 11,000 chars cut, lines of 1 among them, read back after 1; "
+            "1 left whole, the store of saved outputs being full",
+            "  the hook's own time: median 2.0 ms, longest 9.0 ms"])
+        self.assertNotIn("Output filter log [", "\n".join(longhaul.inspect_lines(longhaul.inspect_transcript(
+            self.write(self.reply(), self.path.with_name("s2.jsonl"))))))
 
     def test_the_files_a_bash_command_prints(self):
         reads = longhaul.bash_reads
@@ -3719,6 +3787,468 @@ class Guard(unittest.TestCase):
         other.write_text(transcript.read_text())
         self.assertIn("no record: the hook was off, or saw no whole Read, cat or search",
                       "\n".join(longhaul.inspect_lines(longhaul.inspect_transcript(other))))
+
+
+class Filter(unittest.TestCase):
+    """`longhaul filter`, the plugin's PostToolUse hook on Bash (the token
+    layer, Phase 3): after a command has run, it may hand Claude Code a
+    shorter output in the same shape. Lossless steps first; the lossy ones
+    save the whole output and say where it is."""
+
+    ROOT = "/work/project/src/service"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "DEFAULT_CONFIG")}
+        longhaul.LONGHAUL_HOME, longhaul.DEFAULT_CONFIG = self.home, self.tmp / "claude"
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)  # the user's own settings are not this test's
+        os.environ.pop("LONGHAUL_FILTERS", None)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(longhaul, k, v)
+
+    def grep(self, files=6, per=15):
+        return "".join(f"{self.ROOT}/mod_{f}.py:{10 + i}:    total_{f}_{i} = compute_value({i})\n"
+                       for f in range(files) for i in range(per))
+
+    def build_log(self, lines=2000, middle=None):
+        out = [f"step {i:04d} of the build: wrote artifact_{i}.o" for i in range(lines)]
+        if middle:
+            out[lines // 2] = middle
+        return "\n".join(out) + "\n"
+
+    def data(self, command, stdout="", stderr="", session="s1", tid="toolu_01A", agent=None, **response):
+        data = {"session_id": session, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": tid,
+                "cwd": str(self.tmp), "transcript_path": "/t/s1.jsonl", "tool_input": {"command": command},
+                "tool_response": {"stdout": stdout, "stderr": stderr, "interrupted": False, "isImage": False,
+                                  **response}}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "implementer"
+        return data
+
+    def check(self, data, mode):
+        """The hook's answer, then its log written, as `longhaul filter` does."""
+        notes = []
+        answer = longhaul.filter_check(data, mode, notes)
+        longhaul.filter_logged(notes)
+        return answer
+
+    def shown(self, answer, stream="stdout"):
+        return answer["hookSpecificOutput"]["updatedToolOutput"][stream]
+
+    def logged(self, session="s1"):
+        path = self.home / "filters" / f"{session}.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def lost(self, raw, shown):
+        """The code-like words of raw (colour codes off) that shown no longer holds; a path under the
+        folder said once counts as held when its rest is shown."""
+        said = re.match(r"\[paths below are under (\S+)\]\n", shown)
+        have = longhaul.filter_words(shown)
+        return {w for w in longhaul.filter_words(longhaul.FILTER_ANSI.sub("", raw)) - have
+                if not (said and w.startswith(said.group(1)) and w[len(said.group(1)):] in shown)}
+
+    # ---- the steps
+
+    def test_the_cleanup_drops_colour_redraws_and_trailing_blanks_and_counts_repeats(self):
+        self.assertEqual(longhaul.filter_clean("a\x1b[31mred\x1b[0m  \nDownloading 10%\rDownloading 100%\n"
+                                               "same line\nsame line\nsame line\nend"),
+                         "ared  \nDownloading 100%\nsame line  [×3]\nend")
+        # Review, Phase 3: what the last redraw would not say is kept. Trailing blanks and tabs are
+        # data (a diff's whitespace change, a TSV's empty columns); a carriage return between two
+        # different texts is not a redraw.
+        self.assertEqual(longhaul.filter_clean("1\tuser1\t\t\nx = 1   "), "1\tuser1\t\t\nx = 1   ")
+        self.assertEqual(longhaul.filter_clean("data.log:120:Epoch 1: 10%\rEpoch 1: 100%"),
+                         "data.log:120:Epoch 1: 10%\rEpoch 1: 100%")
+        self.assertEqual(longhaul.filter_clean("Error: disk quota exceeded\r          \nrow one\r\nrow two\r"),
+                         "Error: disk quota exceeded\nrow one\nrow two")
+        # A count only where it is shorter than the lines it stands for.
+        self.assertEqual(longhaul.filter_clean("a\na\na\nb"), "a\na\na\nb")
+        self.assertEqual(longhaul.filter_clean("\n\n\n\nx"), "\n\n\n\nx", "blank lines are left as they are")
+
+    def test_grep_lines_of_one_file_go_under_one_line_naming_it(self):
+        self.assertEqual(longhaul.filter_grouped("src/a.py:1:alpha\nsrc/a.py:2:beta\nsrc/b.py:7:gamma"),
+                         "src/a.py\n  1:alpha\n  2:beta\nsrc/b.py:7:gamma")
+        # Context lines (grep -C, rg -C) stay with their file; "--" splits groups.
+        self.assertEqual(longhaul.filter_grouped("src/a.py-4-before\nsrc/a.py:5:hit\nsrc/a.py-6-after\n--\n"
+                                                 "src/a.py-20-more\nsrc/a.py:21:hit"),
+                         "src/a.py\n  4-before\n  5:hit\n  6-after\n--\nsrc/a.py\n  20-more\n  21:hit")
+        # grep without -n, more than one file.
+        self.assertEqual(longhaul.filter_grouped("lib/x.ts:import a\nlib/x.ts:import b"), "lib/x.ts\n  import a\n  import b")
+        # Review, Phase 3: a log line's time is no file and line (grep of one file prints no path).
+        for logged in ("2026-10-27 12:30:05,123 ERROR worker-30 failed\n2026-10-27 12:30:06,001 ERROR worker-31 failed",
+                       "12:10:05 ERROR job one\n12:10:06 ERROR job two"):
+            self.assertEqual(longhaul.filter_grouped(logged), logged)
+
+    def test_a_long_folder_the_paths_share_is_said_once_only_when_nothing_could_be_misread(self):
+        paths = "".join(f"/work/project/src/pkg_{i}/file_{i}.py\n" for i in range(6))
+        self.assertEqual(longhaul.filter_prefixed(paths),
+                         "[paths below are under /work/project/src/]\n"
+                         + "".join(f"pkg_{i}/file_{i}.py\n" for i in range(6)))
+        # A relative line among them would read as one under the folder.
+        self.assertEqual(longhaul.filter_prefixed(paths + "notes.txt\n"), paths + "notes.txt\n")
+        refs = "".join(f'/// <reference path="../types/m{i}.d.ts" />\n' for i in range(6))
+        self.assertEqual(longhaul.filter_prefixed(refs), refs, "lines starting with / that are no paths")
+        self.assertEqual(longhaul.filter_prefixed("".join(f"/a/f{i}\n" for i in range(6))),
+                         "".join(f"/a/f{i}\n" for i in range(6)), "a short folder is not worth a line")
+        self.assertEqual(longhaul.filter_prefixed(paths[:paths.index("\n", 100)]), paths[:paths.index("\n", 100)],
+                         "fewer than five paths")
+
+    def test_lossless_keeps_every_code_like_word_on_fixtures(self):
+        # The replay's check (2026-10-26), on the kinds it saw change.
+        colour = "".join(f"\x1b[32mPASS\x1b[0m tests/unit/test_case_{i}.py (\x1b[33m{i}ms\x1b[0m)\n" for i in range(60))
+        progress = "".join(f"fetching pkg_{i}: 10%\rfetching pkg_{i}: 60%\rfetching pkg_{i}: 100%\n" for i in range(60))
+        context = "".join(f"{self.ROOT}/mod_{f}.py-{9 + 3 * i}-# about total_{f}_{i}\n"
+                          f"{self.ROOT}/mod_{f}.py:{10 + 3 * i}:    total_{f}_{i} = compute_value({i})\n--\n"
+                          for f in range(6) for i in range(5))
+        repeats = "WARNING: deprecated option legacy_flag\n" * 40 + "done: built target_app\n"
+        found = "".join(f"{self.ROOT}/pkg_{i}/handler_{i}.py\n" for i in range(80))
+        for command, raw in (("grep -rn compute_value src/service", self.grep()),
+                             ("rg -n -C1 total_ src/service", context), ("npm run lint", colour),
+                             ("./fetch.sh", progress), ("make build", repeats),
+                             (f"find {self.ROOT} -name '*.py'", found)):
+            with self.subTest(command=command):
+                shown, done = longhaul.filter_output(command, raw, "lossless")
+                self.assertLess(len(shown), len(raw))
+                self.assertEqual(done["steps"], ["lossless"])
+                self.assertEqual(done["dropped"], 0)
+                self.assertEqual(self.lost(raw, shown), set())
+                self.assertNotIn("[longhaul:", shown, "nothing to fetch back")
+        shown, done = longhaul.filter_output("grep -rn compute_value src/service", self.grep(), "lossless")
+        self.assertEqual(done["kind"], "grep")
+        self.assertTrue(shown.startswith(f"[paths below are under {self.ROOT}/]\nmod_0.py\n  10:    total_0_0"), shown[:200])
+
+    def test_small_output_a_chosen_format_and_files_printed_come_back_byte_for_byte(self):
+        noisy = "\x1b[31mvalue_x\x1b[0m   \n" * 400
+        small = "\x1b[31mred\x1b[0m\n" * 50
+        self.assertLess(len(small), longhaul.FILTER_SMALL)
+        self.assertEqual(longhaul.filter_output("make", small, "on")[0], small)
+        for command in ("git status --porcelain", "rg --json x", "kubectl get pods -o json", "jq . data.json",
+                        "find . -print0", "git ls-files -z", "gh pr list --format x",
+                        # What Claude asked to read: never touched (RTK's lesson: it pages back for the rest).
+                        "cat big.log", "sed -n 1,400p app.py", "head -500 app.log", "tail -n 300 x.log", "nl -ba a.py",
+                        "awk 'NR<300' app.py", "git diff", "git -C repo show HEAD", "git log -p", "less x",
+                        "cd /x && cat a.py | grep foo", "FOO=1 time cat a.py",
+                        # Review, Phase 3: diffs and files printed another way.
+                        "gh pr diff 42", "diff -u a b", "git stash show -p", "git log -U3", "svn diff", "hg diff",
+                        "for f in a b; do cat $f; done", "{ cat a.py; } 2>&1", "bash -c 'cat a.py'",
+                        "sudo -u www cat x", "nice -n 10 cat x", "timeout -s KILL 60 cat x", "ls *.py | xargs cat",
+                        "find . -exec cat {} +", "curl -s https://x.com/a#frag; cat notes.md", "if true; then cat a; fi",
+                        # A line the shell could not be split safely.
+                        "grep x $(git ls-files)", "cat <<EOF\nx\nEOF", "echo 'open", "(cd x; make)", "grep `x` y"):
+            with self.subTest(command=command):
+                shown, done = longhaul.filter_output(command, noisy, "on")
+                self.assertEqual(shown, noisy)
+                self.assertEqual(done["steps"], [])
+
+    def test_no_output_grows_the_line_naming_the_file_counted(self):
+        # Dropping one passed test cannot pay for the line saying where it is.
+        raw = "".join(f"tests/test_x.py::test_case_{i} FAILED\n" for i in range(60)) + "tests/test_x.py::test_ok PASSED\n"
+        with mock.patch.object(longhaul, "FILTER_DROP_MIN", 1):
+            shown, done = longhaul.filter_output("pytest -v", raw, "on", "/h/outputs/s1/t.txt")
+        self.assertEqual(shown, raw)
+        self.assertEqual(done["dropped"], 0)
+
+    def test_on_keeps_the_head_and_tail_and_names_the_lines_left_out_and_the_file(self):
+        raw = self.build_log(middle="error: artifact_1000.o failed to link")
+        lines = raw.split("\n")
+        shown, done = longhaul.filter_output("./build.sh", raw, "on", "/h/outputs/s1/t.txt")
+        self.assertEqual(done["steps"], ["cap"])
+        self.assertLess(len(shown), longhaul.FILTER_HEAD + longhaul.FILTER_TAIL + 600)
+        said = re.search(r"\[longhaul: ([\d,]+) of ([\d,]+) lines not shown \(([\d,]+) characters, the middle\); 1 of them "
+                         r"mentions an error, a failure or a warning\. Answer from this view; read the rest only if you "
+                         r"need it: sed -n '(\d+),(\d+)p' /h/outputs/s1/t\.txt \]", shown)
+        self.assertIsNotNone(said, shown[6900:7600])
+        a, b = int(said.group(4)), int(said.group(5))
+        self.assertEqual(int(said.group(1).replace(",", "")), b - a + 1)
+        self.assertEqual(int(said.group(2).replace(",", "")), len(lines))
+        self.assertEqual(done["dropped"], sum(len(l) + 1 for l in lines[a - 1:b]))
+        self.assertEqual(int(said.group(3).replace(",", "")), done["dropped"])
+        self.assertIn(lines[a - 2] + "\n[longhaul:", shown, "the head ends just before the first line left out")
+        self.assertIn("]\n" + lines[b], shown, "and the tail starts just after the last")
+        self.assertNotIn(lines[a - 1], shown)
+        self.assertNotIn(lines[b - 1], shown)
+        self.assertTrue(shown.startswith(lines[0]))
+        # Review, Phase 3: a path the shell would split is quoted, and nothing sticks to its end.
+        self.assertIn("p' '/h/my outputs/t.txt' ]",
+                      longhaul.filter_output("./build.sh", raw, "on", "/h/my outputs/t.txt")[0])
+        # lossless leaves it whole: nothing to drop there.
+        self.assertEqual(longhaul.filter_output("./build.sh", raw, "lossless")[0], raw)
+
+    def test_on_drops_under_four_kilobytes_never(self):
+        # caveman: a cut that saves little costs more in fetch-backs than it saves.
+        raw = "".join(f"tests/test_x.py::test_case_{i} PASSED [{i}%]\n" for i in range(40)) + "=" * 1200 + "\n"
+        self.assertLess(len(raw), longhaul.FILTER_DROP_MIN + 1200)
+        self.assertEqual(longhaul.filter_output("pytest -v", raw, "on")[1]["dropped"], 0)
+
+    def test_on_drops_passed_tests_and_keeps_failures(self):
+        raw = ("".join(f"tests/test_x.py::test_case_{i} PASSED{' ' * 20}[{i % 100:3d}%]\n" for i in range(150))
+               + "tests/test_x.py::test_bad FAILED\n"
+               + "".join(f"tests/test_y.py::test_more_{i} PASSED{' ' * 20}[{i % 100:3d}%]\n" for i in range(150))
+               + "=== 1 failed, 300 passed in 2.01s ===\n")
+        shown, done = longhaul.filter_output("python3 -m pytest -v tests", raw, "on", "/h/o.txt")
+        self.assertEqual(done["steps"], ["tests"])
+        self.assertIn("tests/test_x.py::test_bad FAILED", shown)
+        self.assertIn("=== 1 failed, 300 passed in 2.01s ===", shown)
+        self.assertNotIn("PASSED", shown)
+        self.assertIn("[longhaul: 300 of 303 lines not shown (", shown)
+        self.assertIn("characters, passed-test lines). Answer from this view; read the rest only if you need it, from "
+                      "the whole output: /h/o.txt ]", shown, "no line range: what was left out is not one run of lines")
+
+    def test_on_never_moves_a_passing_test_s_log_under_another_test(self):
+        # Review, Phase 3: go test -v prints each test's log between its RUN and PASS lines; dropping
+        # both put a passing test's log right above the failing one's.
+        raw = "".join(f"=== RUN   TestCase{i}\n    case_test.go:129: setting up fixture {i}\n--- PASS: TestCase{i} (0.00s)\n"
+                      for i in range(150)) + ("=== RUN   TestBroken\n    broken_test.go:9: got 3 want 4\n"
+                                              "--- FAIL: TestBroken (0.00s)\nFAIL\n")
+        shown, done = longhaul.filter_output("go test -v ./...", raw, "on", "/h/o.txt")
+        self.assertEqual(done["steps"], ["tests"])
+        lines = shown.split("\n")
+        for i, line in enumerate(lines):
+            if "_test.go:" in line:
+                self.assertTrue(lines[i - 1].startswith("=== RUN"), lines[i - 1:i + 1])
+        self.assertIn("=== RUN   TestBroken\n    broken_test.go:9: got 3 want 4\n--- FAIL: TestBroken", shown)
+
+    def test_each_filter_table_row_holds_its_own_tests(self):
+        # RTK's 62 TOML filters carry inline tests; Longhaul's rows do too.
+        names = [row["name"] for row in longhaul.FILTER_TABLE]
+        self.assertEqual(len(names), len(set(names)))
+        for row in longhaul.FILTER_TABLE:
+            self.assertTrue(row["lines"] and row["runs"], row["name"])
+            for line, dropped in row["lines"]:
+                with self.subTest(row=row["name"], line=line):
+                    self.assertEqual(bool(re.search(row["drop"], line)), dropped)
+            self.assertIsInstance(row.get("unless", ""), str)
+            for command, matched in row["runs"]:
+                with self.subTest(row=row["name"], command=command):
+                    self.assertEqual(longhaul.filter_kind(command) == row["name"], matched)
+
+    def test_the_kind_comes_from_the_programs_that_print(self):
+        kind = longhaul.filter_kind
+        self.assertEqual(kind("cd /w && grep -rn x . | head -50"), "grep")
+        self.assertEqual(kind("rg x; git grep y"), "grep")
+        self.assertEqual(kind("find . -name '*.py' 2>/dev/null"), "list")
+        self.assertEqual(kind("ls -la /w && grep x y"), "other")
+        self.assertEqual(kind("FOO=1 timeout 60 pytest -q"), "tests")
+        self.assertEqual(kind("grep x y | cat"), "grep", "a pipe's later programs read its output")
+        self.assertEqual(kind("cat a.py | grep x"), "prints")
+        self.assertEqual(kind("git --no-pager -C . diff --stat"), "prints")
+        self.assertEqual(kind("echo $(date)"), "?")
+
+    # ---- the hook
+
+    def test_the_hook_returns_the_output_in_bash_s_shape_with_every_field_kept(self):
+        data = self.data("grep -rn compute_value src/service", self.grep(), returnCodeInterpretation="matches found")
+        answer = self.check(data, "lossless")
+        self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse")
+        updated = answer["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertEqual(updated, {**data["tool_response"], "stdout": longhaul.filter_output(
+            "grep -rn compute_value src/service", self.grep(), "lossless")[0]})
+        self.assertEqual(set(answer), {"hookSpecificOutput"})
+        self.assertNotIn("permissionDecision", answer["hookSpecificOutput"])
+        [note] = self.logged()
+        self.assertEqual(note["mode"], "lossless")
+        self.assertTrue(note["applied"])
+        self.assertEqual(note["chars"], len(self.grep()))
+        self.assertEqual(note["lossless"], len(updated["stdout"]))
+        self.assertNotIn("compute_value", json.dumps(note), "sizes only: never the text")
+        self.assertNotIn("src/service", json.dumps(note), "nor the command")
+        # Nothing to change: no answer at all (an identity rewrite could undo another hook's).
+        self.assertIsNone(self.check(self.data("./build.sh", self.build_log()), "lossless"))
+        self.assertIsNone(self.check(self.data("grep x y", "a:1:b\n" * 20), "lossless"), "small")
+
+    def test_shadow_changes_nothing_and_logs_what_each_level_would_cut(self):
+        self.assertEqual(longhaul.filter_mode(), "shadow", "the default until a week of it is measured")
+        for value, mode in (("off", "off"), ("lossless", "lossless"), ("on", "on"), ("bogus", "shadow")):
+            os.environ["LONGHAUL_FILTERS"] = value
+            self.assertEqual(longhaul.filter_mode(), mode)
+        self.assertIsNone(self.check(self.data("./build.sh", self.build_log(), agent="a1"), "shadow"))
+        [note] = self.logged()
+        self.assertEqual({k: note[k] for k in ("mode", "kind", "applied", "agent", "id", "steps")},
+                         {"mode": "shadow", "kind": "other", "applied": False, "agent": True, "id": "toolu_01A",
+                          "steps": ["cap"]})
+        self.assertEqual(note["lossless"], note["chars"])
+        self.assertLess(note["on"], note["chars"] - longhaul.FILTER_DROP_MIN)
+        self.assertGreater(note["dropped"], longhaul.FILTER_DROP_MIN)
+        self.assertIsInstance(note["ms"], float)
+        self.assertFalse((self.home / "outputs").exists(), "shadow saves nothing")
+        self.assertEqual(oct((self.home / "filters" / "s1.jsonl").stat().st_mode & 0o777), "0o600")
+
+    def test_an_output_python_cannot_write_is_left_alone_and_no_hook_logs_an_error_s_text(self):
+        # Review, Phase 3: a lone surrogate (an emoji cut in half) made the save raise, and the runner
+        # logged the error's repr, which held the whole output.
+        raw = "SECRET_TOKEN=abc123 \ud83d" + self.build_log()
+        self.assertIsNone(self.check(self.data("./build.sh", raw), "on"))
+        self.assertFalse((self.home / "outputs").exists())
+
+        def fails(_data):
+            raise ValueError("SECRET in the message")
+
+        with mock.patch("sys.stdin", io.StringIO("{}")):
+            self.assertEqual(longhaul.run_hook(fails, "x"), 0)
+        logged = (self.home / "longhaul.log").read_text()
+        self.assertIn("x hook: no answer (ValueError); the engine goes on", logged)
+        self.assertNotIn("SECRET", logged)
+
+    def test_off_and_what_is_never_touched_get_no_answer(self):
+        big = self.grep()
+        home = mock.patch.object(longhaul, "HOME", self.tmp)  # the ~ form of a saved output's path
+        home.start()
+        self.addCleanup(home.stop)
+        self.assertIsNone(self.check(self.data("grep -rn x .", big), "off"))
+        for data in (self.data("grep -rn x .", big, isImage=True),
+                     self.data("grep -rn x .", big, backgroundTaskId="b1"),
+                     self.data("grep -rn x .", big, persistedOutputPath="/c/tool-results/x.txt"),
+                     {**self.data("grep -rn x .", big), "tool_input": {"command": "grep -rn x .", "run_in_background": True}},
+                     {**self.data("grep -rn x .", big), "tool_name": "Read"},
+                     {**self.data("grep -rn x .", big), "hook_event_name": "PreToolUse"},
+                     self.data("grep -rn x .", big, session="../x"), self.data("grep -rn x .", big, tid="a/b"),
+                     # What Claude fetched back is never cut again.
+                     self.data(f"grep -n total {self.home}/outputs/s1/toolu_00.txt", big),
+                     self.data("grep -n total ~/home/outputs/s1/toolu_00.txt", big)):
+            with self.subTest(data=json.dumps(data)[-200:]):
+                self.assertIsNone(self.check(data, "on"))
+        self.assertEqual(self.logged(), [])
+
+    def test_with_rtk_s_hook_in_the_settings_longhaul_steps_aside(self):
+        # ADR-0005, rule 3: one job per tool.
+        data = self.data("grep -rn compute_value src/service", self.grep())
+        self.assertIsNotNone(self.check(data, "lossless"))
+        settings = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
+                                                                            "command": "rtk hook claude"}]}]}}
+        project = self.tmp / ".claude"
+        project.mkdir()
+        (project / "settings.json").write_text(json.dumps(settings))
+        self.assertIsNone(self.check(data, "lossless"), "the project's settings")
+        (project / "settings.json").unlink()
+        longhaul.DEFAULT_CONFIG.mkdir()
+        (longhaul.DEFAULT_CONFIG / "settings.json").write_text(json.dumps(settings))
+        self.assertIsNone(self.check(data, "lossless"), "the user's")
+        (longhaul.DEFAULT_CONFIG / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "/opt/artkit/notify"}]}]}, "env": {"RTK": "1"}}))
+        self.assertIsNotNone(self.check(data, "lossless"), "a word holding rtk, or rtk outside the hooks, is not it")
+
+    def test_on_saves_the_whole_output_first_privately_and_names_it(self):
+        raw = self.build_log()
+        cargo = "".join(f"   Compiling crate_{i} v0.{i}.0\n" for i in range(300)) + "error[E0432]: unresolved import\n"
+        answer = self.check(self.data("cargo build", raw, cargo, tid="toolu_01B"), "on")
+        saved = self.home / "outputs" / "s1" / "toolu_01B.txt"
+        saved_err = self.home / "outputs" / "s1" / "toolu_01B.stderr.txt"
+        self.assertEqual(saved.read_text(), raw, "the exact original")
+        self.assertEqual(saved_err.read_text(), cargo)
+        for path in (saved, saved_err):
+            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        for folder in (saved.parent, saved.parent.parent):
+            self.assertEqual(oct(folder.stat().st_mode & 0o777), "0o700")
+        self.assertRegex(self.shown(answer), rf"read the rest only if you need it: sed -n '\d+,\d+p' {re.escape(str(saved))} \]")
+        self.assertIn(f"compile-progress lines). Answer from this view; read the rest only if you need it: "
+                      f"sed -n '1,300p' {saved_err} ]", self.shown(answer, "stderr"))
+        self.assertIn("error[E0432]: unresolved import", self.shown(answer, "stderr"))
+        [note] = self.logged()
+        self.assertEqual(note["steps"], ["cap", "cargo"])
+        self.assertTrue(note["applied"])
+        stats = json.loads((self.home / "filters" / "stats.json").read_text())
+        self.assertEqual(stats, {"cap": {"drops": 1, "fetched": 0}, "cargo": {"drops": 1, "fetched": 0}})
+
+    def test_a_full_store_cuts_nothing_more_and_old_outputs_go_after_a_week(self):
+        old = self.home / "outputs" / "s0" / "toolu_00.txt"
+        old.parent.mkdir(parents=True)
+        old.write_text("x" * 100)
+        week = time.time() - 8 * 86400
+        os.utime(old, (week, week))
+        with mock.patch.object(longhaul, "FILTER_STORE_MAX", 1000):
+            answer = self.check(self.data("./build.sh", self.build_log()), "on")
+        self.assertIsNone(answer, "caveman: refuse, never evict; nothing lossless to do either")
+        self.assertFalse(old.exists(), "a week old: removed")
+        self.assertFalse(old.parent.exists())
+        self.assertFalse((self.home / "outputs" / "s1").exists())
+        [note] = self.logged()
+        self.assertFalse(note["applied"])
+        self.assertEqual(note["full"], True)
+        self.assertIsNotNone(self.check(self.data("./build.sh", self.build_log(), tid="toolu_01C"), "on"), "room again")
+
+    def test_a_read_of_a_saved_output_is_a_fetch_back_and_a_step_fetched_back_too_often_stops(self):
+        self.check(self.data("./build.sh", self.build_log()), "on")
+        saved = self.home / "outputs" / "s1" / "toolu_01A.txt"
+
+        def guard(tool, **args):
+            data = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": args,
+                    "tool_use_id": "t9", "cwd": str(self.tmp)}
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(data))), \
+                    contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, LONGHAUL_INDEX="off"):
+                longhaul.main(["guard"])  # the guard's hook counts it, before the read runs
+
+        home = mock.patch.object(longhaul, "HOME", self.tmp)  # read as ~/home/outputs/...
+        home.start()
+        self.addCleanup(home.stop)
+        guard("Bash", command="sed -n '900,1000p' ~/home/outputs/s1/toolu_01A.txt")
+        stats = lambda: json.loads((self.home / "filters" / "stats.json").read_text())
+        self.assertEqual(stats(), {"cap": {"drops": 1, "fetched": 1}})
+        guard("Read", file_path=str(saved))
+        self.assertEqual(stats()["cap"]["fetched"], 1, "once per output")
+        self.assertEqual([n.get("fetched") for n in self.logged()], [None, "toolu_01A"])
+        guard("Read", file_path=str(self.home / "outputs" / "s1" / "toolu_99.txt"))
+        self.assertEqual(stats()["cap"]["fetched"], 1, "an output it has no drop for")
+        # RTK's gain: 10% is "watch", 30% stops the step, once it has dropped enough to tell.
+        for drops, fetched, stopped in ((10, 3, {"cap"}), (10, 2, set()), (9, 9, set())):
+            (self.home / "filters" / "stats.json").write_text(json.dumps({"cap": {"drops": drops, "fetched": fetched}}))
+            self.assertEqual(longhaul.filter_stopped(), stopped)
+        (self.home / "filters" / "stats.json").write_text(json.dumps({"cap": {"drops": 10, "fetched": 3}}))
+        self.assertIsNone(self.check(self.data("./build.sh", self.build_log(), tid="toolu_01D"), "on"))
+        self.assertFalse((self.home / "outputs" / "s1" / "toolu_01D.txt").exists())
+
+    def test_the_filter_is_quick_on_a_large_output(self):
+        # The hook budget (ADR-0005, rule 4): 100 ms; the filter's own part is far under it.
+        data = self.data("grep -rn compute_value src/service", self.grep(files=40, per=12))
+        self.assertGreater(len(data["tool_response"]["stdout"]), 30_000)
+        took = []
+        for _ in range(5):
+            start = time.perf_counter()
+            longhaul.filter_check(data, "on", [])
+            took.append(time.perf_counter() - start)
+        self.assertLess(sorted(took)[2], 0.1, took)
+
+    def test_the_plugin_registers_the_filter_after_bash_and_passes_small_output_without_loading_longhaul(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        [entry] = [e for e in hooks["PostToolUse"] if e["matcher"] == "Bash"]
+        [hook] = entry["hooks"]
+        self.assertEqual((hook["type"], hook["command"], hook["timeout"]), ("command", "python3", 5))
+        self.assertEqual(hook["statusMessage"], "Filtering this output (longhaul filter)")
+        self.assertIn(f">= {longhaul.FILTER_SMALL}", hook["args"][2], "the prelude's size is the filter's")
+        command = registered_hook("PostToolUse", "filter")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_FILTERS="lossless")
+        run = lambda data, **more: subprocess.run(command, input=json.dumps(data), capture_output=True, text=True,
+                                                  env={**env, **more}, timeout=30)
+        out = run(self.data("grep -rn compute_value src/service", self.grep()))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["hookSpecificOutput"]["updatedToolOutput"]["stdout"],
+                         longhaul.filter_output("grep -rn x", self.grep(), "lossless")[0])
+        self.assertEqual(run(self.data("grep -rn compute_value src/service", self.grep()), LONGHAUL_FILTERS="off").stdout, "")
+        broken = self.tmp / "broken"
+        broken.mkdir()
+        (broken / "longhaul.py").write_text("import sys\nsys.stderr.write('imported\\n')\nraise SystemExit(3)\n")
+        small = subprocess.run(command[:-1] + [str(broken)], input=json.dumps(self.data("grep x y", "a:1:b\n")),
+                               capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual((small.returncode, small.stdout, small.stderr), (0, "", ""),
+                         "small output: longhaul is never imported")
+        big = subprocess.run(command[:-1] + [str(broken)], input=json.dumps(self.data("grep -rn x .", self.grep())),
+                             capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual((big.returncode, big.stdout, big.stderr), (0, "", "imported\n"),
+                         "a filter that fails leaves the output as it was")
+        self.assertEqual(run({}).returncode, 0)
+        self.assertEqual(subprocess.run(command, input="not json", capture_output=True, text=True, env=env,
+                                        timeout=30).returncode, 0)
+        odd = subprocess.run(command, input=b"\xff\xfe" + json.dumps(self.data("grep -rn x .", self.grep())).encode(),
+                             capture_output=True, env=env, timeout=30)
+        self.assertEqual((odd.returncode, odd.stdout, odd.stderr), (0, b"", b""), "review, Phase 3: not UTF-8")
 
 
 class Index(unittest.TestCase):
@@ -5245,7 +5775,7 @@ class Advisor(unittest.TestCase):
     def test_the_plugin_registers_both_hooks_on_agent_task_sendmessage_and_workflow(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
         guard, pre = hooks["PreToolUse"]
-        [post] = hooks["PostToolUse"]
+        [post] = [e for e in hooks["PostToolUse"] if e["matcher"] != "Bash"]  # Bash's is the filter's (Filter)
         [guard] = guard["hooks"]
         for entry, command, cmd, says, timeout in (
                 (pre, "advisor-hook", self.HOOK, "Checking for an advisor consultation", 30),

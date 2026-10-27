@@ -39,6 +39,18 @@
             "statusMessage": "Tracing an advisor consultation (longhaul advisor)"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys, io, json, os\ntry:\n    b = sys.stdin.buffer.read(1000001); raw = b.decode('utf-8', 'replace')\n    d = json.loads(raw); r = d.get('tool_response') if isinstance(d, dict) else None\n    big = len(b) <= 1000000 and isinstance(r, dict) and any(isinstance(r.get(k), str) and len(r[k]) >= 1500 for k in ('stdout', 'stderr'))\nexcept Exception:\n    big = False\nif big and os.environ.get('LONGHAUL_FILTERS') != 'off':\n    try:\n        sys.path.insert(0, sys.argv[1]); import longhaul; sys.stdin = io.StringIO(raw); longhaul.main(['filter'])\n    except BaseException:\n        pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Filtering this output (longhaul filter)"
+          }
+        ]
       }
     ],
     "SessionStart": [
