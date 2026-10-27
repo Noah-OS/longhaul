@@ -3767,7 +3767,8 @@ def inspect_lines(r: dict) -> list[str]:
         section("Guard [longhaul guard, counted: calls it warned about or blocked]",
                 [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in
                  (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
-                 if g[k]])
+                 if g[k]]
+                + ([f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []))
     s = r.get("subagent_reminders") or {}
     if s.get("subagents"):  # else none was told: no section
         out.append("Subagent reminders [longhaul guard records, counted]")
@@ -3906,6 +3907,8 @@ def inspect_records(r: dict) -> list[dict]:
     for k in GUARD_RULES if r["guard"] else ():
         add("guard_fired", r["guard"][k], "calls", "all", "guard", "counted", k)
         add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "guard", "counted", k)
+    if (r["guard"] or {}).get("wait"):
+        add("guard_fired", r["guard"]["wait"], "calls", "subagents", "guard", "counted", "wait")
     if (r.get("subagent_reminders") or {}).get("subagents"):
         add("subagents_reminded", r["subagent_reminders"]["subagents"], "subagents", "subagents", "guard", "counted")
     c = r["consultations"]
@@ -4480,6 +4483,16 @@ def index_note(program: str, top: str) -> str:
 
 GUARD_BIG = setting("LONGHAUL_GUARD_BIG", 20_000, int, 1)  # bytes: a whole read above this is waste
 GUARD_RULES = ("repeat", "big", "cat")
+# The token layer, Phase 2 (cache-aware waits): a subagent's prompt cache
+# lasts five minutes, and a Bash call that holds it longer has the next
+# request write the whole context again; about half of a busy project's
+# subagent rebuilds came so (inspect's cache rebuilds, 2026-10-27). Advice
+# only, in block mode too; the record counts it as `waits`, beside the
+# read rules, since it costs no bytes of its own.
+WAIT_MAX = 270  # seconds a subagent's call may hold it, with room before its cache's five minutes end
+GUARD_WAIT = ("A subagent's prompt cache lasts 5 minutes, and this call can hold this subagent longer: a wait past "
+              "that writes the whole context again. Run long commands with run_in_background and check back in steps "
+              "under 4 minutes.")
 GUARD_ID = r"[A-Za-z0-9_-]{1,100}"  # a session's or an agent's id; "+" joins them in a record's name
 GUARD_KEEP = 500  # reads kept per record; the oldest go first
 GUARD_NO_PART = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf"}  # offset and limit are no advice
@@ -4585,6 +4598,32 @@ def guard_startup(data: dict, mode: str, index: str):
     return answer or None
 
 
+def guard_wait(data: dict) -> bool:
+    """Whether a subagent's Bash call can hold it past WAIT_MAX seconds: a
+    timeout over that; or, with none given and the default timeout
+    (BASH_DEFAULT_TIMEOUT_MS) over it, a sleep of that or more, or a loop
+    that sleeps. Not a call in the background or one its own timeout ends
+    first, and not the main conversation's, whose cache lasts an hour. Of
+    the command its shape alone is looked at, and nothing of it is kept."""
+    args = dict_at(data, "tool_input")
+    if data.get("tool_name") != "Bash" or data.get("agent_id") is None or args.get("run_in_background") is True:
+        return False
+    command, limit = args.get("command"), as_number(args.get("timeout"))
+    if not isinstance(command, str):
+        return False
+    if limit is not None:
+        return limit > WAIT_MAX * 1000
+    try:
+        default = float(os.environ.get("BASH_DEFAULT_TIMEOUT_MS") or 120_000)  # Claude Code's own default: 2 minutes
+    except ValueError:
+        default = 120_000
+    if default <= WAIT_MAX * 1000:
+        return False
+    units = {"": 1, "s": 1, "m": 60, "h": 3600}
+    sleeps = [float(n) * units[u] for n, u in re.findall(r"\bsleep\s+(\d+(?:\.\d+)?)([smh]?)\b", command)]
+    return any(s >= WAIT_MAX for s in sleeps) or bool(re.search(r"\b(?:until|while|for)\b.*\bsleep\b", command, re.S))
+
+
 def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float):
     """The three rules (GUARD_RULES) over the files a call would put into
     the context: a repeat is a whole read of a file read in full before
@@ -4670,8 +4709,8 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     # program is not cat, so it has no targets. Of its command line only
     # the program is looked at, and the record keeps the count alone.
     search = data.get("tool_name") == "Bash" and program(dict_at(data, "tool_input").get("command")) in SEARCH_PROGRAMS
-    targets = guard_targets(data)
-    record = guard_record_path(data) if targets or search else None
+    targets, wait = guard_targets(data), guard_wait(data)
+    record = guard_record_path(data) if targets or search or wait else None
     if record is None:
         return None
     now = time.time() if now is None else now
@@ -4690,23 +4729,29 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
             nudged = True  # once per context: the count goes on, the note does not
             nudge = f"{GUARD_CODEGRAPH} (This context has made {searches} searches so far.)"
         notes, seen, flagged = guard_rules(targets, reads, fired, cost, now)
+        waits = as_int(kept.get("waits")) + (1 if wait else 0)
         if not (mode == "block" and notes):  # a denied call read nothing
             reads.update(seen)
         if len(reads) > GUARD_KEEP:
             reads = dict(sorted(reads.items(), key=lambda kv: as_number(kv[1].get("at")) or 0)[-GUARD_KEEP:])
         write_json(record, {**{k: kept[k] for k in GUARD_KEPT if k in kept},
-                            "reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged})
+                            "reads": reads, "fired": fired, "bytes": cost, "searches": searches, "nudged": nudged,
+                            **({"waits": waits} if waits else {})})
     guard_logged(data, mode, flagged)
-    if nudge:  # a search fires no rule, so the note is the whole answer; in block mode too, it is never a denial
+    if wait:  # by session alone: a subagent's, and never its command
+        log(f"guard: advised on a long wait in {data['session_id']} (a subagent)")
+    advice = "longhaul guard (advice; the call went ahead): " + GUARD_WAIT if wait else ""
+    if nudge:  # a search fires no read rule, so the note is the answer; in block mode too, it is never a denial
         log(f"guard: {record.stem} was told of the CodeGraph index after {searches} searches")
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": nudge}}
-    if not notes:
-        return None
-    if mode == "block":  # how to turn the guard off is for the user, not the model
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                       "additionalContext": " ".join(filter(None, (nudge, advice)))}}
+    if mode == "block" and notes:  # how to turn the guard off is for the user, not the model
         text = "longhaul guard blocked this call. " + " ".join(notes) + " Make the narrower call instead."
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": text}}
-    text = "longhaul guard (advice; the call went ahead): " + " ".join(notes)
+    if not (notes or wait):
+        return None
+    text = "longhaul guard (advice; the call went ahead): " + " ".join(notes + ([GUARD_WAIT] if wait else []))
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
 
 
@@ -4753,7 +4798,8 @@ def guard_forget(data: dict) -> None:
             try:
                 write_json(file, {**{k: kept[k] for k in GUARD_KEPT if k in kept}, "reads": {},
                                   "fired": dict_at(kept, "fired"), "bytes": dict_at(kept, "bytes"),
-                                  "searches": 0, "nudged": False})
+                                  "searches": 0, "nudged": False,
+                                  **({"waits": kept["waits"]} if as_int(kept.get("waits")) else {})})
                 continue
             except OSError as e:
                 problem = e.strerror or e
@@ -4774,6 +4820,7 @@ def guard_counts(sid: str):
         return None
     total = {k: 0 for k in GUARD_RULES}
     total["bytes"] = {k: 0 for k in GUARD_RULES}
+    total["wait"] = 0  # a subagent's call that could outlast its cache (guard_wait)
     found = False
     for file in guard_records(sid):
         kept = read_json(file) if file.is_file() else None
@@ -4783,6 +4830,7 @@ def guard_counts(sid: str):
         for k in GUARD_RULES:
             total[k] += as_int(dict_at(kept, "fired").get(k))
             total["bytes"][k] += as_int(dict_at(kept, "bytes").get(k))
+        total["wait"] += as_int(kept.get("waits"))
     return total if found else None
 
 

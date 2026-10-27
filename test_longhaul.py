@@ -3242,6 +3242,58 @@ class Guard(unittest.TestCase):
         self.assertNotIn(str(self.big), self.record()["reads"])
         self.assertIsNone(self.check(self.hook("Read", file_path=str(self.small)), mode="off"))
 
+    def test_a_subagents_bash_call_that_can_hold_it_past_its_cache_is_advised_and_never_denied(self):
+        # The token layer, Phase 2 (cache-aware waits): a subagent's prompt
+        # cache lasts five minutes, and about half of a busy project's
+        # subagent rebuilds came after one Bash call that held it longer
+        # (inspect's cache rebuilds, 2026-10-27). A call that can hold it
+        # past WAIT_MAX seconds is advised to run in the background and
+        # check back; in block mode too, it is never a denial.
+        long = self.hook("Bash", agent="a1", command="pytest -q", timeout=600_000)
+        for mode in ("warn", "block"):
+            answer = self.check(long, mode=mode)
+            self.assertIn("run_in_background", self.context(answer), mode)
+            self.assertNotIn("permissionDecision", answer["hookSpecificOutput"], mode)
+        self.assertEqual(self.record(agent="a1")["waits"], 2)
+        self.assertIn("guard: advised on a long wait in s1 (a subagent)", self.logged())
+        self.assertNotIn("pytest", "\n".join(self.logged()), "the command line is never kept")
+        # Not in the background, not when its own timeout ends it first, not
+        # in the main conversation, whose cache lasts an hour.
+        quiet = [self.hook("Bash", agent="a1", command="pytest -q", timeout=600_000, run_in_background=True),
+                 self.hook("Bash", agent="a1", command="until grep -q ok log; do sleep 5; done", timeout=240_000),
+                 self.hook("Bash", command="pytest -q", timeout=600_000),
+                 self.hook("Bash", agent="a1", command="sleep 420"),  # the default timeout, 2 minutes, ends it
+                 self.hook("Bash", agent="a1", command="git status")]
+        with mock.patch.dict(os.environ):
+            os.environ.pop("BASH_DEFAULT_TIMEOUT_MS", None)  # the suite may run inside a session that sets it
+            for data in quiet:
+                self.assertIsNone(self.check(data), data["tool_input"])
+        # With the default timeout raised past it, a wait-shaped command is advised: a long sleep, or a loop that sleeps.
+        with mock.patch.dict(os.environ, {"BASH_DEFAULT_TIMEOUT_MS": "600000"}):
+            for command in ("sleep 420", "sleep 5m && tail -1 log", "until grep -q ok log; do sleep 9; done",
+                            "for i in $(seq 1 58); do test -s out && break; sleep 10; done"):
+                self.assertIn("run_in_background", self.context(self.check(self.hook("Bash", agent="a1", command=command))),
+                              command)
+            self.assertIsNone(self.check(self.hook("Bash", agent="a1", command="sleep 30 && git status")))
+            self.assertIsNone(self.check(self.hook("Bash", agent="a1", command="pytest -q")), "it may be quick")
+
+    def test_inspect_shows_the_long_waits_the_guard_advised_on(self):
+        self.check(self.hook("Bash", agent="a1", command="pytest -q", timeout=600_000))
+        self.assertEqual(longhaul.guard_counts("s1")["wait"], 1)
+        path = self.tmp / "claude" / "projects" / "-app" / "s1.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "assistant", "timestamp": "2026-10-20T10:00:00.000Z", "message": {
+            "id": "m1", "role": "assistant", "model": "claude-opus-5-5", "content": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1}}}) + "\n")
+        with mock.patch.object(longhaul, "LEDGER", self.home / "ledger.jsonl"), \
+                mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"):
+            lines = longhaul.inspect_lines(longhaul.inspect_transcript(path))
+        head = lines.index("Guard [longhaul guard, counted: calls it warned about or blocked]")
+        self.assertEqual(lines[head + 1], "  a subagent's call that could outlast its 5-minute cache: 1")
+        records = longhaul.inspect_records(longhaul.inspect_transcript(path))
+        self.assertIn({"metric": "guard_fired", "value": 1, "scope": "subagents", "item": "wait"},
+                      [{k: x[k] for k in ("metric", "value", "scope", "item")} for x in records])
+
     def logged(self) -> list:
         """The guard's lines in the log, without their time stamps."""
         log = self.home / "longhaul.log"
@@ -3654,7 +3706,8 @@ class Guard(unittest.TestCase):
         transcript.write_text(json.dumps({"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5",
                                           "content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}}) + "\n")
         r = longhaul.inspect_transcript(transcript)
-        self.assertEqual(r["guard"], {"repeat": 1, "big": 1, "cat": 0, "bytes": {"repeat": 300, "big": 30_000, "cat": 0}})
+        self.assertEqual(r["guard"], {"repeat": 1, "big": 1, "cat": 0, "bytes": {"repeat": 300, "big": 30_000, "cat": 0},
+                                      "wait": 0})
         lines = "\n".join(longhaul.inspect_lines(r))
         self.assertIn("Guard [longhaul guard, counted", lines)
         self.assertIn("read again unchanged: 1 (300 bytes)", lines)
