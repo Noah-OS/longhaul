@@ -9980,7 +9980,8 @@ class Shim(unittest.TestCase):
             (fake / name).chmod(0o755)
         env = dict(PATH=os.pathsep.join([str(fake), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
                    HOME=str(self.tmp), LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
-                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"))
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder, so no Codex line (CodexDoctor)
         self.env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
         out = self.shim("doctor", **env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -16586,7 +16587,8 @@ class PreCompact(unittest.TestCase):
                    LONGHAUL_DEFAULT_CONFIG_DIR=str(user / ".claude"),
                    LONGHAUL_DEFAULT_GLOBAL_JSON=str(user / ".claude.json"),
                    LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
-                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off")
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off",
+                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder, so no Codex line (CodexDoctor)
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "doctor"], env=env, cwd=project,
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -17765,7 +17767,14 @@ class Doctor(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.path = os.environ.get("PATH", os.defpath)  # the suite's own, for git
-        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin)})
+        # No Codex here (CodexDoctor has its own): the suite's CODEX_HOME is
+        # an empty folder, which is a Codex folder to the doctor, so this one
+        # names a folder that is not there, here and for a doctor run as a
+        # program; HOME's .codex is not there either.
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "CODEX_HOME": str(self.tmp / "no-codex")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(longhaul, "CODEX_HOME", self.tmp / "no-codex")
         patcher.start()
         self.addCleanup(patcher.stop)
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ATTENDED", "LONGHAUL_GUARD",
@@ -18467,6 +18476,376 @@ class Doctor(unittest.TestCase):
         self.assertEqual(len(said), 2)
         self.assertTrue(said[0].startswith(f"Longhaul {self.VERSION} is on: "))
         self.assertEqual(said[1], "longhaul: the index's line")
+
+
+class CodexDoctor(unittest.TestCase):
+    """The doctor's Codex line (docs plans/2026-10-27-codex.md, X3, Phase 1):
+    what Longhaul reads of OpenAI's Codex today, its chats, for `inspect
+    --agent codex` and `usage`; it installs nothing in Codex and runs no hook
+    there yet. Every path is scratch: HOME, CODEX_HOME, and PATH, which holds
+    a fake `codex` alone when a test puts one there. Every text field of a
+    rollout holds SECRET, which no line may show, and nothing under a Codex
+    folder but sessions/ is opened."""
+
+    SECRET = "sk-SECRET" + "Q" * 80
+    SAID = "Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and installs nothing in Codex yet"
+    ONLY = [("Codex", "doctor_codex")]  # DOCTOR_CHECKS with this line alone: the others are Doctor's
+    NO_CODEX = "`codex` is not on PATH"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.user, self.bin = self.tmp / "user", self.tmp / "bin"
+        self.codex, self.ran = self.user / ".codex", self.tmp / "codex-ran"
+        for folder in (self.user, self.bin):
+            folder.mkdir()
+        for name, value in {"HOME": self.user, "CODEX_HOME": self.codex}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "CODEX_HOME": str(self.codex)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.n = 0
+
+    def rollout(self, home=None, version="0.146.0-alpha.3.1", source="vscode", ago=600, zst=False) -> Path:
+        """A chat's rollout under home/sessions (CODEX_HOME's by default), last
+        written `ago` seconds back: its session_meta as the 0.146 alphas write
+        it (P1), then a message. A compressed one is real where this Python
+        has compression.zstd, else zstd's first bytes, counted and never opened."""
+        self.n += 1
+        day = (home or self.codex) / "sessions" / "2026" / "10" / "27"
+        day.mkdir(parents=True, exist_ok=True)
+        thread = f"019a2b3c-0000-7000-8000-{self.n:012d}"
+        path = day / f"rollout-2026-10-27T10-00-{self.n:02d}-{thread}.jsonl{'.zst' if zst else ''}"
+        meta = {"id": thread, "session_id": thread, "cli_version": version, "source": source,
+                "originator": "codex_vscode", "cwd": f"/work/{self.SECRET}", "model_provider": "openai",
+                "base_instructions": {"text": self.SECRET}}
+        said = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": self.SECRET}]}
+        text = "".join(json.dumps({"type": kind, "timestamp": "2026-10-27T10:00:00.000Z", "ordinal": n, "payload": p})
+                       + "\n" for n, (kind, p) in enumerate((("session_meta", meta), ("response_item", said))))
+        if not zst:
+            path.write_text(text)
+        elif longhaul.zstd:
+            with longhaul.zstd.open(path, "wt", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            path.write_bytes(b"\x28\xb5\x2f\xfd")
+        when = time.time() - ago
+        os.utime(path, (when, when))
+        return path
+
+    def fake_codex(self, out=b"codex-cli 0.164.0\n", code=0, folder=None) -> Path:
+        """A `codex` on PATH that leaves self.ran behind, prints `out` and exits with `code`."""
+        path = (folder or self.bin) / "codex"
+        path.write_text(f"#!{sys.executable}\nimport sys\nopen({str(self.ran)!r}, 'w').close()\n"
+                        f"sys.stdout.buffer.write({out!r})\nsys.exit({code})\n")
+        path.chmod(0o755)
+        return path
+
+    def items(self, check) -> list:
+        """A line's items as (mark, text), in order."""
+        return [(mark, text) for mark, text, _ in check["items"]]
+
+    def version(self, check) -> str:
+        """The line's version item, which has no mark."""
+        [text] = [text for mark, text in self.items(check) if mark is None]
+        return text
+
+    def printed(self, check) -> list:
+        """The line as the doctor prints it, with no heading and no count."""
+        return longhaul.doctor_lines([{"name": "Codex", **check}])[1:-1]
+
+    # ------------------------------------------------------------ the checks
+
+    def test_with_no_codex_folder_there_is_no_line_and_nothing_runs(self):
+        self.assertEqual(longhaul.DOCTOR_CHECKS[-1], ("Codex", "doctor_codex"), "the last line")
+        self.fake_codex()
+        self.assertIsNone(longhaul.doctor_codex())
+        self.assertIsNone(longhaul.doctor_codex(quick=True))
+        self.assertFalse(self.ran.exists(), "no Codex folder: `codex --version` is not run")
+        with mock.patch.object(longhaul, "DOCTOR_CHECKS", self.ONLY):
+            self.assertEqual(longhaul.doctor_checks(), [], "not shown")
+            self.assertEqual(longhaul.doctor_count(longhaul.doctor_checks(quick=True)), (0, 0), "not counted")
+            self.codex.mkdir()
+            self.assertEqual([c["name"] for c in longhaul.doctor_checks(quick=True)], ["Codex"])
+            self.assertEqual(longhaul.doctor_count(longhaul.doctor_checks()), (1, 1))
+
+    def test_each_codex_folder_is_an_item_with_its_chats(self):
+        self.rollout()
+        self.rollout()
+        c = longhaul.doctor_codex()
+        self.assertEqual((c["mark"], c["said"], c["step"]), ("ok", self.SAID, None))
+        self.assertEqual(self.items(c)[0], ("ok", "~/.codex: 2 chats"))
+        # CODEX_HOME another folder: it first, named so, and ~/.codex beside
+        # it, which `inspect` and `usage` do not read.
+        work = self.user / "work-codex"
+        self.rollout(home=work)
+        unread = "not read by `inspect --agent codex` or `usage`, which read CODEX_HOME's"
+        with mock.patch.object(longhaul, "CODEX_HOME", work):
+            c = longhaul.doctor_codex()
+            quick = longhaul.doctor_codex(quick=True)
+        self.assertEqual(self.items(c)[:2], [("ok", "~/work-codex (CODEX_HOME): 1 chat"),
+                                             ("ok", f"~/.codex: 2 chats, {unread} (~/work-codex)")])
+        self.assertEqual(c["mark"], "ok")
+        self.assertEqual(self.items(quick)[0], ("ok", "~/work-codex (CODEX_HOME): 1 chat"))
+        self.assertNotIn("~/.codex", str(self.items(quick)), "quick: CODEX_HOME's alone")
+        # CODEX_HOME names a folder that is not there: ~/.codex alone, which they still do not read.
+        with mock.patch.object(longhaul, "CODEX_HOME", self.user / "gone"):
+            c = longhaul.doctor_codex()
+            self.assertIsNone(longhaul.doctor_codex(quick=True))
+        self.assertEqual(self.items(c)[0], ("ok", f"~/.codex: 2 chats, {unread} (~/gone)"))
+        # ~/.codex by another name, through a link: one folder.
+        link = self.tmp / "codex-link"
+        link.symlink_to(self.codex)
+        with mock.patch.object(longhaul, "CODEX_HOME", link):
+            c = longhaul.doctor_codex()
+        self.assertEqual([item for item in self.items(c) if item[0] == "ok"], [("ok", f"{link}: 2 chats")])
+
+    def test_a_folder_with_no_chats_says_so_and_no_version_is_an_item_without_a_mark(self):
+        self.codex.mkdir()
+        (self.codex / "config.toml").write_text("")
+        c = longhaul.doctor_codex()
+        self.assertEqual(self.items(c), [("ok", "~/.codex: no chats yet"),
+                                         (None, f"version not known: {self.NO_CODEX}, and there is no chat to read it from")])
+        self.assertEqual((c["mark"], c["step"]), ("ok", None), "no version is no fault")
+        self.assertEqual(self.printed(c), [f"✔ Codex: {self.SAID}", "    ✔ ~/.codex: no chats yet",
+                                           f"      version not known: {self.NO_CODEX}, and there is no chat to read it from"])
+        self.assertEqual(self.items(longhaul.doctor_codex(quick=True))[1],
+                         (None, "version not known: there is no chat to read it from"), "quick: PATH is not looked at")
+        (self.codex / "sessions" / "2026").mkdir(parents=True)  # sessions/ with no rollout in it
+        self.assertEqual(self.items(longhaul.doctor_codex())[0], ("ok", "~/.codex: no chats yet"))
+        # A newest chat that names none: not the line's fault either.
+        self.rollout(ago=900)
+        self.rollout(ago=60).write_text("not json\n")
+        c = longhaul.doctor_codex()
+        self.assertEqual(self.version(c), f"version not known: {self.NO_CODEX}, and the newest chat names none")
+        self.assertEqual(c["mark"], "ok")
+
+    def test_the_version_is_codex_versions_when_codex_is_on_path(self):
+        self.rollout()
+        for out, version in ((b"codex-cli 0.164.0\n", "0.164.0"), (b"codex-cli 0.146.0-alpha.3.1\n", "0.146.0-alpha.3.1"),
+                             (b"0.165.0", "0.165.0"), (b"\xff\xfe codex-cli 0.164.1\n", "0.164.1")):
+            with self.subTest(out=out):
+                self.fake_codex(out)
+                c = longhaul.doctor_codex()
+                self.assertEqual(self.version(c), f"version {version}, from `codex --version`")
+                self.assertEqual(c["mark"], "ok", "no Codex range is checked yet: the version is said, not judged")
+        self.assertTrue(self.ran.exists())
+
+    def test_a_codex_that_only_a_relative_path_entry_finds_is_never_run(self):
+        # PATH's "." or "bin" would find a `codex` in the folder the doctor
+        # runs in, a cloned repository's: like doctor_path_hits, it counts
+        # PATH's absolute entries alone.
+        self.rollout()
+        here = self.tmp / "repo"
+        here.mkdir()
+        self.fake_codex(folder=here)
+        was = os.getcwd()
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join((".", str(self.bin)))}):
+            os.chdir(here)
+            try:
+                c = longhaul.doctor_codex()
+            finally:
+                os.chdir(was)
+        self.assertFalse(self.ran.exists(), "the folder's own codex was run")
+        self.assertTrue(self.version(c).endswith(f"; {self.NO_CODEX}"))
+
+    def test_without_codex_on_path_and_always_quick_the_version_is_the_newest_chats(self):
+        self.rollout(version="0.146.0-alpha.9.2", ago=900)
+        self.rollout(version="0.154.0-alpha.6.2", source="cli", ago=60)
+        newest = "version 0.154.0-alpha.6.2, as the newest chat wrote it (started from cli)"
+        self.assertEqual(self.version(longhaul.doctor_codex()), f"{newest}; {self.NO_CODEX}")
+        self.fake_codex()
+        self.assertEqual(self.version(longhaul.doctor_codex(quick=True)), newest)
+        with mock.patch.object(longhaul, "DOCTOR_CHECKS", self.ONLY):
+            longhaul.doctor_checks(quick=True)
+        self.assertFalse(self.ran.exists(), "quick runs no program: the first-chat line's checks")
+        with mock.patch.object(longhaul, "DOCTOR_CHECKS", self.ONLY):
+            longhaul.doctor_checks()
+        self.assertTrue(self.ran.exists(), "the doctor's own run asks codex")
+        # codex there, and no version from it: the newest chat's, and why.
+        for out, code in ((b"codex-cli\n", 0), (b"", 0), (b"codex-cli 0.164.0\n", 1)):
+            with self.subTest(out=out, code=code):
+                self.fake_codex(out, code)
+                self.assertEqual(self.version(longhaul.doctor_codex()), f"{newest}; `codex --version` gave none")
+        # The newest of every folder's chats.
+        work = self.user / "work-codex"
+        self.rollout(home=work, version="0.164.0", source="exec", ago=5)
+        (self.bin / "codex").unlink()
+        with mock.patch.object(longhaul, "CODEX_HOME", self.user / "elsewhere"):
+            self.rollout(home=self.user / "elsewhere", version="0.151.0-alpha.7.2", ago=3000)
+            self.assertIn("0.154.0-alpha.6.2", self.version(longhaul.doctor_codex()))
+        with mock.patch.object(longhaul, "CODEX_HOME", work):
+            self.assertEqual(self.version(longhaul.doctor_codex()),
+                             f"version 0.164.0, as the newest chat wrote it (started from exec); {self.NO_CODEX}")
+
+    def test_a_version_or_a_source_that_is_not_plain_is_never_shown(self):
+        hostile = [self.SECRET, f"0.164.0 {self.SECRET}", f"0.164.0\n{self.SECRET}", "0.164.0\n",
+                   f"\x1b]0;{self.SECRET}\x07", f"0.164.0-{self.SECRET}", "9" * 300 + ".1.1", "v0.164.0", 164, None,
+                   ["0.164.0"], {"version": "0.164.0"}]
+        for value in hostile:
+            with self.subTest(value=value):
+                path = self.rollout(version=value, source=value)
+                c = longhaul.doctor_codex()
+                self.assertEqual(self.version(c), f"version not known: {self.NO_CODEX}, and the newest chat names none")
+                self.assertNotIn("SECRET", "\n".join(self.printed(c)))
+                path.unlink()
+        # A plain version beside a source that is not a plain name: the version alone.
+        sources = [self.SECRET, f"vscode {self.SECRET}", f"vscode\n{self.SECRET}", "a" * 81,
+                   {"subagent": {"thread_spawn": {"agent_role": self.SECRET}}}, ["vscode"]]
+        for source in sources:
+            with self.subTest(source=source):
+                path = self.rollout(version="0.164.0", source=source)
+                c = longhaul.doctor_codex()
+                self.assertEqual(self.version(c), f"version 0.164.0, as the newest chat wrote it; {self.NO_CODEX}")
+                self.assertNotIn("SECRET", "\n".join(self.printed(c)))
+                path.unlink()
+        # Nor what codex prints, unless it ends in a plain version.
+        self.rollout()
+        for out in (self.SECRET.encode(), f"codex-cli 0.164.0 {self.SECRET}\n".encode(), b"0.164.0\x1b]0;x\x07\n"):
+            with self.subTest(out=out):
+                self.fake_codex(out)
+                c = longhaul.doctor_codex()
+                self.assertTrue(self.version(c).endswith("; `codex --version` gave none"), self.version(c))
+                self.assertNotIn("SECRET", "\n".join(self.printed(c)))
+
+    def test_compressed_chats_this_python_cannot_read_are_a_warning_naming_the_python_that_can(self):
+        self.rollout(ago=60)
+        self.rollout(zst=True, ago=8 * 86400)
+        self.rollout(zst=True, ago=9 * 86400)
+        python = sys.version.split()[0]
+        with mock.patch.object(longhaul, "zstd", None):
+            c = longhaul.doctor_codex()
+            one = longhaul.doctor_codex(quick=True)
+        self.assertEqual(self.items(c), [
+            ("ok", "~/.codex: 3 chats, 2 of them compressed"),
+            (None, f"version 0.146.0-alpha.3.1, as the newest chat wrote it (started from vscode); {self.NO_CODEX}"),
+            ("warn", f"2 compressed chats (a week old and more) that this Python ({python}) cannot read: "
+                     "`inspect --agent codex` and `usage` see only the newer ones")])
+        self.assertEqual((c["mark"], c["said"]), ("warn", self.SAID))
+        self.assertEqual(c["step"], "Python 3.14 or later reads them when it is the `python3` on PATH; Longhaul installs "
+                                    "nothing")
+        self.assertEqual(one["mark"], "warn", "quick too")
+        self.assertEqual(self.printed(c)[-1], f"    Next: {c['step']}")
+        # One, in either folder.
+        sorted(self.codex.rglob("*.zst"))[0].unlink()
+        with mock.patch.object(longhaul, "zstd", None):
+            c = longhaul.doctor_codex()
+        self.assertIn(("ok", "~/.codex: 2 chats, 1 of them compressed"), self.items(c))
+        self.assertIn(f"1 compressed chat (a week old and more) that this Python ({python}) cannot read", str(self.items(c)))
+        self.assertIn("Python 3.14 or later reads it when", c["step"])
+        for zst in self.codex.rglob("*.zst"):
+            zst.unlink()
+        work = self.user / "work-codex"
+        self.rollout(home=work, zst=True, ago=8 * 86400)
+        with mock.patch.object(longhaul, "zstd", None), mock.patch.object(longhaul, "CODEX_HOME", work):
+            c = longhaul.doctor_codex()
+        self.assertIn(("ok", "~/work-codex (CODEX_HOME): 1 chat, compressed"), self.items(c))
+        self.assertEqual(c["mark"], "warn")
+        # Beside another CODEX_HOME, ~/.codex's are not read by inspect or usage at all: no warning for them.
+        for zst in work.rglob("*.zst"):
+            zst.unlink()
+        self.rollout(zst=True, ago=8 * 86400)
+        with mock.patch.object(longhaul, "zstd", None), mock.patch.object(longhaul, "CODEX_HOME", work):
+            c = longhaul.doctor_codex()
+        self.assertIn("~/.codex: 2 chats, 1 of them compressed, not read by", str(self.items(c)))
+        self.assertEqual((c["mark"], c["step"]), ("ok", None))
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_on_3_14_compressed_chats_are_read_and_there_is_no_warning(self):
+        self.rollout(zst=True, version="0.164.0", ago=8 * 86400)
+        self.rollout(zst=True, ago=9 * 86400)
+        c = longhaul.doctor_codex()
+        self.assertEqual(self.items(c), [
+            ("ok", "~/.codex: 2 chats, 2 of them compressed"),
+            (None, f"version 0.164.0, as the newest chat wrote it (started from vscode); {self.NO_CODEX}")])
+        self.assertEqual((c["mark"], c["step"]), ("ok", None))
+
+    def test_what_cannot_be_read_never_stops_the_doctor(self):
+        self.rollout()
+        self.fake_codex()
+        for error in (subprocess.TimeoutExpired("codex", 15), FileNotFoundError(2, "No such file"),
+                      PermissionError(13, "Permission denied")):
+            with self.subTest(error=error), mock.patch.object(longhaul.subprocess, "run", side_effect=error):
+                self.assertIsNone(longhaul.codex_version())
+                self.assertTrue(self.version(longhaul.doctor_codex()).endswith("; `codex --version` gave none"))
+        (self.bin / "codex").chmod(0o644)  # there, and not runnable: as not on PATH
+        self.assertTrue(self.version(longhaul.doctor_codex()).endswith(f"; {self.NO_CODEX}"))
+        # A sessions folder that cannot be listed is a warning of its own item.
+        with mock.patch.object(longhaul, "rollout_files", side_effect=PermissionError(13, "Permission denied")):
+            c = longhaul.doctor_codex()
+        self.assertEqual(c["items"][0], ("warn", "~/.codex: its chats could not be listed (Permission denied)",
+                                         "check that you can open ~/.codex/sessions"))
+        self.assertEqual((c["mark"], c["step"]), ("warn", "check that you can open ~/.codex/sessions"))
+        # Anything else is the line's own warning, and the other lines go on.
+        with mock.patch.object(longhaul, "rollout_files", side_effect=RuntimeError("x")), \
+                mock.patch.object(longhaul, "doctor_other", return_value=longhaul.doctor_result("fine"), create=True), \
+                mock.patch.object(longhaul, "DOCTOR_CHECKS", self.ONLY + [("Other", "doctor_other")]):
+            checks = longhaul.doctor_checks()
+        self.assertEqual([(c["name"], c["mark"], c["said"]) for c in checks],
+                         [("Codex", "warn", "could not be checked (RuntimeError)"), ("Other", "ok", "fine")])
+
+    def test_only_the_newest_chats_first_record_is_read_and_nothing_else_of_codex(self):
+        old = self.rollout(ago=900)
+        new = self.rollout(ago=60)
+        for name in ("auth.json", "config.toml", "history.jsonl", "session_index.jsonl"):
+            (self.codex / name).write_text(self.SECRET)
+            (self.codex / name).chmod(0)  # opened, any of them would raise
+        self.addCleanup(lambda: [p.chmod(0o600) for p in self.codex.iterdir() if p.is_file()])
+        before = sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*"))
+        opened, records = [], longhaul.rollout_records
+
+        def read(path):
+            opened.append(path)
+            return records(path)
+
+        with mock.patch.object(longhaul, "rollout_records", read):
+            c = longhaul.doctor_codex()
+            quick = longhaul.doctor_codex(quick=True)
+        self.assertEqual(opened, [new, new], "the newest chat's alone, once a run")
+        self.assertNotIn(old, opened)
+        self.assertEqual((c["mark"], quick["mark"]), ("ok", "ok"))
+        shown = "\n".join(self.printed(c) + self.printed(quick))
+        for word in ("SECRET", "auth", "config", "history", "/work"):
+            self.assertNotIn(word, shown)
+        self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*")), before, "nothing written")
+
+    def test_the_doctor_as_a_program_shows_the_line_and_writes_nothing(self):
+        self.rollout(ago=60)
+        self.rollout(zst=True, ago=8 * 86400)
+        fake = self.tmp / "fakes"
+        fake.mkdir()
+        for name in ("ps", "lsof"):  # the process list is never the real one
+            (fake / name).write_text("#!/bin/sh\nexit 0\n")
+            (fake / name).chmod(0o755)
+        self.fake_codex(folder=fake)  # and the codex it asks is the fake, whatever else is installed
+        before = sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*"))
+        home = self.tmp / "no-home"  # never made: the doctor writes nothing
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")
+               and k not in Checkpoint.SESSION_VARS + ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        env.update(PATH=f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", HOME=str(self.user), LONGHAUL_HOME=str(home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off", CODEX_HOME=str(self.codex))
+        for python in (sys.executable, "/usr/bin/python3"):
+            if not os.path.exists(python):
+                continue
+            with self.subTest(python=python):
+                out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, capture_output=True,
+                                     text=True, timeout=60)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                lines = out.stdout.splitlines()
+                [head] = [l for l in lines if l[2:].startswith("Codex: ")]
+                at = lines.index(head)
+                self.assertIn(head, (f"✔ Codex: {self.SAID}", f"⚠ Codex: {self.SAID}"))
+                self.assertEqual(lines[at + 1:at + 3], ["    ✔ ~/.codex: 2 chats, 1 of them compressed",
+                                                        "      version 0.164.0, from `codex --version`"])
+                self.assertEqual(head.startswith("⚠"), "that this Python" in out.stdout)
+                self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
+                self.assertNotIn("SECRET", out.stdout)
+                self.assertFalse(home.exists(), "nothing written")
+                self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*")), before)
 
 
 class History(unittest.TestCase):
