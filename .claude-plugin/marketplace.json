@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "description": "Longhaul's own marketplace: one plugin, this repository.",
+  "description": "Longhaul's own marketplace, this repository: the longhaul plugin, and longhaul-advisor, its Advisor experiment (off unless the owner enables it).",
   "owner": {
     "name": "Amr Adel"
   },
@@ -9,6 +9,12 @@
       "name": "longhaul",
       "source": "./",
       "description": "Keep the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or /clear. Shows where the tokens go.",
+      "version": "0.2.8"
+    },
+    {
+      "name": "longhaul-advisor",
+      "source": "./plugins/longhaul-advisor",
+      "description": "Longhaul's Advisor experiment: the /longhaul-advisor:advise skill and the read-only advisor agent it consults. Needs the longhaul plugin, whose hook checks, caps and traces every consultation. Off unless the owner enables the experiment.",
       "version": "0.2.8"
     }
   ]

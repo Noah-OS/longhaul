@@ -1,6 +1,6 @@
 ---
 name: advisor
-description: "Longhaul's advisor for the Advisor experiment: a stronger model reviews the executor's brief and answers in a fixed shape. Read-only. Called only through /longhaul:advise, which Longhaul's hook checks, caps and traces; off unless the owner enables the experiment."
+description: "Longhaul's advisor for the Advisor experiment: a stronger model reviews the executor's brief and answers in a fixed shape. Read-only. Called only through /longhaul-advisor:advise, which Longhaul's hook checks, caps and traces; off unless the owner enables the experiment."
 tools: Read, Grep, Glob
 ---
 

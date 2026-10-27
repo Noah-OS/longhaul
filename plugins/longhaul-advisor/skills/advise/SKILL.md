@@ -2,12 +2,12 @@
 name: advise
 description: "Consult a stronger model for an independent review at one of four decision points, then continue the task yourself. Use it: early, after orientation and before the first write, on a multi-file, architectural or unclear task; when stuck (the same failure twice, an approach not converging); before changing approach; and before declaring a long task done, once its files are written and its tests run. Not for trivial edits, docs edits or simple questions. Part of Longhaul's Advisor experiment: it runs only when the owner has enabled the experiment; otherwise it stops at once."
 argument-hint: "[early | stuck | change | done]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul advisor status)
+allowed-tools: Bash(longhaul advisor status)
 ---
 
 First, whether the experiment is on:
 
-!`${CLAUDE_PLUGIN_ROOT}/bin/longhaul advisor status`
+!`longhaul advisor status`
 
 If the last line above does not begin with `enabled`, stop here: tell the user
 in one line that the Advisor is off and why (the line says), and carry on with
@@ -28,7 +28,7 @@ consultation in the same task whose advice conflicts with what you have
 since seen; say what conflicts. Never put a credential in the brief, and
 never an `Admission:` line: Longhaul's hook adds that one itself.
 
-Then call the Agent tool once with `subagent_type` `longhaul:advisor`, a
+Then call the Agent tool once with `subagent_type` `longhaul-advisor:advisor`, a
 `description` naming the trigger (for example "Longhaul advisor consultation
 (stuck)"), and the brief as the `prompt`, and no other field: no
 `run_in_background`, `isolation` or `name`. Never send a brief to any other

@@ -41,11 +41,13 @@ jobs:
       - run: S=$(mktemp -d); LONGHAUL_HOME=$S/home LONGHAUL_DEFAULT_CONFIG_DIR=$S/claude LONGHAUL_DEFAULT_GLOBAL_JSON=$S/claude.json LONGHAUL_NO_NOTIFY=1 python3 -m unittest test_longhaul -q
   validate:
     # The smoke test for the supported version: Claude Code itself, as npm
-    # gives it that day, reads the plugin. The first run (2026-10-21) showed
-    # `validate` runs signed out on the runner, so a refusal fails the run.
+    # gives it that day, reads the plugin, and the Advisor's (Sprint 11, I4).
+    # The first run (2026-10-21) showed `validate` runs signed out on the
+    # runner, so a refusal fails the run.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: npm install -g @anthropic-ai/claude-code
       - run: claude plugin validate --strict .
+      - run: claude plugin validate --strict plugins/longhaul-advisor

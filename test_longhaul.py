@@ -32,6 +32,9 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The Advisor's own plugin (Sprint 11, I4): its skill and its agent, out of
+# Longhaul's always-on context, in the same marketplace.
+ADVISOR_PLUGIN = HERE / "plugins" / "longhaul-advisor"
 # The code index is on by default since 2026-10-23 (the owner): the suite
 # keeps it off, so that no test starts a real `codegraph init` or `trail
 # init` from the PATH; the index tests turn it on in their own environment.
@@ -2586,30 +2589,63 @@ class Plugin(unittest.TestCase):
         self.assertTrue(m["description"] and m["author"]["name"])
         self.assertNotRegex(m["name"], r"^(claude-|anthropic-|anthropics-|cc-plugin-)", "a reserved name")
 
-    def test_every_component_path_the_manifest_names_is_inside_the_plugin_and_exists(self):
-        m = self.manifest()
-        for key in ("skills", "commands", "agents", "hooks", "mcpServers", "outputStyles", "lspServers"):
-            value = m.get(key)  # a path, a list of paths, or (hooks, mcpServers) an inline object
-            for path in [value] if isinstance(value, str) else value if isinstance(value, list) else []:
-                if isinstance(path, str):
-                    self.assertTrue(path.startswith("./") and ".." not in path, path)
-                    self.assertTrue((HERE / path).exists(), path)
+    def advisor_manifest(self):
+        return json.loads((ADVISOR_PLUGIN / ".claude-plugin" / "plugin.json").read_text())
 
-    def test_the_marketplace_lists_this_plugin_once_with_the_manifests_name_version_and_description(self):
+    def test_every_component_path_the_manifest_names_is_inside_the_plugin_and_exists(self):
+        for root, m in ((HERE, self.manifest()), (ADVISOR_PLUGIN, self.advisor_manifest())):
+            for key in ("skills", "commands", "agents", "hooks", "mcpServers", "outputStyles", "lspServers"):
+                value = m.get(key)  # a path, a list of paths, or (hooks, mcpServers) an inline object
+                for path in [value] if isinstance(value, str) else value if isinstance(value, list) else []:
+                    if isinstance(path, str):
+                        self.assertTrue(path.startswith("./") and ".." not in path, path)
+                        self.assertTrue((root / path).exists(), path)
+
+    def test_the_marketplace_lists_longhaul_and_its_advisor_each_with_its_manifests_name_version_and_description(self):
         # P8 (Sprint 5), ADR-0001 decision 1: the root is its own marketplace,
-        # so `/plugin install longhaul@longhaul` works. The entry repeats the
-        # manifest's name, version and description, so a bump changes both
+        # so `/plugin install longhaul@longhaul` works. Each entry repeats its
+        # manifest's name, version and description, so a bump changes the
         # files or fails here (and `validate --strict`, which warns when an
-        # entry's version differs from plugin.json's).
-        m = self.manifest()
+        # entry's version differs from plugin.json's). Sprint 11 (I4): the
+        # Advisor's plugin is the second entry, from its own folder.
+        m, advisor = self.manifest(), self.advisor_manifest()
         market = json.loads((HERE / ".claude-plugin" / "marketplace.json").read_text())
         self.assertEqual(market["name"], "longhaul")
         self.assertTrue(market["description"], "validate --strict fails without one")
+        self.assertNotIn("one plugin", market["description"])
         self.assertEqual(market["owner"], {"name": m["author"]["name"]})  # no email here
-        (entry,) = market["plugins"]
+        (entry, second) = market["plugins"]
         self.assertEqual(entry["source"], "./")
-        for key in ("name", "version", "description"):
-            self.assertEqual(entry[key], m[key], key)
+        self.assertEqual(second["source"], "./plugins/longhaul-advisor")
+        for listed, manifest in ((entry, m), (second, advisor)):
+            for key in ("name", "version", "description"):
+                self.assertEqual(listed[key], manifest[key], key)
+
+    def test_the_advisors_plugin_needs_this_longhaul_and_ships_the_skill_and_the_agent_alone(self):
+        # Sprint 11 (I4, decision 10): the advise skill and the advisor agent
+        # were 44% of Longhaul's always-on tokens with the experiment off, so
+        # they live in a plugin of their own. It needs Longhaul, whose hook
+        # checks, caps and traces every consultation, at its own version or
+        # later, and it says it stays off unless the owner enables it.
+        m, advisor = self.manifest(), self.advisor_manifest()
+        self.assertEqual(advisor["name"], "longhaul-advisor")
+        self.assertEqual(advisor["version"], m["version"])
+        self.assertEqual(advisor["dependencies"], [{"name": "longhaul", "version": f">={m['version']}"}])
+        for key in ("license", "homepage", "repository"):
+            self.assertEqual(advisor[key], m[key], key)
+        self.assertEqual(advisor["author"], {"name": m["author"]["name"]}, "the owner's name; the email stays in one file")
+        self.assertIn("Needs the longhaul plugin, whose hook checks, caps and traces every consultation.",
+                      advisor["description"])
+        self.assertIn("Off unless the owner enables the experiment.", advisor["description"])
+        shipped = sorted(str(p.relative_to(ADVISOR_PLUGIN)) for p in ADVISOR_PLUGIN.rglob("*") if p.is_file())
+        self.assertEqual(shipped, [".claude-plugin/plugin.json", "agents/advisor.md", "skills/advise/SKILL.md"])
+        # Longhaul's own plugin loads its skills/ and agents/: neither holds the Advisor now.
+        self.assertFalse((HERE / "skills" / "advise").exists())
+        self.assertFalse((HERE / "agents").exists())
+        requires_git(self)
+        tracked = subprocess.run(["git", "ls-files", "plugins"], cwd=HERE, capture_output=True, text=True,
+                                 timeout=10).stdout.split()
+        self.assertEqual(sorted(tracked), ["plugins/longhaul-advisor/" + path for path in shipped])
 
     def test_the_changelog_top_entry_is_the_manifests_version(self):
         # Review, Sprint 5 (G2): the newest entry is the version a user
@@ -2628,7 +2664,9 @@ class Plugin(unittest.TestCase):
         # so each is looked for in the index too.
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
-                     "CHANGELOG.md", "hooks/hooks.json", "bin/longhaul", ".github/workflows/tests.yml"):
+                     "CHANGELOG.md", "hooks/hooks.json", "bin/longhaul", ".github/workflows/tests.yml",
+                     "plugins/longhaul-advisor/.claude-plugin/plugin.json",
+                     "plugins/longhaul-advisor/skills/advise/SKILL.md", "plugins/longhaul-advisor/agents/advisor.md"):
             self.assertEqual(subprocess.run(["git", "check-ignore", "-q", path], cwd=HERE, timeout=10).returncode, 1,
                              f"{path} is ignored by .gitignore")
             self.assertIn(path, tracked, f"{path} is not in git's index")
@@ -2696,8 +2734,10 @@ class Plugin(unittest.TestCase):
         # The first run showed `validate` runs signed out on the runner, so a
         # refusal must fail the run: no continue-on-error any more.
         self.assertNotIn("continue-on-error", jobs["validate"])
+        # Sprint 11 (I4): the Advisor's plugin is read on its own too.
         self.assertEqual(self.runs(jobs["validate"]),
-                         ["npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."])
+                         ["npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict .",
+                          "claude plugin validate --strict plugins/longhaul-advisor"])
 
     def test_the_readme_matches_the_code(self):
         # Review, Sprint 5 (G1): the README is read against what it
@@ -4942,8 +4982,14 @@ class Advisor(unittest.TestCase):
             self.assertIsNone(self.trace()[-1]["admission"])
         self.assertEqual(self.trace()[-1]["kind"], "fixable")
         self.assertIn("starting Task:", self.denied(self.call(self.brief(drop=["Task:"]), prompt="p3"), "brief-sections"))
-        text = (HERE / "agents" / "advisor.md").read_text()
+        text = (ADVISOR_PLUGIN / "agents" / "advisor.md").read_text()
         self.assertIn("`Admission:`", text)
+        # Sprint 11 (I4): named advisor in the longhaul-advisor plugin, so its type is ADVISOR_TYPE.
+        head = text.split("---\n", 2)[1]
+        self.assertIn("name: advisor\n", head)
+        self.assertIn("tools: Read, Grep, Glob\n", head)
+        self.assertIn("Called only through /longhaul-advisor:advise", head)
+        self.assertNotIn("longhaul:advis", text)
         for refusal in ("longhaul advisor: not admitted", "longhaul advisor: one brief per consultation"):
             self.assertIn(f"`{refusal}`", text, "the advisor's two refusals, word for word")
 
@@ -8308,6 +8354,45 @@ class InspectSkill(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/inspect/SKILL.md"], cwd=HERE).returncode, 1)
 
 
+class AdviseSkill(unittest.TestCase):
+    """/longhaul-advisor:advise (Sprint 8; in a plugin of its own since
+    Sprint 11, I4): its first step asks Longhaul whether the experiment is
+    on, and only then does it call the advisor's agent type."""
+
+    def test_the_skill_asks_longhauls_command_by_its_bare_name_and_calls_the_advisors_own_agent_type(self):
+        text = (ADVISOR_PLUGIN / "skills" / "advise" / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        flat = " ".join(body.split())
+        self.assertIn("name: advise\n", head)
+        # Its plugin has no bin/: Longhaul's is on the shell's PATH while
+        # Longhaul is enabled, so the step names the bare command, and the
+        # rule that one command alone. A step that fails stops the skill, so
+        # with Longhaul off or missing nothing reaches the advisor.
+        self.assertIn("allowed-tools: Bash(longhaul advisor status)\n", head)
+        self.assertIn("\n!`longhaul advisor status`\n", body)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", text)
+        self.assertIn("If the last line above does not begin with `enabled`, stop here", flat)
+        self.assertIn("`subagent_type` `longhaul-advisor:advisor`", flat)
+        self.assertNotIn("longhaul:advis", text, "the names a 0.2.8 session used")
+        # As Claude Code runs it: the bare name, Longhaul's bin/ first on the
+        # PATH. With the experiment off it exits 0, and its last line does
+        # not begin with `enabled`, so the skill stops at once.
+        tmp = Path(tempfile.mkdtemp())
+        env = {k: v for k, v in os.environ.items()
+               if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
+        env.update(PATH=f"{HERE / 'bin'}{os.pathsep}{env.get('PATH', '')}", LONGHAUL_HOME=str(tmp / "home"),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(tmp / "claude"), LONGHAUL_DEFAULT_GLOBAL_JSON=str(tmp / "claude.json"),
+                   LONGHAUL_NO_NOTIFY="1", CLAUDE_CODE_EXECPATH=str(tmp / "versions" / "2.1.307" / "claude"))
+        out = subprocess.run("longhaul advisor status", shell=True, cwd=tmp, env=env, capture_output=True, text=True,
+                             timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.splitlines()[-1], "off: LONGHAUL_ADVISOR is not experiment")
+        self.assertFalse((tmp / "home" / "advisor").exists(), "nothing was written")
+        requires_git(self)
+        self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "plugins/longhaul-advisor/skills/advise/SKILL.md"],
+                                        cwd=HERE).returncode, 1)
+
+
 class CheckpointSkill(unittest.TestCase):
     """/longhaul:checkpoint (Sprint 4, C1): a plugin skill the model or the
     user invokes to save the conversation's state through the shim."""
@@ -10230,8 +10315,11 @@ class Name(unittest.TestCase):
     # An email that is not an example's (review, Sprint 5, D1): the owner's
     # is in the signed files alone.
     EMAIL = r"[a-z0-9._%+-]+@(?!exam" + r"ple\.com\b)[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}"
-    # The owner chose to keep their name, email and GitHub handle in these.
-    SIGNED = ("LICENSE", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json")
+    # The owner chose to keep their name, email and GitHub handle in these;
+    # the Advisor's manifest (Sprint 11, I4) repeats the name and the
+    # repository's address, and not the email (Plugin pins that).
+    SIGNED = ("LICENSE", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+              "plugins/longhaul-advisor/.claude-plugin/plugin.json")
     # The README is checked line by line (it passed whole before, so a
     # private path pasted into an example would have passed with it): its
     # one allowed match is the repository's own address, which since
