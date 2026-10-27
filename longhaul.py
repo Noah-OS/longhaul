@@ -113,6 +113,14 @@ Usage:
                           default: the latest conversation in the ledger);
                           --json gives one record per number, with its source
   longhaul statusline           the status line command (set in ~/.claude/settings.json)
+  longhaul statusline install|uninstall [--yes]
+                          install sets Claude Code's status line to
+                          `~/.local/bin/longhaul statusline` in settings.json:
+                          the file is copied beside itself first, a status
+                          line of your own is replaced only after a yes in a
+                          terminal (--yes: without asking), and the line is
+                          test-run, the file put back if it fails; uninstall
+                          puts back the line the copy held
   longhaul guard                the plugin's hooks. PreToolUse (Read, Bash): warns about
                           a file read again unchanged, or a whole read or cat of a
                           big one (LONGHAUL_GUARD=block denies instead), and counts
@@ -437,16 +445,20 @@ def write_json(path: Path, data) -> None:
     write_whole(path, json.dumps(data, indent=2) + "\n")
 
 
-def write_whole(path: Path, text: str) -> None:
+def write_whole(path: Path, text, mode: int | None = None) -> None:
     """Write whole or not at all, a file only you can read (mkstemp makes
-    it 0600). The temporary file is unique per write: on 2026-10-16 two
+    it 0600) unless `mode` says otherwise, set before the file takes the
+    name. The temporary file is unique per write: on 2026-10-16 two
     sessions' status lines saved Max.json at the same moment through one
-    shared name, and one found it already moved."""
+    shared name, and one found it already moved. Bytes are written as
+    they are."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "wb" if isinstance(text, bytes) else "w") as f:
             f.write(text)
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -2298,15 +2310,278 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
     return f"\033[1m{acct}\033[0m{gauge('5h', five)}{gauge('week', week)}"
 
 
-def statusline(_opts) -> int:
+def statusline(opts) -> int:
     """Claude Code's status line command. Must print one line and never
-    fail: an error here would blank the line in every session."""
+    fail: an error here would blank the line in every session. With an
+    action, the user's setup of it in a terminal instead: install or
+    uninstall."""
+    action = getattr(opts, "action", None)
+    if action == "install":
+        return statusline_install(opts.yes)
+    if action == "uninstall":
+        return statusline_uninstall()
     try:
         data = json.loads(sys.stdin.read() or "{}")
         print(record_usage(data, os.environ.get("CLAUDE_CONFIG_DIR")))
     except Exception as e:
         log(f"statusline error: {e!r}")
         print("longhaul")
+    return 0
+
+
+# `longhaul statusline install|uninstall` (Sprint 11, I2; the owner's
+# decision 6 of 2026-10-27): the user runs it in a terminal instead of
+# editing settings.json by hand; Longhaul never runs it on its own. The
+# line runs the terminal command, which outlives the plugin's cache.
+STATUSLINE_COMMAND = "~/.local/bin/longhaul statusline"
+STATUSLINE_KEPT = "before-longhaul-statusline"  # install's copy: settings.json.<this>-<stamp>[-n]
+STATUSLINE_UNDONE = "before-longhaul-uninstall"  # uninstall's
+STATUSLINE_TIMEOUT = 10  # seconds the test run may take
+# The test run's reading: no session_id and no rate_limits, so the display
+# keeps no ledger row and no allowance for it (record_usage()).
+STATUSLINE_SAMPLE = {"model": {"id": "claude-sample", "display_name": "Sample"}}
+
+
+def statusline_program(command):
+    """The program a status line command runs when it is Longhaul's: a
+    longhaul or longhaul.py by any path, then `statusline`; else None.
+    The doctor's test, and install's and uninstall's."""
+    if not isinstance(command, str):
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    at = next((i for i, w in enumerate(words) if re.fullmatch(r"(?:.*/)?longhaul(?:\.py)?", w)), None)
+    return words[at] if at is not None and words[at + 1:at + 2] == ["statusline"] else None
+
+
+def statusline_file() -> tuple:
+    """(the settings.json of the chat's folder (chat_config_dir()) by its
+    real path, how to name it). A second account's is a link into
+    ~/.claude (SHARED), and a file put in the link's place would cut it
+    off: the link's target is what changes."""
+    link = Path(chat_config_dir()) / "settings.json"
+    real = Path(os.path.realpath(link))
+    where = home_path(str(real))
+    return real, (f"{where} (linked from {home_path(str(link))})" if link.is_symlink() else where)
+
+
+def statusline_read(path: Path) -> tuple:
+    """(its bytes, or None when there is no file; its data, or None when
+    it is not a JSON object; its mode). No file is {}. Whatever else
+    stops the read is raised."""
+    try:
+        with open(path, "rb") as f:
+            raw, mode = f.read(), os.fstat(f.fileno()).st_mode & 0o777
+    except FileNotFoundError:
+        return None, {}, None
+    try:
+        data = json.loads(raw)
+    except ValueError:  # not UTF-8 either
+        data = None
+    return raw, (data if isinstance(data, dict) else None), mode
+
+
+def statusline_write(path: Path, data: dict, raw, mode) -> None:
+    """`data` over `path`, whole, as Claude Code writes the file (two
+    spaces, the text as it is), with the old file's ending and mode; a new
+    file ends in a newline and is yours alone. Raised when it cannot be."""
+    ending = "\n" if raw is None or raw.endswith(b"\n") else ""
+    write_whole(path, (json.dumps(data, indent=2, ensure_ascii=False) + ending).encode("utf-8"), mode)
+
+
+def statusline_keep(path: Path, raw: bytes, kind: str) -> Path:
+    """A copy of `raw` beside `path`, <name>.<kind>-<stamp>[-n], that only
+    you can read; never over another copy (two in one second each get
+    their own, as release_set()'s do)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    n = 1
+    while True:
+        copy = path.with_name(f"{path.name}.{kind}-{stamp}" + (f"-{n}" if n > 1 else ""))
+        try:
+            fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            n += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+        except BaseException:
+            copy.unlink(missing_ok=True)
+            raise
+        return copy
+
+
+def statusline_kept(path: Path):
+    """The newest copy install kept beside `path`, by the stamp in its name
+    and then its -n, or None."""
+    pattern = re.compile(re.escape(f"{path.name}.{STATUSLINE_KEPT}-") + r"(\d{8}-\d{6})(?:-(\d+))?")
+    found = [((m.group(1), int(m.group(2) or 1)), name) for name in os.listdir(path.parent)
+             for m in [pattern.fullmatch(name)] if m]
+    return path.with_name(max(found)[1]) if found else None
+
+
+def statusline_try():
+    """What is wrong with the status line run as Claude Code runs it (sh
+    -c, from your HOME, a sample reading on stdin), or None: it must exit
+    0 within STATUSLINE_TIMEOUT and print a first line, and not the
+    display's own `longhaul`, which says it failed."""
+    try:
+        here = os.getcwd()
+    except OSError:  # this terminal's folder was removed
+        here = str(HOME)
+    sample = {**STATUSLINE_SAMPLE, "workspace": {"current_dir": here}}
+    try:
+        done = subprocess.run(["/bin/sh", "-c", STATUSLINE_COMMAND], input=json.dumps(sample), capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=STATUSLINE_TIMEOUT,
+                              env={**os.environ, "HOME": str(HOME)})
+    except subprocess.TimeoutExpired:
+        return f"printed no line within {STATUSLINE_TIMEOUT:g} s"
+    except OSError as e:
+        return f"could not start ({e.strerror or type(e).__name__})"
+    first = next(iter(done.stdout.splitlines()), "").strip()
+    if done.returncode != 0:
+        said = next((line.strip() for line in done.stderr.splitlines() if line.strip()), "")
+        return f"exited {done.returncode}" + (f" ({shown(said, 200)})" if said else "")
+    if not first:
+        return "printed nothing"
+    if first == "longhaul":
+        return "printed only `longhaul`, the display's line when it fails (longhaul.log says why)"
+    return None
+
+
+def statusline_undo(path: Path, raw, mode, kept) -> str:
+    """`path` as it was before install (removed when there was none), and
+    then install's copy `kept` removed; why it could not be, or ""."""
+    try:
+        if raw is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_whole(path, raw, mode)
+        if kept:
+            kept.unlink(missing_ok=True)
+    except OSError as e:
+        return e.strerror or type(e).__name__
+    return ""
+
+
+def statusline_install(assume_yes: bool) -> int:
+    """`longhaul statusline install [--yes]`: Claude Code's status line set
+    to STATUSLINE_COMMAND in the chat's settings.json, nothing else in it
+    changed. A status line of the user's own is shown, and replaced only
+    after a yes in a terminal (No unless typed); without a terminal only
+    with --yes (exit 2 otherwise). The file is copied beside itself first
+    (no copy when there was none), and the line is test-run: a run that
+    fails puts the file back, removes the copy and says why (exit 1). A
+    file that is not a JSON object is left alone (exit 2), and so is
+    everything while the terminal command is missing."""
+    launcher = HOME / ".local" / "bin" / "longhaul"
+    if not os.path.exists(launcher):  # a link to nowhere is none either
+        here = home_path(str(Path(__file__).resolve()))
+        here = "~/" + shlex.quote(here[2:]) if here.startswith("~/") else shlex.quote(here)
+        say(f"Not changed: the status line runs {home_path(str(launcher))}, which is not there. "
+            "Make it with this line, then run `longhaul statusline install` again:")
+        print(f"  python3 {here} setup")
+        return 2
+    path, where = statusline_file()
+    try:
+        raw, data, mode = statusline_read(path)
+    except OSError as e:
+        say(f"Not changed: {where} could not be read ({e.strerror or type(e).__name__}).")
+        return 1
+    if data is None:
+        say(f"Not changed: {where} is not a JSON object, so Longhaul leaves it alone; fix it, then run this again.")
+        return 2
+    if statusline_program(dict_at(data, "statusLine").get("command")):
+        say(f"Claude Code's status line is already Longhaul's in {where}; nothing changed.")
+        return 0
+    if data.get("statusLine") is not None and not assume_yes:
+        old = shown(json.dumps(data["statusLine"], ensure_ascii=False), 200)
+        if not terminal():
+            say(f"Not changed: {where} sets a status line of its own ({old}). `longhaul statusline install` asks "
+                "before it replaces one, in a terminal; run it in one, or add --yes to replace it without asking.")
+            return 2
+        say(f"{where} sets a status line of its own: {old}")
+        try:
+            agreed = yes(f"Replace it with Longhaul's (`{STATUSLINE_COMMAND}`)? A copy of the file is kept, and "
+                         "`longhaul statusline uninstall` puts the line back.")
+        except (EOFError, KeyboardInterrupt):
+            agreed = False
+        if not agreed:
+            say("Not changed. Run `longhaul statusline install` to do it later.")
+            return 1
+    kept = None
+    try:
+        kept = statusline_keep(path, raw, STATUSLINE_KEPT) if raw is not None else None
+        statusline_write(path, {**data, "statusLine": {"type": "command", "command": STATUSLINE_COMMAND}}, raw, mode)
+    except (OSError, ValueError) as e:  # written whole or not at all: only the copy to remove
+        if kept:
+            kept.unlink(missing_ok=True)
+        say(f"Not changed: {where} could not be written ({getattr(e, 'strerror', None) or type(e).__name__}).")
+        return 1
+    problem = statusline_try()
+    if problem:
+        stuck = statusline_undo(path, raw, mode, kept)
+        if stuck:
+            say(f"The test run of `{STATUSLINE_COMMAND}` {problem}, and {where} could not be put back ({stuck}): "
+                f"the file as it was is {home_path(str(kept)) if kept else 'none (there was no file)'}.")
+        else:
+            say(f"Not changed: the test run of `{STATUSLINE_COMMAND}` {problem}, so {where} is as it was. "
+                "`longhaul doctor` checks the terminal command.")
+        return 1
+    say(f"Done: Claude Code's status line runs `{STATUSLINE_COMMAND}`, set in {where}"
+        + (f"; the file as it was is kept as {home_path(str(kept))}" if kept else " (a new file)")
+        + ". `longhaul statusline uninstall` undoes it.")
+    return 0
+
+
+def statusline_uninstall() -> int:
+    """`longhaul statusline uninstall`: install undone, only when the chat's
+    settings.json sets Longhaul's status line. The file is copied beside
+    itself first; then the line is the one in the newest copy install
+    kept, or none when that copy had none or there is no copy, and every
+    other key stays as it is now. It asks nothing: it changes Longhaul's
+    own line alone. Any other line, or none, is said and left alone."""
+    path, where = statusline_file()
+    try:
+        raw, data, mode = statusline_read(path)
+    except OSError as e:
+        say(f"Not changed: {where} could not be read ({e.strerror or type(e).__name__}).")
+        return 1
+    if data is None:
+        say(f"Not changed: {where} is not a JSON object, so Longhaul leaves it alone.")
+        return 2
+    if not statusline_program(dict_at(data, "statusLine").get("command")):
+        say("Nothing to undo: " + (f"there is no {where}" if raw is None
+                                   else f"{where} sets no status line" if data.get("statusLine") is None
+                                   else f"the status line in {where} is not Longhaul's") + "; nothing changed.")
+        return 0
+    before, old, unread = statusline_kept(path), None, ""
+    if before:
+        try:
+            found = json.loads(before.read_bytes())
+        except (OSError, ValueError):
+            found = None
+        if isinstance(found, dict):
+            old = found.get("statusLine")
+        else:
+            unread = f" ({home_path(str(before))} could not be read)"
+    now = {k: v for k, v in data.items() if k != "statusLine"} if old is None else {**data, "statusLine": old}
+    copy = None
+    try:
+        copy = statusline_keep(path, raw, STATUSLINE_UNDONE)
+        statusline_write(path, now, raw, mode)
+    except (OSError, ValueError) as e:
+        if copy:
+            copy.unlink(missing_ok=True)
+        say(f"Not changed: {where} could not be written ({getattr(e, 'strerror', None) or type(e).__name__}).")
+        return 1
+    back = (f"the line before it is back, from {home_path(str(before))}: "
+            f"{shown(json.dumps(old, ensure_ascii=False), 200)}" if old is not None
+            else f"it sets no status line now{unread}")
+    say(f"Done: Longhaul's status line is gone from {where}; {back}. The file as it was is kept as "
+        f"{home_path(str(copy))}.")
     return 0
 
 
@@ -9986,15 +10261,10 @@ def doctor_statusline() -> dict:
     if not isinstance(command, str) or not command.strip():
         return doctor_result("not set, so Claude Code's status line shows no account or allowance", mark="warn",
                              step=f"add {DOCTOR_STATUS_LINE} to {where}")
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        words = command.split()
-    at = next((i for i, w in enumerate(words) if re.fullmatch(r"(?:.*/)?longhaul(?:\.py)?", w)), None)
-    if at is None or words[at + 1:at + 2] != ["statusline"]:
+    program = statusline_program(command)
+    if program is None:
         return doctor_result("runs another command, not `longhaul statusline`", mark="warn",
                              step=f"set {DOCTOR_STATUS_LINE} in {where}")
-    program = words[at]
     if "/" in program:
         there = os.path.exists(doctor_expand(program))
     else:
@@ -10495,6 +10765,13 @@ def main(argv: list[str]) -> int:
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
+        if cmd == "statusline":
+            p.add_argument("action", nargs="?", choices=["install", "uninstall"],
+                           help="install: Claude Code's status line set to Longhaul's in settings.json, a copy of "
+                                "the file kept; uninstall: the line before it put back (default: print the status "
+                                "line for the reading on stdin, as Claude Code runs it)")
+            p.add_argument("--yes", action="store_true",
+                           help="install: replace a status line of your own without asking (needed without a terminal)")
         if cmd == "update":
             p.add_argument("action", nargs="?", choices=["status", "on", "off"], default="status",
                            help="status (the default): the running, installed and latest versions, and whether "

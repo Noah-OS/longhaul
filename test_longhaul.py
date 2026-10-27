@@ -14668,6 +14668,322 @@ class AccountCheck(unittest.TestCase):
         self.assertNotIn(self.S, self.log())
 
 
+class StatuslineInstall(unittest.TestCase):
+    """`longhaul statusline install|uninstall` (Sprint 11, I2; the owner's
+    decision 6 of 2026-10-27): the user runs it in a terminal instead of
+    editing settings.json by hand. Install keeps a copy of the file, asks
+    before it replaces a status line of the user's own, writes Longhaul's
+    and test-runs it, putting the file back when the run fails; uninstall
+    puts back the line the copy held. Every path is scratch: HOME (with a
+    fake ~/.local/bin/longhaul), Longhaul's home and Claude Code's folder."""
+
+    LINE = {"type": "command", "command": "~/.local/bin/longhaul statusline"}
+    THEIRS = {"type": "command", "command": "~/bin/my-status --short", "padding": 0}
+    # Prints a status line and keeps what it was given, to be looked at.
+    WORKS = '[ "$1" = statusline ] || exit 9\ncat > "$HOME/sample.json"\nprintf \'\\033[1mmain\\033[0m\\n\'\n'
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.claude = self.user / ".claude"
+        self.claude.mkdir(parents=True)
+        self.path = self.claude / "settings.json"
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude,
+                            "USAGE_DIR": self.home / "usage", "LEDGER": self.home / "ledger.jsonl"}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"LONGHAUL_HOME": str(self.home),
+                                               "LONGHAUL_DEFAULT_CONFIG_DIR": str(self.claude)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)  # put back by the patcher
+        self.launcher()
+
+    def launcher(self, body=WORKS):
+        """The terminal command, a fake at the scratch ~/.local/bin/longhaul."""
+        path = self.user / ".local" / "bin" / "longhaul"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def settings(self, data, mode=0o644, path=None):
+        path = path or self.path
+        path.write_text(data if isinstance(data, str) else json.dumps(data, indent=2) + "\n")
+        path.chmod(mode)
+        return path.read_bytes()
+
+    def run_cli(self, *args, terminal=False, answers=""):
+        """`longhaul statusline ARGS` from a terminal (LONGHAUL_TEST_TTY) or
+        from a script, `answers` typed at its question: the exit code and
+        the output."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(answers)), \
+                mock.patch.dict(os.environ, {"LONGHAUL_TEST_TTY": "1" if terminal else "0"}):
+            code = longhaul.main(["statusline", *args])
+        return code, out.getvalue()
+
+    def copies(self, kind="statusline", folder=None):
+        folder = folder or self.claude
+        return sorted(p for p in folder.iterdir() if p.name.startswith(f"settings.json.before-longhaul-{kind}-"))
+
+    def test_install_keeps_a_copy_and_sets_only_the_status_line(self):
+        before = self.settings({"model": "opus", "env": {"A": "1"}, "theme": "dark", "note": "café"})
+        code, out = self.run_cli("install")
+        self.assertEqual(code, 0, out)
+        text = self.path.read_text(encoding="utf-8")
+        data = json.loads(text)
+        self.assertEqual(data, {"model": "opus", "env": {"A": "1"}, "theme": "dark", "note": "café",
+                                "statusLine": self.LINE})
+        self.assertEqual(list(data), ["model", "env", "theme", "note", "statusLine"], "the order kept")
+        self.assertEqual(text, json.dumps(data, indent=2, ensure_ascii=False) + "\n", "two spaces, its ending kept")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o644, "the file's mode kept")
+        [copy] = self.copies()
+        self.assertRegex(copy.name, r"^settings\.json\.before-longhaul-statusline-\d{8}-\d{6}$")
+        self.assertEqual(copy.read_bytes(), before, "the old file, byte for byte")
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600, "a copy only you can read")
+        self.assertIn("~/.claude/settings.json", out, "which file changed")
+        self.assertIn(f"~/.claude/{copy.name}", out, "where the copy is")
+        self.assertNotIn(str(self.user), out, "home paths shown from ~")
+        # It was test-run as Claude Code runs it: through sh, from this
+        # HOME, with a sample reading on stdin.
+        sample = json.loads((self.user / "sample.json").read_text())
+        self.assertEqual(sample, {"model": {"id": "claude-sample", "display_name": "Sample"},
+                                  "workspace": {"current_dir": os.getcwd()}})
+        self.assertNotIn("session_id", sample, "so the display keeps no ledger row for it")
+        self.assertNotIn("rate_limits", sample)
+        self.assertEqual(longhaul.STATUSLINE_COMMAND, self.LINE["command"])
+        self.assertIn(json.dumps(self.LINE), longhaul.DOCTOR_STATUS_LINE, "the doctor's advice is the same line")
+
+    def test_two_installs_in_one_second_each_keep_their_own_copy(self):
+        self.settings({"statusLine": self.THEIRS})
+        with mock.patch.object(longhaul.time, "strftime", return_value="20261027-120000"):
+            self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+            self.settings({"statusLine": self.THEIRS})
+            self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        self.assertEqual([p.name for p in self.copies()],
+                         ["settings.json.before-longhaul-statusline-20261027-120000",
+                          "settings.json.before-longhaul-statusline-20261027-120000-2"])
+
+    def test_a_status_line_of_your_own_is_shown_and_asked_about_and_a_no_changes_nothing(self):
+        before = self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        for answers in ("n\n", "\n", ""):  # no, the default (No), and the input's end
+            with self.subTest(answers=answers):
+                code, out = self.run_cli("install", terminal=True, answers=answers)
+                self.assertEqual(code, 1, out)
+                self.assertIn("~/bin/my-status --short", out, "the line it would replace, shown")
+                self.assertIn("[y/N]", out, "No is the default")
+                self.assertIn("Not changed", out)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.copies(), [], "no copy for nothing")
+                self.assertFalse((self.user / "sample.json").exists(), "nothing test-run")
+        code, out = self.run_cli("install", terminal=True, answers="y\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.LINE, "theme": "dark"})
+        [copy] = self.copies()
+        self.assertEqual(copy.read_bytes(), before)
+
+    def test_without_a_terminal_it_replaces_a_line_only_with_yes(self):
+        before = self.settings({"statusLine": self.THEIRS})
+        code, out = self.run_cli("install")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--yes", out, "how to do it without a terminal")
+        self.assertIn("~/bin/my-status --short", out)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.copies(), [])
+        code, out = self.run_cli("install", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("[y/N]", out, "not asked")
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.LINE})
+        self.assertEqual(len(self.copies()), 1)
+        # A status line that is null is no line of the user's: nothing to ask.
+        self.settings({"statusLine": None})
+        self.assertEqual(self.run_cli("install")[0], 0)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.LINE})
+
+    def test_a_line_that_is_already_longhauls_is_left_as_it_is(self):
+        for command in (self.LINE["command"], "longhaul statusline", "python3 ~/code/longhaul/longhaul.py statusline"):
+            with self.subTest(command=command):
+                before = self.settings({"statusLine": {"type": "command", "command": command}})
+                code, out = self.run_cli("install", terminal=True, answers="y\n")
+                self.assertEqual(code, 0, out)
+                self.assertIn("already", out)
+                self.assertNotIn("[y/N]", out, "nothing to ask")
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.copies(), [], "no copy")
+
+    def test_a_file_that_is_not_a_json_object_is_refused_and_left_alone(self):
+        for text in ("{not json", "[1, 2]", "", "null"):
+            with self.subTest(text=text):
+                before = self.settings(text)
+                code, out = self.run_cli("install", "--yes")
+                self.assertEqual(code, 2, out)
+                self.assertIn("Not changed", out)
+                self.assertIn("~/.claude/settings.json", out)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.copies(), [])
+                code, out = self.run_cli("uninstall")
+                self.assertEqual(code, 2, out)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(self.copies("uninstall"), [])
+
+    def test_a_missing_file_is_made_with_the_line_alone(self):
+        code, out = self.run_cli("install")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.path.read_text(), json.dumps({"statusLine": self.LINE}, indent=2) + "\n")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "a new file only you can read")
+        self.assertEqual(self.copies(), [], "nothing to keep a copy of")
+
+    def test_the_folder_is_the_chats_own(self):
+        other = self.user / ".claude-pro"
+        other.mkdir()
+        self.settings({"theme": "dark"}, path=other / "settings.json")
+        before = self.settings({"theme": "light"})
+        # Never with a `~`: chat_config_dir() expands it from the real HOME.
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(other)}):
+            code, out = self.run_cli("install")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads((other / "settings.json").read_text()), {"theme": "dark", "statusLine": self.LINE})
+        self.assertEqual(self.path.read_bytes(), before, "the default folder's left alone")
+        self.assertIn("~/.claude-pro/settings.json", out)
+
+    def test_no_terminal_command_is_refused_with_the_line_that_makes_it(self):
+        (self.user / ".local" / "bin" / "longhaul").unlink()
+        (self.user / ".local" / "bin" / "longhaul").symlink_to(self.tmp / "gone")  # a dead link is none either
+        before = self.settings({"theme": "dark"})
+        code, out = self.run_cli("install", "--yes")
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"python3 {longhaul.home_path(str(HERE / 'longhaul.py'))} setup", out)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.copies(), [])
+
+    def test_a_status_line_that_fails_its_test_run_is_undone(self):
+        cases = {"exits 3": ("cat >/dev/null\necho broken >&2\nexit 3\n", "exited 3"),
+                 "prints nothing": ("cat >/dev/null\n", "printed nothing"),
+                 "the fallback": ("cat >/dev/null\necho longhaul\n", "`longhaul`"),
+                 "hangs": ("exec sleep 5\n", "within")}
+        for name, (body, why) in cases.items():
+            for exists in (True, False):
+                with self.subTest(name, exists=exists), mock.patch.object(longhaul, "STATUSLINE_TIMEOUT", 0.5):
+                    self.launcher(body)
+                    self.path.unlink(missing_ok=True)
+                    before = self.settings({"statusLine": self.THEIRS, "theme": "dark"}, mode=0o640) if exists else None
+                    code, out = self.run_cli("install", "--yes")
+                    self.assertEqual(code, 1, out)
+                    self.assertIn(why, out, "why, said")
+                    self.assertIn("Not changed", out)
+                    if exists:
+                        self.assertEqual(self.path.read_bytes(), before, "the old file put back")
+                        self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
+                    else:
+                        self.assertFalse(self.path.exists(), "the file it made, removed")
+                    self.assertEqual(self.copies(), [], "its copy removed with it")
+                    self.assertEqual([p.name for p in self.claude.iterdir()], ["settings.json"] if exists else [])
+
+    def test_the_real_display_passes_the_test_run_and_keeps_no_ledger_row_for_it(self):
+        self.launcher(f'exec "{sys.executable}" "{HERE / "longhaul.py"}" "$@"\n')
+        code, out = self.run_cli("install")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.LINE})
+        self.assertFalse((self.home / "ledger.jsonl").exists(), "the sample has no session id: no row")
+        self.assertNotIn("statusline error", (self.home / "longhaul.log").read_text())
+
+    def test_uninstall_puts_back_the_copys_line_and_keeps_the_rest_as_it_is_now(self):
+        self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        # Changed since the install: what uninstall keeps.
+        now = self.settings({"theme": "light", "statusLine": self.LINE, "model": "opus"}, mode=0o640)
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        data = json.loads(self.path.read_text())
+        self.assertEqual(data, {"theme": "light", "statusLine": self.THEIRS, "model": "opus"})
+        self.assertEqual(list(data), ["theme", "statusLine", "model"])
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o640)
+        [copy] = self.copies("uninstall")
+        self.assertRegex(copy.name, r"^settings\.json\.before-longhaul-uninstall-\d{8}-\d{6}$")
+        self.assertEqual(copy.read_bytes(), now, "the file as it was before uninstall")
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        self.assertIn("~/.claude/settings.json", out)
+        self.assertIn(f"~/.claude/{copy.name}", out)
+        self.assertIn("~/bin/my-status --short", out, "what is back")
+
+    def test_uninstall_takes_the_newest_copy(self):
+        for stamp, command in (("20261020-090000", "old-line"), ("20261027-090000-2", "newest-line"),
+                               ("20261027-090000", "newer-line")):
+            (self.claude / f"settings.json.before-longhaul-statusline-{stamp}").write_text(
+                json.dumps({"statusLine": {"type": "command", "command": command}}))
+        self.settings({"statusLine": self.LINE})
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": {"type": "command", "command": "newest-line"}})
+
+    def test_uninstall_removes_the_key_when_the_copy_had_none_or_there_is_no_copy(self):
+        self.settings({"theme": "dark"})
+        self.assertEqual(self.run_cli("install")[0], 0)
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(self.path.read_text(), json.dumps({"theme": "dark"}, indent=2) + "\n")
+        for name in [p for p in self.claude.iterdir() if p.name != "settings.json"]:
+            name.unlink()
+        self.settings({"statusLine": self.LINE, "theme": "dark"})
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.path.read_text()), {"theme": "dark"}, "no copy: the key removed")
+        self.assertEqual(len(self.copies("uninstall")), 1)
+
+    def test_uninstall_leaves_a_line_that_is_not_longhauls_alone(self):
+        before = self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        (self.claude / "settings.json.before-longhaul-statusline-20261027-090000").write_text("{}")
+        for args in (("uninstall",), ("uninstall", "--yes")):
+            code, out = self.run_cli(*args)
+            self.assertEqual(code, 0, out)
+            self.assertIn("not Longhaul's", out)
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(self.copies("uninstall"), [])
+        self.settings({"theme": "dark"})
+        code, out = self.run_cli("uninstall")
+        self.assertEqual((code, json.loads(self.path.read_text())), (0, {"theme": "dark"}), out)
+        self.path.unlink()
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.path.exists(), "no file made")
+
+    def test_a_linked_settings_file_stays_a_link_and_its_target_changes(self):
+        # The second account's settings.json is a link into ~/.claude (SHARED).
+        other = self.user / ".claude-pro"
+        other.mkdir()
+        before = self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        (other / "settings.json").symlink_to(self.path)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(other)}):
+            code, out = self.run_cli("install", "--yes")
+            self.assertEqual(code, 0, out)
+            self.assertTrue((other / "settings.json").is_symlink(), "still a link")
+            self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.LINE, "theme": "dark"})
+            [copy] = self.copies()
+            self.assertEqual(copy.read_bytes(), before, "the copy beside the file itself")
+            self.assertEqual(self.copies(folder=other), [])
+            self.assertIn("~/.claude/settings.json", out)
+            code, out = self.run_cli("uninstall")
+            self.assertEqual(code, 0, out)
+            self.assertTrue((other / "settings.json").is_symlink(), "still a link")
+            self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.THEIRS, "theme": "dark"})
+
+    def test_the_display_is_as_it_was(self):
+        # What Claude Code runs: no argument, the reading on stdin.
+        reading = {"model": {"id": "claude-sample"}, "workspace": {"current_dir": str(self.tmp)}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(reading))):
+            self.assertEqual(longhaul.main(["statusline"]), 0)
+        self.assertEqual(out.getvalue(), "\033[1mmain\033[0m\n", "no allowance kept here: the account alone")
+        env = {**os.environ, "HOME": str(self.user)}
+        for stdin in (json.dumps(reading), "not json", ""):
+            done = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input=stdin, env=env,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual((done.returncode, done.stderr), (0, ""), stdin)
+            self.assertEqual(done.stdout, "longhaul\n" if stdin == "not json" else "\033[1mmain\033[0m\n", stdin)
+        self.assertFalse(self.path.exists(), "the display writes no settings")
+        self.assertIn("longhaul statusline install|uninstall [--yes]", longhaul.__doc__, "the Usage block names it")
+
+
 class Doctor(unittest.TestCase):
     """`longhaul doctor` and /longhaul:doctor (the owner's decision of
     2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
