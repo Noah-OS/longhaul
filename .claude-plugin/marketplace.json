@@ -8,7 +8,7 @@
     {
       "name": "longhaul",
       "source": "./",
-      "description": "See where your Claude Code sessions' tokens go, and stop the waste; keeps long sessions running across your own subscriptions, opt-in.",
+      "description": "Keep the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or /clear. Shows where the tokens go.",
       "version": "0.2.8"
     }
   ]

@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## 0.2.8 - 2026-10-26
+## 0.2.8 - 2026-10-27
 
 Longhaul hears Claude Code's own word when a turn stops or a chat ends.
 
@@ -13,6 +13,7 @@ Longhaul hears Claude Code's own word when a turn stops or a chat ends.
 
 ### Changed
 
+- **The plugin's description leads with keeping the thread.** `/plugin` showed "See where your Claude Code sessions' tokens go, and stop the waste; keeps long sessions running across your own subscriptions, opt-in." It now shows "Keep the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or /clear. Shows where the tokens go.", and the README opens the same way. Moving a chat to another of your own subscriptions is unchanged and still opt-in; the README's table and the wiki describe it.
 - **The model guide names Fable, narrowly, and a step up after two failures.** Claude was told `haiku`, `sonnet` or `opus` for each subagent. The guide now adds `fable` only for a decision that is hard to undo, the review before a release, or a problem Opus has failed at twice, at most one Fable run per task and with the reason said; and when a run's work fails its tests twice, the next run starts one model higher, not again on the same one. Longhaul still never raises a subagent's model itself, and a cap (`longhaul models cap opus`) still lowers a Fable call. In a models trial only the guided half gets the guide.
 - **Checked on Claude Code 2.1.310.** A live test at a real weekly limit on 2.1.310 saw the limit stop, the question, and a yes carry the chat on on the other account; Claude Code's StopFailure `rate_limit` fired in the same second as the transcript's line, and no quota notification did. `longhaul` no longer says 2.1.304 to 2.1.310 are unchecked.
 
