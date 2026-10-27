@@ -2,6 +2,26 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.2.9 - 2026-10-27
+
+One install, and the reminder that keeps the thread fires after every compaction.
+
+### Added
+
+- **The terminal command without a git clone.** `longhaul setup`, run from the installed plugin, writes a small launcher at `~/.local/bin/longhaul` that runs the newest Longhaul Claude Code has installed (the `installPath` in each Claude config folder's `installed_plugins.json`), so it survives plugin updates. If the plugin is gone it says so in one line: reinstall it. `longhaul doctor` prints the exact line to run. A git clone with `python3 longhaul.py setup` still links the command to the checkout, for working on Longhaul itself.
+- **`longhaul statusline install` and `uninstall`.** Run in a terminal: it backs up `settings.json` beside itself, asks before replacing a status line you already have, test-runs the command and puts everything back if it fails. `uninstall` puts the old status line back. Longhaul never runs either on its own; `longhaul doctor` names `statusline install` as the step when the status line is not Longhaul's.
+- **`longhaul uninstall`, with `--dry-run`.** Lists what Longhaul put outside the plugin (the launcher, the status line, the VS Code wrapper, the auto-update flag) and, without `--dry-run`, asks and removes them; `~/.longhaul` stays unless `--purge`. It then says what stays and how to remove it: the plugin, the code index's lines in `.git/info/exclude`, Trail's hook.
+- **A log line for each compaction.** A `PreCompact` hook writes one line to `~/.longhaul/longhaul.log`: whether you, Claude Code or Longhaul compacted, and how old the checkpoint was. It never blocks a compaction. `longhaul doctor` prints a "# Compact instructions" block to paste into your CLAUDE.md, so Claude Code's own summary keeps the thread too; Longhaul never writes CLAUDE.md.
+- **Why the context reminder fired or not.** Each prompt adds one `reminder check:` line to the same log: the context size read, the threshold, and fired or the reason it did not. Numbers and codes only.
+
+### Changed
+
+- **The Advisor is its own plugin, `longhaul-advisor`,** in the same marketplace: `/longhaul-advisor:advise` and the `longhaul-advisor:advisor` agent. Longhaul alone now adds about 377 tokens to every session, down from about 653; `longhaul-advisor` adds about 291 more where it is installed, and installs Longhaul with it. The experiment stays off under its own rules. A 0.2.8 session's `longhaul:advisor` is still checked as the Advisor.
+
+### Fixed
+
+- **The context reminder went quiet after a compaction.** It is said once per 200k crossing, and the crossing already said survived a compaction; it was forgotten only when a prompt-time reading fell below 100k, which in a long autonomous turn never came. So the 200k crossing after a compaction was skipped and the context grew to 400k before the next save and compaction. It is now forgotten at each compaction.
+
 ## 0.2.8 - 2026-10-27
 
 Longhaul hears Claude Code's own word when a turn stops or a chat ends.

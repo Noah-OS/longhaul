@@ -6450,7 +6450,7 @@ def advisor(opts) -> int:
 # owner's decision of 2026-10-25: before, a conversation told at 800k and
 # compacted near 968k was never told again). Since Sprint 11 (I8) the
 # guard's SessionStart hook forgets it at every compaction too
-# (reminder_forget()): in hermes on 2026-10-26 no prompt's reading fell
+# (reminder_forget()): in a long run on 2026-10-26 no prompt's reading fell
 # under that floor between a compaction and the context's regrowth, so
 # 200k stayed told and the next reminder came at 400k. The guard's PreToolUse hook on Read and Bash says it too
 # (reminder_join(), the owner's second decision of 2026-10-23), so an
@@ -10655,11 +10655,13 @@ def doctor_statusline() -> dict:
     command = dict_at(found, "statusLine").get("command")
     if not isinstance(command, str) or not command.strip():
         return doctor_result("not set, so Claude Code's status line shows no account or allowance", mark="warn",
-                             step=f"add {DOCTOR_STATUS_LINE} to {where}")
+                             step=f"run `longhaul statusline install` in a terminal (or add "
+                                  f"{DOCTOR_STATUS_LINE} to {where} yourself)")
     program = statusline_program(command)
     if program is None:
         return doctor_result("runs another command, not `longhaul statusline`", mark="warn",
-                             step=f"set {DOCTOR_STATUS_LINE} in {where}")
+                             step=f"run `longhaul statusline install` in a terminal, which asks before it "
+                                  f"replaces yours (or set {DOCTOR_STATUS_LINE} in {where} yourself)")
     if "/" in program:
         there = os.path.exists(doctor_expand(program))
     else:

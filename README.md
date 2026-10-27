@@ -64,19 +64,19 @@ Once the plugin is loaded (the next session, or `/reload-plugins`), the guard ru
 
 Run `longhaul doctor` in a terminal (or `/longhaul:doctor` in a chat) to see what's set up and what to do next.
 
-**3. The status line** (optional) needs the terminal command. Keep a checkout, since the command links to it:
+**3. The terminal command and the status line** (optional). `/longhaul:doctor` gives the line to run under *Terminal command*, such as:
 
 ```
-git clone https://github.com/Noah-OS/longhaul.git
-cd longhaul
-python3 longhaul.py setup
+python3 ~/.claude/plugins/cache/longhaul/longhaul/<version>/longhaul.py setup
 ```
 
-Then point the status line at it in your own `~/.claude/settings.json`:
+It writes `~/.local/bin/longhaul`, a short launcher that runs the newest Longhaul Claude Code has installed, so it keeps working after each update. Then, in a terminal:
 
-```json
-"statusLine": {"type": "command", "command": "~/.local/bin/longhaul statusline"}
 ```
+longhaul statusline install
+```
+
+It backs up your `settings.json`, asks before replacing a status line you already have, and checks the command runs; `longhaul statusline uninstall` puts the old one back. `longhaul uninstall --dry-run` lists everything Longhaul put outside the plugin before you remove it. To work on Longhaul itself, a `git clone` and `python3 longhaul.py setup` link the command to your checkout instead.
 
 You need Claude Code and `python3` on your PATH: Python 3.10 or later, nothing pip-installed. Longhaul is built and checked on macOS, and its tests pass on Linux in CI. [Installation](https://github.com/Noah-OS/longhaul/wiki/Installation) has the rest.
 
@@ -103,7 +103,7 @@ The [wiki](https://github.com/Noah-OS/longhaul/wiki) holds the detail:
 
 ## Releases
 
-**0.2.8** (2026-10-27), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.8) · [changelog](CHANGELOG.md). **0.2.7** (2026-10-26): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.7). **0.2.6** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.6). **0.2.5** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.5). **0.2.4** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.4). **0.2.3** (2026-10-24): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.3). **0.2.2** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`, then `/reload-plugins` in a running chat. Longhaul asks GitHub once a day, in the background, whether a newer release is out, and says so when a session starts; the request sends nothing but Longhaul's version number, and `LONGHAUL_UPDATE_CHECK=off` turns it off. Claude Code's own auto-update is off by default for a marketplace like Longhaul's: `longhaul update on` turns it on, after asking (or `/plugin` > Marketplaces > Enable auto-update), and `longhaul update` shows the versions. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
+**0.2.9** (2026-10-27), the latest: [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.9) · [changelog](CHANGELOG.md). **0.2.8** (2026-10-27): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.8). **0.2.7** (2026-10-26): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.7). **0.2.6** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.6). **0.2.5** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.5). **0.2.4** (2026-10-25): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.4). **0.2.3** (2026-10-24): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.3). **0.2.2** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.2). **0.2.1** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.1). **0.2.0** (2026-10-23): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.2.0). **0.1.0** (2026-10-21): [release notes](https://github.com/Noah-OS/longhaul/releases/tag/v0.1.0). Installed copies update when the version changes: `claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`, then `/reload-plugins` in a running chat. Longhaul asks GitHub once a day, in the background, whether a newer release is out, and says so when a session starts; the request sends nothing but Longhaul's version number, and `LONGHAUL_UPDATE_CHECK=off` turns it off. Claude Code's own auto-update is off by default for a marketplace like Longhaul's: `longhaul update on` turns it on, after asking (or `/plugin` > Marketplaces > Enable auto-update), and `longhaul update` shows the versions. What is planned next: [Roadmap](https://github.com/Noah-OS/longhaul/wiki/Roadmap#releases).
 
 ## Development
 
