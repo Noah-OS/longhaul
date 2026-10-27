@@ -16,6 +16,8 @@ import type { Register } from 'claude-code'
 // keeps two compactions of a chat ten minutes apart when a reload of this
 // module has forgotten its own count; a reload forgets a reminder heard too,
 // so it can only miss a compaction, never add one. Any failure shows nothing.
+// Just before /compact, `autocompact-note --before` marks the chat, so the
+// PreCompact hook's log line says Longhaul ran that compaction (Sprint 11, I6).
 
 const TAIL = 65536 // bytes of the log read at most per turn
 const RECENT = 15 * 60 * 1000 // ms of the log a first read takes into account
@@ -98,6 +100,9 @@ async function compact($: any, e: any, sid: string): Promise<void> {
   if (size === undefined) return // due still: the next answered turn has a figure
   armed = due = undefined // before the call: one compaction per reminder, whatever happens
   last[sid] = now
+  try { // the mark for the PreCompact hook: without it, the line says Claude Code's
+    await $.process.run(['python3', '-I', `${$.plugin.root}/longhaul.py`, 'autocompact-note', '--before', sid])
+  } catch {}
   try {
     await $.command.run({ command: 'compact' })
   } catch (err: any) {

@@ -206,7 +206,13 @@ Usage:
                           /compact at the end of the turn in which a chat saved
                           its checkpoint after the reminder: logs it and keeps the
                           time, so a chat compacts at most once in ten minutes;
-                          LONGHAUL_AUTO_COMPACT=off turns the compaction off
+                          LONGHAUL_AUTO_COMPACT=off turns the compaction off.
+                          With --before SID, run just before that /compact, it
+                          marks the chat, for the PreCompact hook, and logs nothing
+  longhaul precompact           the plugin's PreCompact hook: for the main
+                          conversation, logs one line per compaction: its trigger
+                          (manual or auto), who ran it (Longhaul's /compact or
+                          Claude Code) and the checkpoint's age; it never blocks one
   longhaul stop-failure | longhaul quota-note
                           the plugin's StopFailure hook (a turn ended on an API
                           error) and its Notification hook for a wait at a usage
@@ -6855,7 +6861,10 @@ def autocompact_note(opts) -> int:
     day's times kept, older ones dropped). SID must have the session-id
     shape (GUARD_ID) and TOKENS be a whole number of at most 12 digits;
     anything else (or more) does nothing. Exit 0 always: the module shows
-    nothing either way."""
+    nothing either way. With --before SID and nothing else, run just
+    before that /compact, it marks SID instead (autocompact_mark())."""
+    if opts.before is not None:
+        return autocompact_mark(opts.before) if opts.session is None and not opts.rest else 0
     sid, tokens = opts.session, opts.tokens
     if opts.rest or not isinstance(sid, str) or not re.fullmatch(GUARD_ID, sid) \
             or not isinstance(tokens, str) or not re.fullmatch(r"[0-9]{1,12}", tokens):
@@ -6871,6 +6880,120 @@ def autocompact_note(opts) -> int:
             write_json(path, {**kept, sid: int(now)})
     except OSError as e:
         log(f"autocompact: the time of {sid}'s compaction was not kept: {e.strerror or e}")
+    return 0
+
+
+# Each compaction's line (Sprint 11, I6). Claude Code runs its PreCompact
+# hook before every compaction, the trigger manual (/compact) or auto (the
+# auto-compact window, and idle compaction). `longhaul precompact` logs one
+# line for the main conversation (PRECOMPACT_LOGGED): the trigger; by
+# longhaul when this module's /compact ran it, else by claude-code; and how
+# old the session's checkpoint was, in whole seconds, "none" with no file,
+# or "unusable" for one the SessionStart hook would not put back. The
+# module marks its compaction just before /compact (`autocompact-note
+# --before SID`, AUTOCOMPACT_ASKED), and the hook uses the mark up. Of the
+# input only session_id, agent_id, hook_event_name and trigger are read:
+# custom_instructions, the user's words after /compact, is text and is
+# never read, kept or logged. An exit 2 or a "block" would stop the
+# compaction, so the hook prints nothing and exits 0 whatever happens.
+
+AUTOCOMPACT_ASKED = "autocompact-asked.json"  # under LONGHAUL_HOME: {session id: when the module was about to compact it}
+AUTOCOMPACT_ASKED_FRESH = 120  # seconds a mark is good for: /compact's PreCompact hook runs moments after it
+PRECOMPACT_TRIGGERS = ("manual", "auto")  # as the hooks reference lists them; any other is "other"
+PRECOMPACT_LOGGED = "compaction: {sid} trigger={trigger} by={by} checkpoint_age={age}"
+
+
+def autocompact_recent(found, now: float) -> dict:
+    """The marks of AUTOCOMPACT_ASKED under AUTOCOMPACT_KEEP seconds old;
+    anything else in the file (an older mark, junk) goes."""
+    return {k: v for k, v in found.items() if as_number(v) is not None and now - v < AUTOCOMPACT_KEEP} \
+        if isinstance(found, dict) else {}
+
+
+def autocompact_mark(sid) -> int:
+    """`longhaul autocompact-note --before SID`, run by the hooks module
+    just before its /compact of session SID: SID's time in
+    AUTOCOMPACT_ASKED, a file only you can read (a day's marks kept), so
+    the PreCompact hook that follows says Longhaul ran that compaction.
+    It logs nothing: the note after the compaction is the log's line. A
+    SID not of the session-id shape (GUARD_ID) does nothing. Exit 0
+    always."""
+    if not isinstance(sid, str) or not re.fullmatch(GUARD_ID, sid):
+        return 0
+    try:
+        now = time.time()
+        path = LONGHAUL_HOME / AUTOCOMPACT_ASKED
+        with locked("autocompact"):
+            write_json(path, {**autocompact_recent(read_json(path), now), sid: int(now)})
+    except OSError:
+        pass  # no mark: the hook's line says claude-code, and nothing else changes
+    return 0
+
+
+def autocompact_asked(sid: str, now: float) -> bool:
+    """Whether the hooks module marked session `sid` for the compaction
+    about to run: a mark under AUTOCOMPACT_ASKED_FRESH seconds old. The
+    session's mark is used up, fresh or stale, so a later compaction is
+    Claude Code's unless the module marks it again."""
+    path = LONGHAUL_HOME / AUTOCOMPACT_ASKED
+    found = read_json(path)
+    if not isinstance(found, dict) or sid not in found:
+        return False  # the usual compaction: one read, no lock, nothing written
+    with locked("autocompact"):
+        found = read_json(path)
+        found = found if isinstance(found, dict) else {}
+        at = as_number(found.pop(sid, None))
+        write_json(path, autocompact_recent(found, now))
+    return at is not None and 0 <= now - at < AUTOCOMPACT_ASKED_FRESH
+
+
+def precompact_age(sid: str, now: float) -> str:
+    """How old session `sid`'s checkpoint is, for the log: whole seconds;
+    "none" with no file; "unusable" for a file the SessionStart hook would
+    not put back (checkpoint_load()), or could not read."""
+    try:
+        with checkpoint_path(sid).open("rb") as f:
+            raw = f.read(CHECKPOINT_FILE_MAX + 1)  # past the cap it is not read, as the SessionStart hook does
+    except FileNotFoundError:
+        return "none"
+    except OSError:
+        return "unusable"
+    kept, problem = checkpoint_load(raw, sid, now)
+    return "unusable" if problem else str(max(0, int(now - kept["written_at"])))
+
+
+def precompact_note(data, now: float | None = None) -> None:
+    """One PreCompact input logged (PRECOMPACT_LOGGED), for the main
+    conversation of a plain session alone: an input that is not an
+    object, is another event's, names no plain session (GUARD_ID) or is a
+    subagent's (agent_id) logs nothing and leaves the mark. A trigger
+    other than manual or auto (a later version's, or junk) is "other"."""
+    if not isinstance(data, dict) or data.get("hook_event_name") != "PreCompact" or data.get("agent_id") is not None:
+        return
+    sid = data.get("session_id")
+    if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
+        return
+    trigger = data.get("trigger")
+    trigger = trigger if isinstance(trigger, str) and trigger in PRECOMPACT_TRIGGERS else "other"
+    now = time.time() if now is None else now
+    age = precompact_age(sid, now)
+    try:
+        by = "longhaul" if autocompact_asked(sid, now) else "claude-code"
+    except OSError:  # the mark could be neither read under its lock nor used up: not known to be Longhaul's
+        by = "claude-code"
+    log(PRECOMPACT_LOGGED.format(sid=sid, trigger=trigger, by=by, age=age))
+
+
+def precompact(_opts) -> int:
+    """The PreCompact hook command: stdin in, nothing out, exit 0 always,
+    so it never blocks a compaction. An error is logged by its kind alone,
+    as stop_hook() does: the input holds text."""
+    try:
+        raw = sys.stdin.read(STOPS_STDIN_MAX + 1)
+        if len(raw) <= STOPS_STDIN_MAX:
+            precompact_note(json.loads(raw) if raw.strip() else {})
+    except Exception as e:
+        log(f"precompact hook: nothing logged ({type(e).__name__})")
     return 0
 
 
@@ -10780,10 +10903,25 @@ def doctor_lines(checks: list) -> list:
     return lines
 
 
+DOCTOR_COMPACT = ("# Compact instructions",
+                  "When compacting, keep: the goal; the next action; the decisions made and why; the files "
+                  "changed; how to verify the work (the commands and tests).")
+
+
+def doctor_compact_instructions() -> list:
+    """What the doctor prints after the checklist (Sprint 11, I6): a block
+    for the user to paste into their CLAUDE.md, which a compaction reads,
+    asking it to keep what a checkpoint keeps; a blank line first sets it
+    apart. The paste is the user's: Longhaul never writes CLAUDE.md."""
+    return ["", "To keep the thread through a compaction, paste these two lines into your CLAUDE.md "
+                "(Longhaul never writes CLAUDE.md):", *DOCTOR_COMPACT]
+
+
 def doctor(_opts) -> int:
     """`longhaul doctor`: the checklist, read-only; exit 0."""
     for line in doctor_lines(doctor_checks()):
         print(line)
+    print("\n".join(doctor_compact_instructions()))
     return 0
 
 
@@ -10823,7 +10961,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
-                            "vscode", "models", "update", "doctor"):
+                            "vscode", "models", "update", "doctor", "precompact"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -10895,6 +11033,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("session", nargs="?", metavar="SID", help="the session compacted")
             p.add_argument("tokens", nargs="?", metavar="TOKENS", help="its context before, in tokens")
             p.add_argument("rest", nargs="*", help=argparse.SUPPRESS)  # more: nothing is noted
+            p.add_argument("--before", metavar="SID",
+                           help="instead, mark the session about to be compacted, for the PreCompact hook")
         if cmd == "setup":
             p.add_argument("account", nargs="?", help="only this account (default: each one not signed in)")
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
@@ -10904,7 +11044,7 @@ def main(argv: list[str]) -> int:
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
-                "quota-note": quota_note,
+                "quota-note": quota_note, "precompact": precompact,
                 "trial": trial, "update": update, "doctor": doctor}[cmd](opts)
 
     extra: list[str] = []

@@ -6771,9 +6771,9 @@ class Advisor(unittest.TestCase):
         self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]), (5, "Adding the Advisor's note (longhaul advisor)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 12,
-                         "the plugin's seventh hook, the reminder's, the account check's, the stops' two and "
-                         "SessionEnd's (Sprint 10)")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 13,
+                         "the plugin's seventh hook, the reminder's, the account check's, the stops' two, "
+                         "SessionEnd's (Sprint 10) and PreCompact's (Sprint 11)")
         # Off, the hook costs Python's start alone: the switch is read before
         # longhaul is imported.
         wrapper = handler["args"][2]
@@ -7338,10 +7338,11 @@ class Checkpoint(unittest.TestCase):
 
     def test_the_plugin_registers_the_guard_for_startup_and_compaction_and_the_checkpoint_for_compaction_clear_and_resume(self):
         hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())
-        # StopFailure and Notification (Sprint 10) are pinned in Stops, SessionEnd's (L2) in SessionEnd.
+        # StopFailure and Notification (Sprint 10) are pinned in Stops, SessionEnd's (L2) in SessionEnd,
+        # PreCompact's (Sprint 11, I6) in PreCompact.
         self.assertEqual(set(hooks["hooks"]), {"PreToolUse", "SessionStart", "PostToolUse", "UserPromptSubmit",
-                                               "StopFailure", "Notification", "SessionEnd"},
-                         "these seven events and nothing else")
+                                               "StopFailure", "Notification", "SessionEnd", "PreCompact"},
+                         "these eight events and nothing else")
         # The Advisor's two entries on Agent, Task, SendMessage and Workflow
         # (Sprint 8) and its note on UserPromptSubmit are pinned in Advisor.
         self.assertEqual([entry["matcher"] for entry in hooks["hooks"]["PreToolUse"]],
@@ -8009,7 +8010,9 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.startswith("Longhaul "), out.stdout)
         self.assertIn("Chats running now: none running", out.stdout)
-        self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 10 set up\. Next: ")
+        # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
+        self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
+                         r"^\d+ of 10 set up\. Next: ")
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
         for args in (("doctor", "--fix"), ("doctor", "-h")):  # nothing after it: the skill's rule names it alone
             out = self.shim(*args, **env)
@@ -8756,9 +8759,9 @@ class Reminder(unittest.TestCase):
         self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
         self.assertEqual((handler["timeout"], handler["statusMessage"]),
                          (5, "Checking the context's size (longhaul checkpoint)"))
-        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 12,
-                         "the plugin's eighth hook, the account check's (2026-10-25), the stops' two and "
-                         "SessionEnd's (Sprint 10)")
+        self.assertEqual(sum(len(e["hooks"]) for entries in hooks.values() for e in entries), 13,
+                         "the plugin's eighth hook, the account check's (2026-10-25), the stops' two, "
+                         "SessionEnd's (Sprint 10) and PreCompact's (Sprint 11)")
         # An exit 2 on UserPromptSubmit blocks the prompt: whatever longhaul
         # does, BaseException included, the wrapper exits 0.
         wrapper = handler["args"][2]
@@ -13927,9 +13930,12 @@ class Autocompact(unittest.TestCase):
         for banned in ("$.fs.write", "fetch(", "$.http", "XMLHttpRequest", "$.model", "$.tool", "$.agent",
                        "$.prompt", "$.session.compact", "$.env.set"):
             self.assertNotIn(banned, source, banned)
+        # The note's mark just before /compact (Sprint 11, I6), for the PreCompact hook, then the note.
         self.assertEqual(re.findall(r"\$\.process\.run\(\[([^\]]*)\]", source),
                          ["'tail', '-c', String(take), path",
+                          "'python3', '-I', `${$.plugin.root}/longhaul.py`, 'autocompact-note', '--before', sid",
                           "'python3', '-I', `${$.plugin.root}/longhaul.py`, 'autocompact-note', sid, String(size)"])
+        self.assertLess(source.index("'--before', sid"), source.index("$.command.run("), "the mark comes first")
         self.assertEqual(re.findall(r"\$\.command\.run\(([^)]*)\)", source), ["{ command: 'compact' }"])
         self.assertIn("$.env.get('LONGHAUL_AUTO_COMPACT')", source)
         self.assertIn("longhaul.log", source)
@@ -14304,6 +14310,307 @@ class Stops(unittest.TestCase):
             self.assertEqual((out.returncode, out.stdout), (2, ""), command)
             self.assertIn("run it in a terminal", out.stderr)
         self.assertFalse(self.home.exists(), "nothing was written")
+
+
+class PreCompact(unittest.TestCase):
+    """`longhaul precompact` (Sprint 11, I6): Claude Code's PreCompact hook,
+    run before each compaction, manual (/compact) or auto (the auto-compact
+    window, or idle compaction). For the main conversation it logs one
+    line: the trigger, who ran the compaction (Longhaul's own /compact,
+    which hooks/autocompact.ts marks just before with `autocompact-note
+    --before SID`, or Claude Code) and how old the session's checkpoint is.
+    Ids, codes and numbers only: custom_instructions is the user's text
+    and is never read. It never blocks a compaction: nothing printed, exit
+    0. And `longhaul doctor` prints a "# Compact instructions" block for
+    the user to paste into CLAUDE.md, which Longhaul never writes."""
+
+    S = "SENTINEL-NARWHAL-4410"
+    SID = "fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6"
+    OTHER = "0b0e5c1a-7d3f-4c2e-9a61-2f4d8e6b1c90"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")
+                    and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+
+    def tearDown(self):
+        longhaul.LONGHAUL_HOME = self.saved
+
+    def compaction(self, trigger="auto", sid=None, **fields):
+        """A PreCompact input as the hooks reference gives it, its custom_instructions holding S."""
+        return {"session_id": sid or self.SID, "transcript_path": str(self.tmp / f"{sid or self.SID}.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "PreCompact", "trigger": trigger,
+                "custom_instructions": f"keep the parser's plan ({self.S})", **fields}
+
+    def send(self, data):
+        """`longhaul precompact` in this process with `data` (an input, or its raw text) on stdin: what it printed."""
+        raw = data if isinstance(data, str) else json.dumps(data)
+        with mock.patch.object(sys, "stdin", io.StringIO(raw)), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = longhaul.main(["precompact"])
+        self.assertEqual(code, 0)
+        return out.getvalue() + err.getvalue()
+
+    def mark(self, *args):
+        """`longhaul autocompact-note --before ARGS` in this process: its exit code and what it printed."""
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = longhaul.main(["autocompact-note", "--before", *(args or (self.SID,))])
+        return code, out.getvalue() + err.getvalue()
+
+    def asked(self):
+        path = self.home / longhaul.AUTOCOMPACT_ASKED
+        return json.loads(path.read_text()) if path.is_file() else None
+
+    def log(self) -> str:
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def logged(self) -> list:
+        """The compactions' log lines, without their time stamps."""
+        return [line[20:] for line in self.log().splitlines() if line[20:].startswith("compaction:")]
+
+    def line(self, trigger="auto", by="claude-code", age="none", sid=None):
+        return f"compaction: {sid or self.SID} trigger={trigger} by={by} checkpoint_age={age}"
+
+    def checkpoint(self, age=None, sid=None) -> Path:
+        """A checkpoint saved for the session as /longhaul:checkpoint saves it, `age` seconds old when given."""
+        sid = sid or self.SID
+        state = json.dumps({"goal": "finish the parser", "next_action": "run the tests"})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(longhaul.checkpoint_save(sid, state, str(self.tmp), None), 0)
+        path = longhaul.checkpoint_path(sid)
+        if age is not None:
+            kept = json.loads(path.read_text())
+            path.write_text(json.dumps({**kept, "written_at": time.time() - age}))
+        return path
+
+    def everything(self) -> str:
+        """Every file under LONGHAUL_HOME, as text."""
+        return "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+
+    def hook(self, root=None):
+        """The hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""
+        cmd = registered_hook("PreCompact", "precompact")
+        return cmd if root is None else [*cmd[:-1], str(root)]
+
+    def run_hook(self, cmd, data):
+        raw = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.run(cmd, input=raw, env=self.env, cwd=self.tmp, capture_output=True, text=True, timeout=30)
+
+    def test_the_plugin_registers_the_hook_for_every_trigger_and_it_never_blocks(self):
+        hooks = json.loads((HERE / "hooks" / "hooks.json").read_text())["hooks"]
+        [entry] = hooks["PreCompact"]
+        self.assertNotIn("matcher", entry, "manual and auto both: the hook sorts them")
+        [handler] = entry["hooks"]
+        self.assertEqual((handler["type"], handler["command"]), ("command", "python3"))
+        self.assertEqual((handler["args"][:2], handler["args"][3:]), (["-I", "-c"], ["${CLAUDE_PLUGIN_ROOT}"]))
+        self.assertEqual((handler["timeout"], handler["statusMessage"]),
+                         (5, "Noting a compaction (longhaul checkpoint)"))
+        # An exit 2 or a "block" blocks the compaction: the reminder's
+        # wrapper with this command, which exits 0 whatever longhaul does,
+        # BaseException included, and prints nothing of its own.
+        reminder = hooks["UserPromptSubmit"][1]["hooks"][0]
+        self.assertEqual(handler["args"][2], reminder["args"][2].replace("'reminder'", "'precompact'"))
+        self.assertTrue(handler["args"][2].endswith("\nsys.exit(0)"))
+        self.assertEqual(self.hook()[1:-1], handler["args"][:-1], "the tests run the hook as the plugin does")
+        out = self.run_hook(self.hook(), self.compaction("manual"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertEqual(self.logged(), [self.line("manual")])
+        roots = {"broken": "raise ImportError('a half-installed plugin')\n",
+                 "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n",
+                 "exits": "def main(argv):\n    raise SystemExit(2)\n", "returns": "def main(argv):\n    return 2\n",
+                 "interrupted": "def main(argv):\n    raise KeyboardInterrupt\n", "missing": None}
+        for name, source in roots.items():
+            root = self.tmp / "roots" / name
+            if source:
+                root.mkdir(parents=True)
+                (root / "longhaul.py").write_text(source)
+            out = self.run_hook(self.hook(root), self.compaction())
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), name)
+        for raw in ("", "not json {", "[1]", "null", '"PreCompact"', json.dumps(self.compaction(
+                custom_instructions=self.S * 60_000))):
+            out = self.run_hook(self.hook(), raw)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""), raw[:40])
+        self.assertEqual(len(self.logged()), 1, "the one real input alone")
+        # In this process too, an error inside is a line naming its kind and nothing printed.
+        with mock.patch.object(longhaul, "precompact_age", side_effect=RuntimeError(self.S)):
+            self.assertEqual(self.send(self.compaction()), "")
+        self.assertIn("precompact hook: nothing logged (RuntimeError)", self.log())
+        self.assertEqual(len(self.logged()), 1)
+        self.assertNotIn(self.S, self.everything())
+
+    def test_a_compaction_claude_code_ran_says_its_trigger_and_by_claude_code(self):
+        for trigger in ("auto", "manual"):
+            self.assertEqual(self.send(self.compaction(trigger)), "")
+        # A trigger of a later version's, or junk, is "other": never its text.
+        for trigger in ("idle", self.S, None, 5, ["auto"], {"auto": 1}):
+            self.send(self.compaction(trigger))
+        self.send({k: v for k, v in self.compaction().items() if k != "trigger"})
+        self.assertEqual(self.logged(), [self.line("auto"), self.line("manual")] + [self.line("other")] * 7)
+        self.assertIsNone(self.asked(), "no mark made or needed")
+
+    def test_longhauls_own_compaction_says_by_longhaul_and_uses_its_mark_up(self):
+        self.assertEqual(self.mark(), (0, ""))
+        self.assertEqual(self.log(), "", "the mark logs nothing: the note after the compaction is the line")
+        self.assertEqual(set(self.asked()), {self.SID})
+        self.assertEqual(self.send(self.compaction("manual")), "")
+        self.assertEqual(self.logged(), [self.line("manual", "longhaul")])
+        self.assertEqual(self.asked(), {}, "used up")
+        # The next compaction, unmarked, is Claude Code's.
+        self.send(self.compaction("auto"))
+        self.assertEqual(self.logged(), [self.line("manual", "longhaul"), self.line("auto")])
+
+    def test_a_stale_mark_or_another_sessions_is_not_longhauls(self):
+        self.home.mkdir()
+        now = time.time()
+        path = self.home / longhaul.AUTOCOMPACT_ASKED
+        path.write_text(json.dumps({self.SID: now - longhaul.AUTOCOMPACT_ASKED_FRESH - 2, self.OTHER: now}))
+        self.send(self.compaction())
+        self.assertEqual(self.logged(), [self.line()], "two minutes on, the mark is not this compaction's")
+        self.assertEqual(set(self.asked()), {self.OTHER}, "the stale mark goes, another session's stays")
+        self.mark(self.OTHER)
+        self.send(self.compaction())
+        self.assertEqual(self.logged()[-1], self.line(), "another session's mark is its own")
+        self.send(self.compaction(sid=self.OTHER))
+        self.assertEqual(self.logged()[-1], self.line(by="longhaul", sid=self.OTHER))
+        # A mark from the future (a clock set back) or junk is no mark, and goes.
+        path.write_text(json.dumps({self.SID: now + 3_600}))
+        self.send(self.compaction())
+        path.write_text(json.dumps({self.SID: "now"}))
+        self.send(self.compaction())
+        self.assertEqual(self.logged()[-2:], [self.line()] * 2)
+        self.assertEqual(self.asked(), {})
+        path.write_text("[not an object")
+        self.send(self.compaction())
+        self.assertEqual(self.logged()[-1], self.line())
+
+    def test_the_mark_keeps_a_day_and_bad_arguments_make_none(self):
+        record = self.home / longhaul.AUTOCOMPACT_ASKED
+        for args in (("not an id",), ("a/b",), ("x" * 101,), ("",), (self.SID, "5"), (self.SID, self.SID, "5"),
+                     (self.SID, "5", "extra")):
+            self.assertEqual(self.mark(*args), (0, ""), args)
+        self.assertFalse(self.home.exists(), "no record, no log")
+        self.home.mkdir()
+        now = time.time()
+        record.write_text(json.dumps({"old-chat": now - 90_000, "recent-chat": now - 3_600, "junk": "x"}))
+        self.assertEqual(self.mark(), (0, ""))
+        kept = self.asked()
+        self.assertEqual(set(kept), {"recent-chat", self.SID}, "a day's marks are kept, older ones and junk go")
+        self.assertAlmostEqual(kept[self.SID], now, delta=5)
+        self.assertIsInstance(kept[self.SID], int, "whole seconds")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600, "private, like the rest of the home")
+        self.assertFalse((self.home / longhaul.AUTOCOMPACT_RECORD).exists(), "the mark is not the note's record")
+        self.assertEqual(self.log(), "")
+
+    def test_the_checkpoint_age_is_whole_seconds_or_none_or_unusable(self):
+        self.send(self.compaction())
+        self.assertEqual(self.logged(), [self.line(age="none")], "no checkpoint saved")
+        path = self.checkpoint(age=3_612.4)
+        now = json.loads(path.read_text())["written_at"] + 3_612.9
+        with contextlib.redirect_stderr(io.StringIO()):
+            longhaul.precompact_note(self.compaction(), now)
+        self.assertEqual(self.logged()[-1], self.line(age="3612"))
+        self.checkpoint()
+        self.send(self.compaction())
+        self.assertRegex(self.logged()[-1], r" checkpoint_age=[01]$", "just saved")
+        # Unusable: a file the SessionStart hook would not put back.
+        kept = json.loads(path.read_text())
+        for name, text in (("half-written", path.read_text()[:40]), ("another session's", json.dumps(
+                {**kept, "session_id": self.OTHER})), ("a later schema", json.dumps({**kept, "schema_version": 2})),
+                ("too big", json.dumps({**kept, "pad": " " * longhaul.CHECKPOINT_FILE_MAX})),
+                ("no goal", json.dumps({k: v for k, v in kept.items() if k != "goal"}))):
+            path.write_text(text)
+            self.send(self.compaction())
+            self.assertEqual(self.logged()[-1], self.line(age="unusable"), name)
+        path.unlink()
+        path.mkdir()
+        self.send(self.compaction())
+        self.assertEqual(self.logged()[-1], self.line(age="unusable"), "not a file")
+        self.assertNotIn("parser", self.log(), "the checkpoint's text is never logged")
+
+    def test_a_subagents_compaction_and_any_other_input_log_nothing(self):
+        self.mark()
+        self.send(self.compaction(agent_id="a0123456789abcdef", agent_type="Explore"))
+        self.assertEqual(self.logged(), [])
+        self.assertEqual(set(self.asked()), {self.SID}, "a subagent's compaction leaves the chat's mark")
+        for sid in ("a/b", "", "x" * 101, f"{self.SID} trigger=manual"):
+            self.send({**self.compaction(), "session_id": sid})
+        for junk in ({**self.compaction(), "session_id": None}, {**self.compaction(), "session_id": 5},
+                     {**self.compaction(), "hook_event_name": "SessionStart"},
+                     {k: v for k, v in self.compaction().items() if k != "hook_event_name"},
+                     {k: v for k, v in self.compaction().items() if k != "session_id"}):
+            self.send(junk)
+        for raw in ("", "not json {", "[1]", "null", "7", '"PreCompact"',
+                    json.dumps(self.compaction(custom_instructions="x" * longhaul.STOPS_STDIN_MAX))):
+            self.assertEqual(self.send(raw), "", raw[:40])
+        self.assertEqual(self.logged(), [])
+        self.assertEqual(set(self.asked()), {self.SID}, "still the chat's")
+        self.send(self.compaction(agent_id=None))
+        self.assertEqual(self.logged(), [self.line(by="longhaul")], "agent_id null: the main conversation")
+
+    def test_custom_instructions_and_the_inputs_text_are_never_logged_or_kept(self):
+        self.checkpoint()
+        self.mark()
+        for trigger in ("manual", "auto", self.S):
+            self.send(self.compaction(trigger, transcript_path=str(self.tmp / f"{self.S}.jsonl"),
+                                      cwd=str(self.tmp / self.S), permission_mode=self.S))
+        self.assertEqual(len(self.logged()), 3)
+        self.assertNotIn(self.S, self.everything())
+        self.assertNotIn("parser's plan", self.everything())
+        # Never even read: the code names the field nowhere.
+        import inspect
+        source = inspect.getsource(longhaul.precompact) + inspect.getsource(longhaul.precompact_note)
+        self.assertNotIn("custom_instructions", source)
+
+    def test_the_usage_block_names_it_and_the_shim_refuses_it(self):
+        # The hook and the module run longhaul.py themselves; bin/longhaul,
+        # what the model may run, is the owner's boundary and stays as it was.
+        self.assertIn("longhaul precompact", longhaul.__doc__)
+        self.assertIn("--before SID", longhaul.__doc__)
+        shim = (HERE / "bin" / "longhaul").read_text()
+        self.assertNotIn("precompact", shim)
+        for args in (["precompact"], ["autocompact-note", "--before", self.SID]):
+            out = subprocess.run([str(HERE / "bin" / "longhaul"), *args], input=json.dumps(self.compaction()),
+                                 capture_output=True, text=True, env=self.env, timeout=30)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("run it in a terminal", out.stderr)
+        self.assertFalse(self.home.exists(), "nothing was written")
+
+    def test_doctor_prints_the_compact_instructions_last_and_writes_no_claude_md(self):
+        block = longhaul.doctor_compact_instructions()
+        self.assertEqual(block[0], "", "a blank line sets it apart from the checklist")
+        self.assertIn("CLAUDE.md", block[1])
+        self.assertIn("Longhaul never writes CLAUDE.md", block[1])
+        self.assertEqual(block[2:], ["# Compact instructions",
+                                     "When compacting, keep: the goal; the next action; the decisions made and why; "
+                                     "the files changed; how to verify the work (the commands and tests)."])
+        # The doctor as the terminal runs it, every path scratch, in a project folder.
+        fake, user, project = self.tmp / "fakes", self.tmp / "user", self.tmp / "project"
+        for folder in (fake, user / ".claude", project):
+            folder.mkdir(parents=True)
+        for name in ("ps", "lsof"):  # the process list is never the real one
+            (fake / name).write_text("#!/bin/sh\nexit 0\n")
+            (fake / name).chmod(0o755)
+        env = {k: v for k, v in self.env.items() if not k.startswith("LONGHAUL_")
+               and k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        env.update(PATH=f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", HOME=str(user), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(user / ".claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(user / ".claude.json"),
+                   LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "doctor"], env=env, cwd=project,
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertEqual(lines[-len(block):], block)
+        self.assertRegex(lines[-len(block) - 1], r"^\d+ of 10 set up\. Next: ", "after the checklist's count")
+        self.assertEqual(out.stdout.count("# Compact instructions"), 1)
+        self.assertEqual(list(self.tmp.rglob("CLAUDE.md")), [], "printed, never written")
+        self.assertFalse(self.home.exists(), "the doctor writes nothing")
 
 
 class Accounts(unittest.TestCase):
@@ -15820,10 +16127,14 @@ class Doctor(unittest.TestCase):
     # ---------------------------------------------------- the whole checklist
 
     def doctor(self, processes=()):
+        """`longhaul doctor` in this process: its exit code and the checklist's lines. The compact
+        instructions printed after the checklist (Sprint 11, I6) are checked and set aside."""
         with mock.patch.object(longhaul, "doctor_processes", return_value=list(processes)), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             code = longhaul.main(["doctor"])
-        return code, out.getvalue().splitlines()
+        lines, block = out.getvalue().splitlines(), longhaul.doctor_compact_instructions()
+        self.assertEqual(lines[-len(block):], block, "the compact instructions come last")
+        return code, lines[:-len(block)]
 
     def test_the_last_line_counts_what_is_set_up_and_names_the_first_next_step(self):
         before = sorted(self.home.rglob("*"))
@@ -15879,7 +16190,9 @@ class Doctor(unittest.TestCase):
                                  text=True, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("Chats running now: none running", out.stdout)
-            self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 10 set up\. Next: ")
+            # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
+            self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
+                             r"^\d+ of 10 set up\. Next: ")
             self.assertFalse(home.exists(), "nothing written")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
                              timeout=60)

@@ -153,6 +153,19 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "-c", "import sys\ntry:\n    sys.path.insert(0, sys.argv[1]); import longhaul; longhaul.main(['precompact'])\nexcept BaseException:\n    pass\nsys.exit(0)", "${CLAUDE_PLUGIN_ROOT}"],
+            "timeout": 5,
+            "statusMessage": "Noting a compaction (longhaul checkpoint)"
+          }
+        ]
+      }
     ]
   }
 }

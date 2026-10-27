@@ -20,6 +20,7 @@ type World = {
   refuse: boolean
   commands: string[]
   notes: string[][]
+  order: string[] // the notes' arguments and /compact, in the order they ran
   toasts: string[]
   clock: ReturnType<typeof mock.clock>
 }
@@ -28,7 +29,7 @@ type World = {
 // session, the programs run (tail on the log, the note), /compact, pop-ups.
 function world(on: any, env: Record<string, string> = {}): World {
   const w: World = { log: '2026-10-25 11:00:00 index: started codegraph init in ~/p (pid 1)\n', live: 612_345,
-    refuse: false, commands: [], notes: [], toasts: [], clock: mock.clock(on, { now: NOW }) }
+    refuse: false, commands: [], notes: [], order: [], toasts: [], clock: mock.clock(on, { now: NOW }) }
   mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home', ...env })
   on('session.id', () => ({ value: SID }))
   on('session.usage', () => ({ value: { startedAt: NOW - 3_600_000, rateLimits: [],
@@ -40,12 +41,13 @@ function world(on: any, env: Record<string, string> = {}): World {
     const argv: string[] = [...e.argv]
     const ran = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
     if (argv[0] === 'tail' && argv[1] === '-c' && argv[3] === LOG) return { value: { ...ran, stdout: w.log.slice(-Number(argv[2])) } }
-    if (argv[0] === 'python3') { w.notes.push(argv); return { value: ran } }
+    if (argv[0] === 'python3') { w.notes.push(argv); w.order.push(argv.slice(3).join(' ')); return { value: ran } }
     return { deny: 'not run here' }
   })
   on('command.run', ($: any, e: any) => {
     if (w.refuse) throw new Error('refused')
     w.commands.push(e.command)
+    w.order.push(`/${e.command}`)
     return { text: 'Compacted' }
   })
   on('ui.toast', ($: any, e: any) => { w.toasts.push(e.text); return { value: undefined } })
@@ -81,11 +83,15 @@ test('a reminder, then this chat\'s save, compacts it once at the end of the tur
   await turn($)
   expect(w.commands).toEqual(['compact'])
   expect(compacted(w)).toEqual([TOAST])
-  expect(w.notes).toHaveLength(1)
-  const [python, isolated, script, ...rest] = w.notes[0]!
-  expect([python, isolated]).toEqual(['python3', '-I'])
-  expect(script).toMatch(/^\/.*\/longhaul\.py$/)
-  expect(rest).toEqual(['autocompact-note', SID, '612345'])
+  // The mark just before /compact, for the PreCompact hook's line (Sprint 11, I6), then the note.
+  expect(w.notes).toHaveLength(2)
+  for (const note of w.notes) {
+    const [python, isolated, script] = note
+    expect([python, isolated]).toEqual(['python3', '-I'])
+    expect(script).toMatch(/^\/.*\/longhaul\.py$/)
+  }
+  expect(w.order).toEqual([`autocompact-note --before ${SID}`, '/compact', `autocompact-note ${SID} 612345`])
+  expect(w.notes[1]!.slice(3)).toEqual(['autocompact-note', SID, '612345'])
   await turn($)
   await turn($)
   expect(w.commands).toEqual(['compact'])
@@ -175,7 +181,8 @@ test('a refused /compact shows nothing and logs nothing', async ($, on) => {
   line(w, saved())
   await turn($)
   expect(w.commands).toEqual([])
-  expect(w.notes).toEqual([])
+  // The mark before it alone, which logs nothing; no note.
+  expect(w.order).toEqual([`autocompact-note --before ${SID}`])
   expect(compacted(w)).toEqual([])
   // Disarmed: the same save does not try again at the next turn.
   w.refuse = false
@@ -229,7 +236,7 @@ test('without the live window\'s figure the turn\'s own usage counts', async ($,
   await turn($)
   expect(w.commands).toEqual(['compact'])
   expect(compacted(w)).toEqual(['Longhaul: compacted this chat after its checkpoint (602k tokens); the checkpoint comes back now.'])
-  expect(w.notes[0]!.slice(-1)).toEqual(['602006'])
+  expect(w.notes[1]!.slice(-1)).toEqual(['602006']) // the note, after the mark
 })
 
 // A first read after a load (a start, or /reload-plugins) takes the last
