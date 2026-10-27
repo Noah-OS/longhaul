@@ -2787,6 +2787,85 @@ def program(command) -> str:
     return "?"
 
 
+def bash_reads(command, cwd) -> list:
+    """The files a Bash command prints, whole or in part (inferred): the
+    file arguments of cat, head, tail, nl or sed (not sed -i) in each step
+    joined by &&, ||, ; or a new line, after a `cd` among those steps. A
+    step with a pipe, a redirection or a subshell is left alone, as is a
+    word with a variable or a quote the shell could not close, and what
+    follows a heredoc. A relative path needs the folder the command ran
+    in, `cwd`. Only the paths are kept, never the command."""
+    text = str(command)
+    if "<<" in text:  # a heredoc's body is data, not steps
+        end = text.find("\n", text.find("<<"))
+        text = text if end < 0 else text[:end]
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace, lex.whitespace_split = " \t\r", True
+        words = list(lex)
+    except ValueError:
+        return []
+    steps, step, plain = [], [], True
+    for word in words + [";"]:
+        if word and set(word) <= set(";&|\n") and word not in ("|", "|&"):
+            if plain:
+                steps.append(step)
+            step, plain = [], True
+        elif set(word) <= set("();<>|&\n"):
+            plain = False  # a pipe, a redirection or a subshell
+        else:
+            step.append(word)
+
+    def resolve(word):
+        if "$" in word or "`" in word:
+            return None
+        if word == "~" or word.startswith("~/"):
+            word = str(HOME / word[2:])
+        if not os.path.isabs(word):
+            word = os.path.join(cwd, word) if cwd else ""
+        return os.path.normpath(word) if word else None
+
+    found = []
+    for step in steps:
+        while step and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", step[0]):
+            step = step[1:]
+        if not step:
+            continue
+        name, args = step[0].rsplit("/", 1)[-1], step[1:]
+        if name == "cd":  # `cd -` and `cd a b` go where this cannot follow
+            cwd = resolve(args[0] if args else "~") if len(args) <= 1 and args[:1] != ["-"] else None
+            continue
+        files = []
+        if name in ("cat", "nl"):
+            files = [a for a in args if not a.startswith("-")]
+        elif name in ("head", "tail"):
+            skip = False
+            for a in args:
+                if skip:
+                    skip = False
+                elif a in ("-n", "-c"):
+                    skip = True
+                elif not a.startswith("-"):
+                    files.append(a)
+        elif name == "sed":
+            script, rest = False, iter(args)
+            for a in rest:
+                if a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a):
+                    files = []
+                    break  # an edit, not a read
+                if a in ("-e", "-f", "--expression", "--file"):
+                    script = True
+                    next(rest, None)
+                elif a.startswith(("--expression=", "--file=")):
+                    script = True
+                elif not a.startswith("-"):
+                    files.append(a)
+            else:
+                files = files if script else files[1:]
+        found.extend(p for p in map(resolve, files) if p)
+    return found[:20]
+
+
 def shown(text, limit: int = 300) -> str:
     """Text from a transcript, safe to print: no control characters, which
     could move or retitle the terminal, and not too long."""
@@ -3065,6 +3144,59 @@ def cache_ttl(usage: dict, scope: str) -> str:
     return "5m" if scope == "subagents" else "1h"
 
 
+MEMORY_LOADED = (200, 25 * 1024)  # MEMORY.md's first lines and bytes loaded at a session's start (Claude Code's docs)
+NAMED_PATH = re.compile(r"`([~/][^`\s]*)`|\]\(([~/][^)\s]*)\)")  # a path in backquotes or a Markdown link
+
+
+def memory_health(path: Path, cwd) -> dict:
+    """What Claude Code loads at a session's start for the conversation in
+    `path`, as the files stand now (caveman's memory doctor, rebuilt): its
+    project's MEMORY.md, with the lines past its load limit; the user's
+    CLAUDE.md and those from the conversation's folder up, by lines; and
+    the absolute or ~ paths they and the memory name in backquotes or links
+    that are gone. A one-part path (`/compact`) is a command, and one whose
+    top folder this machine has not (`/api/...`) is not a file of it.
+    Sizes and paths only, never the text."""
+    memory = path.parent / "memory"
+    files = [path.parents[2] / "CLAUDE.md"] if path.parent.parent.name == "projects" else []
+    if isinstance(cwd, str) and os.path.isabs(cwd):  # .claude/CLAUDE.md is the folder's own, not its parents'
+        files.append(Path(cwd) / ".claude" / "CLAUDE.md")
+        for folder in [Path(cwd), *Path(cwd).parents]:
+            files += [folder / "CLAUDE.md", folder / "CLAUDE.local.md"]
+    files = list(dict.fromkeys(f for f in files if f.is_file()))  # the user's, met again from a folder in home
+    notes = sorted(memory.glob("*.md"))[:500] if memory.is_dir() else []
+    index = None
+    named, missing = [], []
+    for f in files + notes:
+        try:
+            text = f.read_bytes()[:512 * 1024].decode(errors="replace")
+        except OSError:
+            continue
+        name = f"memory/{f.name}" if f.parent == memory else home_path(str(f))
+        if f.parent == memory and f.name == "MEMORY.md":
+            lines, total, loaded = text.splitlines(keepends=True), 0, 0
+            for line in lines[:MEMORY_LOADED[0]]:
+                total += len(line.encode())
+                if total > MEMORY_LOADED[1]:
+                    break
+                loaded += 1
+            index = {"lines": len(lines), "bytes": len(text.encode()), "unloaded": len(lines) - loaded}
+        elif f.parent != memory:
+            named.append({"path": name, "lines": len(text.splitlines())})
+        for match in NAMED_PATH.finditer(text):
+            word = re.sub(r"(:\d+(:\d+)?|#L\d+(-L?\d+)?)$", "", match.group(1) or match.group(2))
+            if re.search(r"[<>{}*?$\[\]|()@=,;\"'\\:]", word):
+                continue
+            full = str(HOME / word[2:]) if word.startswith("~/") else word
+            if word.startswith("~") and not word.startswith("~/") or full.count("/") < 2:
+                continue
+            if not os.path.isdir("/" + full.split("/")[1]):
+                continue  # not this machine's: a URL's path, a container's
+            if not os.path.exists(full):
+                missing.append({"in": name, "path": home_path(full)})
+    return {"index": index, "files": named, "missing": missing}
+
+
 def text_from(path: Path, offset: int = 0):
     """The file open as text, a bad byte replaced, read from byte `offset`
     on: the start of a line, as trial_scan() finds it, so that the text
@@ -3101,6 +3233,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     # A response that followed a message (a user line with no tool result: a prompt, the coordinator's, an
     # interruption) is in `heard`; `told` holds the files with a message not yet followed by one.
     order, began, ended, owner, called, answered, heard, told = [], {}, {}, {}, {}, {}, set(), set()
+    ran_in: dict = {}  # tool_use id -> the folder its line says it ran in (bash_reads)
     hook_added: dict = {}  # (scope, event) -> [additions, characters] of what hooks put into the context
     for n, file in enumerate(files):
         events.append([])
@@ -3185,6 +3318,8 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                         name, args = shown(b.get("name") or "?", 80), dict_at(b, "input")
                         calls[tid] = (name, tool_target(name, args))
                         owner[tid], called[tid] = key, when
+                        if isinstance(line.get("cwd"), str):
+                            ran_in[tid] = line["cwd"]
                         tool_calls[(scope, name)] += 1
                         events[n].append((when, n, "call", (scope, name, args, tid)))
                 elif kind == "user":
@@ -3204,9 +3339,19 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     # nor a repeat (review, Phase 2). Contexts are replayed in time order.
     repeats = []  # (scope, tool, what, tool_use id)
     seen: dict = collections.defaultdict(dict)  # context -> {whole input: the file read, None for a search}
-    # Read again after a compaction (Phase 0; caveman's compaction_churn): a Read of a file the same context
-    # read before its last compaction, once per file and compaction, whether or not it changed since.
+    # Read again after a compaction (Phase 0; caveman's compaction_churn): a Read, or a Bash step that prints a
+    # file (bash_reads), of a file the same context read before its last compaction, once per file and
+    # compaction, whether or not it changed since. A Bash command's output is shared among the files it read.
     before, since, after = collections.defaultdict(set), collections.defaultdict(set), {}
+
+    def read(ctx, scope, file, chars):
+        if file in before[ctx] and file not in since[ctx]:
+            path = home_path(file)
+            row = after.setdefault((scope, path), {"path": path, "reads": 0, "chars": 0, "scope": scope})
+            row["reads"] += 1
+            row["chars"] += chars
+        since[ctx].add(file)
+
     for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
         if what == "compact":
             seen[ctx] = {}  # what was read is no longer in the context
@@ -3222,14 +3367,12 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
             if same in seen[ctx]:
                 repeats.append((scope, name, calls[tid][1], tid))
             seen[ctx][same] = args.get("file_path") if name == "Read" else None
-            file = args.get("file_path")
-            if name == "Read" and isinstance(file, str):
-                if file in before[ctx] and file not in since[ctx]:
-                    item = after.setdefault((scope, calls[tid][1]), {"path": calls[tid][1], "reads": 0, "chars": 0,
-                                                                     "scope": scope})
-                    item["reads"] += 1
-                    item["chars"] += results[tid][0]
-                since[ctx].add(file)
+            if name == "Read" and isinstance(args.get("file_path"), str):
+                read(ctx, scope, args["file_path"], results[tid][0])
+        elif name == "Bash" and results.get(tid, (0, 0, True))[2] is False:
+            printed = bash_reads(args.get("command", ""), ran_in.get(tid))
+            for one in printed:
+                read(ctx, scope, one, results[tid][0] // len(printed))
 
     # The tokens are summed by model too (Sprint 8), main and subagents
     # apart; a response that names no model is "?", so that each kind's
@@ -3411,6 +3554,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "rereads": sorted(rereads.values(), key=lambda x: (-x["chars"], -x["repeats"], x["path"])),
         "searches": [{"tool": name, "where": what, "repeats": c, "scope": scope}
                      for (scope, name, what), c in sorted(searches.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "memory": memory_health(path, cwd) if window is None else None,
         "cache_rebuilds": rebuilds, "input_cost": input_cost,
         "cache_churn": dict(sorted(churn.items(), key=lambda kv: kv[0] != "main")),
         "reread_after_compaction": sorted(after.values(), key=lambda x: (-x["chars"], -x["reads"], x["path"])),
@@ -3590,8 +3734,8 @@ def inspect_lines(r: dict) -> list[str]:
             "than 10,000 tokens and a quarter of its context; the rebuilds above are among them]",
             [f"  {scope}: {c['requests']:,} request{'s' * (c['requests'] != 1)}, {c['tokens']:,} tokens"
              for scope, c in r["cache_churn"].items()])
-    section("Read again after a compaction [transcript, inferred: the same context read the file before it; "
-            "reads through Bash are not seen]",
+    section("Read again after a compaction [transcript, inferred: the same context read the file before it, with "
+            "Read, or with cat, head, tail, nl or sed in Bash; other reads through Bash are not seen]",
             [f"  {x['path']}: {x['reads']} time{'s' * (x['reads'] != 1)}, {x['chars']:,} chars{where(x)}"
              for x in r["reread_after_compaction"]])
     section("Added by hooks [transcript, counted: the text hooks put into the context, by event; "
@@ -3599,6 +3743,22 @@ def inspect_lines(r: dict) -> list[str]:
             [f"  {x['event']}: {x['times']} time{'s' * (x['times'] != 1)}, {x['chars']:,} chars "
              f"≈ {x['chars'] // 4:,} tokens" + ("  (subagents)" if x["scope"] != "main" else "")
              for x in r["hook_context"]])
+    m = r.get("memory")
+    if m is not None:  # else a window's figures (trial_figures), which read no file on disk
+        def lines_of(n):
+            return f"{n:,} line{'s' * (n != 1)}"
+
+        i, rows = m["index"], []
+        if i:
+            rows.append(f"  MEMORY.md: {lines_of(i['lines'])}, {i['bytes']:,} bytes; "
+                        + (f"{lines_of(i['unloaded'])} past the first 200 lines or 25 KB are not loaded"
+                           if i["unloaded"] else "all loaded"))
+        rows += [f"  {f['path']}: {lines_of(f['lines'])}" for f in m["files"]]
+        rows += [f"  gone: {x['path']}, named in {x['in']}" for x in m["missing"][:20]]
+        if len(m["missing"]) > 20:
+            rows.append(f"  and {len(m['missing']) - 20} more gone")
+        section("Memory and instructions [files on disk now, counted: what Claude Code loads at a session's start, "
+                "and the paths they name that are gone]", rows)
 
     g = r["guard"]
     if g is None:
@@ -3729,6 +3889,14 @@ def inspect_records(r: dict) -> list[dict]:
     for x in r["hook_context"]:
         add("hook_context", x["times"], "additions", x["scope"], "transcript", "counted", x["event"])
         add("hook_context_chars", x["chars"], "chars", x["scope"], "transcript", "counted", x["event"])
+    m = r.get("memory") or {}
+    if m.get("index"):
+        add("memory_index_lines", m["index"]["lines"], "lines", "main", "files", "counted", "MEMORY.md")
+        add("memory_index_unloaded", m["index"]["unloaded"], "lines", "main", "files", "counted", "MEMORY.md")
+    for f in m.get("files", []):
+        add("instruction_lines", f["lines"], "lines", "main", "files", "counted", f["path"])
+    for name, n in sorted(collections.Counter(x["in"] for x in m.get("missing", [])).items()):
+        add("missing_paths", n, "paths", "main", "files", "counted", name)
     for tool, n in r["tool_errors"].items():
         add("tool_errors", n, "errors", "all", "transcript", "counted", tool)
     for kind, n in r["api_errors"].items():

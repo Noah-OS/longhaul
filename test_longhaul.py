@@ -2365,7 +2365,8 @@ class Inspect(unittest.TestCase):
         self.assertGreaterEqual(len(heads), 7, out.stdout)
         self.assertIn(self.CONSULTATIONS, heads)
         for head in heads:
-            self.assertRegex(head, r"\[(transcript|status line|longhaul guard|longhaul advisor trace)[^\]]*\]", head)
+            self.assertRegex(head, r"\[(transcript|status line|longhaul guard|longhaul advisor trace|files on disk now)"
+                                   r"[^\]]*\]", head)
         for head in heads:
             if head.startswith(("Read again", "The same search")):
                 self.assertIn("through Bash are not seen", head)
@@ -2701,12 +2702,99 @@ class Inspect(unittest.TestCase):
         self.assertEqual(r["reread_after_compaction"], [{"path": "/a.py", "reads": 1, "chars": 300, "scope": "main"}])
         self.assertEqual([x["path"] for x in r["rereads"]], ["/a.py"], "t4 stays a plain repeat")
         out = longhaul.inspect_lines(r)
-        head = ("Read again after a compaction [transcript, inferred: the same context read the file before it; "
-                "reads through Bash are not seen]")
+        head = ("Read again after a compaction [transcript, inferred: the same context read the file before it, with "
+                "Read, or with cat, head, tail, nl or sed in Bash; other reads through Bash are not seen]")
         self.assertEqual(out[out.index(head) + 1], "  /a.py: 1 time, 300 chars")
         got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"]) for x in self.records("s1")}
         self.assertEqual(got[("reads_after_compaction", "/a.py")], (1, "reads", "inferred"))
         self.assertEqual(got[("read_after_compaction_chars", "/a.py")], (300, "chars", "inferred"))
+
+    def test_a_file_read_again_through_bash_after_a_compaction_is_counted(self):
+        # Most reads go through Bash (2,833 Bash calls against 13 Reads in the
+        # owner's busiest chat): a file a Bash step prints counts as a Read
+        # does, either way round. Its output is shared among the files it read.
+        a = self.turn("t1", "Read", "x" * 300, file_path="/w/a.py")
+        a[0]["cwd"] = "/w"
+        bash = self.turn("t2", "Bash", "y" * 100, command="cd /w && sed -n '1,80p' b.py c.py")
+        self.write(a + bash + [self.compaction()]
+                   + self.turn("t3", "Bash", "x" * 200, command="sed -n 1,40p /w/a.py")
+                   + self.turn("t4", "Read", "y" * 50, file_path="/w/b.py")
+                   + self.turn("t5", "Bash", "z" * 90, command="cat /w/c.py | grep x")
+                   + self.turn("t6", "Bash", "z" * 90, command="head -n 5 /w/c.py /w/b.py"))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["reread_after_compaction"], [{"path": "/w/a.py", "reads": 1, "chars": 200, "scope": "main"},
+                                                        {"path": "/w/b.py", "reads": 1, "chars": 50, "scope": "main"},
+                                                        {"path": "/w/c.py", "reads": 1, "chars": 45, "scope": "main"}])
+
+    def test_memory_past_its_load_limit_and_paths_that_are_gone_are_shown(self):
+        # What Claude Code loads at a session's start, as the files stand now
+        # (caveman's memory doctor, rebuilt): the first 200 lines or 25 KB of
+        # the project's MEMORY.md, the user's CLAUDE.md and those from the
+        # folder up. A path named in backquotes or a link that is gone is
+        # listed; a slash command is not a path, and a relative one is not
+        # looked for. Never the text.
+        project = self.tmp / "app"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "here.py").write_text("")
+        lines = self.reply()
+        lines[0]["cwd"] = str(project)
+        self.write(lines)
+        (self.claude / "CLAUDE.md").write_text("- `~/nowhere-longhaul-test/x` SECRET\n")
+        (project / "CLAUDE.md").write_text(f"Run `{project}/src/here.py`, not `{project}/old.py:12`; use `/compact`.\n"
+                                           "SECRET: `/api-longhaul-test/personas` is a URL's, not this machine's\n")
+        (self.tmp / ".claude").mkdir()
+        (self.tmp / ".claude" / "CLAUDE.md").write_text("only the folder's own .claude/CLAUDE.md loads\n")
+        memory = self.path.parent / "memory"
+        memory.mkdir()
+        (memory / "MEMORY.md").write_text("".join(f"- [n{i}](n{i}.md) SECRET\n" for i in range(210)))
+        (memory / "n1.md").write_text(f"See [the plan]({project}/plan.md) and `src/x.py`. SECRET\n")
+        size = (memory / "MEMORY.md").stat().st_size
+        r = longhaul.inspect_transcript(self.path)
+        user, mine = longhaul.home_path(str(self.claude / "CLAUDE.md")), longhaul.home_path(str(project / "CLAUDE.md"))
+        self.assertEqual(r["memory"], {
+            "index": {"lines": 210, "bytes": size, "unloaded": 10},
+            "files": [{"path": user, "lines": 1}, {"path": mine, "lines": 2}],
+            "missing": [{"in": user, "path": "~/nowhere-longhaul-test/x"},
+                        {"in": mine, "path": longhaul.home_path(str(project / "old.py"))},
+                        {"in": "memory/n1.md", "path": longhaul.home_path(str(project / "plan.md"))}]})
+        out = longhaul.inspect_lines(r)
+        head = ("Memory and instructions [files on disk now, counted: what Claude Code loads at a session's start, "
+                "and the paths they name that are gone]")
+        self.assertEqual(out[out.index(head) + 1:out.index(head) + 7], [
+            f"  MEMORY.md: 210 lines, {size:,} bytes; 10 lines past the first 200 lines or 25 KB are not loaded",
+            f"  {user}: 1 line", f"  {mine}: 2 lines",
+            f"  gone: ~/nowhere-longhaul-test/x, named in {user}",
+            f"  gone: {longhaul.home_path(str(project / 'old.py'))}, named in {mine}",
+            f"  gone: {longhaul.home_path(str(project / 'plan.md'))}, named in memory/n1.md"])
+        records = self.cli("s1", "--json")
+        got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"])
+               for x in map(json.loads, records.stdout.splitlines())}
+        self.assertEqual(got[("memory_index_unloaded", "MEMORY.md")], (10, "lines", "counted"))
+        self.assertEqual(got[("missing_paths", "memory/n1.md")], (1, "paths", "counted"))
+        self.assertNotIn("SECRET", "\n".join(out) + records.stdout + records.stderr)
+        # 25 KB comes first for long lines; with no memory, nothing is said of it.
+        (memory / "MEMORY.md").write_text("".join("x" * 999 + "\n" for _ in range(50)))
+        self.assertEqual(longhaul.memory_health(self.path, str(project))["index"],
+                         {"lines": 50, "bytes": 50000, "unloaded": 25})
+        self.assertIsNone(longhaul.memory_health(self.tmp / "s2.jsonl", None)["index"])
+
+    def test_the_files_a_bash_command_prints(self):
+        reads = longhaul.bash_reads
+        self.assertEqual(reads("cat a.py b.py", "/w"), ["/w/a.py", "/w/b.py"])
+        self.assertEqual(reads("cd /w/sub && sed -n '10,20p' ../a.py;\nhead -n 5 c.md", "/x"), ["/w/a.py", "/w/sub/c.md"])
+        self.assertEqual(reads("FOO=1 /bin/cat a.py && tail -20 b.py && nl -ba c.py", "/w"),
+                         ["/w/a.py", "/w/b.py", "/w/c.py"])
+        self.assertEqual(reads("tail -f ~/notes.txt", "/w"), [str(longhaul.HOME / "notes.txt")])
+        self.assertEqual(reads("sed -e 1d -e 2d a.py", "/w"), ["/w/a.py"])
+        self.assertEqual(reads("cat /etc/hosts", None), ["/etc/hosts"])
+        for command, why in (("sed -i 's/a/b/' a.py", "an edit"), ("sed -ni 1p a.py", "an edit"),
+                             ("cat a.py | grep x", "filtered"), ("cat a.py > b.py", "a write"),
+                             ("cat a.py 2>/dev/null", "a redirection"), ("(cd x; cat a.py)", "a subshell"),
+                             ("cat $F", "a variable"), ("cat a.py", "no folder for a relative path"),
+                             ("cd $D && cat a.py", "a folder not known"), ('cat "unclosed', "unsplittable"),
+                             ("git show HEAD:a.py", "not a reader"),
+                             ("python3 - <<'EOF'\ncat = 1\nEOF", "a heredoc's body")):
+            self.assertEqual(reads(command, None if why.startswith("no folder") else "/w"), [], why)
 
     def test_the_text_hooks_added_is_counted_by_event_and_never_shown(self):
         # The standing cost of what hooks put into the context: Longhaul's own
