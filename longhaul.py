@@ -3044,6 +3044,8 @@ def consultations(sid: str, keep: bool = False):
 
 REBUILD_MIN = 4096  # tokens: a cached prefix this small or smaller is not counted as written again (RTK's floor)
 CACHE_TTLS = {"5m": 300, "1h": 3600}  # seconds each prompt-cache lifetime lasts with no request
+CACHE_PRICES = {"read": 0.1, "5m": 1.25, "1h": 2.0}  # the API's prices against uncached input's 1, on every model
+CHURN_MIN = 10000  # tokens: a request writing more than this and a quarter of its context churned it (caveman's floor)
 REBUILD_CAUSES = {"tool": "a tool call outlasted the cache's {ttl} lifetime",
                   "idle": "idle past the cache's {ttl} lifetime, with no message",
                   "resumed": "a message came after the cache's {ttl} lifetime",
@@ -3324,18 +3326,24 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     by_tool = sorted(set(tool_calls) | set(tool_chars), key=lambda k: (-tool_chars[k], -tool_calls[k], k))
 
     # The cache written again (Phase 0; RTK's cache-fracture count, rebuilt
-    # for transcripts): in one transcript, a response that read more than
-    # REBUILD_MIN tokens from the cache, then the next reading under 1,024
-    # and writing more than REBUILD_MIN, with no compaction between. Past
+    # for transcripts): in one transcript, a response that left more than
+    # REBUILD_MIN tokens in the cache (read and written), then the next
+    # reading more than REBUILD_MIN fewer and writing more than REBUILD_MIN,
+    # with no compaction between. Not "read none": the system prompt and
+    # tools stay cached across sessions, so a chat that lost its own cache
+    # still reads them. Past
     # the cache's lifetime it was lost to a wait: on a tool call when the
     # call took half the wait or more (one never answered took all of it),
     # else on a message when one came before the request (a subagent that
     # handed its report back waits for the coordinator's), else idle.
     # Within its lifetime the prefix changed instead ("bust").
+    # Churn, beside them (caveman's cache churn, rebuilt): a request after
+    # the first in its context that wrote more than CHURN_MIN tokens and a
+    # quarter of its context, rebuilds included.
     made = collections.defaultdict(list)  # response -> its calls
     for tid, key in owner.items():
         made[key].append(tid)
-    rebuilds = []
+    rebuilds, churn = [], {}
     for seq in order:
         prev = None
         for key in seq:
@@ -3346,8 +3354,14 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
             if prev is not None:
                 last = responses[prev][2]
                 wrote = as_int(usage.get("cache_creation_input_tokens"))
-                if (as_int(last.get("cache_read_input_tokens")) > REBUILD_MIN
-                        and as_int(usage.get("cache_read_input_tokens")) < 1024 and wrote > REBUILD_MIN):
+                size = sum(as_int(usage.get(field)) for k, field in TOKEN_KINDS if k != "output")
+                if wrote > CHURN_MIN and 4 * wrote > size:
+                    row = churn.setdefault(scope, {"requests": 0, "tokens": 0})
+                    row["requests"] += 1
+                    row["tokens"] += wrote
+                held = as_int(last.get("cache_read_input_tokens")) + as_int(last.get("cache_creation_input_tokens"))
+                if held > REBUILD_MIN and wrote > REBUILD_MIN \
+                        and as_int(usage.get("cache_read_input_tokens")) < held - REBUILD_MIN:
                     gap, ttl = max(began[key] - ended[prev], 0.0), cache_ttl(usage, scope)
                     cause, tool = "bust", None
                     if gap >= CACHE_TTLS[ttl]:
@@ -3359,6 +3373,21 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                                      "ttl": ttl, "tokens": wrote})
             prev = key
     rebuilds.sort(key=lambda x: (-x["tokens"], x["seconds"]))
+
+    # What the input cost after caching (caveman's effective input
+    # multiplier, rebuilt): each scope's input at CACHE_PRICES over the same
+    # tokens uncached. A response's writes are at the lifetimes its usage
+    # reports, else at its scope's (cache_ttl).
+    priced, uncached = collections.Counter(), collections.Counter()
+    for scope, _, usage, _ in responses.values():
+        wrote, split = as_int(usage.get("cache_creation_input_tokens")), dict_at(usage, "cache_creation")
+        hour = as_int(split.get("ephemeral_1h_input_tokens")) if split \
+            else wrote if cache_ttl(usage, scope) == "1h" else 0
+        fresh, read = as_int(usage.get("input_tokens")), as_int(usage.get("cache_read_input_tokens"))
+        priced[scope] += (fresh + CACHE_PRICES["read"] * read + CACHE_PRICES["1h"] * hour
+                          + CACHE_PRICES["5m"] * max(wrote - hour, 0))
+        uncached[scope] += fresh + read + wrote
+    input_cost = {s: round(priced[s] / n, 3) for s, n in sorted(uncached.items(), key=lambda kv: kv[0] != "main") if n}
 
     # The session's last ledger row with cache numbers: a reopened
     # conversation's first readings have none (review, Phase 2).
@@ -3382,7 +3411,8 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "rereads": sorted(rereads.values(), key=lambda x: (-x["chars"], -x["repeats"], x["path"])),
         "searches": [{"tool": name, "where": what, "repeats": c, "scope": scope}
                      for (scope, name, what), c in sorted(searches.items(), key=lambda kv: (-kv[1], kv[0]))],
-        "cache_rebuilds": rebuilds,
+        "cache_rebuilds": rebuilds, "input_cost": input_cost,
+        "cache_churn": dict(sorted(churn.items(), key=lambda kv: kv[0] != "main")),
         "reread_after_compaction": sorted(after.values(), key=lambda x: (-x["chars"], -x["reads"], x["path"])),
         "hook_context": [{"event": e, "times": t, "chars": c, "scope": s}
                          for (s, e), (t, c) in sorted(hook_added.items(), key=lambda kv: (-kv[1][1], kv[0]))],
@@ -3537,7 +3567,12 @@ def inspect_lines(r: dict) -> list[str]:
             [f"  {s['tool']}{' in ' + s['where'] if s['where'] else ''}: {times(s['repeats'])}{where(s)}"
              for s in r["searches"]])
 
-    # The token layer, Phase 0: the cache written again, by scope, cause and lifetime, the most tokens first.
+    # The token layer, Phase 0: what the input cost after caching; the cache written again, by scope, cause and
+    # lifetime, the most tokens first; the requests that churned it.
+    costs = [f"{scope} {ratio:.2f}" for scope, ratio in r["input_cost"].items()]
+    section("Input cost after caching [transcript, measured counts at the API's price ratios: a cache read 0.1, "
+            "a write 1.25 for 5 minutes or 2 for an hour; uncached input is 1]",
+            ["  " + ", ".join([costs[0] + " of its uncached price"] + costs[1:])] if costs else [])
     groups: dict = {}
     for x in r["cache_rebuilds"]:
         g = groups.setdefault((x["scope"], x["cause"], x["ttl"]), {"n": 0, "tokens": 0, "tools": collections.Counter()})
@@ -3545,12 +3580,16 @@ def inspect_lines(r: dict) -> list[str]:
         g["tokens"] += x["tokens"]
         if x["tool"]:
             g["tools"][x["tool"]] += 1
-    section("Cache written again [transcript, inferred: a request read its prefix from the cache, the next in its "
-            "transcript wrote it again, with no compaction between]",
+    section("Cache written again [transcript, inferred: a request read less from the cache than the one before it "
+            "left there, and wrote it again, with no compaction between]",
             [f"  {scope}, {REBUILD_CAUSES[cause].format(ttl=ttl)}: {g['n']} time{'s' * (g['n'] != 1)}, "
              f"{g['tokens']:,} tokens" + (f" ({', '.join(f'{t} {c}' for t, c in g['tools'].most_common())})"
                                           if g["tools"] else "")
              for (scope, cause, ttl), g in sorted(groups.items(), key=lambda kv: (-kv[1]["tokens"], kv[0]))])
+    section("Large cache writes [transcript, inferred: a request after the first in its context that wrote more "
+            "than 10,000 tokens and a quarter of its context; the rebuilds above are among them]",
+            [f"  {scope}: {c['requests']:,} request{'s' * (c['requests'] != 1)}, {c['tokens']:,} tokens"
+             for scope, c in r["cache_churn"].items()])
     section("Read again after a compaction [transcript, inferred: the same context read the file before it; "
             "reads through Bash are not seen]",
             [f"  {x['path']}: {x['reads']} time{'s' * (x['reads'] != 1)}, {x['chars']:,} chars{where(x)}"
@@ -3679,6 +3718,11 @@ def inspect_records(r: dict) -> list[dict]:
     for (scope, cause), n in sorted(rebuilt.items()):
         add("cache_rebuilds", n, "rebuilds", scope, "transcript", "inferred", cause)
         add("cache_rebuild_tokens", rewritten[(scope, cause)], "tokens", scope, "transcript", "inferred", cause)
+    for scope, ratio in r["input_cost"].items():
+        add("input_cost_ratio", ratio, "ratio", scope, "transcript", "measured")
+    for scope, c in r["cache_churn"].items():
+        add("cache_churn", c["requests"], "requests", scope, "transcript", "inferred")
+        add("cache_churn_tokens", c["tokens"], "tokens", scope, "transcript", "inferred")
     for x in r["reread_after_compaction"]:
         add("reads_after_compaction", x["reads"], "reads", x["scope"], "transcript", "inferred", x["path"])
         add("read_after_compaction_chars", x["chars"], "chars", x["scope"], "transcript", "inferred", x["path"])

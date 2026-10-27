@@ -2607,6 +2607,20 @@ class Inspect(unittest.TestCase):
         self.assertEqual(r["cache_rebuilds"], [{"scope": "subagents", "cause": "tool", "tool": "Bash", "seconds": 602,
                                                 "ttl": "5m", "tokens": 52000}])
 
+    def test_a_rebuild_that_still_reads_the_shared_system_prompt_is_counted(self):
+        # The system prompt and tools are cached across sessions, so a chat
+        # whose own hour ran out still reads them (this one, 2026-10-27:
+        # 24,734 read, 217,751 written after 7.5 hours away). What counts is
+        # reading less than the request before left in the cache. Writing a
+        # big new message with all of it read is new content, not a rebuild.
+        self.write(self.stamped(0, self.reply(read=200000, write=1000))
+                   + self.stamped(7200, [self.message()]) + self.stamped(7200, self.reply(read=25000, write=180000))
+                   + self.stamped(7210, self.reply(read=205000, write=92000)))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["cache_rebuilds"], [{"scope": "main", "cause": "resumed", "tool": None, "seconds": 7200,
+                                                "ttl": "1h", "tokens": 180000}])
+        self.assertEqual(r["cache_churn"], {"main": {"requests": 2, "tokens": 272000}})
+
     def test_a_rebuild_inside_the_cache_lifetime_is_a_change_and_one_after_a_compaction_is_none(self):
         # Within its lifetime the cache was not lost but changed (a model
         # switch, a new system prompt). After a compaction the context is new,
@@ -2662,8 +2676,8 @@ class Inspect(unittest.TestCase):
         self.agent(self.stamped(10, self.reply(self.call("t1", "Bash", command="pytest -q"), read=50000))
                    + self.stamped(610, [self.result("t1")]) + self.stamped(612, self.reply(read=0, write=52000)))
         out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
-        head = ("Cache written again [transcript, inferred: a request read its prefix from the cache, the next in its "
-                "transcript wrote it again, with no compaction between]")
+        head = ("Cache written again [transcript, inferred: a request read less from the cache than the one before it "
+                "left there, and wrote it again, with no compaction between]")
         self.assertEqual(out[out.index(head) + 1], "  subagents, a tool call outlasted the cache's 5m lifetime: 1 time, "
                                                    "52,000 tokens (Bash 1)")
         got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
@@ -2728,6 +2742,43 @@ class Inspect(unittest.TestCase):
         self.assertEqual(got[("hook_context_chars", "UserPromptSubmit")], (200, "chars", "counted"))
         self.assertEqual(got[("hook_context", "SessionStart")], (1, "additions", "counted"))
         self.assertNotIn("SECRET", "\n".join(out) + records.stdout + records.stderr)
+
+    def test_the_input_cost_after_caching_is_a_share_of_its_fresh_price(self):
+        # caveman's effective input multiplier, rebuilt: the input at the
+        # API's price ratios (a cache read 0.1, a write 1.25 at five minutes
+        # or 2 at an hour) over the same tokens uncached. Each response's
+        # writes at the lifetime it reports, else its scope's (cache_ttl).
+        self.write(self.reply(inp=1000, write=8000) + self.reply(inp=1000, write=0, read=90000))
+        five = self.reply(inp=0, write=8000)
+        five[0]["message"]["usage"]["cache_creation"] = {"ephemeral_5m_input_tokens": 8000,
+                                                         "ephemeral_1h_input_tokens": 0}
+        self.agent(five + self.reply(inp=0, write=0, read=92000))
+        r = longhaul.inspect_transcript(self.path)
+        # main: (2,000 + 8,000 x 2 + 90,000 x 0.1) / 100,000; subagents: (8,000 x 1.25 + 92,000 x 0.1) / 100,000
+        self.assertEqual(r["input_cost"], {"main": 0.27, "subagents": 0.192})
+        out = longhaul.inspect_lines(r)
+        head = ("Input cost after caching [transcript, measured counts at the API's price ratios: a cache read 0.1, "
+                "a write 1.25 for 5 minutes or 2 for an hour; uncached input is 1]")
+        self.assertEqual(out[out.index(head) + 1], "  main 0.27 of its uncached price, subagents 0.19")
+        got = {(x["metric"], x["scope"]): (x["value"], x["unit"], x["confidence"]) for x in self.records("s1")}
+        self.assertEqual(got[("input_cost_ratio", "main")], (0.27, "ratio", "measured"))
+
+    def test_a_request_that_writes_a_quarter_of_its_context_is_churn(self):
+        # caveman's cache churn: a request after the first in its context that
+        # wrote more than 10,000 tokens and more than a quarter of its context.
+        # The first after a compaction writes a new context, which is expected.
+        self.write(self.reply(inp=2, write=40000) + self.reply(write=20000, read=40000)
+                   + self.reply(write=5000, read=60000) + [self.compaction()] + self.reply(write=30000)
+                   + self.reply(write=11000, read=60000))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["cache_churn"], {"main": {"requests": 1, "tokens": 20000}})
+        out = longhaul.inspect_lines(r)
+        head = ("Large cache writes [transcript, inferred: a request after the first in its context that wrote more "
+                "than 10,000 tokens and a quarter of its context; the rebuilds above are among them]")
+        self.assertEqual(out[out.index(head) + 1], "  main: 1 request, 20,000 tokens")
+        got = {(x["metric"], x["scope"]): (x["value"], x["unit"]) for x in self.records("s1")}
+        self.assertEqual(got[("cache_churn", "main")], (1, "requests"))
+        self.assertEqual(got[("cache_churn_tokens", "main")], (20000, "tokens"))
 
 
 class Plugin(unittest.TestCase):
