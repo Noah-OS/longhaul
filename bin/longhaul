@@ -2,12 +2,15 @@
 # What Claude may run of Longhaul from inside a session. Files in a
 # plugin's bin/ are on the Bash tool's PATH while the plugin is enabled
 # (the manifest reference documents it), so Claude could run this as a
-# bare command; the skills run it by its full path all the same, since
-# their allowed-tools rules name that path and a bare `longhaul ...`
-# would prompt. It runs the longhaul.py beside it, so an installed
-# plugin runs its own version. Only the read-only commands are allowed
-# (`advisor status` among them since Sprint 8: the advise skill's first
-# step; `doctor`, with nothing after it, since 2026-10-25: the
+# bare command; Longhaul's skills run it by its full path all the same,
+# since their allowed-tools rules name that path and a bare `longhaul ...`
+# would prompt. The advise skill, in the longhaul-advisor plugin since
+# Sprint 11 (I4), has no bin/ of its own: its rule and its step name the
+# bare `longhaul advisor status`, which is this file while Longhaul is
+# enabled, and a step that fails stops that skill. It runs the longhaul.py
+# beside it, so an installed plugin runs its own version. Only the
+# read-only commands are allowed (`advisor status` among them since
+# Sprint 8: the advise skill's first step; `doctor`, with nothing after it, since 2026-10-25: the
 # /longhaul:doctor skill's checklist, which writes nothing), and
 # `checkpoint save`, which writes one file under LONGHAUL_HOME/
 # checkpoints/ and nothing else: the supervisor starts and watches a
