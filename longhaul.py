@@ -171,11 +171,12 @@ Usage:
                           switch, for the probe record's version; enable runs
                           only from a terminal of your own, never a session's
   longhaul advisor-hook         the plugin's PreToolUse hook on Agent and Task: admits
-                          or denies a call of the longhaul:advisor agent type and
-                          leaves any other alone; advisor-result, its PostToolUse
-                          hook, traces how the consultation went; advisor-note,
-                          its UserPromptSubmit hook, adds a line naming the
-                          decision points while the experiment is fully on
+                          or denies a call of the longhaul-advisor:advisor agent
+                          type (the longhaul-advisor plugin's) and leaves any
+                          other alone; advisor-result, its PostToolUse hook,
+                          traces how the consultation went; advisor-note, its
+                          UserPromptSubmit hook, adds a line naming the decision
+                          points while the experiment is fully on
   longhaul reminder             the plugin's UserPromptSubmit hook: once the context
                           passes LONGHAUL_CHECKPOINT_AT tokens (200000 unless set;
                           off turns it off), and again at each multiple, says to
@@ -5007,9 +5008,11 @@ def checkpoint(opts) -> int:
 #
 # The Advisor experiment (Sprint 8; the decision package's D2.1-D2.8 and
 # D3): a stronger model the executor consults at a few decision points
-# through the /longhaul:advise skill, which calls the Agent tool with
-# subagent_type longhaul:advisor (agents/advisor.md: Read, Grep and Glob
-# alone). `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent,
+# through the /longhaul-advisor:advise skill, which calls the Agent tool
+# with subagent_type longhaul-advisor:advisor (agents/advisor.md: Read,
+# Grep and Glob alone). Both live in plugins/longhaul-advisor, a plugin of
+# their own in the same marketplace since Sprint 11 (I4), so that with the
+# experiment off they cost nothing in Longhaul's always-on context. `longhaul advisor-hook`, the plugin's PreToolUse hook on Agent,
 # Task, SendMessage and Workflow (a message to an advisor is denied: F2;
 # a workflow that names one too: F17), is what
 # enforces it: it admits a consultation only when
@@ -5037,11 +5040,14 @@ def checkpoint(opts) -> int:
 # brief's or a reply's text: the trace keeps sizes, a 12-hex hash, the
 # trigger and the verdict.
 
-ADVISOR_TYPE = "longhaul:advisor"  # the agent type the plugin ships; Region A counts its subagents by it
+ADVISOR_TYPE = "longhaul-advisor:advisor"  # the agent type the Advisor's plugin ships; Region A counts its subagents by it
 # What a subagent_type is checked as, lowercased with every space taken
-# out (F6): the plugin's name, and the bare name, which may reach the
-# same agent. Another plugin's `other:advisor` is not ours.
-ADVISOR_NAMES = (ADVISOR_TYPE, "advisor")
+# out (F6): the Advisor plugin's name; the name the agent had while it was
+# Longhaul's own (0.2.8 and before), which a session started then may
+# still call and its meta.json still names; and the bare name, which may
+# reach the same agent. Another plugin's `other:advisor` is not ours.
+# hooks/hooks.json's fallback checks the same names (a test pins it).
+ADVISOR_NAMES = (ADVISOR_TYPE, "longhaul:advisor", "advisor")
 # The brief's first line and the reply's, from Region A's codes, so the
 # two regions cannot drift apart (F6).
 ADVISOR_TRIGGER = re.compile(r"Trigger:\s*(" + "|".join(CONSULTATION_TRIGGERS) + ")")
@@ -5153,11 +5159,11 @@ ADVISOR_DENIALS = {
     "allowance-unknown": "no fresh allowance reading exists for this session's account, so the near-full rule cannot "
                          "be checked. Continue without advice; do not retry.",
     # Outside the order: a call of any other agent type, a workflow, and a message.
-    "stand-in": "a brief (a first line Trigger:) goes to the longhaul:advisor agent type alone, through "
-                "/longhaul:advise, never to another agent, and no workflow may name the advisor. Continue without "
+    "stand-in": "a brief (a first line Trigger:) goes to the longhaul-advisor:advisor agent type alone, through "
+                "/longhaul-advisor:advise, never to another agent, and no workflow may name the advisor. Continue without "
                 "advice; do not retry.",
     "follow-up": "an advisor answers one brief, so no message goes to it after that. More advice is a new "
-                 "consultation through /longhaul:advise, within its caps; do not send this message again.",
+                 "consultation through /longhaul-advisor:advise, within its caps; do not send this message again.",
     "error":"the hook could not finish its checks. Continue without advice; do not retry.",
 }
 # The line `longhaul advisor-note` (UserPromptSubmit) adds to the executor's
@@ -5166,7 +5172,7 @@ ADVISOR_DENIALS = {
 # description alone (the owner's decision of 2026-10-22). It names the four
 # decision points and leaves the choice to the executor.
 ADVISOR_NOTE = ("Longhaul's Advisor experiment is on in this session. At these points you may consult a stronger "
-                "model with /longhaul:advise: early (after orientation, before the first write, on a multi-file, "
+                "model with /longhaul-advisor:advise: early (after orientation, before the first write, on a multi-file, "
                 "architectural or unclear task), stuck (the same failure twice, or an approach not converging), "
                 "change (before changing approach), done (before declaring a long task done, once its files are "
                 "written and tests run). Not for trivial edits, docs edits or simple questions. You decide whether "

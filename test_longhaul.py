@@ -1877,12 +1877,12 @@ class Inspect(unittest.TestCase):
         self.write(self.reply())
         self.trace(self.decision("c1"), self.outcome("c1"))
         self.agent(self.reply(inp=3, write=100, read=5000, out=40), "agent-a1")
-        self.meta("agent-a1", agentType="longhaul:advisor", toolUseId="c1", model="opus")
+        self.meta("agent-a1", agentType="longhaul-advisor:advisor", toolUseId="c1", model="opus")
         self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a2")
         self.meta("agent-a2", agentType="general-purpose")
         self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a3")  # no meta.json
         self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a4")
-        self.meta("agent-a4", agentType=["longhaul:advisor"])  # not a name
+        self.meta("agent-a4", agentType=["longhaul-advisor:advisor"])  # not a name
         self.agent(self.reply(inp=1, out=9, model="claude-sonnet-5-5"), "agent-a5")
         (self.path.with_suffix("") / "subagents" / "agent-a5.meta.json").write_text("[" * 100_000 + "]" * 100_000)  # RecursionError on 3.9
         r = longhaul.inspect_transcript(self.path)
@@ -1914,8 +1914,9 @@ class Inspect(unittest.TestCase):
         self.trace(self.decision("c1"), self.outcome("c1"), self.decision("c2"),
                    self.decision("c3", "brief-sections"), self.outcome("c3", verdict=None, outcome="unadmitted"),
                    self.outcome("c4", verdict=None, outcome="unadmitted"))
-        for name, meta in (("agent-a1", {"agentType": "longhaul:advisor", "toolUseId": "c1"}),
-                           ("agent-a2", {"agentType": "longhaul:advisor", "toolUseId": "c3"}),  # denied, and ran
+        for name, meta in (("agent-a1", {"agentType": "longhaul-advisor:advisor", "toolUseId": "c1"}),
+                           # Denied, and ran: by the name a 0.2.8 session gave the agent type.
+                           ("agent-a2", {"agentType": "longhaul:advisor", "toolUseId": "c3"}),
                            ("agent-a3", {"agentType": " Advisor"}),  # the bare name, and no toolUseId
                            ("agent-a4", {"agentType": "general-purpose", "toolUseId": "c9"})):
             self.agent(self.reply(), name)
@@ -2561,7 +2562,7 @@ class Inspect(unittest.TestCase):
                     "advisor": secret, "brief_hash": secret, "prompt_id": secret, "brief": secret},
                    {**self.outcome(secret, verdict=secret, outcome=secret), "confidence": secret, "reply": secret})
         self.agent(self.reply({"type": "text", "text": f"Verdict: proceed\n{secret}"}), "agent-adv")
-        self.meta("agent-adv", agentType="longhaul:advisor", description=secret, toolUseId=secret)
+        self.meta("agent-adv", agentType="longhaul-advisor:advisor", description=secret, toolUseId=secret)
         out, records = self.cli("s1"), self.cli("s1", "--json")
         self.assertEqual((out.returncode, records.returncode), (0, 0), out.stderr + records.stderr)
         self.assertIn("denied by reason: other 1", out.stdout, "the Consultations section ran over the trace")
@@ -4710,8 +4711,8 @@ class Index(unittest.TestCase):
 class Advisor(unittest.TestCase):
     """The Advisor experiment's hooks (Sprint 8, region B; the decision
     package's D2.1-D2.8): `longhaul advisor-hook`, PreToolUse on Agent,
-    admits or denies a consultation (a call of the longhaul:advisor agent
-    type), and `longhaul advisor-result`, PostToolUse, traces how it went;
+    admits or denies a consultation (a call of the longhaul-advisor:advisor
+    agent type, from the Advisor's own plugin since Sprint 11), and `longhaul advisor-result`, PostToolUse, traces how it went;
     `longhaul advisor-note`, UserPromptSubmit, adds a line to each prompt
     naming the decision points while the experiment is fully on.
     Off unless LONGHAUL_ADVISOR=experiment and a passing probe is recorded
@@ -4726,7 +4727,7 @@ class Advisor(unittest.TestCase):
     # The Advisor's note, word for word (the owner's decision of 2026-10-22:
     # in 4 benchmark runs the executor never consulted on its own).
     NOTE = ("Longhaul's Advisor experiment is on in this session. At these points you may consult a stronger model "
-            "with /longhaul:advise: early (after orientation, before the first write, on a multi-file, architectural "
+            "with /longhaul-advisor:advise: early (after orientation, before the first write, on a multi-file, architectural "
             "or unclear task), stuck (the same failure twice, or an approach not converging), change (before "
             "changing approach), done (before declaring a long task done, once its files are written and tests run). "
             "Not for trivial edits, docs edits or simple questions. You decide whether a consultation would help.")
@@ -4818,7 +4819,7 @@ class Advisor(unittest.TestCase):
             lines.insert(1, "Reconcile: yes")
         return "\n".join(line for line in lines if not line.startswith(tuple(drop)))
 
-    def call(self, brief=None, session="s1", prompt="p1", tool_id=None, agent="longhaul:advisor"):
+    def call(self, brief=None, session="s1", prompt="p1", tool_id=None, agent="longhaul-advisor:advisor"):
         """A PreToolUse input for an Agent call, as the probe saw one on 2.1.307: a
         brief for the advisor, an ordinary prompt for any other agent type."""
         if brief is None:
@@ -4876,7 +4877,7 @@ class Advisor(unittest.TestCase):
         exe.chmod(0o755)
         return exe, mark
 
-    def subagent(self, agent, tool_id, agent_type="longhaul:advisor", **fields):
+    def subagent(self, agent, tool_id, agent_type="longhaul-advisor:advisor", **fields):
         """A subagent's meta.json beside the session's transcript, as Claude
         Code writes it: its agent type, the call that started it and, when
         the call set one, its model."""
@@ -4930,6 +4931,10 @@ class Advisor(unittest.TestCase):
         self.assertIn("longhaul.main(['advisor-hook'])", wrapper)
         reason = longhaul.advisor_answer({}, {}, longhaul.advisor_denial("error"))["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn(reason.replace("'", "\\'"), wrapper, "the wrapper's deny is the hook's own, word for word")
+        # The names it checks without longhaul are the hook's own (Sprint 11, I4: the Advisor's plugin's type joined them).
+        [names] = re.findall(r"\.lower\(\) in (\([^)]*\))", wrapper)
+        self.assertRegex(names, r"^\('[^']*'(, '[^']*')*\)$", "a tuple of plain strings")
+        self.assertEqual(tuple(re.findall(r"'([^']*)'", names)), longhaul.ADVISOR_NAMES)
 
     def test_a_check_that_cannot_import_longhaul_still_denies_a_consultation(self):
         # F1: a plugin root whose longhaul.py cannot be imported, or whose
@@ -4938,7 +4943,10 @@ class Advisor(unittest.TestCase):
                  "raises": "def main(argv):\n    raise RuntimeError('mid-update')\n", "empty": None}
         deny = longhaul.advisor_answer({}, {}, longhaul.advisor_denial("error"))
         huge = json.dumps(self.call(self.brief(extra="x" * 1_100_000)))
-        cases = [(self.call(), deny), (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
+        # Sprint 11 (I4): the advisor's type by its plugin's name, and the one a 0.2.8 session gave it.
+        cases = [(self.call(), deny), (self.call(agent=" Longhaul-Advisor:Advisor"), deny),
+                 (self.call(agent="longhaul:advisor"), deny), (self.call(agent="longhaul-advisor"), None),
+                 (self.call(agent=" Advisor"), deny), (self.call(agent="other:advisor"), None),
                  (self.call(agent="Explore"), None), ("{not json, an advisor", deny), ("{not json", None), ("", None),
                  ("[]", None), (huge, deny), (huge.replace("advisor", "helper"), deny),  # past the cap: all (F21)
                  ("{not json, an ADVISOR", deny), (huge.replace("advisor", "ADVISOR"), deny),  # any case (F20)
@@ -5255,15 +5263,25 @@ class Advisor(unittest.TestCase):
     def test_a_consultation_is_the_advisors_name_or_the_bare_advisor_however_it_is_spaced(self):
         # F6: lowercased with every space taken out. Another plugin's
         # other:advisor is not ours and passes through as any agent type.
-        for agent in ("longhaul:advisor", " Longhaul : Advisor ", "LONGHAUL:ADVISOR", "advisor", "Advisor", "\tad visor\n"):
+        # Sprint 11 (I4): the agent type is the Advisor plugin's; the name a
+        # 0.2.8 session used is still checked as the advisor's.
+        for agent in ("longhaul-advisor:advisor", " Longhaul-Advisor : Advisor ", "LONGHAUL-ADVISOR:ADVISOR",
+                      "longhaul:advisor", " Longhaul : Advisor ", "LONGHAUL:ADVISOR", "advisor", "Advisor", "\tad visor\n"):
             self.assertTrue(longhaul.advisor_consultation(self.call(agent=agent)), agent)
-        for agent in ("other:advisor", "advisors", "longhaul:advisor2", "longhaul-advisor", "Explore", "", None, 7):
+        for agent in ("other:advisor", "advisors", "longhaul:advisor2", "longhaul-advisor", "longhaul-advisor:advisor2",
+                      "longhaul-advisor:advise", "Explore", "", None, 7):
             self.assertFalse(longhaul.advisor_consultation(self.call(agent=agent)), agent)
-        self.assertEqual(longhaul.ADVISOR_NAMES, ("longhaul:advisor", "advisor"))
+        self.assertEqual(longhaul.ADVISOR_TYPE, "longhaul-advisor:advisor")
+        self.assertEqual(longhaul.ADVISOR_NAMES, ("longhaul-advisor:advisor", "longhaul:advisor", "advisor"))
+        # The old name is still a consultation: with the experiment off, denied.
+        self.denied(self.call(agent="longhaul:advisor"), "off", LONGHAUL_ADVISOR=None)
+        self.denied(self.call(agent="longhaul-advisor:advisor"), "off", LONGHAUL_ADVISOR="off")
         # A bare advisor goes through the whole gate, and the call admitted names the plugin's agent type.
         self.denied(self.call(agent="Advisor", prompt=None) | {"transcript_path": None}, "executor-unknown")
         out = self.admitted(self.call(agent=" advisor"))
-        self.assertEqual(out["updatedInput"]["subagent_type"], "longhaul:advisor")
+        self.assertEqual(out["updatedInput"]["subagent_type"], "longhaul-advisor:advisor")
+        out = self.admitted(self.call(agent="longhaul:advisor", prompt="p2"))
+        self.assertEqual(out["updatedInput"]["subagent_type"], "longhaul-advisor:advisor", "the old name: the new type")
         other = self.call("Look at the parser's tests.", agent="other:advisor")
         self.assertIsNone(self.decide(other), "another plugin's advisor: no answer")
 
@@ -5274,7 +5292,7 @@ class Advisor(unittest.TestCase):
                              (None, "trigger : done\nTask: y"), ("other:advisor", self.brief("early"))):
             for env in ({}, {"LONGHAUL_ADVISOR": None}):
                 reason = self.denied(self.call(brief, agent=agent), "stand-in", **env)
-                self.assertIn("longhaul:advisor", reason)
+                self.assertIn("the longhaul-advisor:advisor agent type alone, through /longhaul-advisor:advise", reason)
                 self.assertEqual(self.trace()[-1]["kind"], "hard")
         self.assertEqual(self.state(), {}, "nothing counted")
         for prompt in ("Find the parser. Trigger: stuck", "Note: first\nTrigger: stuck", "", None, 7):
@@ -5302,12 +5320,13 @@ class Advisor(unittest.TestCase):
         script = "const a = await agent({subagent_type: 'longhaul:advisor', prompt: brief})"
         for tool_input in ({"script": script}, {"name": "review", "args": {"agents": ["Explore", "ADVISOR"]}},
                            {"Advisor": True}, "ask the advisor", ["x", {"y": "an advisory note"}],
-                           {"description": "Consult the advisor", "prompt": self.brief(), "subagent_type": "longhaul:advisor"}):
+                           {"description": "Consult the advisor", "prompt": self.brief(), "subagent_type": "longhaul:advisor"},
+                           {"script": script.replace("longhaul:", "longhaul-advisor:")}):
             data = self.workflow(tool_input)
             self.assertFalse(longhaul.advisor_consultation(data), tool_input)
             for env in ({}, {"LONGHAUL_ADVISOR": None}):
                 reason = self.denied(data, "stand-in", **env)
-                self.assertIn("/longhaul:advise", reason)
+                self.assertIn("/longhaul-advisor:advise", reason)
                 self.assertIn("workflow", reason)
                 self.assertEqual(self.trace()[-1]["kind"], "hard")
         self.assertEqual(self.state(), {}, "nothing counted")
@@ -5348,12 +5367,12 @@ class Advisor(unittest.TestCase):
         for to, session in (("a1f2e3", "s1"), (" a1f2e3 ", "s1"), ("a1f2e3 [3fa9c1]", "s1"), ("a1f2e3", "s2"),
                             ("abeef7f4ab1007404", "s1")):
             reason = self.denied(self.message(to, session), "follow-up", LONGHAUL_ADVISOR=None)
-            self.assertIn("/longhaul:advise", reason)
+            self.assertIn("/longhaul-advisor:advise", reason)
             self.assertEqual(self.trace()[-1]["kind"], "hard")
         self.denied(self.message("main", recipient="abeef7f4ab1007404"), "follow-up")
         self.subagent("c9", "toolu_never")  # an advisor whose result was never traced
         self.denied(self.message("c9"), "follow-up")
-        for to in ("longhaul:advisor", " Advisor "):  # the agent type's own name, as a consultation is named
+        for to in ("longhaul-advisor:advisor", "longhaul:advisor", " Advisor "):  # the agent type's own name, as a consultation is named
             self.denied(self.message(to), "follow-up")
         before = self.trace()
         for to in ("b77", "main", "researcher", "worker [3fa9c1]", "zz", "../c9", "", None, 7, "other:advisor"):
@@ -5386,7 +5405,7 @@ class Advisor(unittest.TestCase):
         path = self.home / "advisor" / "state.json"
         for text in ("not json", "[]", '{"sessions": []}', self.DEEP):
             path.write_text(text)
-            for to in ("a1f2e3", "longhaul:advisor", " Advisor "):
+            for to in ("a1f2e3", "longhaul-advisor:advisor", "longhaul:advisor", " Advisor "):
                 self.denied(self.message(to), "follow-up")
             before = self.trace()
             for to in ("abeef7f4ab1007404", "zz", "b77", "main"):
@@ -5615,7 +5634,7 @@ class Advisor(unittest.TestCase):
         self.assertIn("denied (brief-too-long)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
         late = json.dumps({"session_id": "s1", "tool_use_id": "toolu_f21", "hook_event_name": "PreToolUse",
                            "tool_name": "Agent", "tool_input": {"description": "d", "prompt": "z" * 1_000_100,
-                                                                "subagent_type": "longhaul:advisor"}})
+                                                                "subagent_type": "longhaul-advisor:advisor"}})
         self.assertNotIn("advisor", late[:1_000_001], "the advisor is named only past the part read")
         out = self.run_hook(self.HOOK, late)
         self.assertIn("denied (brief-too-long)", json.loads(out.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
@@ -6258,7 +6277,7 @@ class Advisor(unittest.TestCase):
         """The Agent tool's response to the executor, as PostToolUse gets it;
         on 2.1.307 it names the subagent's id (agentId) too."""
         response = {"status": "completed", "content": [{"type": "text", "text": text}], "totalDurationMs": 1_000}
-        return response if agent is None else {"agentId": agent, "agentType": "longhaul:advisor", **response}
+        return response if agent is None else {"agentId": agent, "agentType": "longhaul-advisor:advisor", **response}
 
     def result(self, data, response, now=None):
         return longhaul.advisor_outcome({**data, "hook_event_name": "PostToolUse", "tool_response": response}, now)
@@ -12686,9 +12705,11 @@ class Models(unittest.TestCase):
         os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] = "1"
         self.assertIsNone(self.routed(self.call()), "Claude Code ignores the call's model then")
         del os.environ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
-        self.config(subagents={"implementer": "sonnet", "longhaul:advisor": "haiku", "advisor": "haiku"}, models="on")
-        out = longhaul.advisor_check(self.call("longhaul:advisor"), time.time())["hookSpecificOutput"]
-        self.assertEqual(out["permissionDecision"], "deny", "the Advisor's own answer (off), never the table's")
+        self.config(subagents={"implementer": "sonnet", "longhaul-advisor:advisor": "haiku", "longhaul:advisor": "haiku",
+                               "advisor": "haiku"}, models="on")
+        for name in ("longhaul-advisor:advisor", "longhaul:advisor"):
+            out = longhaul.advisor_check(self.call(name), time.time())["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny", "the Advisor's own answer (off), never the table's")
         with mock.patch.object(longhaul, "advisor_tail", side_effect=RuntimeError("boom")):
             self.assertIsNone(self.routed(self.call()), "a failure leaves the call as it was")
 
