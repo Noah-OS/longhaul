@@ -1553,6 +1553,262 @@ class Usage(unittest.TestCase):
         self.assertNotIn(sid, out.stdout, "the short id, as everywhere else")
 
 
+class CodexUsage(unittest.TestCase):
+    """`longhaul usage`'s Codex line (docs plans/2026-10-27-codex.md, X2):
+    the newest rate-limits reading in Codex's rollouts, beside the Claude
+    Code accounts. Records shaped as the 0.146 alphas write them (P1);
+    nothing is written anywhere."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.relay = self.tmp / "relay"
+        self.relay.mkdir()
+        (self.relay / "accounts.json").write_text(json.dumps([{"name": "Pro", "config_dir": str(self.tmp / "pro")}]))
+        self.codex = self.tmp / "codex"
+        self.day = self.codex / "sessions" / "2026" / "10" / "27"
+        self.day.mkdir(parents=True)
+        self.saved = {k: getattr(longhaul, k)
+                      for k in ("LONGHAUL_HOME", "USAGE_DIR", "LEDGER", "LABELS", "CODEX_HOME", "DEFAULT_CONFIG")}
+        longhaul.LONGHAUL_HOME, longhaul.USAGE_DIR = self.relay, self.relay / "usage"
+        longhaul.LEDGER, longhaul.LABELS = self.relay / "ledger.jsonl", self.relay / "labels.json"
+        longhaul.CODEX_HOME, longhaul.DEFAULT_CONFIG = self.codex, self.tmp / "claude"
+        self.now = time.time()
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(longhaul, k, v)
+
+    def window(self, used, minutes, resets_in):
+        return {"used_percent": used, "window_minutes": minutes, "resets_at": int(self.now + resets_in)}
+
+    def limits(self, primary=(12.0, 300, 3600), secondary=(40.0, 10080, 86400), reached=None, **fields):
+        """A rate_limits as P1 found it; a window is (used_percent,
+        window_minutes, seconds until resets_at), or None."""
+        return {"limit_id": "codex", "limit_name": None,
+                "primary": primary and self.window(*primary), "secondary": secondary and self.window(*secondary),
+                "plan_type": "plus", "credits": {"has_credits": False, "unlimited": False, "balance": None},
+                "individual_limit": None, "rate_limit_reached_type": reached, "spend_control_reached": None, **fields}
+
+    def stamp(self, ago):
+        """A record's timestamp `ago` seconds before now, as Codex writes it (UTC, milliseconds, Z)."""
+        when = dt.datetime.fromtimestamp(self.now - ago, dt.timezone.utc)
+        return when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def count(self, limits, ago=90, info=True):
+        """A token_count event written `ago` seconds before now."""
+        usage = {"input_tokens": 9000, "cached_input_tokens": 8000, "output_tokens": 300,
+                 "reasoning_output_tokens": 100, "total_tokens": 9300}
+        info = {"last_token_usage": usage, "total_token_usage": usage, "model_context_window": 258400} if info else None
+        return {"type": "event_msg", "timestamp": self.stamp(ago), "ordinal": 7,
+                "payload": {"type": "token_count", "info": info, "rate_limits": limits}}
+
+    def other(self, kind="turn_context", **payload):
+        return {"type": kind, "timestamp": self.stamp(60), "ordinal": 3, "payload": payload}
+
+    def rollout(self, name, records, written_ago=0):
+        """A rollout under sessions/, last written `written_ago` seconds
+        before now; a .zst one compressed as Codex does (3.14 only)."""
+        path = self.day / name
+        text = "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records)
+        if name.endswith(".zst"):
+            with longhaul.zstd.open(path, "wt", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            path.write_text(text)
+        os.utime(path, (self.now - written_ago, self.now - written_ago))
+        return path
+
+    def shown(self):
+        """`longhaul usage`'s output, run here."""
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(longhaul.main(["usage"]), 0)
+        return out.getvalue()
+
+    def codex_lines(self):
+        return [line for line in self.shown().splitlines() if "codex" in line]
+
+    def resets(self, seconds):
+        return longhaul.clock(int(self.now + seconds))
+
+    def test_the_line_names_each_window_by_its_length(self):
+        self.rollout("rollout-a.jsonl", [self.other("session_meta", cli_version="0.146.0-alpha.3.1"),
+                                         self.count(self.limits())])
+        self.assertEqual(self.codex_lines(), [f"  codex 5h 12% (resets {self.resets(3600)})   "
+                                              f"week 40% (resets {self.resets(86400)})   [read 1 min ago]"])
+        for (first, second), labels in (((120, 45), ("2h", "45min")), ((1440, 90), ("24h", "90min")),
+                                        ((60, 10080), ("1h", "week")), ((300.0, None), ("5h", "window"))):
+            with self.subTest(minutes=(first, second)):
+                self.rollout("rollout-a.jsonl", [self.count(self.limits(primary=(12.5, first, 3600),
+                                                                        secondary=(7, second, 7200)))])
+                self.assertEqual(self.codex_lines(), [f"  codex {labels[0]} 12.5% (resets {self.resets(3600)})   "
+                                                      f"{labels[1]} 7% (resets {self.resets(7200)})   [read 1 min ago]"])
+
+    def test_the_newest_rollout_with_a_reading_wins_and_its_last_reading(self):
+        self.rollout("rollout-old.jsonl", [self.count(self.limits(primary=(30.0, 300, 3600)), ago=900)],
+                     written_ago=900)
+        self.rollout("rollout-mid.jsonl", [self.count(self.limits(primary=(10.0, 300, 3600)), ago=600),
+                                           self.count(self.limits(primary=(15.0, 300, 3600)), ago=300),
+                                           self.other("response_item", type="message", role="assistant"),
+                                           self.count(None, ago=200),
+                                           self.other("world_state")], written_ago=200)
+        # The newest has no reading, as a chatgpt_handoff rollout has none (P1).
+        self.rollout("rollout-new.jsonl", [self.other("session_meta"), self.other("event_msg", type="task_started")])
+        [line] = self.codex_lines()
+        self.assertTrue(line.startswith("  codex 5h 15% "), line)
+        self.assertTrue(line.endswith("   [read 5 min ago]"), line)
+        reading = longhaul.codex_reading()
+        self.assertEqual([w["used"] for w in reading["windows"]], [15.0, 40.0])
+        self.assertAlmostEqual(reading["at"], self.now - 300, delta=1)
+        self.assertEqual(longhaul.codex_reading(self.codex), reading, "the folder can be named")
+
+    def test_a_count_with_no_info_and_a_null_window_shows_the_windows_there_are(self):
+        self.rollout("rollout-a.jsonl", [self.count(self.limits(secondary=None), info=False)])
+        self.assertEqual(self.codex_lines(), [f"  codex 5h 12% (resets {self.resets(3600)})   [read 1 min ago]"])
+        self.rollout("rollout-a.jsonl", [self.count(self.limits(primary=None), info=False)])
+        self.assertEqual(self.codex_lines(), [f"  codex week 40% (resets {self.resets(86400)})   [read 1 min ago]"])
+        # No window and no limit reached is no reading: the one before it stands.
+        self.rollout("rollout-a.jsonl", [self.count(self.limits(), ago=300),
+                                         self.count(self.limits(primary=None, secondary=None))])
+        [line] = self.codex_lines()
+        self.assertTrue(line.endswith("[read 5 min ago]"), line)
+
+    def test_a_window_whose_reset_has_passed_reads_reset_since(self):
+        self.rollout("rollout-a.jsonl", [self.count(self.limits(primary=(95.0, 300, -60)), ago=4 * 3600)])
+        self.assertEqual(self.codex_lines(), [f"  codex 5h reset since   week 40% (resets {self.resets(86400)})   "
+                                              "[read 240 min ago]"])
+
+    def test_a_limit_reached_is_said_with_its_type_when_that_is_a_plain_name(self):
+        self.rollout("rollout-a.jsonl", [self.count(self.limits(primary=(100.0, 300, 3600), secondary=None,
+                                                                reached="rate_limit_reached"))])
+        self.assertEqual(self.codex_lines(), [f"  codex 5h 100% (resets {self.resets(3600)})   "
+                                              "limit reached (rate_limit_reached)   [read 1 min ago]"])
+        for odd in ("two words", "x\x1b]0;evil\x07", {"kind": "primary"}, True):
+            with self.subTest(reached=odd):
+                self.rollout("rollout-a.jsonl", [self.count(self.limits(secondary=None, reached=odd))])
+                self.assertEqual(self.codex_lines(), [f"  codex 5h 12% (resets {self.resets(3600)})   "
+                                                      "limit reached   [read 1 min ago]"])
+
+    def test_no_codex_folder_or_no_reading_prints_no_line(self):
+        self.assertEqual(self.codex_lines(), [], "an empty sessions folder")
+        self.rollout("rollout-a.jsonl", [self.other("session_meta"), self.count(None), "not json",
+                                         self.count(self.limits(primary=None, secondary=None))])
+        self.assertEqual(self.codex_lines(), [], "no reading in any rollout")
+        self.assertIsNone(longhaul.codex_reading())
+        shutil.rmtree(self.codex / "sessions")
+        self.assertEqual(self.codex_lines(), [], "a CODEX_HOME with no sessions")
+        longhaul.CODEX_HOME = self.tmp / "none"
+        self.assertEqual(self.codex_lines(), [], "no CODEX_HOME")
+        self.assertIsNone(longhaul.codex_reading())
+
+    def test_only_five_rollouts_are_read(self):
+        self.rollout("rollout-0.jsonl", [self.count(self.limits())], written_ago=600)
+        for n in range(1, 6):
+            self.rollout(f"rollout-{n}.jsonl", [self.other("session_meta")], written_ago=600 - n)
+        self.assertEqual(self.codex_lines(), [])
+        (self.day / "rollout-5.jsonl").unlink()
+        self.assertEqual(len(self.codex_lines()), 1)
+
+    def test_the_time_is_the_files_when_the_record_has_none(self):
+        for stamp in (None, "not a time", 1761580000):
+            with self.subTest(timestamp=stamp):
+                record = self.count(self.limits(secondary=None))
+                record["timestamp"] = stamp
+                self.rollout("rollout-a.jsonl", [record], written_ago=630)
+                [line] = self.codex_lines()
+                self.assertTrue(line.endswith("   [read 10 min ago]"), line)
+
+    def test_compressed_rollouts_this_python_cannot_read_get_a_note(self):
+        for name in ("rollout-a.jsonl.zst", "rollout-b.jsonl.zst"):
+            (self.day / name).write_bytes(b"\x28\xb5\x2f\xfd")
+        with mock.patch.object(longhaul, "zstd", None):
+            self.assertEqual(self.codex_lines(), [
+                "  codex the readings are in 2 compressed rollouts, which Python 3.14 or later reads "
+                f"(this is Python {sys.version.split()[0]})"])
+            # A plain one with a reading is newer than any compressed one: it is shown.
+            self.rollout("rollout-c.jsonl", [self.count(self.limits(secondary=None))])
+            self.assertEqual(self.codex_lines(), [f"  codex 5h 12% (resets {self.resets(3600)})   [read 1 min ago]"])
+            # A plain one with none: the readings can only be in the compressed ones.
+            self.rollout("rollout-c.jsonl", [self.other("session_meta")])
+            [line] = self.codex_lines()
+            self.assertIn("the readings are in 2 compressed rollouts", line)
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_a_compressed_rollout_is_read_on_3_14(self):
+        self.rollout("rollout-a.jsonl.zst", [self.other("session_meta"), self.count(self.limits(secondary=None))])
+        self.assertEqual(self.codex_lines(), [f"  codex 5h 12% (resets {self.resets(3600)})   [read 1 min ago]"])
+
+    def test_a_damaged_rollout_is_skipped(self):
+        self.rollout("rollout-old.jsonl", [self.count(self.limits(primary=(30.0, 300, 3600)), ago=600)],
+                     written_ago=600)
+        cases = {}
+        if os.geteuid() != 0:  # root reads it all the same
+            cases["unreadable"] = lambda path: path.chmod(0)
+        if longhaul.zstd:
+            cases["not zstd"] = lambda path: path.write_bytes(b"not zstd at all")
+            # Cut short, as one being compressed this moment can be.
+            cases["cut short"] = lambda path: path.write_bytes(path.read_bytes()[:-8])
+        for case, damage in cases.items():
+            with self.subTest(case):
+                name = "rollout-new.jsonl" if case == "unreadable" else "rollout-new.jsonl.zst"
+                path = self.rollout(name, [self.count(self.limits(primary=(80.0, 300, 3600)))] * 50)
+                try:
+                    damage(path)
+                    os.utime(path, (self.now, self.now))
+                    [line] = self.codex_lines()
+                    self.assertTrue(line.startswith("  codex 5h 30% "), line)
+                finally:
+                    path.chmod(0o600)
+                    path.unlink()
+
+    def test_nothing_from_the_rollout_but_its_numbers_is_printed_and_nothing_is_written(self):
+        marker = "SENTINEL-CODEX-7"
+        self.rollout("rollout-a.jsonl", [
+            self.other("session_meta", cwd=f"/home/me/{marker}", cli_version=marker, originator=marker),
+            self.other("turn_context", model=marker, cwd=f"/x/{marker}"),
+            self.other("response_item", type="message", role="user",
+                       content=[{"type": "input_text", "text": f"{marker} is the plan"}]),
+            self.other("event_msg", type="item_completed", item={"type": "AgentMessage", "text": marker}),
+            self.count(self.limits(primary=(12.0, 300, 3600), secondary=None, reached=f"{marker} hit",
+                                   limit_id=marker, limit_name=marker, plan_type=marker,
+                                   credits={"has_credits": True, "unlimited": False, "balance": marker},
+                                   individual_limit={"name": marker}, spend_control_reached=marker)),
+        ])
+        before = sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*"))
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   CODEX_HOME=str(self.codex))
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "usage"], env=env, text=True,
+                             capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertIn(f"  codex 5h 12% (resets {self.resets(3600)})   limit reached   [read 1 min ago]",
+                      out.stdout)
+        self.assertNotIn(marker, out.stdout)
+        for word in ("plus", "credits", "limit_id", "plan"):
+            self.assertNotIn(word, out.stdout)
+        self.shown()
+        self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*")), before,
+                         "no ledger row, no file under LONGHAUL_HOME, nothing under CODEX_HOME")
+
+    def test_the_claude_lines_and_the_work_are_unchanged_by_a_codex_reading(self):
+        resets = self.now + 3600
+        longhaul.USAGE_DIR.mkdir()
+        (longhaul.USAGE_DIR / "Pro.json").write_text(json.dumps(
+            {"at": self.now - 630, "session": "s1", "five_hour": {"used_percentage": 23, "resets_at": resets},
+             "seven_day": {"used_percentage": 51, "resets_at": resets + 86400}}))
+        longhaul.save_label("s1", "docs task")
+        longhaul.LEDGER.write_text(json.dumps({"at": self.now - 600, "session": "s1", "account": "Pro", "cost": 0.4,
+                                               "five": 23, "five_resets": resets, "week": 51}) + "\n")
+        without = self.shown().splitlines()
+        self.assertEqual(without[:3], ["Allowance (latest reading per account)",
+                                       f"  Pro   5h 23% (resets {longhaul.clock(resets)})   "
+                                       f"week 51% (resets {longhaul.clock(resets + 86400)})   [read 10 min ago]", ""])
+        self.assertIn("docs task", without[5])
+        self.rollout("rollout-a.jsonl", [self.count(self.limits())])
+        codex = (f"  codex 5h 12% (resets {self.resets(3600)})   week 40% (resets {self.resets(86400)})   "
+                 "[read 1 min ago]")
+        self.assertEqual(self.shown().splitlines(), without[:2] + [codex] + without[2:])
+
+
 class CodexRollouts(unittest.TestCase):
     """Codex's rollouts, listed and read for inspect and usage (docs
     plans/2026-10-27-codex.md, Phase 1). Records shaped as the 0.146 alphas

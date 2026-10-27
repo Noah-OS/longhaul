@@ -2705,6 +2705,9 @@ def usage(opts) -> int:
                 parts.append(f"{label} {part['used_percentage']}% (resets {clock(part['resets_at'])})")
         ago = int((now - u.get("at", now)) / 60)
         print(f"  {name:<5} {'   '.join(parts)}   [read {ago} min ago]")
+    codex = codex_usage_line(codex_reading(), now)  # Codex's, from its rollouts (X2)
+    if codex:
+        print(codex)
 
     totals = summarize(ledger_rows(now - opts.days * 86400))
     if not totals:
@@ -2790,6 +2793,122 @@ def rollout_records(path: Path):
             except (ValueError, RecursionError):
                 record = None
             yield record if isinstance(record, dict) else None
+
+
+# `longhaul usage`'s Codex line (X2): the allowance as Codex last read it,
+# from the token_count event it writes after a response: payload.rate_limits
+# {primary, secondary: {used_percent, window_minutes, resets_at} or null,
+# rate_limit_reached_type, and plan_type, limit_id, credits and more, which
+# are never shown}. On the owner's plan secondary was null (P1). Read, not
+# kept: Phase 1 has no hooks, so `usage` writes nothing for Codex.
+
+# How many rollouts, newest first, are looked through: the newest chat has
+# the newest reading, but a chatgpt_handoff rollout has none (P1), and one
+# can be megabytes (the owner's newest was 2 MB), read to its end each time.
+CODEX_USAGE_READS = 5
+# A reached type shown as it is: a name like rate_limit_reached, never text.
+CODEX_REACHED = r"[A-Za-z][A-Za-z0-9_-]{0,63}"
+
+
+def codex_rate_limits(record) -> dict | None:
+    """The reading in one rollout record: {"windows": [{"used", "minutes",
+    "resets_at"}], "reached"}, or None. Only a token_count event's
+    rate_limits, and only one with a window whose used_percent is a number
+    or a limit reached: a rate_limits with neither says nothing of the
+    allowance. "reached" is the type when it is a plain name, "" for a
+    limit reached under any other type (shown without it), None for none."""
+    payload = dict_at(record, "payload")
+    if not isinstance(record, dict) or record.get("type") != "event_msg" or payload.get("type") != "token_count":
+        return None
+    limits = dict_at(payload, "rate_limits")
+    windows = []
+    for key in ("primary", "secondary"):
+        window = dict_at(limits, key)
+        if as_number(window.get("used_percent")) is not None:
+            windows.append({"used": window["used_percent"], "minutes": as_number(window.get("window_minutes")),
+                            "resets_at": as_number(window.get("resets_at"))})
+    reached = limits.get("rate_limit_reached_type")
+    if not reached:
+        if not windows:
+            return None
+        reached = None
+    elif not (isinstance(reached, str) and re.fullmatch(CODEX_REACHED, reached)):
+        reached = ""
+    return {"windows": windows, "reached": reached}
+
+
+def codex_reading(home: Path | None = None) -> dict | None:
+    """The newest rate-limits reading in Codex's rollouts (CODEX_HOME's,
+    or `home`'s): the last in the newest rollout that has one, of the
+    newest CODEX_USAGE_READS, as codex_rate_limits() gives it with "at",
+    the record's time, or the file's when the record's cannot be read. A
+    rollout that cannot be read through (ROLLOUT_ERRORS: unreadable,
+    damaged, cut short) is passed over. With no reading, {"compressed": n}
+    when the rollouts left unread are the n compressed ones this Python
+    cannot open, a week old and more, the only place one could be; else
+    None."""
+    try:
+        paths, packed = rollout_files(home)
+    except OSError:  # a sessions folder that cannot be walked: as none
+        return None
+    for path in paths[:CODEX_USAGE_READS]:
+        found = None
+        try:
+            for record in rollout_records(path):
+                reading = codex_rate_limits(record)
+                if reading:
+                    found = (record, reading)  # a later one is newer
+            written = path.stat().st_mtime
+        except ROLLOUT_ERRORS:
+            continue
+        if found:
+            stamp = found[0].get("timestamp")
+            at = parse_ts(stamp) if isinstance(stamp, str) else 0.0
+            return {"at": at if at > 0 else written, **found[1]}
+    return {"compressed": packed} if packed and len(paths) <= CODEX_USAGE_READS else None
+
+
+def codex_window_name(minutes) -> str:
+    """A window's name by its length: 5h and week as the Claude Code lines
+    name theirs, else hours when whole (2h) or minutes (45min); "window"
+    when Codex gave no length."""
+    whole = round(minutes) if minutes is not None else 0
+    if whole < 1:
+        return "window"
+    if whole in (300, 10080):
+        return "5h" if whole == 300 else "week"
+    return f"{whole // 60}h" if whole % 60 == 0 else f"{whole}min"
+
+
+def codex_usage_line(reading, now: float):
+    """`longhaul usage`'s line for codex_reading()'s `reading`, laid out as
+    the Claude Code accounts' are, or None. Numbers, the names above and a
+    plain reached type only: nothing else of the record is shown."""
+    if not reading:
+        return None
+    if "compressed" in reading:
+        n = reading["compressed"]
+        return (f"  {'codex':<5} the readings are in {n} compressed rollout{'' if n == 1 else 's'}, which Python "
+                f"3.14 or later reads (this is Python {sys.version.split()[0]})")
+    parts = []
+    for window in reading["windows"]:
+        label, resets = codex_window_name(window["minutes"]), window["resets_at"]
+        if resets is not None and resets <= now:
+            parts.append(f"{label} reset since")
+            continue
+        when = ""
+        if resets is not None:
+            try:
+                when = f" (resets {clock(resets)})"
+            except (OverflowError, OSError, ValueError):  # no time a datetime can hold
+                pass
+        # Codex's used_percent is a float: 12.0 is 12%, 12.5 stays 12.5%.
+        percent = f"{window['used']:.1f}".rstrip("0").rstrip(".")
+        parts.append(f"{label} {percent}%{when}")
+    if reading["reached"] is not None:
+        parts.append("limit reached" + (f" ({reading['reached']})" if reading["reached"] else ""))
+    ago = max(0, int((now - reading["at"]) / 60))
+    return f"  {'codex':<5} {'   '.join(parts)}   [read {ago} min ago]"
 
 
 # -------------------------------------------------------------- inspect
