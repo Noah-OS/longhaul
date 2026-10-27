@@ -8008,7 +8008,8 @@ class Shim(unittest.TestCase):
     def test_setup_never_links_the_command_into_a_plugin_cache(self):
         # P5: link_command() links ~/.local/bin/longhaul to wherever
         # longhaul.py is; from an installed plugin that is a folder that
-        # changes at every update and is deleted on uninstall.
+        # changes at every update and is deleted on uninstall. Since
+        # Sprint 11 (I1) it writes the launcher there instead (Launcher).
         cache = self.tmp / ".claude" / "plugins" / "cache" / "m" / "longhaul" / "0.1.0" / "longhaul.py"
         cache.parent.mkdir(parents=True)
         cache.write_text("")
@@ -8017,9 +8018,10 @@ class Shim(unittest.TestCase):
         with mock.patch.object(longhaul, "HOME", self.tmp), mock.patch.object(longhaul, "say", said.append), \
                 mock.patch.object(longhaul, "__file__", str(cache)):
             linked = longhaul.link_command()
-        self.assertFalse(target.exists(), "no link into the cache")
-        self.assertFalse(linked, "setup must not say Ready then")
-        self.assertTrue(any("python3 longhaul.py setup" in s for s in said), said)
+            launcher = longhaul.launcher_text()
+        self.assertFalse(target.is_symlink(), "no link into the cache")
+        self.assertTrue(linked, "the launcher stands in its place")
+        self.assertEqual(target.read_text(), launcher)
         with mock.patch.object(longhaul, "HOME", self.tmp), mock.patch.object(longhaul, "say", said.append), \
                 mock.patch.object(longhaul, "__file__", str(HERE / "longhaul.py")):
             longhaul.link_command()
@@ -8060,9 +8062,216 @@ class Shim(unittest.TestCase):
         out = setup()
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertIn("already exists and is not longhaul; left it alone", out.stdout)
-        self.assertIn("is not linked as a command", out.stdout)
+        self.assertIn("is not set up as a command", out.stdout)
         self.assertNotIn("Ready", out.stdout)
         self.assertEqual(target.read_text(), "#!/bin/sh\n")
+
+
+class Launcher(unittest.TestCase):
+    """I1 (Sprint 11, the owner's decision 5): `longhaul setup`, run from
+    the installed plugin, writes ~/.local/bin/longhaul, a launcher that runs
+    the newest Longhaul Claude Code has installed, found from
+    installed_plugins.json in the config folders Longhaul knows, with
+    `python3 -I`; a lost cache stops it with one line: reinstall the
+    plugin. A checkout's setup still links (the developer's way). Every
+    path is scratch: HOME, Longhaul's home and Claude Code's folders."""
+
+    REPO = json.loads((HERE / ".claude-plugin" / "plugin.json").read_text())["repository"].split("github.com/", 1)[1]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.user, self.home, self.claude = self.tmp / "user", self.tmp / "home", self.tmp / "user" / ".claude"
+        for folder in (self.home, self.claude):
+            folder.mkdir(parents=True)
+        self.target = self.user / ".local" / "bin" / "longhaul"
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("LONGHAUL_", "CLAUDE", "PYTHON"))}
+        self.env.update(HOME=str(self.user), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude),
+                        LONGHAUL_NO_NOTIFY="1", PATH=os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]))
+        for name, value in {"HOME": self.user, "LONGHAUL_HOME": self.home, "DEFAULT_CONFIG": self.claude}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+    def copy(self, version, root=None) -> Path:
+        """An installed copy of Longhaul (by default in Claude Code's cache):
+        its manifest, and a longhaul.py that says which copy it is, what it
+        was given and whether it runs isolated (-I)."""
+        root = root or self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / version
+        (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        shutil.copy(HERE / ".claude-plugin" / "plugin.json", root / ".claude-plugin" / "plugin.json")
+        (root / "longhaul.py").write_text(f"import sys\nprint('copy {version}', sys.argv[1:], sys.flags.isolated)\n")
+        return root
+
+    def installed(self, *rows, folder=None, shape=2):
+        """installed_plugins.json in `folder` (default: ~/.claude), as Claude
+        Code writes it: each row (version, installPath) one of
+        longhaul@longhaul's installs, beside another plugin's newer one."""
+        entries = [{"scope": "user", "version": v, "installPath": str(p)} for v, p in rows]
+        other = self.copy("9.9.9", self.tmp / "other-plugin")
+        path = (folder or self.claude) / "plugins" / "installed_plugins.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": shape, "plugins": {
+            "other@example": [{"scope": "user", "version": "9.9.9", "installPath": str(other)}],
+            "longhaul@longhaul": entries if shape == 2 else entries[0]}}, indent=2))
+
+    def launcher(self) -> Path:
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.target.write_text(longhaul.launcher_text())
+        self.target.chmod(0o755)
+        return self.target
+
+    def launch(self, *args, **env):
+        """The launcher run as a terminal runs it, in a scratch folder holding a longhaul.py of its own."""
+        (self.tmp / "longhaul.py").write_text("print('the folder it runs in')\n")
+        return subprocess.run([str(self.target), *args], capture_output=True, text=True, env={**self.env, **env},
+                              cwd=self.tmp, timeout=30, stdin=subprocess.DEVNULL)
+
+    def link_command(self, file: Path, said: list) -> bool:
+        """link_command() as `python3 <file> setup` runs it."""
+        with mock.patch.object(longhaul, "say", said.append), mock.patch.object(longhaul, "__file__", str(file)):
+            return longhaul.link_command()
+
+    def test_the_launcher_runs_the_newest_installed_copy_isolated_with_the_arguments(self):
+        self.installed(("0.2.8", self.copy("0.2.8")), ("0.2.10", self.copy("0.2.10")),
+                       ("0.3.0", self.tmp / "gone" / "0.3.0"))  # its cache is gone: passed over
+        self.launcher()
+        out = self.launch("status", "--days", "2", PYTHONPATH=str(self.tmp))
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        # 0.2.10 is newer than 0.2.8 by number; -I: no PYTHONPATH, no user site, not the folder it runs in.
+        self.assertEqual(out.stdout, "copy 0.2.10 ['status', '--days', '2'] 1\n")
+        self.assertEqual(longhaul.installed_copies()[0],
+                         ("0.2.10", str(self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / "0.2.10" / "longhaul.py")))
+        self.assertEqual([v for v, _ in longhaul.installed_copies()], ["0.2.10", "0.2.8"], "newest first; other@example is not ours")
+
+    def test_the_launcher_and_installed_copies_read_every_config_folder_longhaul_knows(self):
+        # ~/.claude, each account's folder in accounts.json, and the
+        # terminal's CLAUDE_CONFIG_DIR; the launcher and installed_copies()
+        # choose the same copy each time.
+        self.installed(("0.2.8", self.copy("0.2.8")))
+        pro, chat = self.tmp / "claude-pro", self.tmp / "claude-chat"
+        self.installed(("0.2.9", self.copy("0.2.9", self.tmp / "pro-cache")), folder=pro)
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(pro)},
+            {"name": "Junk", "config_dir": 7}, {"name": "Here", "config_dir": "claude-here"}]))
+        here = self.tmp / "claude-here"  # a relative folder would be read against the folder it runs in: never
+        self.installed(("5.0.0", self.copy("5.0.0", self.tmp / "here-cache")), folder=here)
+        self.launcher()
+        for env, version, root in (({}, "0.2.9", self.tmp / "pro-cache"),
+                                   ({"CLAUDE_CONFIG_DIR": str(chat)}, "0.2.9", self.tmp / "pro-cache"),
+                                   ("newer in the chat's folder", "0.3.1", self.tmp / "chat-cache")):
+            if isinstance(env, str):
+                self.installed(("0.3.1", self.copy("0.3.1", self.tmp / "chat-cache")), folder=chat)
+                env = {"CLAUDE_CONFIG_DIR": str(chat)}
+            out = self.launch("doctor", **env)
+            self.assertEqual(out.stdout, f"copy {version} ['doctor'] 1\n", (env, out.stderr))
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(longhaul.installed_copies()[0], (version, str(root / "longhaul.py")), env)
+        self.assertEqual(self.launch().stdout, "copy 0.2.9 [] 1\n", "without CLAUDE_CONFIG_DIR the chat's folder is not read")
+        # Each folder once, by its real path, absolute ones only: the update
+        # command's list of marketplaces is read through the same list.
+        os.environ["CLAUDE_CONFIG_DIR"] = str(chat)
+        self.assertEqual(longhaul.config_folders(), [self.claude, pro, chat])
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.claude) + "/"
+        self.assertEqual(longhaul.config_folders(), [self.claude, pro])
+
+    def test_without_an_installed_copy_the_launcher_says_in_one_line_to_reinstall(self):
+        self.launcher()
+        said = ("longhaul: no installed Longhaul was found. Reinstall the plugin: "
+                f"claude plugin install longhaul --marketplace {self.REPO}\n")
+        path = self.claude / "plugins" / "installed_plugins.json"
+        path.parent.mkdir(parents=True)
+        for junk in (None, "{not json", "[]", json.dumps({"plugins": []}), json.dumps({"plugins": {"longhaul@longhaul": "x"}}),
+                     json.dumps({"plugins": {"longhaul@longhaul": [{"version": "1.0.0"}, {"installPath": 3},
+                                                                   {"installPath": ""}, {"installPath": "."}]}})):
+            if junk is not None:
+                path.write_text(junk)
+            out = self.launch("doctor")
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (1, "", said), junk)
+            self.assertEqual(longhaul.installed_copies(), [], junk)  # "." would be this checkout's own longhaul.py
+        # The older shape, one install and no list, still counts.
+        self.installed(("0.2.8", self.copy("0.2.8")), shape=1)
+        self.assertEqual(self.launch().stdout, "copy 0.2.8 [] 1\n")
+
+    def test_the_launcher_is_short_python_on_the_oldest_and_newest_versions(self):
+        text = longhaul.launcher_text()
+        compile(text, "longhaul-launcher", "exec")  # the suite runs on the oldest Python and the newest
+        self.assertTrue(text.startswith("#!/usr/bin/env python3\n# longhaul-launcher 1: "), text[:80])
+        self.assertLessEqual(len(text.splitlines()), 45, "short enough to read whole")
+        self.assertEqual(re.findall(r"^import (\w+)$", text, re.M), ["json", "os", "re", "sys"], "the stdlib alone")
+        self.assertNotIn("INSTALL_COMMAND", text)
+        self.assertIn(f"claude plugin install longhaul --marketplace {self.REPO}", text, "the manifest's repository")
+        with mock.patch.object(longhaul, "plugin_repository", return_value=""):
+            self.assertIn("Reinstall the plugin: claude plugin install longhaul@longhaul\")", longhaul.launcher_text())
+        self.assertIn('[sys.executable, "-I", script]', text, "the copy runs isolated, as the hooks run it")
+
+    def test_setup_from_the_installed_plugin_writes_the_launcher_and_from_a_checkout_links(self):
+        cache = self.copy("0.2.8") / "longhaul.py"  # Claude Code's copy, under ~/.claude/plugins
+        said = []
+        self.assertTrue(self.link_command(cache, said))
+        self.assertFalse(self.target.is_symlink(), "no link into the cache, which moves at every update")
+        self.assertEqual(self.target.read_text(), longhaul.launcher_text())
+        self.assertTrue(os.access(self.target, os.X_OK))
+        self.assertIn("wrote ~/.local/bin/longhaul, Longhaul's launcher", " ".join(said))
+        self.assertIn("~/.local/bin is not on PATH", " ".join(said))
+        said.clear()
+        self.assertTrue(self.link_command(cache, said))
+        self.assertNotIn("wrote", " ".join(said), "today's launcher is left as it is")
+        self.target.write_text(longhaul.launcher_text().replace("longhaul-launcher 1", "longhaul-launcher 0"))
+        self.assertTrue(self.link_command(cache, said))
+        self.assertEqual(self.target.read_text(), longhaul.launcher_text(), "an older one is brought up to date")
+        # From a checkout (the developer's way) the launcher gives way to a link.
+        said.clear()
+        self.assertTrue(self.link_command(HERE / "longhaul.py", said))
+        self.assertEqual(self.target.resolve(), (HERE / "longhaul.py").resolve())
+        self.assertIn("the developer's way", " ".join(said))
+        # The installed plugin's setup leaves a link to a checkout alone...
+        said.clear()
+        self.assertTrue(self.link_command(cache, said))
+        self.assertEqual(self.target.resolve(), (HERE / "longhaul.py").resolve())
+        self.assertIn("left it alone", " ".join(said))
+        # ...and replaces a link into the cache, as a hand made it, or to a longhaul.py that is gone.
+        for old in (cache, self.tmp / "gone" / "longhaul.py"):
+            self.target.unlink()
+            self.target.symlink_to(old)
+            self.assertTrue(self.link_command(cache, said), old)
+            self.assertFalse(self.target.is_symlink(), old)
+            self.assertEqual(self.target.read_text(), longhaul.launcher_text(), old)
+        # Someone else's command is never touched.
+        for other in ("a file", "a link"):
+            self.target.unlink()
+            if other == "a file":
+                self.target.write_text("#!/bin/sh\n")
+            else:
+                self.target.symlink_to(self.tmp / "other-tool")
+            said.clear()
+            self.assertFalse(self.link_command(cache, said), other)
+            self.assertIn("already exists and is not longhaul; left it alone", " ".join(said), other)
+        self.assertEqual(os.readlink(self.target), str(self.tmp / "other-tool"))
+
+    def test_setup_run_from_the_installed_copy_gives_a_command_that_runs_it(self):
+        # The whole route a user takes: the line the doctor gives, then `longhaul`.
+        copy = self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / "0.2.8"
+        (copy / ".claude-plugin").mkdir(parents=True)
+        shutil.copy(HERE / "longhaul.py", copy / "longhaul.py")
+        shutil.copy(HERE / ".claude-plugin" / "plugin.json", copy / ".claude-plugin" / "plugin.json")
+        self.installed(("0.2.8", copy))
+        out = subprocess.run([sys.executable, str(copy / "longhaul.py"), "setup"], capture_output=True, text=True,
+                             env=self.env, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Ready", out.stdout)
+        self.assertFalse(self.target.is_symlink())
+        out = self.launch("-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul", out.stdout)
+        shutil.rmtree(copy)  # a lost cache: one line, reinstall
+        out = self.launch("status")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(len(out.stderr.splitlines()), 1, out.stderr)
+        self.assertIn("Reinstall the plugin", out.stderr)
 
 
 class InspectSkill(unittest.TestCase):
@@ -14635,6 +14844,42 @@ class Doctor(unittest.TestCase):
         self.assertEqual(c["mark"], "bad")
         self.assertIn("~/.local/bin/longhaul links to a file that is gone", c["said"])
         self.assertIn("python3 longhaul.py setup", c["step"])
+
+    def test_the_terminal_command_line_knows_the_launcher_and_gives_the_exact_setup_line(self):
+        # I1 (Sprint 11): with an installed copy, the step is the one line
+        # to type, from that copy; the clone is the developer's way only.
+        self.installed()
+        rest = f".claude/plugins/cache/longhaul/longhaul/{self.VERSION}"
+        copy = self.checkout(self.VERSION, name=f"user/{rest}")
+        line = f"`python3 ~/{rest}/longhaul.py setup`"
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn(line, c["step"])
+        self.assertIn("a launcher that runs the newest installed Longhaul", c["step"])
+        self.assertNotIn("git clone", c["step"])
+        # A link into the plugin's own copy is moved to the launcher by the same line.
+        target = self.link(copy)
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn(line, c["step"])
+        # The launcher: what it runs.
+        target.unlink()
+        target.write_text(longhaul.launcher_text())
+        target.chmod(0o755)
+        c = longhaul.doctor_command()
+        self.assertEqual((c["mark"], c["said"]),
+                         ("ok", f"~/.local/bin/longhaul, Longhaul's launcher: runs {self.VERSION} (~/{rest})"))
+        target.write_text(longhaul.launcher_text().replace("longhaul-launcher 1", "longhaul-launcher 0"))
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("an older launcher", c["said"])
+        self.assertIn(line, c["step"])
+        # A lost cache: the launcher finds nothing to run.
+        shutil.rmtree(copy)
+        c = longhaul.doctor_command()
+        self.assertEqual(c["mark"], "bad")
+        self.assertIn("finds no installed Longhaul", c["said"])
+        self.assertIn(f"`claude plugin install longhaul --marketplace {self.REPO}`", c["step"])
 
     def test_claude_codes_version_against_the_checked_range(self):
         low, high = longhaul.TESTED_VERSIONS

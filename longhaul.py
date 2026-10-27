@@ -95,7 +95,12 @@ Usage:
                           (on), or its own sign-in again (off); it edits VS
                           Code's settings for you, a copy kept
   longhaul setup [NAME]         sign each account in to its own folder (a browser
-                          sign-in); only the emails in accounts.json count
+                          sign-in); only the emails in accounts.json count. It
+                          sets up the `longhaul` command too: run from the
+                          installed plugin (the line `longhaul doctor` gives),
+                          it writes ~/.local/bin/longhaul, a launcher that runs
+                          the newest Longhaul Claude Code has installed; run
+                          from a checkout of your own, it links there instead
   longhaul status               accounts, sign-ins, limits, links
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
@@ -6940,13 +6945,9 @@ def release_files() -> list:
     Longhaul knows, ~/.claude's, each account's and the chat's
     (CLAUDE_CONFIG_DIR), once by its real path: an account's plugins/ is a
     link into ~/.claude's (SHARED), and one file must be edited once. Only
-    the files there are, in that order."""
-    accounts, _problem = read_accounts_file()
-    folders = [DEFAULT_CONFIG]
-    folders += [config_of(a) for a in accounts or [] if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)]
-    folders.append(Path(chat_config_dir()))
+    the files there are, in that order (config_folders())."""
     seen, files = set(), []
-    for folder in folders:
+    for folder in config_folders():
         real = os.path.realpath(folder / "plugins" / "known_marketplaces.json")
         if real not in seen and os.path.isfile(real):
             seen.add(real)
@@ -8949,25 +8950,202 @@ def auth_status(acct: dict, binary: str | None = None) -> dict:
         return {"loggedIn": False, "unknown": True, "why": f"exit {out.returncode}, no JSON"}
 
 
+# The terminal command (Sprint 11, I1; the owner's decision 5 of
+# 2026-10-27). An installed plugin's folder changes at every update and goes
+# at uninstall, so a link into it dies with it (ADR-0001, decision 3), and
+# the command took a git clone of its own. `longhaul setup`, run from the
+# installed copy, writes this launcher at ~/.local/bin/longhaul instead: it
+# finds the newest Longhaul Claude Code has installed, at each run, as
+# installed_copies() does, and runs it with -I, as the hooks run Longhaul,
+# so PYTHONPATH and the folder it runs in put no module of their own into
+# it. It is the stdlib alone, and short, to be read whole. INSTALL_COMMAND
+# is filled in when it is written (launcher_text()). Setup from a checkout
+# of your own still links to it (the developer's way).
+LAUNCHER_TAG = "# longhaul-launcher"  # its second line names it, and its version: setup and the doctor know it by it
+LAUNCHER = r'''#!/usr/bin/env python3
+# longhaul-launcher 1: Longhaul's terminal command, written by `longhaul setup`.
+# It runs the newest Longhaul Claude Code has installed: the installPath of
+# longhaul@longhaul in installed_plugins.json, in each Claude config folder
+# Longhaul knows (CLAUDE_CONFIG_DIR, ~/.claude, and each account's config_dir
+# in ~/.longhaul/accounts.json), absolute folders and paths only. It reads
+# those files, then runs that copy's longhaul.py with `python3 -I` and your
+# arguments, and does nothing else.
+import json
+import os
+import re
+import sys
+
+
+def read(path):
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+folders = [os.environ.get("CLAUDE_CONFIG_DIR"), os.environ.get("LONGHAUL_DEFAULT_CONFIG_DIR") or "~/.claude"]
+accounts = read(os.path.join(os.environ.get("LONGHAUL_HOME") or "~/.longhaul", "accounts.json"))
+if isinstance(accounts, list):
+    folders += [a.get("config_dir") for a in accounts if isinstance(a, dict)]
+copies = []
+for folder in folders:
+    folder = os.path.expanduser(folder) if isinstance(folder, str) else ""
+    found = read(os.path.join(folder, "plugins", "installed_plugins.json")) if os.path.isabs(folder) else None
+    plugins = found.get("plugins") if isinstance(found, dict) else None
+    entries = plugins.get("longhaul@longhaul") if isinstance(plugins, dict) else None
+    for entry in entries if isinstance(entries, list) else [entries]:
+        path = entry.get("installPath") if isinstance(entry, dict) else None
+        path = os.path.expanduser(path) if isinstance(path, str) else ""
+        script = os.path.join(path, "longhaul.py")
+        if os.path.isabs(path) and os.path.isfile(script):
+            copies.append(([int(n) for n in re.findall(r"\d+", str(entry.get("version")))], script))
+if not copies:
+    sys.exit("longhaul: no installed Longhaul was found. Reinstall the plugin: INSTALL_COMMAND")
+script = max(copies)[1]
+os.execv(sys.executable, [sys.executable, "-I", script] + sys.argv[1:])
+'''
+
+
+def install_command() -> str:
+    """The one command that installs Longhaul again, from the repository
+    the manifest names (a marketplace not added yet is added with it)."""
+    repo = plugin_repository()
+    return f"claude plugin install longhaul --marketplace {repo}" if repo else "claude plugin install longhaul@longhaul"
+
+
+def launcher_text() -> str:
+    """The launcher as setup writes it."""
+    return LAUNCHER.replace("INSTALL_COMMAND", install_command())
+
+
+def launcher_at(path) -> bool:
+    """Whether `path` is a launcher setup wrote, of any version: a file, not
+    a link, whose start names it."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        with open(path, "rb") as f:
+            return LAUNCHER_TAG.encode() in f.read(200)
+    except OSError:
+        return False
+
+
+def config_folders() -> list:
+    """The Claude config folders Longhaul knows: ~/.claude (DEFAULT_CONFIG),
+    each account's in accounts.json, and the CLAUDE_CONFIG_DIR this runs
+    under, in that order, each once by its real path. Absolute ones only:
+    a relative one would be read against whatever folder this runs in. The
+    launcher reads the same ones."""
+    accounts, _problem = read_accounts_file()
+    folders = [DEFAULT_CONFIG] + [config_of(a) for a in accounts or [] if isinstance(a.get("config_dir"), str)]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        folders.append(Path(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"])))
+    seen, kept = set(), []
+    for folder in folders:
+        real = os.path.realpath(folder)
+        if folder.is_absolute() and real not in seen:
+            seen.add(real)
+            kept.append(folder)
+    return kept
+
+
+def installed_copies() -> list:
+    """Each longhaul.py Claude Code has installed, as (version, path), newest
+    first: the installPath of longhaul@longhaul in installed_plugins.json, in
+    each of config_folders(), in either shape the file has had, any scope,
+    an absolute path whose longhaul.py is there. The first is the one the
+    launcher runs (the same order: the version's numbers, then the path)."""
+    copies = []
+    for folder in config_folders():
+        entries = dict_at(read_json(folder / "plugins" / "installed_plugins.json"), "plugins").get(RELEASE_PLUGIN)
+        for entry in entries if isinstance(entries, list) else [entries]:
+            path = entry.get("installPath") if isinstance(entry, dict) else None
+            path = os.path.expanduser(path) if isinstance(path, str) else ""
+            script = os.path.join(path, "longhaul.py")
+            if os.path.isabs(path) and os.path.isfile(script):
+                version = str(entry.get("version"))
+                copies.append(([int(n) for n in re.findall(r"\d+", version)], script, version))
+    return [(version, script) for _, script, version in sorted(copies, reverse=True)]
+
+
+def setup_line_to_type():
+    """The exact terminal line that sets up the terminal command from the
+    newest installed copy, `~` kept so it reads short; None without one."""
+    copies = installed_copies()
+    if not copies:
+        return None
+    script, home = copies[0][1], str(HOME)
+    if script.startswith(home + "/"):
+        return f"python3 ~/{shlex.quote(script[len(home) + 1:])} setup"
+    return f"python3 {shlex.quote(script)} setup"
+
+
+def on_path(folder: Path) -> bool:
+    """Whether `folder` is one of PATH's entries, by real path."""
+    real = os.path.realpath(folder)
+    return any(os.path.isabs(e) and os.path.realpath(e) == real for e in os.environ.get("PATH", "").split(os.pathsep))
+
+
+def write_launcher(target: Path) -> bool:
+    """The launcher at `target`, in place of an older one, a link into the
+    plugin's cache or a link to a longhaul.py that is gone; True when the
+    command runs Longhaul now. A link to a checkout of your own is the
+    developer's way, left alone (True); anything else is someone else's,
+    left alone (False)."""
+    text = launcher_text()
+    if target.is_symlink():
+        real = os.path.realpath(target)
+        if os.path.basename(real) != "longhaul.py":
+            say(f"{target} already exists and is not longhaul; left it alone")
+            return False
+        if os.path.exists(real) and not doctor_in_plugins(real):
+            say(f"{home_path(str(target))} links to your checkout in {home_path(os.path.dirname(real))} (the "
+                "developer's way); left it alone. Remove it and run this again to use the installed plugin instead.")
+            return True
+    elif target.exists():
+        if not launcher_at(target):
+            say(f"{target} already exists and is not longhaul; left it alone")
+            return False
+        if target.read_text(errors="replace") == text:
+            return True
+    write_whole(target, text)
+    os.chmod(target, 0o755)
+    say(f"wrote {home_path(str(target))}, Longhaul's launcher: `longhaul` runs the newest Longhaul Claude Code has "
+        "installed, from any folder and after every update")
+    return True
+
+
 def link_command() -> bool:
-    """Link ~/.local/bin/longhaul to this file; True when the link points here."""
+    """The terminal command at ~/.local/bin/longhaul; True when it runs
+    Longhaul. From an installed plugin's copy, the launcher (LAUNCHER,
+    write_launcher()); from a checkout of your own, a link to this file,
+    which takes the place of a launcher. Says when ~/.local/bin is not on
+    PATH."""
     target = HOME / ".local" / "bin" / "longhaul"
     here = Path(__file__).resolve()
-    if (HOME / ".claude" / "plugins").resolve() in here.parents:
-        # An installed plugin's folder changes at every update and goes at
-        # uninstall; a link into it dies with it (ADR-0001, decision 3).
-        say(f"not linking {target}: this longhaul is an installed plugin's copy ({here.parent}), "
-            "which moves at every update. Run `python3 longhaul.py setup` from a checkout of your own.")
-        return False
-    if target.is_symlink() and target.resolve() == here:
-        return True
-    if target.exists() or target.is_symlink():
+    if doctor_in_plugins(str(here)):
+        done = write_launcher(target)
+    elif target.is_symlink() and target.resolve() == here:
+        done = True
+    elif launcher_at(target):
+        target.unlink()
+        target.symlink_to(here)
+        say(f"linked {home_path(str(target))} to this checkout ({home_path(str(here.parent))}) in place of "
+            "Longhaul's launcher: the developer's way")
+        done = True
+    elif target.exists() or target.is_symlink():
         say(f"{target} already exists and is not longhaul; left it alone")
         return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(here)
-    say(f"linked {target}, so `longhaul` works from any folder")
-    return True
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(here)
+        say(f"linked {target}, so `longhaul` works from any folder")
+        done = True
+    if done and not on_path(target.parent):
+        say(f"{home_path(str(target.parent))} is not on PATH: add it in your shell's profile (for zsh, "
+            "`export PATH=\"$HOME/.local/bin:$PATH\"` in ~/.zshrc), then open a new terminal")
+    return done
 
 
 def setup(opts) -> int:
@@ -8989,9 +9167,10 @@ def setup(opts) -> int:
             say(f"no account called {opts.account}: none is on the list yet; `longhaul add NAME EMAIL` adds one")
             return 2
         if not link_command():
-            say("`longhaul` is not linked as a command (see above). A second subscription is `longhaul add NAME EMAIL`.")
+            say("`longhaul` is not set up as a command (see above). A second subscription is `longhaul add NAME EMAIL`.")
             return 1
-        say("Ready: point the status line at `~/.local/bin/longhaul statusline` in your own ~/.claude/settings.json. "
+        say("Ready: `longhaul` works from any folder, and `longhaul doctor` shows what is set up. Point the status "
+            "line at `~/.local/bin/longhaul statusline` in your own ~/.claude/settings.json. "
             "A second subscription is `longhaul add NAME EMAIL`.")
         return 0
     names = [a["name"] for a in accounts]
@@ -9053,7 +9232,7 @@ def setup(opts) -> int:
     if link_command():
         say("Ready: run `longhaul`.")
     else:
-        say("The accounts are set up, but `longhaul` is not linked as a command (see above): run `python3 longhaul.py` instead.")
+        say("The accounts are set up, but `longhaul` is not set up as a command (see above): run `python3 longhaul.py` instead.")
     return 0
 
 
@@ -9621,10 +9800,10 @@ def doctor_is_shim(path: str) -> bool:
 
 
 def doctor_in_plugins(path: str) -> bool:
-    """Whether a real path is inside Claude Code's plugins folder, whose
-    copies move at every update."""
+    """Whether a real path is inside Claude Code's plugins folder, in any
+    config folder Longhaul knows, whose copies move at every update."""
     real = os.path.realpath(path)
-    return any(inside(real, os.path.realpath(str(folder / "plugins"))) for folder in (DEFAULT_CONFIG, HOME / ".claude"))
+    return any(inside(real, os.path.realpath(str(folder / "plugins"))) for folder in config_folders() + [HOME / ".claude"])
 
 
 def doctor_installed() -> dict:
@@ -9679,12 +9858,18 @@ def doctor_plugin() -> dict:
 def doctor_command() -> dict:
     """2. The terminal command: `longhaul` on PATH (the plugin's own shim
     is not it), runnable, and its version, read from the manifest beside
-    the longhaul.py it links to, against the installed plugin's.
-    Accounts, switching, the status line, trials, models and VS Code all
-    need it."""
+    the longhaul.py it links to, against the installed plugin's; or the
+    launcher setup writes (Sprint 11, I1), and the copy it runs. Accounts,
+    switching, the status line, trials, models and VS Code all need it.
+    Its step is the exact line to type, from the newest installed copy;
+    the clone is for a developer, or when no copy is installed."""
     repo = plugin_repository() or "the repository"
-    link = (f"keep a checkout and link it: `git clone https://github.com/{repo}.git`, then `python3 longhaul.py "
-            "setup` in it (it links ~/.local/bin/longhaul; ~/.local/bin must be on PATH)")
+    line = setup_line_to_type()
+    link = (f"run `{line}` in a terminal: it writes ~/.local/bin/longhaul, a launcher that runs the newest installed "
+            "Longhaul (~/.local/bin must be on PATH)" if line else
+            "install the plugin (see Plugin), then run `longhaul doctor` again for the line that sets it up; or keep "
+            f"a checkout of your own: `git clone https://github.com/{repo}.git`, then `python3 longhaul.py setup` in "
+            "it (it links ~/.local/bin/longhaul; ~/.local/bin must be on PATH)")
     hits = [hit for hit in doctor_path_hits("longhaul") if not doctor_is_shim(hit[0])]
     found = next((path for path, runnable in hits if runnable), None)
     if found is None:
@@ -9701,6 +9886,17 @@ def doctor_command() -> dict:
         return doctor_result("`longhaul` is not on PATH; accounts, switching, the status line, trials, models and "
                              "VS Code need it", mark="bad", step=link)
     real = Path(os.path.realpath(found))
+    if launcher_at(real):
+        copies = installed_copies()
+        if not copies:
+            return doctor_result(f"{home_path(found)} is Longhaul's launcher, and it finds no installed Longhaul to run",
+                                 mark="bad", step=f"reinstall the plugin: `{install_command()}`")
+        if real.read_text(errors="replace") != launcher_text():
+            return doctor_result(f"{home_path(found)} is an older launcher than this Longhaul writes", mark="warn",
+                                 step=link)
+        version, script = copies[0]
+        return doctor_result(f"{home_path(found)}, Longhaul's launcher: runs {version} "
+                             f"({home_path(os.path.dirname(script))})")
     if doctor_in_plugins(str(real)):
         return doctor_result(f"{home_path(found)} links into the plugin's own copy, which moves at every update",
                              mark="warn", step=link)
