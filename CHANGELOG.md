@@ -2,6 +2,15 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.1 - 2026-10-27
+
+Two small fixes after 0.3.0.
+
+### Fixed
+
+- **`longhaul setup` names `longhaul statusline install`.** With no second subscription, its last line still said to point the status line at `~/.local/bin/longhaul statusline` in `settings.json` by hand. Since 0.2.9, `longhaul statusline install` does that, with a backup.
+- **The README gives the VS Code panel's install.** Step 1 gave only the lines typed in a terminal. It now gives the panel's way too: type `/plugins`, add Longhaul's repository in the Marketplaces tab, then install Longhaul from the Plugins tab. It also gives the extension's install link.
+
 ## 0.3.0 - 2026-10-27
 
 The token layer: where a session's context costs more than its size, a checkpoint that keeps the thread, and an output filter measured before it cuts anything.
