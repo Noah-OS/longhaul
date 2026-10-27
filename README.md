@@ -48,11 +48,17 @@ Longhaul was built from those patterns as they show up in real use: in one perso
 > [!IMPORTANT]
 > A plugin runs code with your privileges, and Longhaul's hooks run in every session once it is enabled. Read [what the hooks do](https://github.com/Noah-OS/longhaul/wiki/Hooks) before you install it.
 
-**1. Install the plugin**, in Claude Code:
+**1. Install the plugin**, in Claude Code in a terminal:
 
 ```
 /plugin marketplace add Noah-OS/longhaul
 /plugin install longhaul@longhaul
+```
+
+In the VS Code panel, type `/plugins`, add `Noah-OS/longhaul` in the **Marketplaces** tab, then install Longhaul from the **Plugins** tab with **Install for you**. Or open this link in VS Code, which takes you to the same choice:
+
+```
+vscode://anthropic.claude-code/install-plugin?plugin=longhaul&marketplace=Noah-OS/longhaul
 ```
 
 **2. See the report**, in any session:

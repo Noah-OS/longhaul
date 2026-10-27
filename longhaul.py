@@ -10962,9 +10962,8 @@ def setup(opts) -> int:
         if not link_command():
             say("`longhaul` is not set up as a command (see above). A second subscription is `longhaul add NAME EMAIL`.")
             return 1
-        say("Ready: `longhaul` works from any folder, and `longhaul doctor` shows what is set up. Point the status "
-            "line at `~/.local/bin/longhaul statusline` in your own ~/.claude/settings.json. "
-            "A second subscription is `longhaul add NAME EMAIL`.")
+        say("Ready: `longhaul` works from any folder, and `longhaul doctor` shows what is set up. "
+            "`longhaul statusline install` sets the status line. A second subscription is `longhaul add NAME EMAIL`.")
         return 0
     names = [a["name"] for a in accounts]
     if opts.account and opts.account not in names:

@@ -3131,6 +3131,17 @@ class Plugin(unittest.TestCase):
         with self.subTest("the Claude Code range", first=first, last=last):
             self.assertLessEqual(set(re.findall(r"\b(\d+\.\d+\.\d+) to (\d+\.\d+\.\d+)\b", readme)), {(first, last)},
                                  "any version range the README gives is TESTED_VERSIONS")
+        manifest = json.loads((HERE / ".claude-plugin" / "plugin.json").read_text())
+        market = json.loads((HERE / ".claude-plugin" / "marketplace.json").read_text())
+        repo = manifest["repository"].split("github.com/", 1)[1]
+        with self.subTest("the install steps", repo=repo):
+            # The terminal's typed lines and the VS Code panel's install link
+            # (the extension's documented form) name this repository and the
+            # plugin as its marketplace lists it, so a rename leaves neither stale.
+            self.assertIn(manifest["name"], [plugin["name"] for plugin in market["plugins"]])
+            for step in (f"/plugin marketplace add {repo}", f"/plugin install {manifest['name']}@{market['name']}",
+                         f"vscode://anthropic.claude-code/install-plugin?plugin={manifest['name']}&marketplace={repo}"):
+                self.assertTrue(lines(readme, step), f"README.md gives no {step!r}")
         _, jobs = self.workflow()
         with self.subTest("the test command"):
             fenced = re.findall(r"^```[^\n]*\n(.*?)\n```$", readme, re.M | re.S)
@@ -9071,7 +9082,10 @@ class Shim(unittest.TestCase):
                              env={**self.env, "HOME": str(self.tmp)}, timeout=30, stdin=subprocess.DEVNULL)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(target.resolve(), (HERE / "longhaul.py").resolve(), "linked, with no account to sign in")
-        self.assertIn("longhaul statusline", out.stdout, "what to point the status line at")
+        # Since 0.2.9 `longhaul statusline install` writes the setting itself
+        # (and backs up settings.json); the line no longer sends you to edit it.
+        self.assertIn("`longhaul statusline install`", out.stdout, "the command that sets the status line")
+        self.assertNotIn("settings.json", out.stdout)
         self.assertIn("longhaul add", out.stdout, "a second subscription is the advanced feature")
         self.assertFalse((self.tmp / "home" / "accounts.json").exists(), "no account was invented")
 
