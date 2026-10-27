@@ -3042,6 +3042,27 @@ def consultations(sid: str, keep: bool = False):
             "no_outcome": len(admitted_ids - outcome_ids), "admitted_ids": admitted_ids}
 
 
+REBUILD_MIN = 4096  # tokens: a cached prefix this small or smaller is not counted as written again (RTK's floor)
+CACHE_TTLS = {"5m": 300, "1h": 3600}  # seconds each prompt-cache lifetime lasts with no request
+REBUILD_CAUSES = {"tool": "a tool call outlasted the cache's {ttl} lifetime",
+                  "idle": "idle past the cache's {ttl} lifetime, with no message",
+                  "resumed": "a message came after the cache's {ttl} lifetime",
+                  "bust": "the cached prefix changed within its {ttl} lifetime"}
+
+
+def cache_ttl(usage: dict, scope: str) -> str:
+    """The prompt cache's lifetime for a response: the one its usage says it
+    wrote at (Claude Code 2.1.300 and later), else the default for its scope:
+    five minutes for a subagent, an hour for the main conversation, which is
+    a subscription's (inferred: an API key's main conversation has five)."""
+    made = dict_at(usage, "cache_creation")
+    if as_int(made.get("ephemeral_1h_input_tokens")):
+        return "1h"
+    if as_int(made.get("ephemeral_5m_input_tokens")):
+        return "5m"
+    return "5m" if scope == "subagents" else "1h"
+
+
 def text_from(path: Path, offset: int = 0):
     """The file open as text, a bad byte replaced, read from byte `offset`
     on: the start of a line, as trial_scan() finds it, so that the text
@@ -3073,8 +3094,15 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     compactions, api_errors, unreadable, lines, cwd = [], collections.Counter(), 0, 0, None
     tool_calls, tool_chars = collections.Counter(), collections.Counter()  # (scope, tool) -> calls, output characters
     spans, ends = {}, {}  # a subagent's file -> [its first time, its last], and how it ends (subagent_runs below)
+    # The token layer, Phase 0: per file, its responses in order and its compactions (the cache rebuilds below);
+    # when each response began and ended, which response made each call, and when each call began and was answered.
+    # A response that followed a message (a user line with no tool result: a prompt, the coordinator's, an
+    # interruption) is in `heard`; `told` holds the files with a message not yet followed by one.
+    order, began, ended, owner, called, answered, heard, told = [], {}, {}, {}, {}, {}, set(), set()
+    hook_added: dict = {}  # (scope, event) -> [additions, characters] of what hooks put into the context
     for n, file in enumerate(files):
         events.append([])
+        order.append([])
         when = 0.0  # a line with no time keeps its place after the one before
         if window is not None and n and file.stat().st_mtime < window[0]:
             continue  # a subagent's last written before the window: no line of it is inside
@@ -3090,6 +3118,20 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                     unreadable += 1
                     continue
                 kind, msg = line.get("type"), dict_at(line, "message")
+                added = dict_at(line, "attachment") if kind == "attachment" else {}
+                if added.get("type") == "hook_additional_context":
+                    # What a hook put into the context (Phase 0), by event: its size alone, never its text. The
+                    # transcript does not say whose hook it was. Not a counted line, and it moves no time on.
+                    at = parse_ts(line.get("timestamp")) or when
+                    if window is None or window[0] <= at < window[1]:
+                        event = added.get("hookEvent")
+                        event = event if isinstance(event, str) and re.fullmatch(r"[A-Za-z]{1,40}", event) else "other"
+                        row = hook_added.setdefault(("subagents" if n or line.get("isSidechain") else "main", event),
+                                                    [0, 0])
+                        row[0] += 1
+                        text = added.get("content")  # a list of strings as Claude Code 2.1.310 writes it
+                        row[1] += sum(len(t) for t in text if isinstance(t, str)) if isinstance(text, list) \
+                            else len(text) if isinstance(text, str) else 0
                 if kind not in ("assistant", "user", "system"):
                     continue
                 when = parse_ts(line.get("timestamp")) or when
@@ -3116,6 +3158,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                                         else "?", "before": as_int(meta.get("preTokens")),
                                         "after": as_int(meta.get("postTokens")), "scope": scope})
                     events[n].append((when, n, "compact", None))
+                    order[n].append(None)
                 elif kind == "assistant" and line.get("isApiErrorMessage"):
                     error = line.get("error")
                     api_errors[error if isinstance(error, str) and re.fullmatch(r"[a-z_]{1,40}", error)
@@ -3125,12 +3168,21 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                     # <synthetic> lines are Claude Code's own (18 on this Mac), not API requests.
                     if isinstance(key, str) and model != "<synthetic>" and (usage or key not in responses):
                         responses[key] = (scope, shown(model, 80) if isinstance(model, str) else None, usage, n)
+                    if isinstance(key, str) and model != "<synthetic>":
+                        if key not in began:
+                            began[key] = when
+                            order[n].append(key)
+                            if n in told:
+                                heard.add(key)
+                                told.discard(n)
+                        ended[key] = when
                     for b in blocks:
                         tid = b.get("id")
                         if b.get("type") != "tool_use" or not isinstance(tid, str) or tid in calls:
                             continue
                         name, args = shown(b.get("name") or "?", 80), dict_at(b, "input")
                         calls[tid] = (name, tool_target(name, args))
+                        owner[tid], called[tid] = key, when
                         tool_calls[(scope, name)] += 1
                         events[n].append((when, n, "call", (scope, name, args, tid)))
                 elif kind == "user":
@@ -3138,6 +3190,9 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                         tid = b.get("tool_use_id")
                         if b.get("type") == "tool_result" and isinstance(tid, str):
                             results[tid] = (*output_size(b.get("content")), b.get("is_error") is True, scope)
+                            answered[tid] = when
+                    if not any(b.get("type") == "tool_result" for b in blocks):
+                        told.add(n)
 
     # The same read or search again, with the same input, in the same
     # context, when nothing since could have changed its answer: no edit
@@ -3147,9 +3202,13 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     # nor a repeat (review, Phase 2). Contexts are replayed in time order.
     repeats = []  # (scope, tool, what, tool_use id)
     seen: dict = collections.defaultdict(dict)  # context -> {whole input: the file read, None for a search}
+    # Read again after a compaction (Phase 0; caveman's compaction_churn): a Read of a file the same context
+    # read before its last compaction, once per file and compaction, whether or not it changed since.
+    before, since, after = collections.defaultdict(set), collections.defaultdict(set), {}
     for _, ctx, what, item in heapq.merge(*events, key=lambda e: e[0]):
         if what == "compact":
             seen[ctx] = {}  # what was read is no longer in the context
+            before[ctx] |= since.pop(ctx, set())
             continue
         scope, name, args, tid = item
         if name in EDITS:
@@ -3161,6 +3220,14 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
             if same in seen[ctx]:
                 repeats.append((scope, name, calls[tid][1], tid))
             seen[ctx][same] = args.get("file_path") if name == "Read" else None
+            file = args.get("file_path")
+            if name == "Read" and isinstance(file, str):
+                if file in before[ctx] and file not in since[ctx]:
+                    item = after.setdefault((scope, calls[tid][1]), {"path": calls[tid][1], "reads": 0, "chars": 0,
+                                                                     "scope": scope})
+                    item["reads"] += 1
+                    item["chars"] += results[tid][0]
+                since[ctx].add(file)
 
     # The tokens are summed by model too (Sprint 8), main and subagents
     # apart; a response that names no model is "?", so that each kind's
@@ -3256,6 +3323,43 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         tool_chars[(scope, calls.get(tid, ("?",))[0])] += chars
     by_tool = sorted(set(tool_calls) | set(tool_chars), key=lambda k: (-tool_chars[k], -tool_calls[k], k))
 
+    # The cache written again (Phase 0; RTK's cache-fracture count, rebuilt
+    # for transcripts): in one transcript, a response that read more than
+    # REBUILD_MIN tokens from the cache, then the next reading under 1,024
+    # and writing more than REBUILD_MIN, with no compaction between. Past
+    # the cache's lifetime it was lost to a wait: on a tool call when the
+    # call took half the wait or more (one never answered took all of it),
+    # else on a message when one came before the request (a subagent that
+    # handed its report back waits for the coordinator's), else idle.
+    # Within its lifetime the prefix changed instead ("bust").
+    made = collections.defaultdict(list)  # response -> its calls
+    for tid, key in owner.items():
+        made[key].append(tid)
+    rebuilds = []
+    for seq in order:
+        prev = None
+        for key in seq:
+            if key is None:  # a compaction: the context after it is new, and writing it is expected
+                prev = None
+                continue
+            scope, _, usage, _ = responses[key]
+            if prev is not None:
+                last = responses[prev][2]
+                wrote = as_int(usage.get("cache_creation_input_tokens"))
+                if (as_int(last.get("cache_read_input_tokens")) > REBUILD_MIN
+                        and as_int(usage.get("cache_read_input_tokens")) < 1024 and wrote > REBUILD_MIN):
+                    gap, ttl = max(began[key] - ended[prev], 0.0), cache_ttl(usage, scope)
+                    cause, tool = "bust", None
+                    if gap >= CACHE_TTLS[ttl]:
+                        runs = [((answered[t] if t in answered else began[key]) - called[t], t) for t in made[prev]]
+                        longest, t = max(runs) if runs else (0.0, None)
+                        cause = "tool" if t and 2 * longest >= gap else "resumed" if key in heard else "idle"
+                        tool = calls[t][0] if t and cause != "resumed" else None
+                    rebuilds.append({"scope": scope, "cause": cause, "tool": tool, "seconds": round(gap),
+                                     "ttl": ttl, "tokens": wrote})
+            prev = key
+    rebuilds.sort(key=lambda x: (-x["tokens"], x["seconds"]))
+
     # The session's last ledger row with cache numbers: a reopened
     # conversation's first readings have none (review, Phase 2).
     cache, fields = None, (("hit", "cache_hit"), ("misses", "cache_misses"), ("recache", "recache"))
@@ -3278,6 +3382,10 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "rereads": sorted(rereads.values(), key=lambda x: (-x["chars"], -x["repeats"], x["path"])),
         "searches": [{"tool": name, "where": what, "repeats": c, "scope": scope}
                      for (scope, name, what), c in sorted(searches.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "cache_rebuilds": rebuilds,
+        "reread_after_compaction": sorted(after.values(), key=lambda x: (-x["chars"], -x["reads"], x["path"])),
+        "hook_context": [{"event": e, "times": t, "chars": c, "scope": s}
+                         for (s, e), (t, c) in sorted(hook_added.items(), key=lambda kv: (-kv[1][1], kv[0]))],
         "search": search_stats(events, calls, results, cwd),
         "tool_errors": dict(collections.Counter(calls.get(tid, ("?",))[0]
                                                 for tid, (_, _, error, _) in results.items() if error).most_common()),
@@ -3429,6 +3537,30 @@ def inspect_lines(r: dict) -> list[str]:
             [f"  {s['tool']}{' in ' + s['where'] if s['where'] else ''}: {times(s['repeats'])}{where(s)}"
              for s in r["searches"]])
 
+    # The token layer, Phase 0: the cache written again, by scope, cause and lifetime, the most tokens first.
+    groups: dict = {}
+    for x in r["cache_rebuilds"]:
+        g = groups.setdefault((x["scope"], x["cause"], x["ttl"]), {"n": 0, "tokens": 0, "tools": collections.Counter()})
+        g["n"] += 1
+        g["tokens"] += x["tokens"]
+        if x["tool"]:
+            g["tools"][x["tool"]] += 1
+    section("Cache written again [transcript, inferred: a request read its prefix from the cache, the next in its "
+            "transcript wrote it again, with no compaction between]",
+            [f"  {scope}, {REBUILD_CAUSES[cause].format(ttl=ttl)}: {g['n']} time{'s' * (g['n'] != 1)}, "
+             f"{g['tokens']:,} tokens" + (f" ({', '.join(f'{t} {c}' for t, c in g['tools'].most_common())})"
+                                          if g["tools"] else "")
+             for (scope, cause, ttl), g in sorted(groups.items(), key=lambda kv: (-kv[1]["tokens"], kv[0]))])
+    section("Read again after a compaction [transcript, inferred: the same context read the file before it; "
+            "reads through Bash are not seen]",
+            [f"  {x['path']}: {x['reads']} time{'s' * (x['reads'] != 1)}, {x['chars']:,} chars{where(x)}"
+             for x in r["reread_after_compaction"]])
+    section("Added by hooks [transcript, counted: the text hooks put into the context, by event; "
+            "whose hook it was is not recorded]",
+            [f"  {x['event']}: {x['times']} time{'s' * (x['times'] != 1)}, {x['chars']:,} chars "
+             f"≈ {x['chars'] // 4:,} tokens" + ("  (subagents)" if x["scope"] != "main" else "")
+             for x in r["hook_context"]])
+
     g = r["guard"]
     if g is None:
         out.append("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, cat or search]")
@@ -3539,6 +3671,20 @@ def inspect_records(r: dict) -> list[dict]:
     for s in r["searches"]:
         add("repeated_searches", s["repeats"], "searches", s["scope"], "transcript", "inferred",
             f"{s['tool']} {s['where']}".strip())
+    rebuilt = collections.Counter()  # (scope, cause) -> rebuilds; the tokens beside them
+    rewritten = collections.Counter()
+    for x in r["cache_rebuilds"]:
+        rebuilt[(x["scope"], x["cause"])] += 1
+        rewritten[(x["scope"], x["cause"])] += x["tokens"]
+    for (scope, cause), n in sorted(rebuilt.items()):
+        add("cache_rebuilds", n, "rebuilds", scope, "transcript", "inferred", cause)
+        add("cache_rebuild_tokens", rewritten[(scope, cause)], "tokens", scope, "transcript", "inferred", cause)
+    for x in r["reread_after_compaction"]:
+        add("reads_after_compaction", x["reads"], "reads", x["scope"], "transcript", "inferred", x["path"])
+        add("read_after_compaction_chars", x["chars"], "chars", x["scope"], "transcript", "inferred", x["path"])
+    for x in r["hook_context"]:
+        add("hook_context", x["times"], "additions", x["scope"], "transcript", "counted", x["event"])
+        add("hook_context_chars", x["chars"], "chars", x["scope"], "transcript", "counted", x["event"])
     for tool, n in r["tool_errors"].items():
         add("tool_errors", n, "errors", "all", "transcript", "counted", tool)
     for kind, n in r["api_errors"].items():

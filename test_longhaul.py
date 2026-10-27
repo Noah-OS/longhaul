@@ -2576,6 +2576,159 @@ class Inspect(unittest.TestCase):
         self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)
         self.assertNotIn("SECRET", longhaul.LEDGER.read_text() + (longhaul.USAGE_DIR / "sessions" / "s1.json").read_text())
 
+    # The token layer, Phase 0 (docs/plans/2026-10-27-token-layer.md): what
+    # the context cost beyond its own growth, from the transcript alone.
+
+    def stamped(self, seconds, lines):
+        """The lines, written that many seconds after 10:00: a wait of minutes, where at() has one minute."""
+        when = dt.datetime(2026, 10, 20, 10, 0, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=seconds)
+        return [{**l, "timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z")} for l in lines]
+
+    def result(self, tid, output="ok"):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": output}]}}
+
+    def message(self, text="carry on", **more):
+        return {"type": "user", "message": {"role": "user", "content": text}, **more}
+
+    def test_a_subagent_that_waits_past_its_cache_lifetime_writes_its_context_again(self):
+        # A request that read its prefix from the cache, then the next one in
+        # that transcript reading none of it and writing it again, with no
+        # compaction between, is a rebuild. A subagent's cache lives five
+        # minutes: one held ten by a Bash call loses it (the owner's busiest
+        # project, 2026-10-24 to 10-27: 52 such rebuilds, 14% of its
+        # subagents' cache writes).
+        self.write(self.stamped(0, self.reply(read=40000)) + self.stamped(5, self.reply(read=41000)))
+        self.agent(self.stamped(10, self.reply(self.call("t1", "Bash", command="until grep -q passed log; do sleep 9; done"),
+                                               read=50000))
+                   + self.stamped(610, [self.result("t1", "Command did not complete within its 600s timeout")])
+                   + self.stamped(612, self.reply(read=0, write=52000)))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["cache_rebuilds"], [{"scope": "subagents", "cause": "tool", "tool": "Bash", "seconds": 602,
+                                                "ttl": "5m", "tokens": 52000}])
+
+    def test_a_rebuild_inside_the_cache_lifetime_is_a_change_and_one_after_a_compaction_is_none(self):
+        # Within its lifetime the cache was not lost but changed (a model
+        # switch, a new system prompt). After a compaction the context is new,
+        # so writing it is expected. A prefix of 4,096 tokens or less is too
+        # small to count.
+        self.write(self.stamped(0, self.reply(read=60000)) + self.stamped(20, self.reply(read=0, write=61000))
+                   + self.stamped(30, self.reply(read=61000)) + self.stamped(40, [self.compaction()])
+                   + self.stamped(50, self.reply(read=0, write=20000))
+                   + self.stamped(60, self.reply(read=3000)) + self.stamped(70, self.reply(read=0, write=9000)))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["cache_rebuilds"], [{"scope": "main", "cause": "bust", "tool": None, "seconds": 20,
+                                                "ttl": "1h", "tokens": 61000}])
+
+    def test_a_rebuild_names_what_the_wait_was(self):
+        # Resumed by a message: the coordinator's to a subagent that had
+        # answered, or had handed its report back through a quick tool call
+        # (SubagentHandback in the owner's busiest project, 64 rebuilds), or an
+        # interruption. Idle: a quick tool call and no message, as when the
+        # API was retried. The lifetime is the one the response reports
+        # (usage.cache_creation) when it does.
+        resumed = self.reply(read=0, write=30000)
+        resumed[0]["message"]["usage"]["cache_creation"] = {"ephemeral_5m_input_tokens": 30000,
+                                                            "ephemeral_1h_input_tokens": 0}
+        self.write(self.reply())
+        self.agent(self.stamped(0, self.reply(read=30000))
+                   + self.stamped(900, [self.message("The coordinator sent a message while you were working", isMeta=True)])
+                   + self.stamped(900, resumed)
+                   + self.stamped(910, self.reply(self.call("t1", "Read", file_path="/a.py"), read=31000))
+                   + self.stamped(911, [self.result("t1")]) + self.stamped(1300, self.reply(read=0, write=32000))
+                   + self.stamped(1310, self.reply(self.call("t2", "SubagentHandback", message="done"), read=33000))
+                   + self.stamped(1311, [self.result("t2", "Report delivered")])
+                   + self.stamped(1900, [self.message("[Request interrupted by user]")])
+                   + self.stamped(1900, self.reply(read=0, write=34000)))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["cache_rebuilds"], [
+            {"scope": "subagents", "cause": "resumed", "tool": None, "seconds": 590, "ttl": "5m", "tokens": 34000},
+            {"scope": "subagents", "cause": "idle", "tool": "Read", "seconds": 390, "ttl": "5m", "tokens": 32000},
+            {"scope": "subagents", "cause": "resumed", "tool": None, "seconds": 900, "ttl": "5m", "tokens": 30000}])
+
+    def test_a_long_tool_call_holds_the_cache_even_when_a_message_follows_it(self):
+        # A message queued while a Bash call ran arrives with its result: the
+        # call held the wait, not the message.
+        self.write(self.reply())
+        self.agent(self.stamped(10, self.reply(self.call("t1", "Bash", command="pytest -q"), read=50000))
+                   + self.stamped(610, [self.result("t1")])
+                   + self.stamped(610, [self.message("The coordinator sent a message while you were working", isMeta=True)])
+                   + self.stamped(612, self.reply(read=0, write=52000)))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual([(x["cause"], x["tool"]) for x in r["cache_rebuilds"]], [("tool", "Bash")])
+
+    def test_the_report_and_json_show_the_rebuilds_by_cause(self):
+        self.write(self.reply())
+        self.agent(self.stamped(10, self.reply(self.call("t1", "Bash", command="pytest -q"), read=50000))
+                   + self.stamped(610, [self.result("t1")]) + self.stamped(612, self.reply(read=0, write=52000)))
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        head = ("Cache written again [transcript, inferred: a request read its prefix from the cache, the next in its "
+                "transcript wrote it again, with no compaction between]")
+        self.assertEqual(out[out.index(head) + 1], "  subagents, a tool call outlasted the cache's 5m lifetime: 1 time, "
+                                                   "52,000 tokens (Bash 1)")
+        got = {(x["metric"], x["scope"], x["item"]): (x["value"], x["unit"], x["source"], x["confidence"])
+               for x in self.records("s1")}
+        self.assertEqual(got[("cache_rebuilds", "subagents", "tool")], (1, "rebuilds", "transcript", "inferred"))
+        self.assertEqual(got[("cache_rebuild_tokens", "subagents", "tool")], (52000, "tokens", "transcript", "inferred"))
+        self.write(self.reply())
+        self.agent(self.reply())
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        self.assertEqual(out[out.index(head) + 1], "  none")
+
+    def test_a_file_read_again_after_a_compaction_is_counted(self):
+        # What the compaction made Claude read again (caveman's
+        # compaction_churn): a Read of a file the same context read before its
+        # last compaction, once per file and compaction. A file first read
+        # after it is not; a second read after it stays a plain repeat.
+        self.write(self.turn("t1", "Read", "x" * 300, file_path="/a.py") + self.turn("t2", "Read", "y", file_path="/c.py")
+                   + [self.compaction()] + self.turn("t3", "Read", "x" * 300, file_path="/a.py")
+                   + self.turn("t4", "Read", "x" * 300, file_path="/a.py") + self.turn("t5", "Read", "z", file_path="/b.py"))
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["reread_after_compaction"], [{"path": "/a.py", "reads": 1, "chars": 300, "scope": "main"}])
+        self.assertEqual([x["path"] for x in r["rereads"]], ["/a.py"], "t4 stays a plain repeat")
+        out = longhaul.inspect_lines(r)
+        head = ("Read again after a compaction [transcript, inferred: the same context read the file before it; "
+                "reads through Bash are not seen]")
+        self.assertEqual(out[out.index(head) + 1], "  /a.py: 1 time, 300 chars")
+        got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"]) for x in self.records("s1")}
+        self.assertEqual(got[("reads_after_compaction", "/a.py")], (1, "reads", "inferred"))
+        self.assertEqual(got[("read_after_compaction_chars", "/a.py")], (300, "chars", "inferred"))
+
+    def test_the_text_hooks_added_is_counted_by_event_and_never_shown(self):
+        # The standing cost of what hooks put into the context: Longhaul's own
+        # and every other tool's, since the transcript does not say whose. By
+        # event, with a name that is not a plain word kept out; never the text.
+        secret = "sk-ant-oat01-SECRET" + "Q" * 80
+
+        def added(event, text):  # a list of strings, as Claude Code 2.1.310 writes it
+            return {"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [text],
+                                                           "hookName": event, "toolUseID": event, "hookEvent": event}}
+
+        plain = added("SessionStart", "a" * 400)
+        plain["attachment"]["content"] = "a" * 400  # a plain string is counted the same
+        self.write(self.reply() + [plain, added("UserPromptSubmit", "b" * 100),
+                                   added("UserPromptSubmit", (secret * 2)[:100]), added(secret, "d" * 10)])
+        self.agent(self.reply() + [added("PreToolUse", "e" * 30)])
+        self.agent(self.reply() + [added("PreToolUse", "e" * 30)], "agent-a2")
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual(r["hook_context"], [{"event": "SessionStart", "times": 1, "chars": 400, "scope": "main"},
+                                             {"event": "UserPromptSubmit", "times": 2, "chars": 200, "scope": "main"},
+                                             {"event": "PreToolUse", "times": 2, "chars": 60, "scope": "subagents"},
+                                             {"event": "other", "times": 1, "chars": 10, "scope": "main"}])
+        self.assertEqual(r["lines"], 3, "an attachment is not a transcript line counted elsewhere")
+        out = longhaul.inspect_lines(r)
+        head = ("Added by hooks [transcript, counted: the text hooks put into the context, by event; "
+                "whose hook it was is not recorded]")
+        self.assertEqual(out[out.index(head) + 1:out.index(head) + 5], [
+            "  SessionStart: 1 time, 400 chars ≈ 100 tokens", "  UserPromptSubmit: 2 times, 200 chars ≈ 50 tokens",
+            "  PreToolUse: 2 times, 60 chars ≈ 15 tokens  (subagents)", "  other: 1 time, 10 chars ≈ 2 tokens"])
+        records = self.cli("s1", "--json")
+        got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"])
+               for x in map(json.loads, records.stdout.splitlines())}
+        self.assertEqual(got[("hook_context_chars", "UserPromptSubmit")], (200, "chars", "counted"))
+        self.assertEqual(got[("hook_context", "SessionStart")], (1, "additions", "counted"))
+        self.assertNotIn("SECRET", "\n".join(out) + records.stdout + records.stderr)
+
 
 class Plugin(unittest.TestCase):
     """The repository is also a Claude Code plugin (docs/adr/0001-plugin-layout.md)."""
