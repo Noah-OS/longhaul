@@ -6434,8 +6434,9 @@ def advisor(opts) -> int:
 # owner's decision of 2026-10-25: before, a conversation told at 800k and
 # compacted near 968k was never told again). Since Sprint 11 (I8) the
 # guard's SessionStart hook forgets it at every compaction too
-# (reminder_forget()): a compaction that left 163k, above that floor, had
-# kept 200k told, and the next reminder came at 400k. The guard's PreToolUse hook on Read and Bash says it too
+# (reminder_forget()): in hermes on 2026-10-26 no prompt's reading fell
+# under that floor between a compaction and the context's regrowth, so
+# 200k stayed told and the next reminder came at 400k. The guard's PreToolUse hook on Read and Bash says it too
 # (reminder_join(), the owner's second decision of 2026-10-23), so an
 # unattended run with no prompts hears it as well; the one record serves
 # both, so a multiple is said once wherever it is crossed first. Of the
@@ -6626,8 +6627,9 @@ def reminder_forget(data: dict) -> None:
     Sprint 11, I8): the highest multiple the conversation was told of is
     forgotten, under the guard's lock, whoever compacted, so the next
     crossing of the threshold reminds again. Before, only a reading under
-    reminder_fell()'s floor forgot it: a context compacted from just past
-    200k to 163k was told next at 400k. A reading from before the compaction
+    reminder_fell()'s floor forgot it, and when no prompt's reading fell
+    under it before the context regrew, 200k stayed told and the next
+    reminder came at 400k. A reading from before the compaction
     cannot say it at once: reminder_size() stops at the compaction's line.
     A subagent's start, and its own record, are left alone. One line is
     logged when there was a multiple to forget."""
