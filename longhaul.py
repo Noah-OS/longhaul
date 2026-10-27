@@ -121,6 +121,14 @@ Usage:
                           terminal (--yes: without asking), and the line is
                           test-run, the file put back if it fails; uninstall
                           puts back the line the copy held
+  longhaul uninstall [--dry-run] [--purge] [--yes]
+                          removes what Longhaul set up outside the plugin: its
+                          status line in each config folder (the line before
+                          it put back), VS Code's wrapper line, Claude Code's
+                          auto-update for Longhaul's marketplace and the
+                          terminal command, after a yes in a terminal (--yes:
+                          without asking); --purge removes ~/.longhaul too;
+                          --dry-run only lists. Then it says what stays
   longhaul guard                the plugin's hooks. PreToolUse (Read, Bash): warns about
                           a file read again unchanged, or a whole read or cat of a
                           big one (LONGHAUL_GUARD=block denies instead), and counts
@@ -2365,12 +2373,12 @@ def statusline_program(command):
     return words[at] if at is not None and words[at + 1:at + 2] == ["statusline"] else None
 
 
-def statusline_file() -> tuple:
-    """(the settings.json of the chat's folder (chat_config_dir()) by its
-    real path, how to name it). A second account's is a link into
-    ~/.claude (SHARED), and a file put in the link's place would cut it
-    off: the link's target is what changes."""
-    link = Path(chat_config_dir()) / "settings.json"
+def statusline_file(link: Path | None = None) -> tuple:
+    """(the settings.json at `link`, by default the chat's folder's
+    (chat_config_dir()), by its real path; how to name it). A second
+    account's is a link into ~/.claude (SHARED), and a file put in the
+    link's place would cut it off: the link's target is what changes."""
+    link = link or Path(chat_config_dir()) / "settings.json"
     real = Path(os.path.realpath(link))
     where = home_path(str(real))
     return real, (f"{where} (linked from {home_path(str(link))})" if link.is_symlink() else where)
@@ -2545,14 +2553,16 @@ def statusline_install(assume_yes: bool) -> int:
     return 0
 
 
-def statusline_uninstall() -> int:
-    """`longhaul statusline uninstall`: install undone, only when the chat's
-    settings.json sets Longhaul's status line. The file is copied beside
-    itself first; then the line is the one in the newest copy install
-    kept, or none when that copy had none or there is no copy, and every
-    other key stays as it is now. It asks nothing: it changes Longhaul's
-    own line alone. Any other line, or none, is said and left alone."""
-    path, where = statusline_file()
+def statusline_uninstall(link: Path | None = None) -> int:
+    """`longhaul statusline uninstall`: install undone, only when the
+    settings.json at `link` (by default the chat's, statusline_file())
+    sets Longhaul's status line. The file is copied beside itself first;
+    then the line is the one in the newest copy install kept, or none when
+    that copy had none or there is no copy, and every other key stays as
+    it is now. It asks nothing: it changes Longhaul's own line alone. Any
+    other line, or none, is said and left alone. `longhaul uninstall`
+    runs it on each config folder's."""
+    path, where = statusline_file(link)
     try:
         raw, data, mode = statusline_read(path)
     except OSError as e:
@@ -10202,6 +10212,155 @@ def clear(_opts) -> int:
     return 0
 
 
+# --------------------------------------------------------------- uninstall
+#
+# `longhaul uninstall` (Sprint 11, I7; the install report's item 5): what
+# Longhaul set up outside the plugin, listed, then removed after a yes. The
+# plugin itself is Claude Code's to remove; what stays is said.
+
+UNINSTALL_STAYS = (
+    "the plugin itself: `claude plugin uninstall longhaul@longhaul`, then `claude plugin marketplace remove "
+    "longhaul` (Claude Code keeps its cache for about 14 days)",
+    "the code index's lines in each repository's .git/info/exclude (.codegraph/, .trail/)",
+    "the hook Trail's init wrote into a repository's .claude/settings.json",
+    "your account folders and their sign-ins",
+    "the .before-longhaul-* copies of the files Longhaul changed",
+)
+
+
+def command_is_longhauls(path: Path) -> bool:
+    """Whether the terminal command at `path` is Longhaul's: the launcher
+    (launcher_at()), or setup's link to a longhaul.py, there or not."""
+    return launcher_at(path) or (path.is_symlink() and os.path.basename(os.path.realpath(path)) == "longhaul.py")
+
+
+def uninstall_auto_update(path: Path) -> int:
+    """Claude Code's auto-update off for Longhaul's marketplace in one
+    known_marketplaces.json (release_set()), said."""
+    try:
+        backup = release_set(path, False)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        say(f"Not changed: {home_path(str(path))} could not be written "
+            f"({getattr(e, 'strerror', None) or type(e).__name__}).")
+        return 1
+    say(f"Done: Claude Code's auto-update is off for Longhaul's marketplace in {home_path(str(path))} "
+        f"(the old file is kept as {backup}).")
+    return 0
+
+
+def uninstall_command(path: Path) -> int:
+    try:
+        path.unlink()
+    except OSError as e:
+        say(f"Not removed: {home_path(str(path))} ({e.strerror or type(e).__name__}).")
+        return 1
+    say(f"Removed the terminal command {home_path(str(path))}.")
+    return 0
+
+
+def uninstall_purge() -> int:
+    """LONGHAUL_HOME removed, and printed, never said: a log line would
+    make the folder again."""
+    where = home_path(str(LONGHAUL_HOME))
+    try:
+        shutil.rmtree(LONGHAUL_HOME)
+    except OSError as e:
+        print(f"Not removed: {where} ({e.strerror or type(e).__name__}); what is left of it is still there.")
+        return 1
+    print(f"Removed {where}, Longhaul's own records.")
+    return 0
+
+
+def uninstall_plan(purge: bool) -> tuple:
+    """(what `longhaul uninstall` removes, in the order it does, each (what,
+    how); what of Longhaul's it will not remove, and why; what it found
+    that is not Longhaul's). It only reads. The status line goes before
+    the terminal command it runs, and Longhaul's home last."""
+    todo, refused, theirs, seen = [], [], [], set()
+    for folder in config_folders():
+        link = folder / "settings.json"
+        real = os.path.realpath(link)
+        if real in seen:  # an account's settings.json is a link into ~/.claude's (SHARED)
+            continue
+        seen.add(real)
+        try:
+            data = statusline_read(Path(real))[1]
+        except OSError:
+            data = None
+        if statusline_program(dict_at(data, "statusLine").get("command")):
+            todo.append((f"the status line in {statusline_file(link)[1]}, the line before it put back",
+                         lambda link=link: statusline_uninstall(link)))
+    try:
+        found = jsonc_load(VSCODE_SETTINGS.read_text(errors="replace")) if VSCODE_SETTINGS.is_file() else None
+    except OSError:
+        found = None
+    wrapper = found.get(VSCODE_WRAPPER_KEY) if isinstance(found, dict) else None
+    if isinstance(wrapper, str) and wrapper.endswith("longhaul-vscode"):  # vscode_off() removes any wrapper
+        todo.append((f"VS Code's {VSCODE_WRAPPER_KEY} line in {home_path(str(VSCODE_SETTINGS))}, so its Claude "
+                     "panel signs in on its own again", vscode_off))
+    for path in release_files():
+        if dict_at(read_json(path), RELEASE_MARKETPLACE).get("autoUpdate") is True:
+            todo.append((f"Claude Code's auto-update for Longhaul's marketplace in {home_path(str(path))} "
+                         "(turned off)", lambda path=path: uninstall_auto_update(path)))
+    command = HOME / ".local" / "bin" / "longhaul"
+    if command_is_longhauls(command):
+        todo.append((f"the terminal command {home_path(str(command))}", lambda: uninstall_command(command)))
+    elif os.path.lexists(command):
+        theirs.append(f"{home_path(str(command))} is not Longhaul's")
+    if purge:
+        where = home_path(str(LONGHAUL_HOME))
+        why = ("it is a link" if LONGHAUL_HOME.is_symlink() else
+               "it is your home folder or above it" if home_or_above(str(LONGHAUL_HOME)) else
+               "it is not a folder" if os.path.lexists(LONGHAUL_HOME) and not LONGHAUL_HOME.is_dir() else "")
+        if why:
+            refused.append(f"{where}: {why}, so --purge leaves it")
+        elif LONGHAUL_HOME.is_dir():
+            todo.append((f"{where}, Longhaul's own records (the accounts list, the ledger, the log, the "
+                         "checkpoints)", uninstall_purge))
+    return todo, refused, theirs
+
+
+def uninstall(opts) -> int:
+    """`longhaul uninstall [--dry-run] [--purge] [--yes]`: what Longhaul set
+    up outside the plugin (uninstall_plan()), listed, then removed in that
+    order after a yes in a terminal; without a terminal only with --yes
+    (exit 2 otherwise). --dry-run lists and writes nothing, the log
+    included. Then what stays. Exit 0 when all of it is done, 1 when any
+    of it is not (a --purge refused among them)."""
+    todo, refused, theirs = uninstall_plan(opts.purge)
+    if todo:
+        print(f"Longhaul {'would remove' if opts.dry_run else 'removes'}:")
+        print("\n".join(f"  - {what}" for what, _ in todo))
+    else:
+        print("Nothing of Longhaul's to remove.")
+    for line in refused + theirs:
+        print(f"Left alone: {line}.")
+    failed, purged = bool(refused) and not opts.dry_run, False
+    if not opts.dry_run:
+        if todo and not opts.yes:
+            if not terminal():
+                print("Nothing removed: `longhaul uninstall` asks first, in a terminal; run it in one, or add --yes "
+                      "to remove these without asking (--dry-run only lists them).")
+                return 2
+            try:
+                agreed = yes("Remove these?")
+            except (EOFError, KeyboardInterrupt):
+                agreed = False
+            if not agreed:
+                print("Nothing removed.")
+                return 1
+        for _what, remove in todo:
+            failed = remove() != 0 or failed
+            purged = purged or (remove is uninstall_purge and not os.path.lexists(LONGHAUL_HOME))
+    stays = list(UNINSTALL_STAYS)
+    if not purged:
+        stays.append(f"{home_path(str(LONGHAUL_HOME))}, Longhaul's own records (`longhaul uninstall --purge` "
+                     "removes it)")
+    print("What stays:")
+    print("\n".join(f"  - {line}" for line in stays))
+    return 1 if failed else 0
+
+
 # --------------------------------------------------------------- doctor
 #
 # `longhaul doctor` and /longhaul:doctor (the owner's decision of
@@ -10961,7 +11120,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
-                            "vscode", "models", "update", "doctor", "precompact"):
+                            "vscode", "models", "update", "doctor", "precompact", "uninstall"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd == "usage":
@@ -11016,6 +11175,12 @@ def main(argv: list[str]) -> int:
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
+        if cmd == "uninstall":
+            p.add_argument("--dry-run", action="store_true", help="list what it would remove, and remove nothing")
+            p.add_argument("--purge", action="store_true",
+                           help="remove Longhaul's own records too (LONGHAUL_HOME, ~/.longhaul): the accounts "
+                                "list, the ledger, the log, the checkpoints")
+            p.add_argument("--yes", action="store_true", help="remove them without asking (needed without a terminal)")
         if cmd == "statusline":
             p.add_argument("action", nargs="?", choices=["install", "uninstall"],
                            help="install: Claude Code's status line set to Longhaul's in settings.json, a copy of "
@@ -11045,7 +11210,7 @@ def main(argv: list[str]) -> int:
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact,
-                "trial": trial, "update": update, "doctor": doctor}[cmd](opts)
+                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

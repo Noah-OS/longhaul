@@ -15564,6 +15564,194 @@ class StatuslineInstall(unittest.TestCase):
         self.assertIn("longhaul statusline install|uninstall [--yes]", longhaul.__doc__, "the Usage block names it")
 
 
+class Uninstall(unittest.TestCase):
+    """`longhaul uninstall [--dry-run] [--purge] [--yes]` (Sprint 11, I7;
+    the install report's item 5): what Longhaul set up outside the plugin,
+    listed and then removed after a yes: the status line (its line before
+    put back, by I2's uninstall), VS Code's wrapper line, Claude Code's
+    auto-update for Longhaul's marketplace and the terminal command; with
+    --purge, Longhaul's home too. Then what stays. Every path is scratch:
+    HOME, Longhaul's home, Claude Code's folders and VS Code's settings."""
+
+    LINE = {"type": "command", "command": "~/.local/bin/longhaul statusline"}
+    THEIRS = {"type": "command", "command": "~/bin/my-status"}
+    MARKETS = {"other": {"source": {"source": "github", "repo": "example/other"}, "autoUpdate": True},
+               "longhaul": {"source": {"source": "github", "repo": "example/longhaul"}, "autoUpdate": True}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.claude, self.pro = self.user / ".claude", self.user / ".claude-pro"
+        self.vscode = self.user / "vscode" / "settings.json"
+        self.launcher = self.user / ".local" / "bin" / "longhaul"
+        for folder in (self.claude, self.pro, self.home, self.vscode.parent, self.launcher.parent):
+            folder.mkdir(parents=True)
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude,
+                            "VSCODE_SETTINGS": self.vscode}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"LONGHAUL_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)  # put back by the patcher
+        (self.home / "accounts.json").write_text(json.dumps([{"name": "Pro", "email": "pro@example.com",
+                                                               "config_dir": str(self.pro)}]))
+        (self.home / "ledger.jsonl").write_text("{}\n")
+
+    # ---------------------------------------------------------- scratch setups
+
+    def everything(self):
+        """All of it Longhaul's: the status line in ~/.claude (a copy of the
+        line before it kept by install) and in the second account's folder,
+        VS Code's wrapper, auto-update on, and setup's link."""
+        (self.claude / "settings.json").write_text(json.dumps({"theme": "dark", "statusLine": self.LINE}))
+        (self.claude / "settings.json.before-longhaul-statusline-20261027-090000").write_text(
+            json.dumps({"statusLine": self.THEIRS}))
+        (self.pro / "settings.json").write_text(json.dumps({"statusLine": self.LINE, "model": "opus"}))
+        wrapper = str(HERE / "longhaul-vscode")
+        self.vscode.write_text('{\n    // mine\n    "editor.fontSize": 13,\n'
+                               f'    "claudeCode.claudeProcessWrapper": {json.dumps(wrapper)},\n}}\n')
+        (self.claude / "plugins").mkdir()
+        (self.claude / "plugins" / "known_marketplaces.json").write_text(json.dumps(self.MARKETS, indent=2) + "\n")
+        self.launcher.symlink_to(HERE / "longhaul.py")
+
+    def run_cli(self, *args, terminal=False, answers=""):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(answers)), \
+                mock.patch.dict(os.environ, {"LONGHAUL_TEST_TTY": "1" if terminal else "0"}):
+            code = longhaul.main(["uninstall", *args])
+        return code, out.getvalue()
+
+    def tree(self):
+        """Every path under the scratch folder, with what it is and holds."""
+        found = {}
+        for root, dirs, files in os.walk(self.tmp):
+            for name in dirs + files:
+                p = Path(root) / name
+                st = os.lstat(p)
+                found[str(p.relative_to(self.tmp))] = (st.st_mode, st.st_mtime_ns, os.readlink(p) if p.is_symlink()
+                                                       else p.read_bytes() if p.is_file() else None)
+        return found
+
+    def json_at(self, path):
+        return json.loads(path.read_text())
+
+    # ---------------------------------------------------------- the tests
+
+    def test_dry_run_lists_everything_and_writes_nothing(self):
+        self.everything()
+        before = self.tree()
+        code, out = self.run_cli("--dry-run", "--purge")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tree(), before, "nothing written, not even the log")
+        self.assertFalse((self.home / "longhaul.log").exists())
+        listed = out[:out.index("What stays")]
+        for what in ("~/.claude/settings.json", "~/.claude-pro/settings.json", "~/vscode/settings.json",
+                     "~/.claude/plugins/known_marketplaces.json", "~/.local/bin/longhaul",
+                     longhaul.home_path(str(self.home))):
+            self.assertIn(what, listed)
+        self.assertIn("would remove", out)
+        self.assertIn("What stays", out)
+
+    def test_a_run_removes_what_it_listed_in_order_and_says_what_stays(self):
+        self.everything()
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.json_at(self.claude / "settings.json"), {"theme": "dark", "statusLine": self.THEIRS},
+                         "the line before it put back")
+        self.assertEqual(self.json_at(self.pro / "settings.json"), {"model": "opus"}, "no copy there: the key removed")
+        vscode = self.vscode.read_text()
+        self.assertNotIn("claudeProcessWrapper", vscode)
+        self.assertIn("// mine", vscode, "VS Code's own format kept")
+        markets = self.json_at(self.claude / "plugins" / "known_marketplaces.json")
+        self.assertEqual((markets["longhaul"]["autoUpdate"], markets["other"]["autoUpdate"]), (False, True))
+        self.assertFalse(os.path.lexists(self.launcher), "the terminal command removed")
+        self.assertTrue(self.home.is_dir(), "kept without --purge")
+        self.assertTrue((self.home / "accounts.json").exists())
+        # The status line before the command it runs, so no chat runs a line
+        # that is gone.
+        self.assertLess(out.index("status line is gone"), out.index("Removed the terminal command"))
+        for stays in ("claude plugin uninstall longhaul@longhaul", "claude plugin marketplace remove longhaul",
+                      "14 days", ".git/info/exclude", ".codegraph/", ".trail/", ".claude/settings.json",
+                      "account folders", ".before-longhaul-", "--purge"):
+            self.assertIn(stays, out[out.index("What stays"):], stays)
+
+    def test_it_asks_first_in_a_terminal_and_refuses_without_one(self):
+        self.everything()
+        before = self.tree()
+        code, out = self.run_cli()
+        self.assertEqual(code, 2, out)
+        self.assertIn("--yes", out)
+        self.assertEqual(self.tree(), before, "nothing removed")
+        for answers in ("n\n", "\n", ""):
+            code, out = self.run_cli(terminal=True, answers=answers)
+            self.assertEqual(code, 1, out)
+            self.assertIn("[y/N]", out)
+            self.assertIn("Nothing removed", out)
+            self.assertEqual(self.tree(), before, answers)
+        code, out = self.run_cli(terminal=True, answers="y\n")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(self.launcher))
+
+    def test_purge_removes_longhauls_home_and_nothing_writes_it_again(self):
+        self.everything()
+        code, out = self.run_cli("--purge", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(self.home.exists(), "gone, and not made again by a log line")
+        self.assertNotIn(longhaul.home_path(str(self.home)), out[out.index("What stays"):], "it is not what stays")
+        self.assertTrue(self.user.is_dir())
+
+    def test_purge_refuses_a_home_that_is_your_home_a_link_or_no_folder(self):
+        cases = {"your home": lambda: self.user, "above it": lambda: self.tmp,
+                 "a link": lambda: (self.tmp / "link").symlink_to(self.home) or self.tmp / "link",
+                 "a file": lambda: (self.tmp / "file").write_text("x") and self.tmp / "file"}
+        for name, make in cases.items():
+            with self.subTest(name):
+                target = make()
+                before = self.tree()
+                with mock.patch.object(longhaul, "LONGHAUL_HOME", target):
+                    code, out = self.run_cli("--purge", "--yes")
+                self.assertEqual(code, 1, out)
+                self.assertIn("--purge leaves it", out)
+                self.assertTrue(os.path.lexists(target))
+                self.assertTrue(self.home.is_dir())
+                self.assertEqual({k: v for k, v in self.tree().items() if "longhaul.log" not in k},
+                                 {k: v for k, v in before.items() if "longhaul.log" not in k})
+
+    def test_what_is_not_longhauls_is_left_alone(self):
+        theirs = {"statusLine": self.THEIRS}
+        (self.claude / "settings.json").write_text(json.dumps(theirs))
+        self.vscode.write_text('{"claudeCode.claudeProcessWrapper": "/opt/my-wrapper"}')
+        (self.claude / "plugins").mkdir()
+        (self.claude / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps({**self.MARKETS, "longhaul": {"source": {}, "autoUpdate": False}}))
+        self.launcher.write_text("#!/bin/sh\n# my own longhaul\nexit 0\n")
+        before = self.tree()
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Nothing of Longhaul's to remove", out)
+        self.assertEqual(self.tree(), before)
+        self.assertIn("~/.local/bin/longhaul is not Longhaul's", out)
+        # A link to another program is not Longhaul's either; setup's link
+        # to a longhaul.py is, there or not, and so is the launcher (I1).
+        self.launcher.unlink()
+        self.launcher.symlink_to(HERE / "fake_claude.py")
+        self.assertFalse(longhaul.command_is_longhauls(self.launcher))
+        self.launcher.unlink()
+        self.launcher.symlink_to(self.tmp / "gone" / "longhaul.py")
+        self.assertTrue(longhaul.command_is_longhauls(self.launcher))
+        self.launcher.unlink()
+        self.launcher.write_text(longhaul.launcher_text())
+        self.assertTrue(longhaul.command_is_longhauls(self.launcher))
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(self.launcher), "the launcher removed")
+
+    def test_the_usage_block_names_it(self):
+        self.assertTrue("longhaul uninstall [--dry-run] [--purge] [--yes]" in longhaul.__doc__)
+
+
 class Doctor(unittest.TestCase):
     """`longhaul doctor` and /longhaul:doctor (the owner's decision of
     2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
