@@ -50,6 +50,9 @@ os.environ.setdefault("LONGHAUL_INDEX", "off")
 os.environ.setdefault("LONGHAUL_UPDATE_CHECK", "off")
 os.environ.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
+# Codex's folder: an empty one of the suite's own, so that no test reads the
+# machine's ~/.codex; the Codex tests point CODEX_HOME at their own.
+os.environ["CODEX_HOME"] = tempfile.mkdtemp(prefix="longhaul-test-codex-")
 sys.path.insert(0, str(HERE))
 import longhaul  # noqa: E402
 
@@ -1548,6 +1551,69 @@ class Usage(unittest.TestCase):
         self.assertNotIn(secret, out.stderr)
         self.assertIn("-Users-me-code-myproj 9f0e1d2c", out.stdout)
         self.assertNotIn(sid, out.stdout, "the short id, as everywhere else")
+
+
+class CodexRollouts(unittest.TestCase):
+    """Codex's rollouts, listed and read for inspect and usage (docs
+    plans/2026-10-27-codex.md, Phase 1). Records shaped as the 0.146 alphas
+    write them (P1)."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.day = self.home / "sessions" / "2026" / "10" / "27"
+        self.day.mkdir(parents=True)
+
+    def write(self, name, records, when):
+        path = self.day / name
+        text = "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records)
+        if name.endswith(".zst"):
+            with longhaul.zstd.open(path, "wt", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            path.write_text(text)
+        os.utime(path, (when, when))
+        return path
+
+    def test_the_suite_never_reads_the_machines_codex_folder(self):
+        self.assertNotEqual(longhaul.CODEX_HOME, Path.home() / ".codex")
+        self.assertTrue(str(longhaul.CODEX_HOME).startswith(tempfile.gettempdir()))
+
+    def test_only_sessions_rollouts_are_listed_newest_first(self):
+        old = self.write("rollout-2026-10-27T09-00-00-a.jsonl", [{"type": "session_meta"}], 1000)
+        new = self.write("rollout-2026-10-27T10-00-00-b.jsonl", [{"type": "session_meta"}], 2000)
+        (self.home / "auth.json").write_text("{}")
+        (self.home / "session_index.jsonl").write_text("{}\n")
+        (self.day / "notes.jsonl").write_text("{}\n")
+        (self.day / "rollout-c.json").write_text("{}\n")
+        self.assertEqual(longhaul.rollout_files(self.home), ([new, old], 0))
+
+    def test_without_zstd_a_compressed_rollout_is_counted_and_not_listed(self):
+        plain = self.write("rollout-a.jsonl", [{"type": "session_meta"}], 1000)
+        (self.day / "rollout-b.jsonl.zst").write_bytes(b"\x28\xb5\x2f\xfd")
+        with mock.patch.object(longhaul, "zstd", None):
+            self.assertEqual(longhaul.rollout_files(self.home), ([plain], 1))
+            with self.assertRaises(OSError):
+                list(longhaul.rollout_records(self.day / "rollout-b.jsonl.zst"))
+
+    def test_records_are_dicts_and_a_bad_line_is_none(self):
+        path = self.write("rollout-a.jsonl", [{"type": "session_meta"}, "not json", "[1, 2]", "",
+                                              {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}}], 1000)
+        self.assertEqual(list(longhaul.rollout_records(path)),
+                         [{"type": "session_meta"}, None, None,
+                          {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}}])
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_a_compressed_rollout_reads_as_a_plain_one(self):
+        records = [{"type": "session_meta", "payload": {"cli_version": "0.146.0-alpha.3.1"}}, {"type": "world_state"}]
+        packed = self.write("rollout-a.jsonl.zst", records, 1000)
+        self.assertEqual(longhaul.rollout_files(self.home), ([packed], 0))
+        self.assertEqual(list(longhaul.rollout_records(packed)), records)
+
+    @unittest.skipUnless(longhaul.zstd, "compression.zstd is Python 3.14's")
+    def test_a_damaged_compressed_rollout_raises_a_rollout_error(self):
+        (self.day / "rollout-a.jsonl.zst").write_bytes(b"not zstd at all")
+        with self.assertRaises(longhaul.ROLLOUT_ERRORS):
+            list(longhaul.rollout_records(self.day / "rollout-a.jsonl.zst"))
 
 
 class Inspect(unittest.TestCase):

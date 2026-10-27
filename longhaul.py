@@ -2726,6 +2726,72 @@ def usage(opts) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- codex
+#
+# OpenAI's Codex (docs plans/2026-10-27-codex.md, Phase 1): its rollouts,
+# read for `inspect --agent codex` and `usage`. A rollout is one chat,
+# CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl, a JSON record a line:
+# {type, timestamp, ordinal, payload}. Codex compresses one older than a
+# week to .jsonl.zst, which Python 3.14's compression.zstd reads; an older
+# Python counts those and reads none. Codex calls the format "not a stable
+# interface": a record type not known here is counted, never an error.
+# Read from the owner's 21 rollouts (the 0.146 to 0.154 alphas, P1) and
+# Codex's source at eec8bde, structure only. Under CODEX_HOME only
+# sessions/ is read: never auth.json or any other file there.
+
+try:
+    from compression import zstd
+except ImportError:  # before Python 3.14
+    zstd = None
+
+# Codex's own variable for its folder, as Codex reads it; tests point it at a temp folder.
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+# What reading a rollout can raise past its open: a damaged or half-written .zst raises zstd's own error.
+ROLLOUT_ERRORS = (OSError, EOFError, ValueError) + ((zstd.ZstdError,) if zstd else ())
+
+
+def rollout_files(home: Path | None = None) -> tuple[list[Path], int]:
+    """The rollouts under home/sessions that this Python can read, newest
+    first by when each was last written, and how many compressed ones it
+    cannot (no compression.zstd before 3.14). A file gone between the
+    listing and its time is left out."""
+    found, packed = [], 0
+    for path in files_of(((home or CODEX_HOME) / "sessions").rglob("rollout-*")):
+        if path.name.endswith(".jsonl.zst"):
+            if zstd is None:
+                packed += 1
+                continue
+        elif not path.name.endswith(".jsonl"):
+            continue
+        try:
+            found.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    found.sort(key=lambda x: (-x[0], str(x[1])))
+    return [path for _, path in found], packed
+
+
+def rollout_records(path: Path):
+    """Each line of a rollout as a dict, None for a line that is not a
+    JSON object. Plain or .zst; raises one of ROLLOUT_ERRORS when the file
+    cannot be opened or read through."""
+    if path.name.endswith(".zst"):
+        if zstd is None:
+            raise OSError(f"{path.name} is compressed and this Python has no compression.zstd (3.14 and later)")
+        f = zstd.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        f = path.open(encoding="utf-8", errors="replace")
+    with f:
+        for raw in f:
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+            except (ValueError, RecursionError):
+                record = None
+            yield record if isinstance(record, dict) else None
+
+
 # -------------------------------------------------------------- inspect
 #
 # `longhaul inspect [ID|PATH]`: where one conversation's usage went, from its
