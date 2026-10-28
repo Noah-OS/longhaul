@@ -11646,7 +11646,7 @@ class CodexCheckpoint(unittest.TestCase):
         # skill is named by what it is.
         old = self.check(self.start("resume"), now=self.saved_at() + 27 * 3600)
         self.assertEqual(old["systemMessage"], "Longhaul put back a checkpoint from 1 day ago: it may be out of date. "
-                                               "If it is, ask Codex to save a fresh one with Longhaul's checkpoint skill.")
+                                               "If it is, ask Codex to save a fresh one with $longhaul:checkpoint.")
         self.assertNothingClaudeOnly(old["systemMessage"], self.context(old))
 
     def test_the_largest_put_back_under_codex_is_within_codex_s_default_context_limit(self):

@@ -6877,10 +6877,14 @@ CHECKPOINT_OLD = 6 * 3600
 CHECKPOINT_OLD_SAID = ("Longhaul put back a checkpoint from {ago}: it may be out of date. If it is, ask Claude to save "
                        "a fresh one with /longhaul:checkpoint.")
 CHECKPOINT_CARRY_RECORD_MAX = 4_096  # what the lookup reads of a carry record: a save writes a few hundred bytes
+# The checkpoint skill under Codex: a Codex skill is invoked as $<name>,
+# and Codex names a plugin's skill <plugin>:<skill> (X4: the skill is
+# codex-skills/checkpoint, which .codex-plugin/plugin.json names). One
+# constant, so every line that names it changes with it.
+CODEX_CHECKPOINT_SKILL = "$longhaul:checkpoint"
 # What the save and the hook say that names the agent, by agent
 # (checkpoint_agent()). A Codex chat (the Codex plan's X5) is told nothing
-# of Claude Code: a clear is said in words, and the skill is named by what it
-# is, since how a plugin's skills are named under Codex is P3's question.
+# of Claude Code: a clear is said in words, and the skill is Codex's.
 # The checkpoint's own text is the same for both.
 CHECKPOINT_WORDS = {
     "claude": {
@@ -6894,7 +6898,7 @@ CHECKPOINT_WORDS = {
         "needs": "save needs the Codex chat's id: pass it, or run from inside a Codex chat (CODEX_THREAD_ID)",
         "clear": "a clear",
         "old": ("Longhaul put back a checkpoint from {ago}: it may be out of date. If it is, ask Codex to save a fresh "
-                "one with Longhaul's checkpoint skill."),
+                "one with " + CODEX_CHECKPOINT_SKILL + "."),
         "carried": ("Carried over from the chat before the clear (saved {age} ago, in this folder). "
                     "If the user has started something new, ignore it."),
         "restored": "Longhaul restored your checkpoint from before the clear ({age} old)."},
@@ -8982,11 +8986,8 @@ SUBAGENT_MODEL = ("Longhaul: your context as a subagent is about {k}k tokens, an
                   "of it. Finish the step you are on, then stop and report back: what you have done, what is left, "
                   "and anything the next agent needs to know, so the main conversation can hand the rest to a fresh "
                   "subagent.")
-# Codex's lines, meaning what the three above do. A Codex skill is invoked
-# as $<name>, and Codex names a plugin's skill <plugin>:<skill> (X4: the
-# skill is codex-skills/checkpoint, which .codex-plugin/plugin.json names):
-# one constant, so the lines change with it.
-CODEX_CHECKPOINT_SKILL = "$longhaul:checkpoint"
+# Codex's lines, meaning what the three above do; the skill is named by
+# CODEX_CHECKPOINT_SKILL (the checkpoint region).
 CODEX_REMINDER_USER = ("Longhaul: this chat's context is about {k}k tokens, and every request carries all of it "
                        "again. To shrink it without losing the thread: " + CODEX_CHECKPOINT_SKILL + ", then /compact. "
                        "The checkpoint comes back.")
