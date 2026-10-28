@@ -5000,6 +5000,253 @@ class Guard(unittest.TestCase):
                       "\n".join(longhaul.inspect_lines(longhaul.inspect_transcript(other))))
 
 
+class CodexGuard(unittest.TestCase):
+    """The guard on Codex (the Codex plan's X7, Phase 3): Codex has no Read
+    tool, and each shell command, a code cell's included, reaches the hook
+    as Bash with the command string alone (docs/discovery/
+    2026-10-28-codex-hooks.md). So under Codex the guard reads the shell's
+    own reads: cat and nl whole, head, tail and sed -n in part, in each
+    step of a command and after a cd. The user's pop-up is the answer's
+    systemMessage, since Codex runs no display.ts; its startup is the
+    index's part alone, and it gives no advice on waits. Inputs are
+    synthetic, built from the discovery doc's schema."""
+
+    SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+    AGENT = "019f9d8f-0000-7000-8000-000000000001"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.addCleanup(setattr, longhaul, "LONGHAUL_HOME", saved)
+        seen_this_version(self.home)
+        no_guide(self, self.home)
+        self.big = self.tmp / "big.py"
+        self.big.write_text("x" * 30_000)
+        self.small = self.tmp / "small.py"
+        self.small.write_text("y" * 300)
+
+    def pre(self, command, agent=None, **extra):
+        """A Codex PreToolUse input for a shell command, as Codex sends it."""
+        data = {"session_id": self.SID, "turn_id": "turn-1", "transcript_path": str(self.tmp / "rollout.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra",
+                "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": command},
+                "tool_use_id": "call_1"}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "explorer"
+        data.update(extra)
+        return data
+
+    def start(self, source="startup", agent=None):
+        data = {"session_id": self.SID, "transcript_path": str(self.tmp / "rollout.jsonl"), "cwd": str(self.tmp),
+                "hook_event_name": "SessionStart", "model": "gpt-5.6-terra", "source": source}
+        if agent:
+            data["agent_id"], data["agent_type"] = agent, "explorer"
+        return data
+
+    def check(self, data, mode="warn", index="off"):
+        """The guard's answer to a Codex input, made Longhaul's as run_hook makes it."""
+        return longhaul.guard_check(longhaul.codex_hook_input(data), mode, index=index)
+
+    def context(self, answer):
+        return (answer or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def record(self, agent=None):
+        name = f"codex-{self.SID}" + (f"+{agent}" if agent else "")
+        return json.loads((self.home / "guard" / f"{name}.json").read_text())
+
+    def hook(self, data, mode="warn"):
+        """`longhaul guard --agent codex` as hooks/codex_hook.py runs it: its exit and its answer."""
+        out = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(data))), mock.patch("sys.stdout", out), \
+                mock.patch.dict(os.environ, {"LONGHAUL_GUARD": mode, "LONGHAUL_INDEX": "off"}):
+            code = longhaul.main(["guard", "--agent", "codex"])
+        return code, json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def test_a_whole_cat_or_nl_of_a_big_file_is_warned_about_and_the_user_is_shown_it(self):
+        big, shown = self.big, longhaul.home_path
+        answer = self.check(self.pre(f"cat {big}"))
+        self.assertTrue(self.context(answer).startswith("longhaul guard (advice; the call went ahead): "))
+        self.assertIn(f"`cat` of {shown(str(big))} (30,000 bytes) puts the whole file into the context",
+                      self.context(answer))
+        self.assertNotIn("permissionDecision", answer["hookSpecificOutput"], "warn mode lets the call run")
+        self.assertEqual(answer["systemMessage"], "Longhaul: told Codex big.py is 30 KB; reading only the part it "
+                                                  "needs keeps the context small.")
+        # nl numbers every line and prints them all: no option of its own prints a part.
+        other = self.tmp / "other.py"
+        other.write_text("z" * 25_000)
+        answer = self.check(self.pre("nl -ba other.py"))
+        self.assertIn(f"`nl` of {shown(str(other))} (25,000 bytes)", self.context(answer))
+        self.assertEqual(self.record()["fired"], {"repeat": 0, "big": 0, "cat": 2}, "a shell's whole read is a cat's")
+        self.assertEqual(self.record()["bytes"]["cat"], 55_000)
+        # In any step of a command, joined by && ; || or a new line, after a
+        # cd among them; a relative path from the hook's cwd, as on Claude Code.
+        (self.tmp / "sub").mkdir()
+        deep = self.tmp / "sub" / "deep.py"
+        deep.write_text("d" * 21_000)
+        for n, command in enumerate(("cd sub && cat deep.py", "git status; cat sub/deep.py", "ls || cat sub/deep.py",
+                                     "echo start\ncat sub/deep.py\necho done", f"cd {self.tmp / 'sub'}; nl deep.py")):
+            fresh = self.pre(command, session_id=f"s{n}")
+            self.assertIn(f"of {shown(str(deep))} (21,000 bytes)", self.context(self.check(fresh)), command)
+        self.assertIsNone(self.check(self.pre("cat sub/deep.py", cwd="sub", session_id="s9")), "no folder known")
+
+    def test_head_tail_and_sed_n_are_parts_never_a_whole_read_or_a_repeat(self):
+        for command in (f"head -n 50 {self.big}", f"tail -20 {self.big}", f"sed -n '1,200p' {self.big}",
+                        f"sed -n 1,5p {self.big} && tail -n 5 {self.big}", f"nl -ba {self.big} | sed -n '1,80p'",
+                        f"cat {self.big} | head -50", f"cat {self.big} > /dev/null", f"wc -l {self.big}"):
+            self.assertIsNone(self.check(self.pre(command)), command)
+            self.assertIsNone(self.check(self.pre(command), mode="block"), command)
+        self.assertEqual(self.record()["fired"], {"repeat": 0, "big": 0, "cat": 0})
+        self.assertEqual(self.record()["reads"], {}, "a part is no whole read")
+        # A part after a whole read is not a repeat; and a part is not a whole
+        # read either, so the whole read after it is the file's first.
+        self.assertIsNone(self.check(self.pre(f"cat {self.small}")))
+        self.assertIsNone(self.check(self.pre(f"sed -n '1,5p' {self.small}"), mode="block"))
+        self.assertIsNone(self.check(self.pre(f"head {self.small}"), mode="block"))
+        self.assertEqual(self.record()["fired"]["repeat"], 0)
+
+    def test_a_whole_read_of_a_file_read_before_and_unchanged_is_warned_about_with_the_shells_advice(self):
+        self.assertIsNone(self.check(self.pre(f"cat {self.small}")), "the first read says nothing")
+        answer = self.check(self.pre("nl small.py"))  # the same file, by another program and a relative path
+        text = self.context(answer)
+        self.assertIn(f"{longhaul.home_path(str(self.small))} (300 bytes) was read in full", text)
+        self.assertIn("already in the context", text)
+        self.assertIn("sed -n with a range", text, "Codex reads in the shell")
+        self.assertNotIn("Read with offset", text, "Codex has no Read tool")
+        self.assertEqual(answer["systemMessage"], "Longhaul: told Codex small.py hasn't changed since it last read it.")
+        self.assertEqual(self.record()["fired"]["repeat"], 1)
+        self.small.write_text("y" * 301)  # changed: read afresh
+        self.assertIsNone(self.check(self.pre(f"cat {self.small}")))
+
+    def test_block_mode_denies_with_a_reason_through_the_codex_hook_and_shows_the_user(self):
+        code, answer = self.hook(self.pre(f"cd {self.tmp} && cat big.py"), mode="block")
+        self.assertEqual(code, 0)
+        out = answer["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "deny"))
+        self.assertTrue(out["permissionDecisionReason"].startswith("longhaul guard blocked this call. "), out)
+        self.assertIn("Make the narrower call instead", out["permissionDecisionReason"])
+        self.assertNotIn("LONGHAUL_GUARD", out["permissionDecisionReason"], "the switch is the user's")
+        self.assertEqual(answer["systemMessage"],
+                         "Longhaul: refused a whole read of big.py (30 KB); Codex reads a part instead.")
+        self.assertNotIn(str(self.big), self.record()["reads"], "a denied call read nothing")
+        self.assertFalse((self.home / "guard" / f"{self.SID}.json").exists(), "keyed codex-<id>")
+        # A repeat denied, and two files in one call: a line each for the user.
+        self.assertIsNone(self.hook(self.pre(f"cat {self.small}"), mode="block")[1])
+        code, answer = self.hook(self.pre(f"cat {self.small} && cat {self.big}"), mode="block")
+        self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(answer["systemMessage"].split("\n"), [
+            "Longhaul: refused a repeat read of small.py; it hasn't changed since Codex last read it.",
+            "Longhaul: refused a whole read of big.py (30 KB); Codex reads a part instead."])
+        # Warn mode through the same hook: the note for the model, the line for the user, no decision.
+        code, answer = self.hook(self.pre(f"cat {self.big}"), mode="warn")
+        self.assertEqual(set(answer), {"systemMessage", "hookSpecificOutput"})
+        self.assertEqual(set(answer["hookSpecificOutput"]), {"hookEventName", "additionalContext"})
+        self.assertIsNone(self.hook(self.pre(f"cat {self.big}"), mode="off")[1])
+
+    def test_a_sub_agents_reads_are_its_own_and_show_the_user_nothing(self):
+        # As display.ts does on Claude Code: the main chat did not make that read.
+        self.check(self.pre(f"cat {self.small}"))
+        self.assertIsNone(self.check(self.pre(f"cat {self.small}", agent=self.AGENT)), "its own context's first")
+        other = self.tmp / "other.py"
+        other.write_text("z" * 25_000)
+        for mode, file in (("warn", self.big), ("block", other)):
+            answer = self.check(self.pre(f"cat {file}", agent=self.AGENT), mode=mode)
+            self.assertIn(file.name, json.dumps(answer), mode)
+            self.assertNotIn("systemMessage", answer, mode)
+        self.assertEqual(self.record(agent=self.AGENT)["fired"]["cat"], 2)
+        self.assertEqual(self.record()["fired"]["cat"], 0, "the main chat's record is its own")
+
+    def test_the_record_the_log_and_the_answer_keep_paths_and_sizes_never_the_command(self):
+        secret = "sk-ant-SECRET" + "Q" * 40
+        answer = self.check(self.pre(f"TOKEN={secret} cat {self.big}; echo {secret}"))
+        self.assertIn("big.py", self.context(answer))
+        for file in self.home.rglob("*"):
+            self.assertNotIn("SECRET", file.read_text() if file.is_file() else "", file.name)
+        self.assertNotIn("SECRET", json.dumps(answer))
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn(f"guard: advised on a whole read of {longhaul.home_path(str(self.big))} (30,000 bytes) "
+                      f"in codex-{self.SID}", log)
+
+    def test_a_codex_startup_gives_the_index_part_alone(self):
+        # The first-chat line points to /longhaul:doctor, a Claude Code skill;
+        # the release's line is about Claude Code's plugin update; and the
+        # CodeGraph note names an MCP tool Codex may not have.
+        (self.tmp / ".codegraph").mkdir()
+        setup = mock.patch.object(longhaul, "setup_line", return_value="the first-chat line")
+        release = mock.patch.object(longhaul, "release_startup", return_value="the release's line")
+        with setup as first, release as newer:
+            claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn", index="off")
+            self.assertEqual(claude["systemMessage"], "the first-chat line\nthe release's line",
+                             "Claude Code's, as it was")
+            self.assertEqual(self.context(claude), longhaul.GUARD_CODEGRAPH)
+            first.reset_mock()
+            newer.reset_mock()
+            self.assertIsNone(self.check(self.start()), "nothing of Claude Code's")
+            first.assert_not_called()
+            newer.assert_not_called()
+            # The auto-init's part stays: its line for the user and its note for the model.
+            top = str(self.tmp)
+            with mock.patch.object(longhaul, "index_start", return_value=([("codegraph", top)], [])) as index:
+                answer = self.check(self.start(), index="on")
+            self.assertEqual(index.call_args[0][1], "on")
+            self.assertEqual(answer["systemMessage"], longhaul.index_message([("codegraph", top)], []))
+            self.assertEqual(self.context(answer), longhaul.index_note("codegraph", top))
+            self.assertNotIn("CodeGraph index (.codegraph/)", json.dumps(answer))
+
+    def test_no_wait_advice_and_no_search_nudge_under_codex(self):
+        # The wait weighs a sub-agent's sleep against Claude's five-minute
+        # prompt cache; the nudge names CodeGraph's MCP tool.
+        (self.tmp / ".codegraph").mkdir()
+        with mock.patch.dict(os.environ, {"BASH_DEFAULT_TIMEOUT_MS": "600000"}):
+            for command in ("sleep 420", "until grep -q ok log; do sleep 9; done"):
+                given = longhaul.codex_hook_input(self.pre(command, agent=self.AGENT))
+                claude = {**{k: v for k, v in given.items() if k != "longhaul_agent"}, "session_id": "s1"}
+                self.assertIn("run_in_background", self.context(longhaul.guard_check(claude, "warn")), "Claude Code's")
+                self.assertIsNone(self.check(self.pre(command, agent=self.AGENT)), command)
+            for n in range(longhaul.GUARD_SEARCHES + 5):
+                self.assertIsNone(self.check(self.pre("grep -rn x .")), n)
+        self.assertFalse((self.home / "guard" / f"codex-{self.SID}.json").exists(), "nothing recorded")
+        self.assertFalse((self.home / "guard" / f"codex-{self.SID}+{self.AGENT}.json").exists())
+
+    def test_a_compaction_or_a_clear_forgets_the_reads_of_a_codex_chat_and_its_sub_agents(self):
+        for source in ("compact", "clear"):
+            self.check(self.pre(f"cat {self.small}"))
+            self.check(self.pre(f"cat {self.small}", agent=self.AGENT))
+            self.assertIn("already", self.context(self.check(self.pre(f"cat {self.small}"))), source)
+            self.assertIsNone(self.check(self.start(source=source)), source)
+            self.assertEqual(self.record()["reads"], {}, source)
+            self.assertEqual(self.record(agent=self.AGENT)["reads"], {}, source)
+            self.assertIsNone(self.check(self.pre(f"cat {self.small}")), f"read afresh after {source}")
+            self.assertIsNone(self.check(self.pre(f"cat {self.small}", agent=self.AGENT)), source)
+            self.assertIsNone(self.check(self.start(source=source)), source)
+        self.assertEqual(self.record()["fired"]["repeat"], 2, "the counts stay")
+        self.check(self.pre(f"cat {self.small}"))
+        self.assertIsNone(self.check(self.start(source="resume")))
+        self.assertIn("already", self.context(self.check(self.pre(f"cat {self.small}"))), "a resume keeps them")
+
+    def test_claude_code_is_unchanged(self):
+        # Of a Claude Code Bash call only a bare cat on the first line is a read, and its notes name Read.
+        claude = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1",
+                  "cwd": str(self.tmp), "transcript_path": "/t/s1.jsonl"}
+
+        def bash(command):
+            return longhaul.guard_check({**claude, "tool_input": {"command": command}}, "warn")
+
+        for command in (f"cat {self.big} && echo done", f"cd {self.tmp} && cat big.py", f"nl -ba {self.big}",
+                        f"echo x\ncat {self.big}"):
+            self.assertIsNone(bash(command), command)
+        answer = bash(f"cat {self.big}")
+        self.assertEqual(set(answer), {"hookSpecificOutput"}, "no systemMessage: display.ts shows the user")
+        bash(f"cat {self.small}")
+        self.assertIn("use Read with offset and limit", self.context(bash(f"cat {self.small}")))
+        self.assertEqual(longhaul.guard_targets({**claude, "tool_input": {"command": f"cat {self.big}"}}),
+                         [("cat", self.big, True)])
+        self.assertEqual(longhaul.bash_reads(f"cd {self.tmp} && nl -ba big.py; head -3 small.py", None),
+                         [str(self.big), str(self.small)], "inspect's reads, as they were")
+
+
 class Filter(unittest.TestCase):
     """`longhaul filter`, the plugin's PostToolUse hook on Bash (the token
     layer, Phase 3): after a command has run, it may hand Claude Code a
