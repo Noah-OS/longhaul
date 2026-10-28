@@ -9300,7 +9300,8 @@ def autocompact_note(opts) -> int:
 # hook before every compaction, the trigger manual (/compact) or auto (the
 # auto-compact window, and idle compaction). `longhaul precompact` logs one
 # line for the main conversation (PRECOMPACT_LOGGED): the trigger; by
-# longhaul when this module's /compact ran it, else by claude-code; and how
+# longhaul when this module's /compact ran it, else by claude-code (by codex
+# in a Codex chat, codex-<id>: the Codex plan's X5); and how
 # old the session's checkpoint was, in whole seconds, "none" with no file,
 # or "unusable" for one the SessionStart hook would not put back. The
 # module marks its compaction just before /compact (`autocompact-note
@@ -9390,10 +9391,13 @@ def precompact_note(data, now: float | None = None) -> None:
     trigger = trigger if isinstance(trigger, str) and trigger in PRECOMPACT_TRIGGERS else "other"
     now = time.time() if now is None else now
     age = precompact_age(sid, now)
-    try:
-        by = "longhaul" if autocompact_asked(sid, now) else "claude-code"
-    except OSError:  # the mark could be neither read under its lock nor used up: not known to be Longhaul's
-        by = "claude-code"
+    if data.get("longhaul_agent") == "codex":  # Codex's /compact or its own auto-compact: Longhaul starts none there
+        by = "codex"
+    else:
+        try:
+            by = "longhaul" if autocompact_asked(sid, now) else "claude-code"
+        except OSError:  # the mark could be neither read under its lock nor used up: not known to be Longhaul's
+            by = "claude-code"
     log(PRECOMPACT_LOGGED.format(sid=sid, trigger=trigger, by=by, age=age))
 
 

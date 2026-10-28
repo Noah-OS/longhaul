@@ -17429,6 +17429,20 @@ class PreCompact(unittest.TestCase):
         self.send(self.compaction("auto"))
         self.assertEqual(self.logged(), [self.line("manual", "longhaul"), self.line("auto")])
 
+    def test_a_codex_chats_compaction_says_by_codex(self):
+        # Under Codex (the Codex plan's X5) the chat is codex-<id> and Codex
+        # ran the compaction, its /compact or its own auto-compact: Longhaul
+        # starts none there, so a mark for the same raw id is not one.
+        self.assertEqual(self.mark(), (0, ""))
+        for trigger in ("manual", "auto"):
+            raw = json.dumps(self.compaction(trigger))
+            with mock.patch.object(sys, "stdin", io.StringIO(raw)), contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(longhaul.main(["precompact", "--agent", "codex"]), 0)
+            self.assertEqual(out.getvalue(), "")
+        codex = f"codex-{self.SID}"
+        self.assertEqual(self.logged(), [self.line("manual", "codex", sid=codex), self.line("auto", "codex", sid=codex)])
+        self.assertEqual(set(self.asked()), {self.SID}, "a Claude Code session's mark is left for it")
+
     def test_a_stale_mark_or_another_sessions_is_not_longhauls(self):
         self.home.mkdir()
         now = time.time()
