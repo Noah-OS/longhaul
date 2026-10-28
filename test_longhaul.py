@@ -20093,16 +20093,16 @@ class Doctor(unittest.TestCase):
 
 
 class CodexDoctor(unittest.TestCase):
-    """The doctor's Codex line (docs plans/2026-10-27-codex.md, X3, Phase 1):
-    what Longhaul reads of OpenAI's Codex today, its chats, for `inspect
-    --agent codex` and `usage`; it installs nothing in Codex and runs no hook
-    there yet. Every path is scratch: HOME, CODEX_HOME, and PATH, which holds
-    a fake `codex` alone when a test puts one there. Every text field of a
-    rollout holds SECRET, which no line may show, and nothing under a Codex
-    folder but sessions/ is opened."""
+    """The doctor's Codex line (docs plans/2026-10-27-codex.md, X3): what
+    Longhaul reads of OpenAI's Codex, its chats, for `inspect --agent codex`
+    and `usage`. Every path is scratch: HOME, CODEX_HOME, and PATH, which
+    holds a fake `codex` alone when a test puts one there. Every text field
+    of a rollout holds SECRET, which no line may show, and nothing under a
+    Codex folder but sessions/ is opened: each folder's config.toml items
+    are CodexDoctorConfig's, and codex_config_items stands in for them here."""
 
     SECRET = "sk-SECRET" + "Q" * 80
-    SAID = "Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and installs nothing in Codex yet"
+    SAID = "Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and runs in Codex through its plugin's hooks"
     ONLY = [("Codex", "doctor_codex")]  # DOCTOR_CHECKS with this line alone: the others are Doctor's
     NO_CODEX = "`codex` is not on PATH"
 
@@ -20117,6 +20117,9 @@ class CodexDoctor(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "CODEX_HOME": str(self.codex)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(longhaul, "codex_config_items", return_value=[])  # CodexDoctorConfig's
         patcher.start()
         self.addCleanup(patcher.stop)
         self.n = 0
@@ -20168,6 +20171,12 @@ class CodexDoctor(unittest.TestCase):
     def printed(self, check) -> list:
         """The line as the doctor prints it, with no heading and no count."""
         return longhaul.doctor_lines([{"name": "Codex", **check}])[1:-1]
+
+    @staticmethod
+    def zstd_in(python) -> bool:
+        """Whether `python` has compression.zstd (3.14 and later)."""
+        return subprocess.run([python, "-I", "-c", "import compression.zstd"], capture_output=True,
+                              timeout=30).returncode == 0
 
     # ------------------------------------------------------------ the checks
 
@@ -20452,12 +20461,434 @@ class CodexDoctor(unittest.TestCase):
                 lines = out.stdout.splitlines()
                 [head] = [l for l in lines if l[2:].startswith("Codex: ")]
                 at = lines.index(head)
-                self.assertIn(head, (f"✔ Codex: {self.SAID}", f"⚠ Codex: {self.SAID}"))
+                # ⚠: no config.toml, so Longhaul's plugin is not installed in this Codex (CodexDoctorConfig).
+                self.assertEqual(head, f"⚠ Codex: {self.SAID}")
                 self.assertEqual(lines[at + 1:at + 3], ["    ✔ ~/.codex: 2 chats, 1 of them compressed",
                                                         "      version 0.164.0, from `codex --version`"])
-                self.assertEqual(head.startswith("⚠"), "that this Python" in out.stdout)
+                self.assertIn("    ⚠ ~/.codex: Longhaul's plugin is not installed there", out.stdout)
+                self.assertEqual("that this Python" in out.stdout, not self.zstd_in(python))
                 self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
                 self.assertNotIn("SECRET", out.stdout)
+                self.assertFalse(home.exists(), "nothing written")
+                self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*")), before)
+
+
+# tomllib is Python 3.11's: the doctor reads Codex's config.toml with it, and before it says so instead.
+TOMLLIB = sys.version_info >= (3, 11)
+
+
+class CodexDoctorConfig(unittest.TestCase):
+    """The doctor's Codex line, each Codex folder's config.toml (the Codex
+    plan's X3, its second half): hooks on or off, Longhaul's plugin
+    installed and enabled, its hooks trusted in /hooks (by Codex's own hash,
+    recomputed from Longhaul's hooks file), the MCP servers for the code
+    index, and where Codex compacts. Every path is scratch: HOME,
+    CODEX_HOME, Longhaul's hooks file and PATH, which has no `codex`. The
+    values the doctor must not read (an MCP server's env and headers, a
+    provider's key) hold SECRET, which no line may show; auth.json is never
+    opened and nothing is written."""
+
+    SECRET = "sk-SECRET" + "Q" * 80
+    FILE = "hooks/codex-hooks.json"
+    HOOK = 'python3 -I "$PLUGIN_ROOT/hooks/codex_hook.py" '
+    # Longhaul's hooks file for Codex, as X4 writes it near enough: the five events, six handlers.
+    HOOKS = {"description": "Longhaul's hooks for Codex", "hooks": {
+        "SessionStart": [{"matcher": "startup|resume|clear|compact",
+                          "hooks": [{"type": "command", "command": HOOK + "checkpoint", "timeout": 10,
+                                     "additionalContextLimit": 4000}]}],
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": HOOK + "reminder", "timeout": 10}]}],
+        "PreToolUse": [{"matcher": "^Bash$", "hooks": [{"type": "command", "command": HOOK + "guard", "timeout": 10}]},
+                       {"matcher": "^Agent$",
+                        "hooks": [{"type": "command", "command": HOOK + "models-hook", "timeout": 10}]}],
+        "PostToolUse": [{"matcher": "^Bash$",
+                         "hooks": [{"type": "command", "command": HOOK + "filter", "timeout": 10}]}],
+        "PreCompact": [{"hooks": [{"type": "command", "command": HOOK + "precompact", "timeout": 10}]}]}}
+    TAILS = [f"{FILE}:session_start:0:0", f"{FILE}:user_prompt_submit:0:0", f"{FILE}:pre_tool_use:0:0",
+             f"{FILE}:pre_tool_use:1:0", f"{FILE}:post_tool_use:0:0", f"{FILE}:pre_compact:0:0"]
+    PLUGIN = ('[plugins."longhaul@longhaul"]', "enabled = true")
+    TRUST_STEP = "open /hooks in Codex and trust Longhaul's hooks: until then they do not run"
+    NOT_READ = "so the hooks, the plugin, its trust and the MCP servers are not checked"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.user, self.bin = self.tmp / "user", self.tmp / "bin"
+        self.codex = self.user / ".codex"
+        self.hooks = self.tmp / "plugin" / self.FILE
+        for folder in (self.codex, self.bin, self.hooks.parent):
+            folder.mkdir(parents=True)
+        self.hooks.write_text(json.dumps(self.HOOKS))
+        for name, value in {"HOME": self.user, "CODEX_HOME": self.codex, "DOCTOR_CODEX_HOOKS_PATH": self.hooks}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "CODEX_HOME": str(self.codex)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("LONGHAUL_CHECKPOINT_AT", None)  # put back by the patch above
+
+    def config(self, *lines, home=None):
+        """config.toml under `home` (CODEX_HOME's by default), from its lines."""
+        home = home or self.codex
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.toml").write_text("\n".join(lines) + "\n")
+
+    def trust(self, key="longhaul@longhaul", only=None, wrong=(), off=(), content=False) -> tuple:
+        """[hooks.state] tables trusting Longhaul's handlers under `key` (all,
+        or the tails in `only`) as Codex writes them: the ones in `wrong`
+        with another hash, the ones in `off` turned off in /hooks, each with a
+        trusted_content_hash when `content` (Codex 0.165 and later)."""
+        lines = []
+        for tail, hashed in longhaul.codex_hooks_declared():
+            if only is not None and tail not in only:
+                continue
+            lines += [f'[hooks.state."{key}:{tail}"]',
+                      f'trusted_hash = "{"sha256:" + "0" * 64 if tail in wrong else hashed}"']
+            lines += ['trusted_content_hash = "sha256:' + "1" * 64 + '"'] if content else []
+            lines += ["enabled = false"] if tail in off else []
+        return tuple(lines)
+
+    def items(self, home=None) -> list:
+        """codex_config_items()'s (mark, text) for `home` (CODEX_HOME by default)."""
+        return [(mark, text) for mark, text, _ in longhaul.codex_config_items(home or self.codex)]
+
+    def item(self, words: str, home=None) -> tuple:
+        """The one config item whose text holds `words`: (mark, text, step)."""
+        found = [i for i in longhaul.codex_config_items(home or self.codex) if words in i[1]]
+        self.assertEqual(len(found), 1, (words, found))
+        return found[0]
+
+    def printed(self) -> str:
+        """The doctor's Codex line as printed, every item and the step."""
+        return "\n".join(longhaul.doctor_lines([{"name": "Codex", **longhaul.doctor_codex()}]))
+
+    # ------------------------------------------------------- the trust hash
+
+    def test_the_trust_hash_is_codexs_own(self):
+        # Codex's own suite pins these two declarations' trusted_hash
+        # (core/tests/suite/hooks.rs at rust-v0.165.0, "Declaration-only
+        # approvals"): the same handler under PreToolUse and PostToolUse.
+        command = "python3 -I -S ${PLUGIN_ROOT}/hooks/pre_tool_use_hook.py"
+        for event, want in (("PreToolUse", "sha256:c9ee1aca1b5d8c72b99df6571c87d61350b09f7f4594ae30e7250a2027e9d76b"),
+                            ("PostToolUse", "sha256:9eef43ad6f26b1f9b94f318a50445f8bb62c363da08152a2966b73d308bf42ba")):
+            with self.subTest(event=event):
+                self.assertEqual(longhaul.codex_hook_hash(event, "^Bash$", {"type": "command", "command": command}),
+                                 want)
+
+    def test_the_hash_is_of_the_handler_as_codex_normalizes_it(self):
+        h, base = longhaul.codex_hook_hash, {"type": "command", "command": "x"}
+        want = h("PreToolUse", "^Bash$", base)
+        for same in ({**base, "timeout": 600}, {**base, "async": False}, {**base, "additionalContextLimit": 2500},
+                     {**base, "commandWindows": "y", "args": ["z"], "statusMessage": None, "matcher": "q"}):
+            with self.subTest(same=same):
+                self.assertEqual(h("PreToolUse", "^Bash$", same), want)
+        for event, matcher, handler in (("PreToolUse", "Bash", base), ("PreToolUse", None, base),
+                                        ("PostToolUse", "^Bash$", base), ("PreToolUse", "^Bash$", {**base, "timeout": 10}),
+                                        ("PreToolUse", "^Bash$", {**base, "async": True}),
+                                        ("PreToolUse", "^Bash$", {**base, "statusMessage": "s"}),
+                                        ("PreToolUse", "^Bash$", {**base, "additionalContextLimit": 4000}),
+                                        ("PreToolUse", "^Bash$", {**base, "command": "x "})):
+            with self.subTest(event=event, matcher=matcher, handler=handler):
+                self.assertNotEqual(h(event, matcher, handler), want)
+        # A matcher Codex ignores for the event, and a limit it ignores for one: not hashed.
+        self.assertEqual(h("UserPromptSubmit", "anything", base), h("UserPromptSubmit", None, base))
+        self.assertEqual(h("PreCompact", None, {**base, "additionalContextLimit": 4000}), h("PreCompact", None, base))
+        # A timeout of 0 is 1; SessionEnd's is 1 by default and at most 3.
+        self.assertEqual(h("Stop", None, {**base, "timeout": 0}), h("Stop", None, {**base, "timeout": 1}))
+        self.assertEqual(h("SessionEnd", None, base), h("SessionEnd", None, {**base, "timeout": 1}))
+        self.assertEqual(h("SessionEnd", None, {**base, "timeout": 30}), h("SessionEnd", None, {**base, "timeout": 3}))
+        # What Codex skips or cannot read is no hook of Longhaul's: no hash.
+        for handler in ({"type": "mcp_tool", "server": "s", "tool": "t"}, {"type": "command", "command": "  "},
+                        {"type": "command"}, "x", {**base, "timeout": "10"}, {**base, "timeout": -1},
+                        {**base, "timeout": True}, {**base, "async": "yes"}, {**base, "statusMessage": 3}):
+            with self.subTest(handler=handler):
+                self.assertIsNone(h("PreToolUse", None, handler))
+        self.assertIsNone(h("NoSuchEvent", None, base))
+
+    def test_longhauls_hooks_file_gives_each_handler_its_key_and_hash(self):
+        declared = longhaul.codex_hooks_declared()
+        self.assertEqual([tail for tail, _ in declared], self.TAILS)
+        first = self.HOOKS["hooks"]["PreToolUse"][0]
+        self.assertEqual(declared[2][1], longhaul.codex_hook_hash("PreToolUse", first["matcher"], first["hooks"][0]))
+        self.assertEqual(longhaul.DOCTOR_CODEX_HOOKS, self.FILE, "the path Codex's trust keys name")
+        self.assertEqual(longhaul.DOCTOR_CODEX_HOOKS_PATH.relative_to(self.tmp / "plugin"), Path(self.FILE))
+        # A handler Codex skips keeps its place: the next one's index is its own.
+        self.hooks.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+            {"type": "mcp_tool", "server": "s", "tool": "t"}, {"type": "command", "command": "x"}]}]}}))
+        self.assertEqual([tail for tail, _ in longhaul.codex_hooks_declared()], [f"{self.FILE}:pre_tool_use:0:1"])
+        # Missing, not JSON, not Codex's shape, or no handler: None.
+        for text in ("not json", "[]", '{"hooks": []}', '{"hooks": {"PreToolUse": {}}}', '{"hooks": {"Nope": []}}',
+                     '{"hooks": {"PreToolUse": [{"hooks": [{"type": "mcp_tool"}]}]}}'):
+            with self.subTest(text=text):
+                self.hooks.write_text(text)
+                self.assertIsNone(longhaul.codex_hooks_declared())
+        self.hooks.unlink()
+        self.assertIsNone(longhaul.codex_hooks_declared())
+
+    # ------------------------------------------------------------ the items
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_hooks_are_on_by_codexs_default_and_off_is_broken(self):
+        self.assertEqual(self.item(": hooks o")[:2], ("ok", "~/.codex: hooks on (Codex's default)"), "no config.toml")
+        self.config("[features]", "hooks = true")
+        self.assertEqual(self.item(": hooks o")[:2], ("ok", "~/.codex: hooks on ([features] hooks = true)"))
+        self.config("[features]", "codex_hooks = false", "hooks = true")  # hooks wins: Codex reads the keys in order
+        self.assertEqual(self.item(": hooks o")[:2], ("ok", "~/.codex: hooks on ([features] hooks = true)"))
+        for lines, key in ((("[features]", "hooks = false"), "hooks"), (("features.hooks = false",), "hooks"),
+                           (("[features]", "codex_hooks = false"), "codex_hooks")):
+            with self.subTest(lines=lines):
+                self.config(*lines, *self.PLUGIN, *self.trust())  # a dotted key first: after a table it is that table's
+                self.assertEqual(self.item(": hooks o"), (
+                    "bad", f"~/.codex: hooks off ([features] {key} = false), so none of Longhaul's hooks runs there",
+                    f"set `{key} = true` under [features] in ~/.codex/config.toml, or remove the line (on is Codex's "
+                    "default); Longhaul never writes it"))
+                c = longhaul.doctor_codex()
+                self.assertEqual((c["mark"], c["step"]), ("bad", self.item(": hooks o")[2]))
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_the_plugin_is_installed_and_enabled_turned_off_or_missing(self):
+        repo = longhaul.plugin_repository()
+        self.assertEqual(self.item("plugin")[:2], ("warn", "~/.codex: Longhaul's plugin is not installed there, so no "
+                                                           "checkpoint, reminder, guard or filter in Codex"))
+        self.assertEqual(self.item("plugin")[2], f"in a terminal: `codex plugin marketplace add {repo}`, then `codex "
+                                                 "plugin add longhaul@longhaul`; then trust its hooks in Codex's /hooks")
+        c = longhaul.doctor_codex()
+        self.assertEqual((c["mark"], c["step"]), ("warn", self.item("plugin")[2]))
+        installed = ("ok", "~/.codex: Longhaul's plugin installed and enabled (longhaul@longhaul)", None)
+        for lines in (self.PLUGIN, ('[plugins."longhaul@longhaul"]',), ('plugins."longhaul@longhaul".enabled = true',)):
+            with self.subTest(lines=lines):
+                self.config(*lines)
+                self.assertEqual(self.item("plugin"), installed)
+        self.config('[plugins."longhaul@longhaul"]', "enabled = false")
+        self.assertEqual(self.item("plugin"), (
+            "bad", "~/.codex: Longhaul's plugin is installed but turned off (longhaul@longhaul)",
+            'set `enabled = true` under [plugins."longhaul@longhaul"] in ~/.codex/config.toml; Longhaul never writes it'))
+        # Any marketplace's; the enabled one of two; no other plugin's.
+        self.config('[plugins."longhaul@mine"]', "enabled = true")
+        self.assertEqual(self.item("plugin")[:2], ("ok", "~/.codex: Longhaul's plugin installed and enabled (longhaul@mine)"))
+        self.config('[plugins."longhaul@a"]', "enabled = false", '[plugins."longhaul@b"]', "enabled = true")
+        self.assertIn("(longhaul@b)", self.item("plugin")[1])
+        self.config('[plugins."longhauler@longhaul"]', '[plugins."other@longhaul"]', "enabled = true")
+        self.assertEqual(self.item("plugin")[0], "warn")
+        # A marketplace's name that is not plain is not shown.
+        self.config(f'[plugins."longhaul@{self.SECRET}"]', "enabled = false")
+        self.assertEqual(self.item("plugin")[:2], ("bad", "~/.codex: Longhaul's plugin is installed but turned off"))
+        self.assertNotIn("SECRET", self.printed())
+        # Codex's plugins turned off: nothing of any plugin runs.
+        self.config("[features]", "plugins = false", *self.PLUGIN)
+        self.assertEqual(self.item("plugins are off"), (
+            "bad", "~/.codex: Codex's plugins are off ([features] plugins = false), so Longhaul's plugin does not run "
+                   "there",
+            "set `plugins = true` under [features] in ~/.codex/config.toml, or remove the line (on is Codex's default); "
+            "Longhaul never writes it"))
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_longhauls_hooks_are_trusted_changed_or_waiting_by_count(self):
+        self.config(*self.PLUGIN, *self.trust())
+        self.assertEqual(self.item("trusted"), ("ok", "~/.codex: Longhaul's 6 hooks trusted in /hooks", None))
+        self.assertEqual(longhaul.doctor_codex()["mark"], "ok")
+        # Codex 0.165 and later pin the plugin's files too, which the doctor does not hash.
+        self.config(*self.PLUGIN, *self.trust(content=True))
+        self.assertEqual(self.item("trusted")[:2], (
+            "ok", "~/.codex: Longhaul's 6 hooks trusted in /hooks; Codex also checks the plugin's files "
+                  "(trusted_content_hash), which the doctor does not: after an update it asks for trust again"))
+        # Partly: two trusted, one changed since, one turned off, two never trusted.
+        t = self.TAILS
+        self.config(*self.PLUGIN, *self.trust(only=t[:4], wrong=t[3:4], off=t[:1]))
+        self.assertEqual(self.item("trusted"), (
+            "warn", "~/.codex: of Longhaul's 6 hooks, 2 trusted, 1 changed since trusted (an update can change one), "
+                    "2 not trusted yet, 1 turned off in /hooks", self.TRUST_STEP))
+        self.config(*self.PLUGIN, *self.trust(off=t[1:2]))
+        self.assertEqual(self.item("trusted"), ("warn", "~/.codex: of Longhaul's 6 hooks, 5 trusted, 1 turned off in "
+                                                        "/hooks", "turn Longhaul's hooks back on in Codex's /hooks"))
+        self.config(*self.PLUGIN)
+        self.assertEqual(self.item("trusted"), ("warn", "~/.codex: none of Longhaul's 6 hooks is trusted yet, so none "
+                                                        "runs", self.TRUST_STEP))
+        # Under the plugin's own key: another marketplace's trust is not this one's.
+        self.config('[plugins."longhaul@mine"]', *self.trust())
+        self.assertEqual(self.item("trusted")[1], "~/.codex: none of Longhaul's 6 hooks is trusted yet, so none runs")
+        self.config('[plugins."longhaul@mine"]', *self.trust(key="longhaul@mine"))
+        self.assertEqual(self.item("trusted")[0], "ok")
+        # Not installed: nothing to trust, no item.
+        self.config(*self.trust())
+        self.assertFalse([text for _, text in self.items() if "trusted" in text])
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_without_longhauls_hooks_file_trust_entries_are_counted(self):
+        self.hooks.unlink()
+        self.config(*self.PLUGIN, *(f'[hooks.state."longhaul@longhaul:{tail}"]\ntrusted_hash = "sha256:{n}"'
+                                    for n, tail in enumerate(self.TAILS[:3])),
+                    '[hooks.state."longhaul@longhaul:x:stop:0:0"]', "enabled = false",
+                    '[hooks.state."other@longhaul:x:stop:0:0"]', 'trusted_hash = "sha256:1"')
+        self.assertEqual(self.item("trust"), (
+            None, "~/.codex: 3 of Longhaul's hooks have a trust entry, not checked: this Longhaul has no readable "
+                  "hooks/codex-hooks.json to check them against, and an update may need trusting again in /hooks", None))
+        self.config(*self.PLUGIN)
+        self.assertEqual(self.item("trusted"), ("warn", "~/.codex: none of Longhaul's hooks is trusted yet, so none runs",
+                                                self.TRUST_STEP))
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_mcp_servers_for_the_code_index_are_named_and_nothing_else_of_them_shown(self):
+        s = self.SECRET
+        self.config("[mcp_servers.codegraph]", 'command = "codegraph"', 'args = ["serve", "--mcp"]',
+                    f'env = {{ CODEGRAPH_TOKEN = "{s}" }}', "",
+                    "[mcp_servers.trail-code]", 'url = "https://example.invalid/mcp"',
+                    f'http_headers = {{ Authorization = "Bearer {s}" }}', f'bearer_token = "{s}"', "enabled = false", "",
+                    "[mcp_servers.github]", 'command = "gh-mcp"', f'env = {{ GITHUB_TOKEN = "{s}" }}', "",
+                    f'[mcp_servers."codegraph {s}"]', 'command = "x"', "",
+                    "[model_providers.custom]", f'name = "{s}"', f'env_key = "{s}"',
+                    f'experimental_bearer_token = "{s}"', f'base_url = "https://{s}.invalid"')
+        self.assertEqual(self.item("MCP"), ("ok", "~/.codex: MCP servers for the code index: codegraph, trail-code "
+                                                  "(turned off)", None))
+        shown = self.printed()
+        for word in ("SECRET", "github", "example.invalid", "Bearer", "gh-mcp", "--mcp"):
+            self.assertNotIn(word, shown)
+        self.config("[mcp_servers.codegraph]", 'command = "codegraph"')
+        self.assertEqual(self.item("MCP")[1], "~/.codex: MCP server for the code index: codegraph")
+        self.config("[mcp_servers.github]", 'command = "gh-mcp"')
+        self.assertEqual(self.item("MCP"), (
+            None, "~/.codex: no MCP server for the code index; Longhaul tells Codex of a CodeGraph index by its command "
+                  "line (`codegraph explore`), which needs none", None))
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_compaction_is_codexs_own_point_and_no_line_to_paste(self):
+        default = ("~/.codex: Codex compacts at its default, 90% of the model's context window (about 245k tokens on "
+                   "today's 272k models); ")
+        self.assertEqual(self.item("compacts"), (None, default + "Longhaul's reminder asks for a checkpoint at 200,000 "
+                                                                 "tokens, before that", None))
+        self.config("model_auto_compact_token_limit = 230_000")
+        self.assertEqual(self.item("compacts")[:2], (
+            None, "~/.codex: Codex compacts at 230,000 tokens (model_auto_compact_token_limit), or at 90% of the "
+                  "model's context window if that is lower; Longhaul's reminder asks for a checkpoint at 200,000 "
+                  "tokens, before that"))
+        self.config("model_auto_compact_token_limit = 150000")
+        self.assertTrue(self.item("compacts")[1].endswith("; Longhaul's reminder, at 200,000 tokens, comes after that"))
+        self.config("model_auto_compact_token_limit = true")  # not a number: Codex's default
+        self.assertEqual(self.item("compacts")[1], default + "Longhaul's reminder asks for a checkpoint at 200,000 "
+                                                             "tokens, before that")
+        self.config()
+        with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_AT": "off"}):
+            self.assertEqual(self.item("compacts")[1], default + "Longhaul's reminder is off (LONGHAUL_CHECKPOINT_AT=off)")
+        with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_AT": "250000"}):
+            self.assertTrue(self.item("compacts")[1].endswith("Longhaul's reminder, at 250,000 tokens, comes after that"))
+        self.assertFalse([text for _, text in self.items() if "paste" in text], "the owner's decision: no paste line")
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_a_config_toml_that_cannot_be_read_is_a_warning_and_never_stops_the_doctor(self):
+        for text in ("this is [not toml", b"\xff\xfe = 1", "[features]\nhooks = false\nhooks = true"):
+            with self.subTest(text=text):
+                path = self.codex / "config.toml"
+                path.write_bytes(text if isinstance(text, bytes) else text.encode())
+                self.assertEqual(longhaul.codex_config_items(self.codex), [
+                    ("warn", f"~/.codex: config.toml is not valid TOML, {self.NOT_READ}",
+                     "fix the TOML in ~/.codex/config.toml")])
+                self.assertEqual(longhaul.doctor_codex()["mark"], "warn")
+        (self.codex / "config.toml").chmod(0)
+        self.addCleanup((self.codex / "config.toml").chmod, 0o600)
+        self.assertEqual(longhaul.codex_config_items(self.codex), [
+            ("warn", "~/.codex: config.toml could not be read (Permission denied)",
+             "check that you can open ~/.codex/config.toml")])
+        work = self.user / "work-codex"
+        (work / "config.toml").mkdir(parents=True)
+        self.assertEqual(self.items(work), [("warn", "~/work-codex: config.toml could not be read (Is a directory)")])
+
+    def test_without_tomllib_config_toml_is_not_read_and_the_warning_names_the_python_that_can(self):
+        python = sys.version.split()[0]
+        with mock.patch.dict(sys.modules, {"tomllib": None}):  # `import tomllib` raises, as before 3.11
+            self.assertEqual(self.items()[:2], [("ok", "~/.codex: hooks on (Codex's default)"),
+                                                ("warn", "~/.codex: Longhaul's plugin is not installed there, so no "
+                                                         "checkpoint, reminder, guard or filter in Codex")],
+                             "no config.toml: Codex's defaults, read with no TOML reader")
+            self.config(*self.PLUGIN)
+            self.assertEqual(longhaul.codex_config_items(self.codex), [
+                ("warn", f"~/.codex: config.toml not read: this Python ({python}) has no TOML reader (tomllib, Python "
+                         f"3.11 and later), {self.NOT_READ}",
+                 "Python 3.11 or later reads it when it is the `python3` on PATH; Longhaul installs nothing")])
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_each_codex_folder_has_its_own_items_after_the_chats(self):
+        work = self.user / "work-codex"
+        self.config(*self.PLUGIN, *self.trust(), home=work)
+        with mock.patch.object(longhaul, "CODEX_HOME", work):
+            c = longhaul.doctor_codex()
+            quick = longhaul.doctor_codex(quick=True)
+        texts = [text for _, text, _ in c["items"]]
+        self.assertTrue(texts[0].startswith("~/work-codex (CODEX_HOME): ") and texts[1].startswith("~/.codex: no chats"))
+        self.assertTrue(texts[2].startswith("version not known"))
+        self.assertEqual([t.split(":")[0] for t in texts[3:]], ["~/work-codex"] * 5 + ["~/.codex"] * 4)
+        self.assertIn(("ok", "~/work-codex: Longhaul's 6 hooks trusted in /hooks"), self.items(work))
+        self.assertIn("~/.codex: Longhaul's plugin is not installed there", str(c["items"]))
+        self.assertNotIn("~/.codex", str(quick["items"]), "quick: CODEX_HOME's alone")
+        self.assertIn("~/work-codex: hooks on (Codex's default)", str(quick["items"]))
+
+    def test_nothing_but_config_toml_is_opened_and_nothing_is_written(self):
+        self.config(*self.PLUGIN, *self.trust(), "[mcp_servers.codegraph]", f'env = {{ K = "{self.SECRET}" }}')
+        for name in ("auth.json", ".credentials.json", "history.jsonl", "session_index.jsonl"):
+            (self.codex / name).write_text(self.SECRET)
+        before = sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*"))
+        opened, real = [], io.open
+
+        def spy(file, *args, **kwargs):
+            opened.append(os.path.realpath(file) if isinstance(file, (str, Path)) else file)
+            return real(file, *args, **kwargs)
+
+        with mock.patch("io.open", spy), mock.patch("builtins.open", spy):
+            shown = self.printed()
+        under = [path for path in opened if isinstance(path, str) and path.startswith(str(self.codex))]
+        self.assertEqual(sorted(set(under)), [str(self.codex / "config.toml")] if TOMLLIB else [], "before 3.11: none")
+        for word in ("SECRET", "sha256", "auth", "credentials"):
+            self.assertNotIn(word, shown)
+        self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*")), before, "nothing written")
+
+    def test_the_doctor_as_a_program_shows_the_config_lines_on_each_python(self):
+        s = self.SECRET
+        self.config("model_auto_compact_token_limit = 230000", *self.PLUGIN, "",  # a top-level key before any table
+                    "[mcp_servers.codegraph]", 'command = "codegraph"', f'env = {{ CODEGRAPH_TOKEN = "{s}" }}', "",
+                    "[model_providers.custom]", f'experimental_bearer_token = "{s}"')
+        (self.codex / "auth.json").write_text(s)
+        (self.codex / "auth.json").chmod(0)
+        self.addCleanup((self.codex / "auth.json").chmod, 0o600)
+        fake = self.tmp / "fakes"
+        fake.mkdir()
+        for name in ("ps", "lsof", "codex"):  # the process list is never the real one, nor the codex asked
+            (fake / name).write_text("#!/bin/sh\nexit 0\n")
+            (fake / name).chmod(0o755)
+        before = sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*"))
+        home = self.tmp / "no-home"  # never made: the doctor writes nothing
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")
+               and k not in Checkpoint.SESSION_VARS + ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        env.update(PATH=f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", HOME=str(self.user), LONGHAUL_HOME=str(home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off", CODEX_HOME=str(self.codex))
+        for python in (sys.executable, "/usr/bin/python3"):
+            if not os.path.exists(python):
+                continue
+            with self.subTest(python=python):
+                out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, capture_output=True,
+                                     text=True, timeout=60)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                lines = out.stdout.splitlines()
+                has_toml = subprocess.run([python, "-I", "-c", "import tomllib"], capture_output=True,
+                                          timeout=30).returncode == 0
+                if has_toml:
+                    for line in ("    ✔ ~/.codex: hooks on (Codex's default)",
+                                 "    ✔ ~/.codex: Longhaul's plugin installed and enabled (longhaul@longhaul)",
+                                 "    ✔ ~/.codex: MCP server for the code index: codegraph",
+                                 "      ~/.codex: Codex compacts at 230,000 tokens (model_auto_compact_token_limit), or "
+                                 "at 90% of the model's context window if that is lower; Longhaul's reminder asks for "
+                                 "a checkpoint at 200,000 tokens, before that"):
+                        self.assertIn(line, lines)
+                    # No trust entry: none of Longhaul's hooks runs yet, whatever this checkout's hooks file holds.
+                    self.assertTrue([l for l in lines if l.startswith("    ⚠ ~/.codex: none of Longhaul's")
+                                     and l.endswith("is trusted yet, so none runs")], out.stdout)
+                else:
+                    version = subprocess.run([python, "-I", "-c", "import sys; print(sys.version.split()[0])"],
+                                             capture_output=True, text=True, timeout=30).stdout.strip()
+                    self.assertIn(f"    ⚠ ~/.codex: config.toml not read: this Python ({version}) has no TOML reader "
+                                  f"(tomllib, Python 3.11 and later), {self.NOT_READ}", lines)
+                self.assertNotIn("SECRET", out.stdout)
+                self.assertNotIn("sha256", out.stdout)
                 self.assertFalse(home.exists(), "nothing written")
                 self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*")), before)
 
