@@ -1908,9 +1908,12 @@ class CodexInspect(unittest.TestCase):
         self.home = self.tmp / "codex"
         self.day = self.home / "sessions" / "2026" / "10" / "27"
         self.day.mkdir(parents=True)
-        patcher = mock.patch.object(longhaul, "CODEX_HOME", self.home)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Longhaul's own home, where its Codex hooks keep their records: the
+        # one cli() hands the command, so a report made here reads the same.
+        for patcher in (mock.patch.object(longhaul, "CODEX_HOME", self.home),
+                        mock.patch.object(longhaul, "LONGHAUL_HOME", self.tmp / "relay")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.second = 0
         self.running = dict.fromkeys(self.six(0), 0)  # the token_counts' total so far: count() adds to it
 
@@ -2397,6 +2400,8 @@ class CodexInspect(unittest.TestCase):
             heads = [l for l in out[1:] if l.strip() and not l.startswith(" ")]
             self.assertGreaterEqual(len(heads), 10, out)
             for head in heads:
+                if head.startswith("Guard ["):  # Longhaul's own record, headed as Claude Code's (the tests below)
+                    continue
                 self.assertRegex(head, r"\[rollout, (measured|counted|inferred)[^\]]*\]$", head)
 
     def test_json_gives_every_number_its_source_and_confidence_in_claudes_shape(self):
@@ -2443,6 +2448,106 @@ class CodexInspect(unittest.TestCase):
             self.assertIn(f"  {tool}: ", out.stdout, "the report ran over the tools")
             self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)
         self.assertIn("rg", self.cli(self.MAIN).stdout, "a command's program, which the report may name")
+
+    # ------------------------------------------------ what Longhaul's own Codex hooks kept
+
+    GUARD = "Guard [longhaul guard, counted: calls it warned about or blocked]"
+    FILTER = "Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]"
+
+    def hooked(self):
+        """What Longhaul's own Codex hooks keep of the chat, made as they
+        make it: the guard's catches through guard_check() (a whole cat of a
+        big file and a repeat read in the main chat, a whole nl of the big
+        file in its sub-agent), and the shadow filter's log, two notes in
+        the shape filter_check() writes under Codex. Beside them another
+        chat's, and a Claude Code session's under the bare id, which are not
+        this chat's."""
+        big, small = self.tmp / "big.py", self.tmp / f"small-{self.SECRET}.py"
+        big.write_text("x" * 30_000)
+        small.write_text("y" * 300)
+
+        def pre(command, thread=self.MAIN, agent=None, caught=True):
+            data = {"session_id": thread, "turn_id": "t1", "transcript_path": None, "cwd": str(self.tmp),
+                    "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra", "permission_mode": "default",
+                    "tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "call_1"}
+            if agent:
+                data["agent_id"], data["agent_type"] = agent, "explorer"
+            answer = longhaul.guard_check(longhaul.codex_hook_input(data), "warn")
+            self.assertEqual(answer is not None, caught, command)
+
+        pre(f"cat {big}")
+        pre(f"cat {small}", caught=False)
+        pre(f"cat {small}")  # read again, unchanged
+        pre(f"nl -ba {big}", agent=self.CHILD)
+        pre(f"cat {big}", thread=self.OTHER)
+        longhaul.guard_check({"session_id": self.MAIN, "hook_event_name": "PreToolUse", "tool_name": "Read",
+                              "tool_input": {"file_path": str(big)}}, "warn")  # Claude Code's, keyed by the bare id
+        folder = longhaul.LONGHAUL_HOME / "filters"
+        folder.mkdir(parents=True)
+        note = {"at": 1793116800.0, "agent": False, "codex": True, "mode": "shadow", "kind": "grep", "steps": [],
+                "applied": False}
+        notes = [{**note, "id": "call_1", "chars": 9000, "lossless": 8000, "on": 3000, "dropped": 5000,
+                  "steps": ["cap"], "shown": 9000, "ms": 2.0},
+                 {**note, "id": "call_2", "agent": True, "chars": 5000, "lossless": 4000, "on": 4000, "dropped": 0,
+                  "shown": 5000, "ms": 4.0}]
+        (folder / f"codex-{self.MAIN}.jsonl").write_text("".join(json.dumps(n) + "\n" for n in notes))
+        for name in (f"codex-{self.OTHER}", self.MAIN):
+            (folder / f"{name}.jsonl").write_text(json.dumps({**notes[0], "chars": 99999}) + "\n")
+
+    def test_the_guards_catches_and_the_shadow_filters_measure_come_from_longhauls_own_records(self):
+        # As Claude Code's inspect reads them for its sessions (guard_counts(),
+        # filter_counts()), keyed codex-<id> as codex_hook_input() keys the
+        # hooks': the chat's guard record and its sub-agents', and its filter log.
+        self.chat()
+        self.hooked()
+        out = self.cli(self.MAIN)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertEqual(self.section(lines, "Guard ["), [
+            self.GUARD,
+            "  read again unchanged: 1 (300 bytes)",
+            "  cat or nl of a big file: 2 (60,000 bytes)"])
+        self.assertEqual(self.section(lines, "Output filter log ["), [
+            self.FILTER,
+            "  shadow (changes nothing): 2 outputs; lossless would cut 2,000 chars, on 7,000, lines of 1 output "
+            "among them",
+            "  the hook's own time: median 2.0 ms, longest 4.0 ms"])
+        self.assertLess(lines.index(self.FILTER), lines.index("Failures [rollout, counted]"), "Claude Code's order")
+        self.assertLess(lines.index(self.GUARD), lines.index(self.FILTER))
+        self.assertNotIn("SECRET", out.stdout + out.stderr, "numbers alone: no path the guard's record holds")
+        # The same numbers in --json, as Claude Code's (its source the guard, counted).
+        out = self.cli(self.MAIN, "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = {(x["metric"], x["item"]): (x["value"], x["scope"], x["source"], x["confidence"], x["session"])
+               for x in map(json.loads, out.stdout.splitlines()) if x["metric"].startswith("guard_")}
+        self.assertEqual(got, {("guard_fired", "repeat"): (1, "all", "guard", "counted", self.MAIN),
+                               ("guard_fired", "big"): (0, "all", "guard", "counted", self.MAIN),
+                               ("guard_fired", "cat"): (2, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "repeat"): (300, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "big"): (0, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "cat"): (60000, "all", "guard", "counted", self.MAIN)})
+        # Another chat's records are its own: one catch, and its filter log.
+        lines = self.cli(self.OTHER).stdout.splitlines()
+        self.assertEqual(self.section(lines, "Guard [")[1:], ["  cat or nl of a big file: 1 (30,000 bytes)"])
+        self.assertIn("  shadow (changes nothing): 1 output; lossless would cut 91,999 chars, on 96,999, lines of 1 "
+                      "output among them", lines)
+
+    def test_with_no_record_of_longhauls_hooks_the_guard_says_so_and_the_filter_log_is_not_shown(self):
+        # A chat Longhaul's hooks never saw (Codex's hooks off, or Longhaul
+        # not installed in Codex): as Claude Code's, the guard's line says why
+        # there is none, and the filter log's section is left out.
+        self.chat()
+        out = self.cli(self.MAIN)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Guard [longhaul guard: no record: the hook was off, or saw no read by cat, nl, head, tail or "
+                      "sed]", out.stdout.splitlines())
+        self.assertNotIn("Output filter log [", out.stdout)
+        self.assertNotIn("guard_", self.cli(self.MAIN, "--json").stdout)
+        # A record with the reminder's keys alone is no record of the guard's (guard_counts()).
+        folder = longhaul.LONGHAUL_HOME / "guard"
+        folder.mkdir(parents=True)
+        (folder / f"codex-{self.MAIN}.json").write_text(json.dumps({"reminder": {"at": 200000}}))
+        self.assertIn("Guard [longhaul guard: no record", self.cli(self.MAIN).stdout)
 
     # ------------------------------------------------ the command line
 
@@ -5484,11 +5589,14 @@ class CodexGuard(unittest.TestCase):
     def test_a_codex_startup_gives_the_index_part_alone(self):
         # The first-chat line points to /longhaul:doctor, a Claude Code skill;
         # the release's line is about Claude Code's plugin update; and the
-        # CodeGraph note names an MCP tool Codex may not have.
+        # CodeGraph note names an MCP tool Codex may not have. With no
+        # `codegraph` on PATH, no note of the index's command line either
+        # (the test below).
         (self.tmp / ".codegraph").mkdir()
         setup = mock.patch.object(longhaul, "setup_line", return_value="the first-chat line")
         release = mock.patch.object(longhaul, "release_startup", return_value="the release's line")
-        with setup as first, release as newer:
+        bare = mock.patch.dict(os.environ, {"PATH": str(self.tmp / "no-bin")})
+        with setup as first, release as newer, bare:
             claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn", index="off")
             self.assertEqual(claude["systemMessage"], "the first-chat line\nthe release's line",
                              "Claude Code's, as it was")
@@ -5506,6 +5614,69 @@ class CodexGuard(unittest.TestCase):
             self.assertEqual(answer["systemMessage"], longhaul.index_message([("codegraph", top)], []))
             self.assertEqual(self.context(answer), longhaul.index_note("codegraph", top))
             self.assertNotIn("CodeGraph index (.codegraph/)", json.dumps(answer))
+
+    def test_a_codex_main_chat_is_told_of_codegraph_by_its_command_line(self):
+        # The owner, 2026-10-28 (X7): Codex's model is told of a CodeGraph
+        # index by its command line, `codegraph explore`, when the program is
+        # on PATH, by PATH's absolute entries alone (index_program()); the
+        # MCP tool is not named. Only at the main chat's start, with the
+        # guard on and the project indexed.
+        (self.tmp / ".codegraph").mkdir()
+        tools = Path(tempfile.mkdtemp())
+        program = tools / "codegraph"
+        program.write_text("#!/bin/sh\nexit 0\n")
+        program.chmod(0o755)
+        on_path = mock.patch.dict(os.environ, {"PATH": f"{self.tmp / 'no-bin'}{os.pathsep}{tools}"})
+        cli = longhaul.GUARD_CODEGRAPH_CLI
+        self.assertIn('`codegraph explore "<question>"`', cli)
+        self.assertIn("grep and rg for plain text", cli)
+        self.assertNotIn("mcp__", cli)
+        self.assertNotIn("\n", cli)
+        with on_path:
+            for mode in ("warn", "block"):
+                answer = self.check(self.start(), mode)
+                self.assertEqual(answer, {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                                 "additionalContext": cli}}, mode)
+            self.assertIn(f"guard: named the CodeGraph index at {longhaul.home_path(str(self.tmp))} at startup",
+                          (self.home / "longhaul.log").read_text())
+            # Through Codex's hook, as hooks/codex_hook.py runs it: the note is what Codex takes back.
+            self.assertEqual(self.hook(self.start()), (0, {"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": cli}}))
+            # Beside the auto-init's note, it goes first, as Claude Code's does.
+            top = str(self.tmp)
+            with mock.patch.object(longhaul, "index_start", return_value=([("trail", top)], [])):
+                self.assertEqual(self.context(self.check(self.start(), index="on")),
+                                 f"{cli} {longhaul.index_note('trail', top)}")
+            # A sub-agent's start, the guard off, another start than startup: no note.
+            self.assertIsNone(self.check(self.start(agent=self.AGENT)), "a sub-agent's")
+            self.assertIsNone(self.check(self.start(), "off"), "the guard off")
+            for source in ("resume", "clear", "compact", "fork"):
+                self.assertIsNone(self.check(self.start(source=source)), source)
+            # Claude Code's start is unchanged: its own note, the MCP tool's.
+            claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn")
+            self.assertEqual(self.context(claude), longhaul.GUARD_CODEGRAPH)
+        # No index here: no note.
+        os.rmdir(self.tmp / ".codegraph")
+        with on_path:
+            self.assertIsNone(self.check(self.start()), "no index")
+        (self.tmp / ".codegraph").mkdir()
+        # No program: none on PATH, one by a relative entry alone, one the project holds, one that cannot run.
+        inside = self.tmp / "bin"
+        inside.mkdir()
+        shutil.copy(program, inside / "codegraph")
+        here = os.getcwd()
+        os.chdir(tools)
+        self.addCleanup(os.chdir, here)
+        for path in (str(self.tmp / "no-bin"), ".", str(inside)):
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                self.assertIsNone(self.check(self.start()), path)
+        program.chmod(0o644)
+        with on_path:
+            self.assertIsNone(self.check(self.start()), "not runnable")
+        # Claude Code's start names its index with no program on PATH, as it always did.
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "no-bin")}):
+            claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn")
+            self.assertEqual(self.context(claude), longhaul.GUARD_CODEGRAPH)
 
     def test_no_wait_advice_and_no_search_nudge_under_codex(self):
         # The wait weighs a sub-agent's sleep against Claude's five-minute
@@ -6457,6 +6628,67 @@ class Index(unittest.TestCase):
                              capture_output=True, text=True, timeout=10)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(log.read_text().count("index: skipped, unattended session\n"), 2, "an attended one: not again")
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+
+    def test_a_codex_exec_run_never_starts_one(self):
+        # Codex sets no CLAUDE_CODE_SESSION_ATTENDED. Its unattended run,
+        # `codex exec`, says so in the first record of its rollout, which
+        # Codex writes before the SessionStart hook runs: session_meta's
+        # source is "exec", where the terminal's is "cli" and VS Code's
+        # "vscode" (codex-rs rust-v0.165.0, protocol.rs SessionSource,
+        # exec/src/lib.rs). A synthetic rollout: of its first line the label
+        # alone is read, and nothing after it.
+        thread, secret = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f", "SECRET-INSTRUCTIONS-7731"
+        both = self.planned("codegraph", "trail")
+
+        def rollout(source, first="session_meta"):
+            path = self.tmp / "rollout-2026-10-28T10-00-00-019f9d8e.jsonl"
+            meta = {"id": thread, "session_id": thread, "cwd": str(self.repo / "src"), "originator": "codex_exec",
+                    "cli_version": "0.165.0", "base_instructions": {"text": f"You are Codex. {secret}"}}
+            if source is not None:
+                meta["source"] = source
+            path.write_text(json.dumps({"type": first, "timestamp": "2026-10-28T10:00:00.000Z", "payload": meta})
+                            + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "user_message",
+                                                                                   "message": secret}}) + "\n")
+            return str(path)
+
+        def start(transcript, **more):
+            """A Codex SessionStart for a new chat, as Codex sends it."""
+            return {"session_id": thread, "transcript_path": transcript, "cwd": str(self.repo / "src"),
+                    "hook_event_name": "SessionStart", "model": "gpt-5.6-terra", "permission_mode": "default",
+                    "source": "startup", **more}
+
+        def codex(data):
+            return self.plan(longhaul.codex_hook_input(data))
+
+        self.assertEqual(codex(start(rollout("exec"))), [], "codex exec")
+        for source in ("cli", "vscode", "mcp", {"custom": "atlas"}, None):
+            self.assertEqual(codex(start(rollout(source))), both, source)
+        # No sign of an exec run is no refusal: no rollout (`codex exec
+        # --ephemeral` writes none, and its transcript_path is null), one not
+        # there, a relative path, a folder, a first record that is not session_meta.
+        for transcript in (None, str(self.tmp / "gone.jsonl"), "rollout.jsonl", str(self.tmp), 7):
+            self.assertEqual(codex(start(transcript)), both, transcript)
+        self.assertEqual(codex(start(rollout("exec", first="turn_context"))), both, "not session_meta")
+        # Claude Code's start is never read so: its transcript is no rollout.
+        self.assertEqual(self.plan({**self.start(), "transcript_path": rollout("exec")}), both, "Claude Code's")
+        # The refusal said in the log, as the unattended session's is, once; never a word of the rollout's.
+        log = (self.home / "longhaul.log").read_text()
+        self.assertEqual(log.count("index: skipped, a codex exec run\n"), 1, log)
+        self.assertNotIn(secret, log)
+        # Through Codex's hook, as hooks/codex_hook.py runs it: nothing started or written.
+        hook = [sys.executable, "-I", str(HERE / "hooks" / "codex_hook.py"), "guard"]
+        out = subprocess.run(hook, input=json.dumps(start(rollout("exec"))), env=self.env, cwd=str(self.repo / "src"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+        # A terminal chat's start, through the same hook: both start.
+        out = subprocess.run(hook, input=json.dumps(start(rollout("cli"))), env=self.env, cwd=str(self.repo / "src"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
         for program in self.MAPS:
             self.assertEqual(self.wait(program)["exit"], 0, program)
@@ -16807,10 +17039,12 @@ class CodexModels(unittest.TestCase):
     """Auto Model on Codex, log only (the Codex plan's X9, Phase 4): `longhaul
     models-hook --agent codex`, on PreToolUse spawn_agent, logs each pick of
     the main chat (agent type, model, reasoning effort, fork) as models_rule
-    logs Claude Code's, and never changes the call: Longhaul's table and cap
-    name Claude's models, and a Codex ladder is the owner's to choose. The
-    inputs are spawn_agent's two versions (docs/discovery/2026-10-28-codex-
-    hooks.md, 10). Claude Code keeps Auto Model in the Advisor's hook."""
+    logs Claude Code's, and each of a sub-agent's own, marked so; an
+    inherited model is the spawner's. It never changes the call: Longhaul's
+    table and cap name Claude's models, and a Codex ladder is the owner's to
+    choose. The inputs are spawn_agent's two versions (docs/discovery/
+    2026-10-28-codex-hooks.md, 10). Claude Code keeps Auto Model in the
+    Advisor's hook."""
 
     S = "SENTINEL-NARWHAL-4410"  # text of the call's, which no record may hold
     SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
@@ -16889,12 +17123,12 @@ class CodexModels(unittest.TestCase):
         # only "none" does not. v1 forks with fork_context true alone.
         self.assertEqual(self.logged(), [
             f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort high",
-            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
             f"models: worker picked gpt-5.6-terra (its call) in {sid}, effort low",
-            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: default on inherited (inherited) in {sid}, effort inherited"])
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited"])
         self.no_text()
 
     def test_null_and_empty_fields_are_codex_s_defaults(self):
@@ -16908,9 +17142,9 @@ class CodexModels(unittest.TestCase):
         del given["fork_context"]  # v1's fork_context defaults to false
         self.codex(self.spawn(given))
         self.assertEqual(self.logged(), [
-            f"models: default on inherited (inherited) in {sid}, effort inherited",
-            f"models: default on inherited (inherited) in {sid}, effort inherited",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
             f"models: default picked gpt-5.6-sol (its call) in {sid}, effort inherited"])
 
     def test_a_field_of_the_wrong_shape_is_never_logged(self):
@@ -16923,18 +17157,62 @@ class CodexModels(unittest.TestCase):
         for bad in (f"the best one {self.S}", "a/b", "x" * 65, 7, ["gpt-5.6-sol"], {"model": "gpt-5.6-sol"}, False):
             self.codex(self.spawn(self.v1(agent_type="worker", model=bad, reasoning_effort=bad)))
         self.assertEqual(self.logged(), [f"models: worker picked unknown (its call) in {sid}, effort unknown"] * 7)
-        # Not a spawn of the main chat: no line.
+        # Not a spawn: no line.
         before = len(self.logged())
         for data in (self.spawn("not an object"), self.spawn([self.v1()]), self.spawn(None),
                      self.spawn(self.v1(), tool_name="Agent"), self.spawn(self.v1(), tool_name="Bash"),
                      self.spawn(self.v1(), hook_event_name="PostToolUse", tool_response="ok"),
-                     self.spawn(self.v1(), agent_id="019f9d8f-0000-7000-8000-000000000001", agent_type="worker"),
                      {}, [], "text"):
             self.assertEqual(self.codex(data), "", data)
         self.assertEqual(self.logged()[before:], [])
         # A session id no record could be named by is left out (codex_hook_input): the line says codex alone.
         self.codex(self.spawn(self.v1(agent_type="worker"), session_id="../x"))
-        self.assertEqual(self.logged()[-1], "models: worker on inherited (inherited) in codex, effort inherited")
+        self.assertEqual(self.logged()[-1], "models: worker on gpt-5.6-terra (inherited) in codex, effort inherited")
+        # A spawner's model that is not a name, or none: the inherited model unknown, as Claude Code's says it.
+        for bad in (f"the best one {self.S}", "a/b", 7, None, ""):
+            self.codex(self.spawn(self.v1(agent_type="worker"), model=bad))
+        self.assertEqual(self.logged()[-5:], [f"models: worker on unknown (inherited) in {sid}, effort inherited"] * 5)
+        data = self.spawn(self.v1(agent_type="worker"))
+        del data["model"]
+        self.codex(data)
+        self.assertEqual(self.logged()[-1], f"models: worker on unknown (inherited) in {sid}, effort inherited")
+        self.no_text()
+
+    def test_a_spawn_with_no_model_is_logged_on_the_spawners_model(self):
+        # Every Codex hook input carries `model`, the model of the chat (or
+        # sub-agent) whose call it is: a sub-agent spawned with none starts
+        # on it (codex-rs agent/child_config.rs build_agent_spawn_config),
+        # unless its role's own config file names another, which is Codex's
+        # config and not read.
+        sid = "codex-" + self.SID[:8]
+        self.codex(self.spawn(self.v2(), model="gpt-5.6-sol"))
+        self.codex(self.spawn(self.v1(agent_type="explorer", reasoning_effort="high"), model="gpt-5.6-terra"))
+        self.codex(self.spawn(self.v1(model="gpt-5.6-sol"), model="gpt-5.6-terra"))  # its own: the spawner's not named
+        self.assertEqual(self.logged(), [
+            f"models: default on gpt-5.6-sol (inherited) in {sid}, effort inherited, fork",
+            f"models: explorer on gpt-5.6-terra (inherited) in {sid}, effort high",
+            f"models: default picked gpt-5.6-sol (its call) in {sid}, effort inherited"])
+
+    def test_a_sub_agents_own_spawn_is_logged_marked_as_a_sub_agents(self):
+        # A sub-agent's hooks carry the root's session_id and its own thread
+        # as agent_id (codex_hook_input()); its `model` is its own. Its spawn
+        # is logged by the same pick, marked a sub-agent's as the guard marks
+        # one, the agent never named; and the call is never changed.
+        sid, agent = "codex-" + self.SID[:8], "019f9d8f-0000-7000-8000-000000000001"
+        self.config(models_cap="haiku")
+        for given in (self.v1(agent_type="worker", model="gpt-5.6-terra", reasoning_effort="low"), self.v2()):
+            data = self.spawn(given, agent_id=agent, agent_type="explorer", model="gpt-5.6-sol")
+            self.assertIsNone(longhaul.models_codex_check(longhaul.codex_hook_input(data)), given)
+            self.assertEqual(self.codex(data), "", given)
+        self.assertEqual(self.logged(), [
+            f"models: worker picked gpt-5.6-terra (its call) in {sid} (a sub-agent), effort low"] * 2 + [
+            f"models: default on gpt-5.6-sol (inherited) in {sid} (a sub-agent), effort inherited, fork"] * 2)
+        self.assertNotIn(agent, (self.home / "longhaul.log").read_text())
+        self.assertNotIn("019f9d8f", (self.home / "longhaul.log").read_text())
+        # Auto Model off: no line, the sub-agent's as the main chat's.
+        self.config(models="off")
+        self.codex(self.spawn(self.v2(), agent_id=agent, agent_type="explorer"))
+        self.assertEqual(len(self.logged()), 4)
         self.no_text()
 
     def test_the_call_is_never_changed_whatever_the_mode_the_table_or_the_cap(self):
@@ -17047,7 +17325,7 @@ class CodexModels(unittest.TestCase):
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), stdin)
         sid = "codex-" + self.SID[:8]
         self.assertEqual(self.logged(), [f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort medium",
-                                         f"models: default on inherited (inherited) in {sid}, effort inherited, fork"])
+                                         f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork"])
         self.no_text()
 
 

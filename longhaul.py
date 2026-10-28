@@ -3390,6 +3390,11 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
         "allowance": allowance,
         "tool_errors": dict(failed.most_common()),
         "unknown": dict(unknown.most_common()),
+        # What Longhaul's own Codex hooks kept of the chat, keyed codex-<id> as
+        # codex_hook_input() keys them: the guard's records (its sub-agents'
+        # among them) and the filter's log, read as Claude Code's are.
+        "guard": guard_counts(f"codex-{sid}") if sid != "?" else None,
+        "filter": filter_counts(f"codex-{sid}") if sid != "?" else None,
     }
 
 
@@ -3499,6 +3504,10 @@ def rollout_lines(r: dict) -> list[str]:
         section("Allowance [rollout, measured: the last rate_limits reading"
                 + (f", {clock(a['at'])}]" if a["at"] else "]"), rows)
 
+    # Longhaul's own records, as Claude Code's report gives them and in its order: the guard's, the filter's log.
+    out.extend(inspect_guard_lines(r.get("guard"), codex=True))
+    out.extend(inspect_filter_lines(r.get("filter")))
+
     out.append("Failures [rollout, counted]")
     out.append("  tool errors: " + (", ".join(f"{t} {c:,}" for t, c in r["tool_errors"].items()) or "none"))
     out.append("  record types not known here: " + (", ".join(f"{t} {c:,}" for t, c in r["unknown"].items()) or "none"))
@@ -3515,8 +3524,9 @@ def rollout_lines(r: dict) -> list[str]:
 def rollout_metrics(r: dict) -> list[dict]:
     """The same numbers as flat records, shaped as inspect_records()'s: one
     number each, with the chat's id as its session, what it is of (`item`,
-    `kind`), where it came from (the rollout, or an estimate) and how sure it
-    is. No totals, and no search counts where the rollout recorded none."""
+    `kind`), where it came from (the rollout, an estimate, or the guard's
+    own record) and how sure it is. No totals, and no search counts where
+    the rollout recorded none."""
     out = []
 
     def add(metric, value, unit, scope, confidence, item=None, kind=None, source="rollout"):
@@ -3568,6 +3578,9 @@ def rollout_metrics(r: dict) -> list[dict]:
     for w in (r["allowance"] or {}).get("windows", []):
         add("allowance_used_percent", w["used"], "percent", "all", "measured", w["label"])
         add("allowance_resets_at", w["resets"], "epoch_seconds", "all", "measured", w["label"])
+    for k in GUARD_RULES if r.get("guard") else ():  # Longhaul's own record, as inspect_records() gives it
+        add("guard_fired", r["guard"][k], "calls", "all", "counted", k, source="guard")
+        add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "counted", k, source="guard")
     for tool, n in r["tool_errors"].items():
         add("tool_errors", n, "errors", "all", "counted", tool)
     for kind, n in r["unknown"].items():
@@ -4614,6 +4627,54 @@ def find_transcript(target: str | None) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
+def inspect_guard_lines(g, codex: bool = False) -> list[str]:
+    """The guard's section of the report, from guard_counts(): what its
+    hook warned about or blocked, by rule, or why it kept no record.
+    Claude Code's and Codex's alike (rollout_lines()); under Codex
+    (`codex`) every read is the shell's, so its no-record line and its cat
+    rule name the readers the guard sees there (guard_targets())."""
+    if g is None:
+        seen = "read by cat, nl, head, tail or sed" if codex else "whole Read, cat or search"
+        return [f"Guard [longhaul guard: no record: the hook was off, or saw no {seen}]"]
+    labels = (("repeat", "read again unchanged"), ("big", "whole read of a big file"),
+              ("cat", "cat or nl of a big file" if codex else "cat of a big file"))
+    rows = [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in labels if g[k]]
+    rows += [f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []
+    return ["Guard [longhaul guard, counted: calls it warned about or blocked]"] + (rows or ["  none"])
+
+
+def inspect_filter_lines(fl) -> list[str]:
+    """The output filter's log section of the report, from filter_counts():
+    what its hook did, or in shadow would have done, by mode; nothing when
+    it logged nothing for the conversation. Claude Code's and Codex's
+    alike (rollout_lines()): on Codex the filter is in shadow alone."""
+    if not fl:
+        return []
+    rows = []
+    for mode in ("shadow", "lossless", "on"):
+        m = fl["modes"].get(mode)
+        if not m:
+            continue
+        if mode == "shadow":
+            rows.append(f"  shadow (changes nothing): {m['calls']:,} output{'s' * (m['calls'] != 1)}; lossless would "
+                        f"cut {m['lossless_cut']:,} chars, on {m['on_cut']:,}"
+                        + (f", lines of {m['would_drop']:,} output{'s' * (m['would_drop'] != 1)} among them"
+                           if m.get("would_drop") else ""))
+            continue
+        row = (f"  {mode}: {m.get('applied', 0):,} output{'s' * (m.get('applied', 0) != 1)} shortened, "
+               f"{m.get('cut', 0):,} chars cut")
+        if mode == "on" and m.get("dropped"):
+            row += f", lines of {m['dropped']:,} among them, read back after {fl['fetched']:,}"
+        if m.get("full"):
+            row += f"; {m['full']:,} left whole, the store of saved outputs being full"
+        rows.append(row)
+    if fl["ms"]:
+        rows.append(f"  the hook's own time: median {fl['ms'][(len(fl['ms']) - 1) // 2]:.1f} ms, "
+                    f"longest {fl['ms'][-1]:.1f} ms")
+    return (["Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]"]
+            + (rows or ["  none"]))
+
+
 def inspect_lines(r: dict) -> list[str]:
     """The report as text. Each heading names where its numbers came from."""
     def where(item):
@@ -4766,15 +4827,7 @@ def inspect_lines(r: dict) -> list[str]:
         section("Memory and instructions [files on disk now, counted: what Claude Code loads at a session's start, "
                 "and the paths they name that are gone]", rows)
 
-    g = r["guard"]
-    if g is None:
-        out.append("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, cat or search]")
-    else:
-        section("Guard [longhaul guard, counted: calls it warned about or blocked]",
-                [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in
-                 (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
-                 if g[k]]
-                + ([f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []))
+    out.extend(inspect_guard_lines(r["guard"]))
     f = r.get("filter_replay") or {}
     if f.get("lossless", 0) < f.get("chars", 0) or f.get("on", 0) < f.get("chars", 0):  # else nothing to cut: no section
         def cut(n):
@@ -4792,31 +4845,7 @@ def inspect_lines(r: dict) -> list[str]:
                 "as they stand now]",
                 [f"  Bash output: {f['outputs']:,} output{'s' * (f['outputs'] != 1)}, {f['chars']:,} chars",
                  f"  lossless would cut {cut(f['chars'] - f['lossless'])}, dropping nothing", on])
-    fl = r.get("filter")
-    if fl:  # else the hook logged nothing for this conversation: no section
-        rows = []
-        for mode in ("shadow", "lossless", "on"):
-            m = fl["modes"].get(mode)
-            if not m:
-                continue
-            if mode == "shadow":
-                rows.append(f"  shadow (changes nothing): {m['calls']:,} output{'s' * (m['calls'] != 1)}; lossless would "
-                            f"cut {m['lossless_cut']:,} chars, on {m['on_cut']:,}"
-                            + (f", lines of {m['would_drop']:,} output{'s' * (m['would_drop'] != 1)} among them"
-                               if m.get("would_drop") else ""))
-                continue
-            row = (f"  {mode}: {m.get('applied', 0):,} output{'s' * (m.get('applied', 0) != 1)} shortened, "
-                   f"{m.get('cut', 0):,} chars cut")
-            if mode == "on" and m.get("dropped"):
-                row += f", lines of {m['dropped']:,} among them, read back after {fl['fetched']:,}"
-            if m.get("full"):
-                row += f"; {m['full']:,} left whole, the store of saved outputs being full"
-            rows.append(row)
-        if fl["ms"]:
-            rows.append(f"  the hook's own time: median {fl['ms'][(len(fl['ms']) - 1) // 2]:.1f} ms, "
-                        f"longest {fl['ms'][-1]:.1f} ms")
-        section("Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]",
-                rows)
+    out.extend(inspect_filter_lines(r.get("filter")))
     s = r.get("subagent_reminders") or {}
     if s.get("subagents"):  # else none was told: no section
         out.append("Subagent reminders [longhaul guard records, counted]")
@@ -5112,14 +5141,15 @@ def index_program(name: str, top: str):
 def index_plan(data: dict, index: str) -> list:
     """The (program, top, found) a session's start may build, or []: for
     a `startup` SessionStart of the main conversation (no agent_id), with
-    the index on, the session attended and the cwd in a work tree
-    index_top() accepts, each program found, with the path it was found
-    at: the runner runs that path and looks nothing up again. Whether a
-    program's map is there already is the state's question (index_due),
-    not this one's. Nothing is started or written here, and the one
-    refusal logged is the unattended session's (review, Sprint 7, F9: the
-    live check and a user's "why not" read it there); the others say
-    nothing."""
+    the index on, the session attended (under Codex, not a `codex exec`
+    run: codex_exec_run()) and the cwd in a work tree index_top()
+    accepts, each program found, with the path it was found at: the
+    runner runs that path and looks nothing up again. Whether a program's
+    map is there already is the state's question (index_due), not this
+    one's. Nothing is started or written here, and the refusals logged
+    are the unattended session's and the exec run's (review, Sprint 7,
+    F9: the live check and a user's "why not" read it there); the others
+    say nothing."""
     if index != "on" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
         return []
     if data.get("agent_id") is not None:
@@ -5127,11 +5157,37 @@ def index_plan(data: dict, index: str) -> list:
     if os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
         log("index: skipped, unattended session")  # a `-p` run (a script's, a loop's) asked for no index
         return []
+    if codex_exec_run(data):
+        log("index: skipped, a codex exec run")  # Codex's unattended run, which sets no CLAUDE_CODE_SESSION_ATTENDED
+        return []
     top = index_top(data.get("cwd"))
     if top is None:
         return []
     found = {program: index_program(program, top) for program in INDEX_COMMANDS}
     return [(program, top, found[program]) for program in INDEX_COMMANDS if found[program]]
+
+
+def codex_exec_run(data: dict) -> bool:
+    """Whether a Codex SessionStart is a `codex exec` run's, Codex's
+    unattended one: the first record of its rollout (transcript_path),
+    session_meta, which Codex writes before the hook runs, says source
+    "exec", where the terminal's says "cli" and VS Code's "vscode"
+    (codex-rs rust-v0.165.0: protocol.rs SessionSource, exec/src/lib.rs).
+    Of the rollout that line alone is read (rollout_first()), and of it
+    the label alone. No rollout (`codex exec --ephemeral` writes none),
+    a path not absolute or not a file, or a first record that is not
+    session_meta, is no sign of one. Claude Code's input never is."""
+    path = data.get("transcript_path")
+    if data.get("longhaul_agent") != "codex" or not isinstance(path, str) or not os.path.isabs(path):
+        return False
+    try:
+        if not Path(path).is_file():  # a folder, or a pipe that would hold the hook
+            return False
+    except (OSError, ValueError):
+        return False
+    first = rollout_first(Path(path))
+    return (isinstance(first, dict) and first.get("type") == "session_meta"
+            and dict_at(first, "payload").get("source") == "exec")
 
 
 def index_key(top: str) -> str:
@@ -5569,6 +5625,12 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "what does Y depend on, where is Z defined), `codegraph explore \"<question>\"` or the "
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
+# Under Codex the index is named by its command line alone (the owner,
+# 2026-10-28, X7): CodeGraph's MCP tool is Codex's only if its own config
+# adds the server, and the program on PATH is there to run.
+GUARD_CODEGRAPH_CLI = ("This project has a CodeGraph index (.codegraph/). For a symbol, its callers or how code connects, "
+                       "run `codegraph explore \"<question>\"` in the shell: it answers in one call with the source and "
+                       "the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
 GUARD_WHOLE = ("cat", "nl")  # under Codex, the readers that print a whole file: no option of nl's prints a part
 # What a Codex user is shown of each read the rules flag, by rule and by mode (warn, block): display.ts's
@@ -5658,9 +5720,14 @@ def guard_startup(data: dict, mode: str, index: str):
     Under Codex the index's part alone: the first-chat line points to
     /longhaul:doctor, a Claude Code skill; the release's line is about
     Claude Code's plugin update; and the guard's note names CodeGraph's
-    MCP tool, which Codex has only if its own config adds the server."""
+    MCP tool, which Codex has only if its own config adds the server, so
+    Codex's model is told of the index by its command line instead
+    (GUARD_CODEGRAPH_CLI), when `codegraph` is on PATH by its absolute
+    entries and not the project's own (index_program())."""
     codex = data.get("longhaul_agent") == "codex"
-    named = not codex and mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    if named and codex:  # a program to run: the folder that holds the index is the project's top here
+        named = index_program("codegraph", os.path.dirname(map_at(data["cwd"], ".codegraph"))) is not None
     started, message, first = [], "", None
     try:  # the first chat after an install or an update: one line pointing to /longhaul:doctor (setup_line)
         first = None if codex else setup_line(data)
@@ -5680,7 +5747,7 @@ def guard_startup(data: dict, mode: str, index: str):
     notes = []
     if named:
         log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
-        notes.append(GUARD_CODEGRAPH)
+        notes.append(GUARD_CODEGRAPH_CLI if codex else GUARD_CODEGRAPH)
     notes.extend(index_note(program, top) for program, top in started)
     answer = {"systemMessage": message} if message else {}
     if notes:
@@ -11009,10 +11076,10 @@ def models_rule(data: dict):
 # PreToolUse on spawn_agent (its matcher "Agent" selects it too) runs
 # `longhaul models-hook --agent codex`, a hook of its own: on Claude Code
 # Auto Model runs in the Advisor's hook, which stays off on Codex (X10).
-# Each pick of the main chat is logged as models_rule() logs Claude Code's,
-# and the call is never changed: the table and the cap name Claude's
-# models, and a Codex ladder (the owner's chats run gpt-5.6-terra and
-# gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
+# Each pick is logged as models_rule() logs Claude Code's, a sub-agent's
+# own marked so, and the call is never changed: the table and the cap
+# name Claude's models, and a Codex ladder (the owner's chats run
+# gpt-5.6-terra and gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
 # (docs/discovery/2026-10-28-codex-hooks.md, 10; codex-rs rust-v0.165.0,
 # tools/handlers/multi_agents/spawn.rs and multi_agents_v2/spawn.rs):
 # v1 {message?, items?, agent_type?, model?, reasoning_effort?,
@@ -11026,21 +11093,23 @@ MODELS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")  # a type's, model
 
 
 def models_codex_check(data):
-    """Auto Model on Codex: the main chat's spawn_agent call logged by its
-    pick, and None always, so the call runs as it was (no updatedInput),
-    whatever the mode, the table or the cap say. The pick: the agent type
-    (Codex's default when none), the model and the reasoning effort given,
-    or "inherited" (the role's or the chat's, which Codex sets), and
-    whether it forks. A field null or empty is not given; an agent type
-    that is not a name is no line, as in models_rule(); a model or effort
-    that is not one is "unknown". Nothing with Auto Model off, or for a
-    sub-agent's own call (models_rule()'s rule: the owner, 2026-10-25).
-    Names only, never message, items or task_name (a name the model
-    wrote). The session is codex-<id> (codex_hook_input()), so the line
-    says whose it is."""
+    """Auto Model on Codex: a spawn_agent call logged by its pick, and
+    None always, so the call runs as it was (no updatedInput), whatever
+    the mode, the table or the cap say. The pick: the agent type (Codex's
+    default when none), the model and the reasoning effort given, else
+    the model the call's spawner runs on, the hook input's `model`, which
+    a sub-agent spawned with none starts on (codex-rs agent/child_config.rs,
+    unless its role's config file names another, which is Codex's and not
+    read) and "inherited" for the effort; and whether it forks. A field
+    null or empty is not given; an agent type that is not a name is no
+    line, as in models_rule(); a model or effort that is not one is
+    "unknown". A sub-agent's own call is logged too, marked a sub-agent's
+    as the guard marks one (guard_logged()), the agent never named.
+    Nothing with Auto Model off. Names only, never message, items or
+    task_name (a name the model wrote). The session is codex-<id>
+    (codex_hook_input()), so the line says whose it is."""
     if not isinstance(data, dict) or data.get("longhaul_agent") != "codex" \
-            or data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != "spawn_agent" \
-            or data.get("agent_id") is not None:
+            or data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != "spawn_agent":
         return None
     given = data.get("tool_input")
     if not isinstance(given, dict):
@@ -11056,7 +11125,9 @@ def models_codex_check(data):
     kind = named(given.get("agent_type"), MODELS_CODEX_TYPE)
     if kind is None or models_settings()[1] == "off":
         return None
-    model = named(given.get("model"), "inherited") or "unknown"
+    model = named(given.get("model"), "")  # "" when none is given: the spawner's
+    inherited = model == ""
+    model = (named(data.get("model"), None) if inherited else model) or "unknown"
     effort = named(given.get("reasoning_effort"), "inherited") or "unknown"
     if "fork_context" in given or "task_name" not in given:  # v1's (v2 refuses fork_context and needs task_name)
         fork = given.get("fork_context") is True
@@ -11065,8 +11136,9 @@ def models_codex_check(data):
         fork = not (isinstance(turns, str) and turns.strip().lower() == "none")
     sid = data.get("session_id")
     sid = sid[:14] if isinstance(sid, str) else "codex"  # "codex-" and the id's first 8, as Claude Code's 8
-    said = "on inherited (inherited)" if model == "inherited" else f"picked {model} (its call)"
-    log(f"models: {kind} {said} in {sid}, effort {effort}" + (", fork" if fork else ""))
+    said = f"on {model} (inherited)" if inherited else f"picked {model} (its call)"
+    who = " (a sub-agent)" if data.get("agent_id") is not None else ""
+    log(f"models: {kind} {said} in {sid}{who}, effort {effort}" + (", fork" if fork else ""))
     return None
 
 
