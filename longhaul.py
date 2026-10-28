@@ -4103,10 +4103,10 @@ def consultations(sid: str, keep: bool = False):
             "no_outcome": len(admitted_ids - outcome_ids), "admitted_ids": admitted_ids}
 
 
-REBUILD_MIN = 4096  # tokens: a cached prefix this small or smaller is not counted as written again (RTK's floor)
+REBUILD_MIN = 4096  # tokens: a cached prefix this small or smaller is not counted as written again
 CACHE_TTLS = {"5m": 300, "1h": 3600}  # seconds each prompt-cache lifetime lasts with no request
 CACHE_PRICES = {"read": 0.1, "5m": 1.25, "1h": 2.0}  # the API's prices against uncached input's 1, on every model
-CHURN_MIN = 10000  # tokens: a request writing more than this and a quarter of its context churned it (caveman's floor)
+CHURN_MIN = 10000  # tokens: a request writing more than this and a quarter of its context churned it
 REBUILD_CAUSES = {"tool": "a tool call outlasted the cache's {ttl} lifetime",
                   "idle": "idle past the cache's {ttl} lifetime, with no message",
                   "resumed": "a message came after the cache's {ttl} lifetime",
@@ -4132,7 +4132,7 @@ NAMED_PATH = re.compile(r"`([~/][^`\s]*)`|\]\(([~/][^)\s]*)\)")  # a path in bac
 
 def memory_health(path: Path, cwd) -> dict:
     """What Claude Code loads at a session's start for the conversation in
-    `path`, as the files stand now (caveman's memory doctor, rebuilt): its
+    `path`, as the files stand now: its
     project's MEMORY.md, with the lines past its load limit; the user's
     CLAUDE.md and those from the conversation's folder up, by lines; and
     the absolute or ~ paths they and the memory name in backquotes or links
@@ -4344,7 +4344,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     # nor a repeat (review, Phase 2). Contexts are replayed in time order.
     repeats = []  # (scope, tool, what, tool_use id)
     seen: dict = collections.defaultdict(dict)  # context -> {whole input: the file read, None for a search}
-    # Read again after a compaction (Phase 0; caveman's compaction_churn): a Read, or a Bash step that prints a
+    # Read again after a compaction (Phase 0): a Read, or a Bash step that prints a
     # file (bash_reads), of a file the same context read before its last compaction, once per file and
     # compaction, whether or not it changed since. A Bash command's output is shared among the files it read.
     before, since, after = collections.defaultdict(set), collections.defaultdict(set), {}
@@ -4473,8 +4473,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         tool_chars[(scope, calls.get(tid, ("?",))[0])] += chars
     by_tool = sorted(set(tool_calls) | set(tool_chars), key=lambda k: (-tool_chars[k], -tool_calls[k], k))
 
-    # The cache written again (Phase 0; RTK's cache-fracture count, rebuilt
-    # for transcripts): in one transcript, a response that left more than
+    # The cache written again (Phase 0): in one transcript, a response that left more than
     # REBUILD_MIN tokens in the cache (read and written), then the next
     # reading more than REBUILD_MIN fewer and writing more than REBUILD_MIN,
     # with no compaction between. Not "read none": the system prompt and
@@ -4485,7 +4484,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     # else on a message when one came before the request (a subagent that
     # handed its report back waits for the coordinator's), else idle.
     # Within its lifetime the prefix changed instead ("bust").
-    # Churn, beside them (caveman's cache churn, rebuilt): a request after
+    # Churn, beside them: a request after
     # the first in its context that wrote more than CHURN_MIN tokens and a
     # quarter of its context, rebuilds included.
     made = collections.defaultdict(list)  # response -> its calls
@@ -4522,8 +4521,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
             prev = key
     rebuilds.sort(key=lambda x: (-x["tokens"], x["seconds"]))
 
-    # What the input cost after caching (caveman's effective input
-    # multiplier, rebuilt): each scope's input at CACHE_PRICES over the same
+    # What the input cost after caching: each scope's input at CACHE_PRICES over the same
     # tokens uncached. A response's writes are at the lifetimes its usage
     # reports, else at its scope's (cache_ttl).
     priced, uncached = collections.Counter(), collections.Counter()
@@ -6116,18 +6114,15 @@ def guard(opts) -> int:
 # Under Codex (the Codex plan's X8) the same hook only measures: shadow
 # whatever LONGHAUL_FILTERS says but off, its log keyed codex-<id> and
 # marked "codex" (filter_check() says why).
-# Learned from RTK (github.com/rtk-ai/rtk, whose CLI is Apache-2.0) and
-# caveman (github.com/juliusbrussee/caveman): their rules, rebuilt here
-# in Python; none of their code.
 
 FILTER_MODES = ("off", "shadow", "lossless", "on")
-FILTER_SMALL = 1_500  # characters: smaller output passes untouched (RTK); hooks.json's prelude checks it first
-FILTER_DROP_MIN = 4_096  # characters: a lossy step leaves out this much, or nothing (caveman)
+FILTER_SMALL = 1_500  # characters: smaller output passes untouched; hooks.json's prelude checks it first
+FILTER_DROP_MIN = 4_096  # characters: the lossy steps leave out this much together, or nothing
 FILTER_CAP = 12_000  # characters: in `on`, a longer output after the lossless steps keeps its head and tail
 FILTER_HEAD, FILTER_TAIL = 7_000, 2_000
 FILTER_KEEP_DAYS = 7
-FILTER_STORE_MAX = 200 * 2**20  # bytes of saved outputs; when full, nothing more is cut (caveman: refuse, never evict)
-FILTER_WATCH_AT, FILTER_OFF_AT, FILTER_MIN_DROPS = 0.10, 0.30, 10  # fetch-back rates of a lossy step (RTK's gain)
+FILTER_STORE_MAX = 200 * 2**20  # bytes of saved outputs; when full, nothing more is cut (refuse, never evict)
+FILTER_WATCH_AT, FILTER_OFF_AT, FILTER_MIN_DROPS = 0.10, 0.30, 10  # fetch-back rates of a lossy step
 FILTER_LOG_MAX = 2 * 2**20  # bytes of one conversation's filter log
 FILTER_NEXT = 3  # calls after a cut that inspect's replay looks at
 FILTER_PRINTS = {"cat", "sed", "head", "tail", "nl", "awk", "gawk", "less", "more", "bat", "xxd", "od", "hexdump"}
@@ -6148,8 +6143,8 @@ FILTER_MATCH = re.compile(r"^(?P<path>(?=[^\s:]*[/.])[^\s:]+):(?P<rest>\d+[:-].*
 FILTER_FILE = re.compile(r"^(?P<path>(?:\.{0,2}/)?[\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z0-9]+):(?P<rest>.*)$")  # without -n
 FILTER_WORD = re.compile(r"[\w.-]*/[\w./-]+\.\w+|[A-Za-z_][A-Za-z0-9_]{5,}|\b[0-9a-f]{7,40}\b")
 # The noisy tools' rows, `on` only: the lines a row drops, matched with
-# colour codes off, and the tests each row carries (RTK's filters carry
-# theirs): (line, dropped?) and (command, the row's?). The first row
+# colour codes off, and the tests each row carries:
+# (line, dropped?) and (command, the row's?). The first row
 # whose `when` matches a command that prints is the output's kind.
 FILTER_TABLE = (
     # A passing test's own output stays under its header: go's === RUN lines are kept, and a run
@@ -6466,7 +6461,7 @@ def filter_cut(text: str, kind: str, saved: str, stopped=()):
             f"{' and '.join(whats)})")
     if alarm:
         hint += f"; {alarm:,} of them mention{'s' * (alarm == 1)} an error, a failure or a warning"
-    # caveman's line. The path comes last, quoted for the shell, with nothing stuck to it.
+    # The path comes last, quoted for the shell, with nothing stuck to it.
     hint += ". Answer from this view; read the rest only if you need it"
     a, b = dropped[0] + 1, dropped[-1] + 1
     if b - a + 1 == len(dropped):  # one run of lines: say which
@@ -6561,7 +6556,7 @@ def filter_store(sid: str, texts: dict):
     """Save each whole output ({path: text}) under LONGHAUL_HOME/outputs/,
     private, and remove those saved more than FILTER_KEEP_DAYS ago. False
     when the store would pass FILTER_STORE_MAX: then nothing is saved,
-    and nothing cut (caveman: refuse, never evict)."""
+    and nothing cut (refuse, never evict)."""
     root = LONGHAUL_HOME / "outputs"
     with locked("filter-store", wait=1):
         used, old = 0, time.time() - FILTER_KEEP_DAYS * 86400
@@ -6752,10 +6747,9 @@ def filter_counts(sid: str):
 
 def filter_cmd(opts) -> int:
     """The PostToolUse hook command on Bash: stdin in, JSON or nothing
-    out, exit 0 always. It answers first and logs after (RTK's hook
-    hygiene), so the log never holds the output back. Under Codex
-    (--agent codex) it only measures and logs: filter_check() keeps it
-    in shadow there."""
+    out, exit 0 always. It answers first and logs after, so the log
+    never holds the output back. Under Codex (--agent codex) it only
+    measures and logs: filter_check() keeps it in shadow there."""
     notes = []
     code = run_hook(lambda data: filter_check(data, filter_mode(), notes), "filter", getattr(opts, "agent", "claude"))
     sys.stdout.flush()
