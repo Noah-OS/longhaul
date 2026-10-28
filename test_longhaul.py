@@ -2460,7 +2460,10 @@ class CodexInspect(unittest.TestCase):
         self.assertIn("3 Codex rollouts start with 019a2b3c; give more of the id.", out.stderr)
         for args, said in ((["019a2b3c-ffff"], "no Codex rollout found for 019a2b3c-ffff"),
                            ([str(self.tmp / "nowhere.jsonl")], "there is no file"),
-                           (["a b"], "is neither a Codex rollout's id nor its path")):
+                           (["a b"], "is neither a Codex rollout's id nor its path"),
+                           # an id of up to 100 is looked for: the hooks' 94 (CODEX_HOOK_ID) is not inspect's
+                           (["f" * 100], "no Codex rollout found for"),
+                           (["f" * 101], "is neither a Codex rollout's id nor its path")):
             out = self.cli(*args)
             self.assertEqual((out.returncode, out.stdout), (1, ""), args)
             self.assertIn(said, out.stderr, args)

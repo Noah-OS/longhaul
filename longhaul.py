@@ -5989,7 +5989,7 @@ def run_hook(check, name: str, agent: str = "claude") -> int:
 # answer cut to what Codex takes back, since Codex drops an answer it
 # refuses whole, its additionalContext with it.
 CODEX_HOOK_COMMANDS = ("guard", "checkpoint", "reminder", "precompact", "filter", "models-hook")
-CODEX_ID = re.compile(r"[A-Za-z0-9_-]{1,94}")  # a Codex thread's id; "codex-" and it make a GUARD_ID
+CODEX_HOOK_ID = re.compile(r"[A-Za-z0-9_-]{1,94}")  # a Codex thread's id; "codex-" and it make a GUARD_ID
 # By event: the hookSpecificOutput fields Codex takes beside hookEventName,
 # and whether a top-level decision "block" with a reason is one.
 CODEX_HOOK_ANSWERS = {
@@ -6017,7 +6017,7 @@ def codex_hook_input(data) -> dict:
         return {}
     data = {**data, "longhaul_agent": "codex"}
     sid, agent = data.pop("session_id", None), data.pop("agent_id", None)
-    if isinstance(sid, str) and CODEX_ID.fullmatch(sid):
+    if isinstance(sid, str) and CODEX_HOOK_ID.fullmatch(sid):
         data["session_id"] = f"codex-{sid}"
     if isinstance(agent, str) and re.fullmatch(GUARD_ID, agent):
         data["agent_id"] = agent
@@ -7055,7 +7055,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     recorded = False
     if agent == "codex" and here is not None and checkpoint_path(here) is None:
         # A CODEX_THREAD_ID that could not name a file (codex- and an id
-        # CODEX_ID takes make a GUARD_ID): this chat cannot be told from
+        # CODEX_HOOK_ID takes make a GUARD_ID): this chat cannot be told from
         # another, so no id given is taken either, and the value is not repeated.
         problem = "CODEX_THREAD_ID is not a Codex chat's id: letters, digits, - or _ (at most 94)"
     elif path is None:
