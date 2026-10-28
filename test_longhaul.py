@@ -1789,6 +1789,19 @@ class CodexUsage(unittest.TestCase):
         self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.tmp.rglob("*")), before,
                          "no ledger row, no file under LONGHAUL_HOME, nothing under CODEX_HOME")
 
+    def test_a_time_a_week_or_more_away_shows_its_date_and_one_that_cannot_be_shown_is_a_question_mark(self):
+        # The owner's plan has one 30-day window (P1): "resets Sun 06:29"
+        # could not say which Sunday. A resets_at in milliseconds, which a
+        # Codex format change could bring, raised out of the report.
+        now = dt.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+        at = lambda days: (now + dt.timedelta(days=days)).timestamp()
+        self.assertEqual(longhaul.clock(at(0)), "12:00")
+        self.assertEqual(longhaul.clock(at(3)), (now + dt.timedelta(days=3)).strftime("%a 12:00"))
+        self.assertEqual(longhaul.clock(at(-6)), (now - dt.timedelta(days=6)).strftime("%a 12:00"))
+        later = now + dt.timedelta(days=20)
+        self.assertEqual(longhaul.clock(at(20)), f"{later.day} {later:%b} 12:00")
+        self.assertEqual([longhaul.clock(t) for t in (1793000000000, 1e20, float("nan"), -1e20)], ["?"] * 4)
+
     def test_the_claude_lines_and_the_work_are_unchanged_by_a_codex_reading(self):
         resets = self.now + 3600
         longhaul.USAGE_DIR.mkdir()
@@ -2547,6 +2560,39 @@ class CodexInspect(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn("  1 compressed rollout under CODEX_HOME not looked in (Python 3.14 and later read it): "
                           "a sub-agent's there is not counted", out.splitlines())
+
+    def test_a_time_the_report_cannot_show_is_a_question_mark_not_a_crash(self):
+        # The release review (0.3.2): a resets_at in milliseconds, or a
+        # record time at datetime's edge, raised out of rollout_lines.
+        limits = self.limits()
+        limits["primary"]["resets_at"] = 1793000000000
+        records = [self.meta(self.MAIN), self.turn("t1", "gpt-5.6-terra"), self.count(limits=limits, inp=100)]
+        records[-1]["timestamp"] = "9999-12-31T23:59:59-14:00"
+        self.write(self.MAIN, records)
+        code, out, err = self.here("--agent", "codex", self.MAIN)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("  5h: 42% used, resets ?", out.splitlines())
+        self.assertIn("Allowance [rollout, measured: the last rate_limits reading, ?]", out.splitlines())
+
+    def test_a_path_that_cannot_be_opened_says_so(self):
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        (locked / "r.jsonl").write_text(json.dumps(self.meta(self.MAIN)) + "\n")
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        for target in (str(locked / "r.jsonl"), "~no-such-user-longhaul/r.jsonl"):
+            with self.subTest(target=target):
+                path, why = longhaul.find_rollout(target)
+                self.assertIsNone(path)
+                self.assertTrue(why.endswith(("cannot be opened.", f"there is no file {target}.")), why)
+                self.assertFalse(longhaul.rollout_given(target))
+
+    def test_a_token_count_with_no_tokens_or_fewer_than_none_is_no_response(self):
+        bad = [self.rec("event_msg", {"type": "token_count", "info": {"last_token_usage": {"total_tokens": n},
+                                                                     "total_token_usage": {"total_tokens": n}}})
+               for n in (-5, 0)]
+        r = longhaul.inspect_rollout(self.write(self.MAIN, [self.meta(self.MAIN), *bad]))
+        self.assertEqual((r["requests"]["main"], r["bare"]["main"]), (0, 1))
 
 
 class Inspect(unittest.TestCase):

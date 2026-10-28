@@ -17,11 +17,12 @@ Longhaul reads OpenAI's Codex: one chat's report, Codex's allowance beside Claud
 
   Each heading names where its numbers came from and how sure they are, as for Claude Code. Codex does not record a search or a read made inside one of its code cells, and the report says so rather than showing 0. `--json` gives the numbers.
 - **Codex's allowance in `longhaul usage`.** After the Claude Code accounts, a `codex` line: each window's share used and when it resets, as Codex last read it, and how long ago. It is read from the newest chats each time; nothing is kept.
-- **A Codex line in `longhaul doctor`**, when a Codex folder is there: each folder's chats and how many are compressed, and the Codex version, from `codex --version` or as the newest chat wrote it.
-- **What Longhaul reads of Codex.** Of a Codex folder, only `sessions/`, never `auth.json` or any other file. Of a chat, only record types, numbers and names (models, tools, paths), never what was said. Codex compresses a chat after a week (`.jsonl.zst`): Python 3.14's standard library reads those, an older Python counts them and skips them, and the doctor says how many. Longhaul installs nothing.
+- **A Codex line in `longhaul doctor`**, when a Codex folder is there: each folder's chats and how many are compressed, and the Codex version, from `codex --version` or as the newest chat wrote it. It is one of the quick checks the first chat after an install or an update counts, so that chat lists `sessions/` and reads the newest chat's first record.
+- **What Longhaul reads of Codex.** Of a Codex folder, only `sessions/`, never `auth.json` or any other file. Of a chat, only record types, numbers, names (models, tools) and the paths of the files its commands read, as the commands named them; never what was said. Codex compresses a chat after a week (`.jsonl.zst`): Python 3.14's standard library reads those, an older Python counts them and skips them, and the doctor says how many. Longhaul installs nothing.
 
 ### Changed
 
+- **A time a week or more away shows its date**, `24 Nov 06:29`, not a weekday that could be any week's: a 30-day window's reset. A time that cannot be shown, such as a reset given in milliseconds, is `?`.
 - **The README says Auto Model's effect is not measured yet.** The trial that was to measure it was stopped early.
 
 ## 0.3.1 - 2026-10-27

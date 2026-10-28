@@ -7,9 +7,9 @@ allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor)
 The checklist below is Longhaul's reading of this machine: its own files,
 Claude Code's and VS Code's settings, the programs on PATH, the chats
 running now (each one's folder and account, never what it says), and
-Codex's chats when Codex is here (how many, and the version the newest
-names, never what they say). It names accounts, never their emails. The
-doctor changes nothing.
+Codex's chats when Codex is here (how many, and Codex's version, from
+`codex --version` or the newest chat, never what they say). It names
+accounts, never their emails. The doctor changes nothing.
 
 !`${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor`
 

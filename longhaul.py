@@ -593,9 +593,17 @@ def notify(msg: str) -> None:
 
 
 def clock(epoch: float) -> str:
-    when = dt.datetime.fromtimestamp(epoch)
-    fmt = "%H:%M" if when.date() == dt.date.today() else "%a %H:%M"
-    return when.strftime(fmt)
+    """A time as Longhaul shows it: 14:05 today, Tue 14:05 within six days
+    either side, else 24 Nov 14:05 (a 30-day window's reset, P1); "?" for
+    one this machine cannot show, as milliseconds read as seconds are."""
+    try:
+        when = dt.datetime.fromtimestamp(epoch)
+    except (ValueError, OverflowError, OSError, TypeError):
+        return "?"
+    days = abs((when.date() - dt.date.today()).days)
+    if not days:
+        return when.strftime("%H:%M")
+    return when.strftime("%a %H:%M") if days < 7 else f"{when.day} {when:%b %H:%M}"
 
 
 def ago_text(seconds: float) -> str:
@@ -3152,7 +3160,7 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
                 info = dict_at(payload, "info")
                 last, total = dict_at(info, "last_token_usage"), dict_at(info, "total_token_usage")
                 now = as_int(last.get("total_tokens"))
-                if now and (not total or total != running):  # a response: not a repeat of the total before
+                if (now or 0) > 0 and (not total or total != running):  # a response: not a repeat of the total before
                     running = total
                     responses += 1
                     requests[scope] += 1
@@ -3581,11 +3589,11 @@ def rollout_given(target) -> bool:
     one, so with no --agent an id stays Claude Code's."""
     if not rollout_path_like(target):
         return False
-    path = Path(target).expanduser()
     try:
+        path = Path(target).expanduser()
         if not path.is_file():
             return False
-    except OSError:
+    except (OSError, RuntimeError):  # a folder that cannot be read, or ~name for no such user
         return False
     if path.name.endswith(".jsonl.zst"):
         return True
@@ -3609,8 +3617,12 @@ def find_rollout(target: str | None) -> tuple[Path | None, str]:
     sessions = CODEX_HOME / "sessions"
     where = home_path(str(sessions))
     if rollout_path_like(target):
-        path = Path(target).expanduser()
-        if not path.is_file():
+        try:
+            path = Path(target).expanduser()
+            there = path.is_file()
+        except (OSError, RuntimeError):  # a folder that cannot be read, or ~name for no such user
+            return None, f"{shown(target)} cannot be opened."
+        if not there:
             return None, f"there is no file {shown(target)}."
         return (None, rollout_packed(path)) if path.name.endswith(".zst") and zstd is None else (path, "")
     if target:
