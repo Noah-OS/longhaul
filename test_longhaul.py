@@ -2692,8 +2692,7 @@ class Inspect(unittest.TestCase):
         self.assertEqual(out[out.index(head) + 1], "  none")
 
     def test_a_file_read_again_after_a_compaction_is_counted(self):
-        # What the compaction made Claude read again (caveman's
-        # compaction_churn): a Read of a file the same context read before its
+        # What the compaction made Claude read again: a Read of a file the same context read before its
         # last compaction, once per file and compaction. A file first read
         # after it is not; a second read after it stays a plain repeat.
         self.write(self.turn("t1", "Read", "x" * 300, file_path="/a.py") + self.turn("t2", "Read", "y", file_path="/c.py")
@@ -2728,8 +2727,8 @@ class Inspect(unittest.TestCase):
                                                         {"path": "/w/c.py", "reads": 1, "chars": 45, "scope": "main"}])
 
     def test_memory_past_its_load_limit_and_paths_that_are_gone_are_shown(self):
-        # What Claude Code loads at a session's start, as the files stand now
-        # (caveman's memory doctor, rebuilt): the first 200 lines or 25 KB of
+        # What Claude Code loads at a session's start, as the files stand now:
+        # the first 200 lines or 25 KB of
         # the project's MEMORY.md, the user's CLAUDE.md and those from the
         # folder up. A path named in backquotes or a link that is gone is
         # listed; a slash command is not a path, and a relative one is not
@@ -2900,7 +2899,7 @@ class Inspect(unittest.TestCase):
         self.assertNotIn("SECRET", "\n".join(out) + records.stdout + records.stderr)
 
     def test_the_input_cost_after_caching_is_a_share_of_its_fresh_price(self):
-        # caveman's effective input multiplier, rebuilt: the input at the
+        # The input at the
         # API's price ratios (a cache read 0.1, a write 1.25 at five minutes
         # or 2 at an hour) over the same tokens uncached. Each response's
         # writes at the lifetime it reports, else its scope's (cache_ttl).
@@ -2920,7 +2919,7 @@ class Inspect(unittest.TestCase):
         self.assertEqual(got[("input_cost_ratio", "main")], (0.27, "ratio", "measured"))
 
     def test_a_request_that_writes_a_quarter_of_its_context_is_churn(self):
-        # caveman's cache churn: a request after the first in its context that
+        # Cache churn: a request after the first in its context that
         # wrote more than 10,000 tokens and more than a quarter of its context.
         # The first after a compaction writes a new context, which is expected.
         self.write(self.reply(inp=2, write=40000) + self.reply(write=20000, read=40000)
@@ -3942,7 +3941,7 @@ class Filter(unittest.TestCase):
         self.assertEqual(longhaul.filter_output("make", small, "on")[0], small)
         for command in ("git status --porcelain", "rg --json x", "kubectl get pods -o json", "jq . data.json",
                         "find . -print0", "git ls-files -z", "gh pr list --format x",
-                        # What Claude asked to read: never touched (RTK's lesson: it pages back for the rest).
+                        # What Claude asked to read: never touched (cut, it pages back for the rest).
                         "cat big.log", "sed -n 1,400p app.py", "head -500 app.log", "tail -n 300 x.log", "nl -ba a.py",
                         "awk 'NR<300' app.py", "git diff", "git -C repo show HEAD", "git log -p", "less x",
                         "cd /x && cat a.py | grep foo", "FOO=1 time cat a.py",
@@ -3993,7 +3992,7 @@ class Filter(unittest.TestCase):
         self.assertEqual(longhaul.filter_output("./build.sh", raw, "lossless")[0], raw)
 
     def test_on_drops_under_four_kilobytes_never(self):
-        # caveman: a cut that saves little costs more in fetch-backs than it saves.
+        # A cut that saves little costs more in fetch-backs than it saves.
         raw = "".join(f"tests/test_x.py::test_case_{i} PASSED [{i}%]\n" for i in range(40)) + "=" * 1200 + "\n"
         self.assertLess(len(raw), longhaul.FILTER_DROP_MIN + 1200)
         self.assertEqual(longhaul.filter_output("pytest -v", raw, "on")[1]["dropped"], 0)
@@ -4027,7 +4026,7 @@ class Filter(unittest.TestCase):
         self.assertIn("=== RUN   TestBroken\n    broken_test.go:9: got 3 want 4\n--- FAIL: TestBroken", shown)
 
     def test_each_filter_table_row_holds_its_own_tests(self):
-        # RTK's 62 TOML filters carry inline tests; Longhaul's rows do too.
+        # Each row carries its own inline tests.
         names = [row["name"] for row in longhaul.FILTER_TABLE]
         self.assertEqual(len(names), len(set(names)))
         for row in longhaul.FILTER_TABLE:
@@ -4175,7 +4174,7 @@ class Filter(unittest.TestCase):
         os.utime(old, (week, week))
         with mock.patch.object(longhaul, "FILTER_STORE_MAX", 1000):
             answer = self.check(self.data("./build.sh", self.build_log()), "on")
-        self.assertIsNone(answer, "caveman: refuse, never evict; nothing lossless to do either")
+        self.assertIsNone(answer, "refuse, never evict; nothing lossless to do either")
         self.assertFalse(old.exists(), "a week old: removed")
         self.assertFalse(old.parent.exists())
         self.assertFalse((self.home / "outputs" / "s1").exists())
@@ -4206,7 +4205,7 @@ class Filter(unittest.TestCase):
         self.assertEqual([n.get("fetched") for n in self.logged()], [None, "toolu_01A"])
         guard("Read", file_path=str(self.home / "outputs" / "s1" / "toolu_99.txt"))
         self.assertEqual(stats()["cap"]["fetched"], 1, "an output it has no drop for")
-        # RTK's gain: 10% is "watch", 30% stops the step, once it has dropped enough to tell.
+        # 10% is "watch", 30% stops the step, once it has dropped enough to tell.
         for drops, fetched, stopped in ((10, 3, {"cap"}), (10, 2, set()), (9, 9, set())):
             (self.home / "filters" / "stats.json").write_text(json.dumps({"cap": {"drops": drops, "fetched": fetched}}))
             self.assertEqual(longhaul.filter_stopped(), stopped)
@@ -8217,7 +8216,7 @@ class Checkpoint(unittest.TestCase):
         # from the last, keeping what still holds. A save that leaves out some
         # of the last one's owner_said or facts, word for word, says how many,
         # by count alone; a fact that changed is replaced and names what it
-        # replaces (the skill's rule, from caveman's supersedes).
+        # replaces (the skill's rule).
         self.assertEqual(self.save(self.more(facts=[f"f1 {self.S}", f"f2 {self.S}", f"f3 {self.S}"]), "s1").returncode, 0)
         later = self.more(owner_said=[f"another {self.S}"], facts=[f"f1 {self.S}", f"f4 (replaces: f2) {self.S}"])
         out = self.save(later, "s1")
