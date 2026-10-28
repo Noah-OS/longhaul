@@ -23,6 +23,11 @@
 !hooks/autocompact.ts
 !hooks/autocompact.test.ts
 !hooks/codex_hook.py
+!hooks/codex-hooks.json
+!.codex-plugin/
+!.codex-plugin/plugin.json
+!codex-skills/
+!codex-skills/**
 !bin/
 !bin/longhaul
 !skills/

@@ -1,0 +1,102 @@
+{
+  "description": "Longhaul's hooks under OpenAI Codex, named by .codex-plugin/plugin.json; Claude Code's are hooks/hooks.json. Each runs `longhaul COMMAND --agent codex` through hooks/codex_hook.py and exits 0; the filter's checks the output's size first.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" guard",
+            "timeout": 5,
+            "statusMessage": "Checking this call (longhaul guard)"
+          }
+        ]
+      },
+      {
+        "matcher": "spawn_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" models-hook",
+            "timeout": 10,
+            "statusMessage": "Noting this sub-agent's model (longhaul auto model)"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -c 'import sys, io, json, os\ntry:\n    b = sys.stdin.buffer.read(1000001); raw = b.decode(\"utf-8\", \"replace\")\n    d = json.loads(raw); r = d.get(\"tool_response\") if isinstance(d, dict) else None\n    big = len(b) <= 1000000 and isinstance(r, str) and len(r) >= 1500\nexcept Exception:\n    big = False\nif big and os.environ.get(\"LONGHAUL_FILTERS\") != \"off\":\n    try:\n        sys.stderr = open(os.devnull, \"w\"); sys.path.insert(0, sys.argv[1]); import longhaul\n        sys.stdin = io.StringIO(raw); longhaul.main([\"filter\", \"--agent\", \"codex\"])\n    except BaseException:\n        pass\nsys.exit(0)' \"$PLUGIN_ROOT\"",
+            "timeout": 5,
+            "statusMessage": "Measuring this output (longhaul filter, in shadow)"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" guard",
+            "timeout": 5,
+            "statusMessage": "Forgetting this chat's reads (longhaul guard)"
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" guard",
+            "timeout": 5,
+            "statusMessage": "Looking for a code index (longhaul guard)"
+          }
+        ]
+      },
+      {
+        "matcher": "compact|clear|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" checkpoint",
+            "timeout": 5,
+            "additionalContextLimit": 4000,
+            "statusMessage": "Looking for a checkpoint (longhaul checkpoint)"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" reminder",
+            "timeout": 5,
+            "statusMessage": "Checking the context's size (longhaul checkpoint)"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$PLUGIN_ROOT/hooks/codex_hook.py\" precompact",
+            "timeout": 5,
+            "statusMessage": "Noting a compaction (longhaul checkpoint)"
+          }
+        ]
+      }
+    ]
+  }
+}

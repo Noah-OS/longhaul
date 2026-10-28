@@ -3984,6 +3984,313 @@ class Inspect(unittest.TestCase):
         self.assertEqual(got[("cache_churn_tokens", "main")], (20000, "tokens"))
 
 
+class CodexPackaging(unittest.TestCase):
+    """The repository as an OpenAI Codex plugin too (the Codex plan's X4):
+    `codex plugin marketplace add` with its GitHub address, `codex plugin
+    add longhaul@longhaul`, then one trust step in /hooks. Codex reads
+    .codex-plugin/plugin.json before .claude-plugin/plugin.json, and its
+    `hooks` and `skills` name Codex's own files, so Codex never loads
+    Claude Code's hooks/hooks.json (whose `args` it has no field for) or
+    the skills/ whose `!` lines it does not run. Read from codex-rs
+    rust-v0.165.0: core-plugins/src/manifest.rs and loader.rs, the hook
+    engine's matcher and hooks/schema/generated
+    (docs/discovery/2026-10-28-codex-hooks.md)."""
+
+    CODEX = HERE / ".codex-plugin" / "plugin.json"
+    HOOKS = HERE / "hooks" / "codex-hooks.json"
+    SKILLS = HERE / "codex-skills"
+    # Every event a Codex hooks file can name: protocol/src/hooks.rs's
+    # HookEventsToml, one generated input schema each (model-request's holds
+    # Pre- and PostModelRequest). Claude Code's StopFailure and
+    # Notification are not among them.
+    EVENTS = {"PreModelRequest", "PostModelRequest", "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact",
+              "PostCompact", "SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop",
+              "Interrupt"}
+    SOURCES = {"startup", "resume", "clear", "compact", "fork"}  # session-start's `source`, its matcher's input
+    TOOLS = {"Bash", "spawn_agent"}  # hook_names.rs: every shell tool is Bash; a sub-agent's spawn is spawn_agent
+    # A handler's fields (HookHandlerConfig::Command): no `args`.
+    FIELDS = {"type", "command", "commandWindows", "timeout", "async", "statusMessage", "additionalContextLimit"}
+    WRAPPED = re.compile(r'python3 -I "\$PLUGIN_ROOT/hooks/codex_hook\.py" ([a-z-]+)')
+    PRELUDE = re.compile(r'''python3 -I -c '([^']*)' "\$PLUGIN_ROOT"''')
+    # What Codex runs, by event and matcher, and each command's timeout:
+    # Codex's own default is 600 seconds.
+    RUNS = {("PreToolUse", "Bash"): ["guard"], ("PreToolUse", "spawn_agent"): ["models-hook"],
+            ("PostToolUse", "Bash"): ["filter"], ("SessionStart", "compact|clear"): ["guard"],
+            ("SessionStart", "startup"): ["guard"], ("SessionStart", "compact|clear|resume"): ["checkpoint"],
+            ("UserPromptSubmit", None): ["reminder"], ("PreCompact", None): ["precompact"]}
+    TIMEOUTS = {"guard": 5, "checkpoint": 5, "reminder": 5, "precompact": 5, "filter": 5, "models-hook": 10}
+    THREAD = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # `python3` in a command is the Python under test, on both floors.
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "python3").symlink_to(sys.executable)
+
+    def manifest(self, path=None):
+        return json.loads((path or self.CODEX).read_text())
+
+    def handlers(self):
+        """(event, matcher, handler) for each handler in Codex's hooks file."""
+        return [(event, group.get("matcher"), handler)
+                for event, groups in self.manifest(self.HOOKS)["hooks"].items()
+                for group in groups for handler in group["hooks"]]
+
+    def name(self, command):
+        """The Longhaul command a hook command runs, or None for any other."""
+        wrapped = self.WRAPPED.fullmatch(command)
+        if wrapped:
+            return wrapped.group(1)
+        return "filter" if self.PRELUDE.fullmatch(command) else None
+
+    def env(self, **extra):
+        return {**os.environ, "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                "LONGHAUL_HOME": str(self.tmp / "home"), "CODEX_HOME": str(self.tmp / "codex"),
+                "LONGHAUL_NO_NOTIFY": "1", **extra}
+
+    def shell(self, command, stdin, shell="/bin/sh", **extra):
+        """`command` as Codex runs a hook's (`$SHELL -lc`, here without the
+        login profile), on `stdin` bytes."""
+        return subprocess.run([shell, "-c", command], input=stdin, env=self.env(**extra), capture_output=True,
+                              timeout=60)
+
+    def test_the_codex_manifest_names_codexs_hooks_file_and_codexs_skills(self):
+        claude = self.manifest(HERE / ".claude-plugin" / "plugin.json")
+        m = self.manifest()
+        # One plugin: the name a marketplace entry installs (longhaul@longhaul)
+        # and the namespace of its skills; one version, so a bump changes
+        # both manifests or fails here.
+        self.assertEqual((m["name"], m["version"]), (claude["name"], claude["version"]))
+        market = json.loads((HERE / ".claude-plugin" / "marketplace.json").read_text())
+        self.assertIn(m["name"], [plugin["name"] for plugin in market["plugins"]])
+        self.assertTrue(m["description"])
+        self.assertNotIn("Claude", m["description"], "Codex's own words")
+        self.assertEqual(m["interface"]["displayName"], "Longhaul")
+        self.assertEqual(m["interface"]["developerName"], claude["author"]["name"])
+        self.assertEqual(m["interface"]["websiteURL"], claude["homepage"])
+        self.assertNotIn("author", m, "the owner's email stays in one file")
+        self.assertEqual(m["hooks"], "./hooks/codex-hooks.json")
+        self.assertEqual(m["skills"], "./codex-skills/")
+        for path in (m["hooks"], m["skills"]):
+            self.assertTrue(path.startswith("./") and ".." not in path, path)
+            self.assertTrue((HERE / path).exists(), path)
+        # A root plugin.json with an agent-plugins.org $schema would come
+        # first and load no hooks at all (loader.rs), and Claude Code's
+        # manifest names neither field, so it keeps hooks/hooks.json and skills/.
+        self.assertNotIn("$schema", m)
+        self.assertFalse((HERE / "plugin.json").exists())
+        for key in ("hooks", "skills"):
+            self.assertNotIn(key, claude, "Claude Code keeps its defaults")
+
+    def test_the_codex_hooks_file_names_only_codex_events_and_runs_only_longhauls_codex_commands(self):
+        hooks = self.manifest(self.HOOKS)
+        self.assertLessEqual(set(hooks), {"description", "hooks"}, "Codex refuses a hooks file with any other key")
+        self.assertLessEqual(set(hooks["hooks"]), self.EVENTS)
+        runs = collections.defaultdict(list)
+        for event, groups in hooks["hooks"].items():
+            for group in groups:
+                self.assertLessEqual(set(group), {"matcher", "hooks"}, event)
+        for event, matcher, handler in self.handlers():
+            with self.subTest(event=event, matcher=matcher):
+                self.assertLessEqual(set(handler), self.FIELDS)
+                self.assertEqual(handler["type"], "command")
+                name = self.name(handler["command"])
+                self.assertIn(name, longhaul.CODEX_HOOK_COMMANDS, handler["command"])
+                self.assertEqual(handler["timeout"], self.TIMEOUTS[name])
+                self.assertTrue(handler["statusMessage"].endswith(")"), "says which of Longhaul's features runs")
+                runs[event, matcher].append(name)
+                if matcher is not None:
+                    # Letters, digits, _ and | alone: Codex matches each
+                    # alternative whole (engine/matcher.rs), never as a
+                    # regex's part of a longer name.
+                    self.assertRegex(matcher, r"^[A-Za-z0-9_|]+$")
+                    self.assertLessEqual(set(matcher.split("|")),
+                                         self.SOURCES if event == "SessionStart" else self.TOOLS)
+        self.assertEqual(dict(runs), self.RUNS)
+        self.assertEqual({name for names in runs.values() for name in names}, set(longhaul.CODEX_HOOK_COMMANDS),
+                         "every Codex hook command is registered")
+
+    def test_only_the_checkpoint_raises_codexs_context_limit(self):
+        # A put-back can pass the 2,500 tokens Codex keeps before it spills
+        # the rest to a file (bytes / 4: a non-ASCII text counts more); the
+        # owner set the limit at 4,000 (2026-10-28: a full checkpoint is
+        # about 2,200 to 2,700), in the hooks file alone.
+        limits = [(event, matcher, handler["additionalContextLimit"]) for event, matcher, handler in self.handlers()
+                  if "additionalContextLimit" in handler]
+        self.assertEqual(limits, [("SessionStart", "compact|clear|resume", 4_000)])
+
+    def test_every_hook_command_runs_through_a_shell_from_a_folder_with_a_space_and_exits_0_quietly(self):
+        # Codex hands the whole line to the user's shell with PLUGIN_ROOT
+        # set (engine/discovery.rs); the quotes hold a space in the path.
+        root = self.tmp / "plugin root"
+        root.symlink_to(HERE)
+        shells = [s for s in ("/bin/sh", shutil.which("bash"), shutil.which("zsh")) if s]
+        for _, _, handler in self.handlers():
+            for shell in shells:
+                for stdin in (b"{}", b"", b"not json"):
+                    with self.subTest(command=self.name(handler["command"]), shell=shell, stdin=stdin):
+                        out = self.shell(handler["command"], stdin, shell, PLUGIN_ROOT=str(root))
+                        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
+
+    def prelude(self):
+        [command] = [h["command"] for event, _, h in self.handlers() if event == "PostToolUse"]
+        return command
+
+    def fake(self, main="    seen = {'argv': argv, 'stdin': sys.stdin.read()}\n"
+                        "    open(os.path.join(here, 'ran.json'), 'w').write(json.dumps(seen))\n"):
+        """A plugin folder whose longhaul.py says it was imported and runs `main`."""
+        root = Path(tempfile.mkdtemp(dir=self.tmp))
+        (root / "longhaul.py").write_text("import json, os, sys\nhere = os.path.dirname(os.path.abspath(__file__))\n"
+                                          "open(os.path.join(here, 'imported'), 'w').write('yes')\n"
+                                          f"def main(argv):\n{main}")
+        return root
+
+    def post(self, response, **extra):
+        return json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": self.THREAD,
+                           "tool_use_id": "call_1", "tool_input": {"command": "./build.sh"},
+                           "tool_response": response, **extra}).encode()
+
+    def test_the_filter_prelude_passes_small_output_without_importing_longhaul(self):
+        # Codex's hook took 67 ms on 3.14 and 228 ms on 3.9 against 29 and 72
+        # for Claude Code's prelude (the lead's measure, 2026-10-28): most
+        # outputs are small, so the size is checked before longhaul is
+        # imported. Codex's tool_response for a shell is one string.
+        code = self.PRELUDE.fullmatch(self.prelude()).group(1)
+        self.assertNotIn("\\", code, "fish keeps a backslash in single quotes its own way")
+        root = self.fake()
+        small = "x" * (longhaul.FILTER_SMALL - 1)
+        for stdin in (self.post(small), b"", b"not json", b"[1, 2]", b"\xff\xfe", self.post(None),
+                      self.post({"stdout": "x" * longhaul.FILTER_SMALL}), self.post("x" * 1_000_001)):
+            with self.subTest(stdin=stdin[:60]):
+                out = self.shell(self.prelude(), stdin, PLUGIN_ROOT=str(root))
+                self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
+                self.assertFalse((root / "imported").exists(), "longhaul was imported")
+        big = self.post("x" * longhaul.FILTER_SMALL)
+        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root), LONGHAUL_FILTERS="off")
+        self.assertEqual((out.returncode, out.stdout), (0, b""))
+        self.assertFalse((root / "imported").exists(), "LONGHAUL_FILTERS=off stops it first, as on Claude Code")
+        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
+        self.assertEqual(json.loads((root / "ran.json").read_text()),
+                         {"argv": ["filter", "--agent", "codex"], "stdin": big.decode()}, "the input as it came")
+
+    def test_the_filter_prelude_exits_0_and_prints_nothing_when_longhaul_fails(self):
+        big = self.post("x" * longhaul.FILTER_SMALL)
+        for main in ("    print('noise', file=sys.stderr); raise RuntimeError('boom')\n", "    sys.exit(2)\n",
+                     "    raise KeyboardInterrupt\n"):
+            with self.subTest(main=main):
+                out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(self.fake(main)))
+                self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
+        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(self.tmp / "nowhere"))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""), "no longhaul.py to import")
+        # And the real one, in shadow on Codex: it answers nothing.
+        home = self.tmp / "home"
+        out = self.shell(self.prelude(), self.post("\n".join(f"line {i} of the build" for i in range(400))),
+                         PLUGIN_ROOT=str(HERE), LONGHAUL_HOME=str(home))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
+
+    def skill(self, name):
+        text = (self.SKILLS / name / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        return text, head, body
+
+    def test_codexs_skills_are_longhauls_three_with_no_line_codex_cannot_run(self):
+        # Codex names a plugin's skills <manifest name>:<skill name>
+        # (ext/skills/src/loader/namespace.rs), and a user or a hook calls
+        # one as $<that> (skills/src/mentions.rs takes the colon). Seen on
+        # Codex CLI 0.163.0 (2026-10-29, a scratch CODEX_HOME, `codex debug
+        # prompt-input`): longhaul:checkpoint, longhaul:doctor and
+        # longhaul:inspect, from codex-skills/ alone.
+        self.assertEqual(sorted(p.name for p in self.SKILLS.iterdir()), ["checkpoint", "doctor", "inspect"])
+        self.assertEqual(longhaul.CODEX_CHECKPOINT_SKILL, f"${self.manifest()['name']}:checkpoint")
+        for name in ("checkpoint", "doctor", "inspect"):
+            with self.subTest(skill=name):
+                text, head, body = self.skill(name)
+                self.assertIn(f"name: {name}\n", head)
+                self.assertRegex(head, r"(?m)^description: \".{80,}\"$")
+                # Codex runs no `!` line (core-plugins/src/command_migration.rs)
+                # and hands the model a SKILL.md as it is, nothing substituted
+                # (ext/skills/src/host_prompt.rs): no Claude Code variable,
+                # rule or slash command either.
+                for claude_only in ("!`", "! `", "CLAUDE", "$ARGUMENTS", "allowed-tools", "/longhaul:", "Claude",
+                                    "Bash tool", "Write tool"):
+                    self.assertNotIn(claude_only, text)
+                # Codex puts no plugin's bin/ on the shell's PATH (only its
+                # own, core/src/tools/runtimes/mod.rs) and no PLUGIN_ROOT in
+                # it (that is the hooks' and MCP servers'); its skills prompt
+                # resolves a skill's relative paths from the skill's folder
+                # (ext/skills/src/catalog_prompt.rs), and the plugin is copied
+                # whole into Codex's cache, so the shim is named from there.
+                self.assertIn("`../../bin/longhaul`", body)
+                self.assertEqual((self.SKILLS / name / "../../bin/longhaul").resolve(), HERE / "bin" / "longhaul")
+                self.assertIn("relative to the folder this SKILL.md is in", " ".join(body.split()))
+        # Claude Code's own skills stay where its manifest's default reads them.
+        self.assertEqual(sorted(p.name for p in (HERE / "skills").iterdir()), ["checkpoint", "doctor", "inspect"])
+
+    def run_skill(self, name, command, stdin=None, **extra):
+        """`command` as the model runs it: the shim by the skill folder's
+        absolute path, quoted, from a workspace elsewhere."""
+        work = self.tmp / "work space"
+        work.mkdir(exist_ok=True)
+        command = command.replace("../../bin/longhaul", f'"{self.SKILLS / name}/../../bin/longhaul"', 1)
+        return subprocess.run(["/bin/sh", "-c", command], cwd=work, input=stdin, text=True,
+                              env=self.env(**extra), capture_output=True, timeout=60)
+
+    def test_the_checkpoint_skill_saves_this_chats_state_through_the_shim(self):
+        text, head, body = self.skill("checkpoint")
+        self.assertIn("compaction", head)
+        self.assertIn("resume", head)
+        for key in longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS + longhaul.CHECKPOINT_MORE:
+            self.assertIn(f'"{key}"', body, "the schema's twelve fields, as the save takes them")
+        for rule in ("1,000 characters", "20 entries", "16,000 bytes", "the last checkpoint", "5,000", "(replaces: ",
+                     "no tabs", "sub-agent"):
+            self.assertIn(rule, body)
+        self.assertIn("secret", body.lower())
+        example = json.loads(body.split("```json\n", 1)[1].split("```", 1)[0])
+        state, problem, _ = longhaul.checkpoint_validate(example)
+        self.assertIsNone(problem)
+        self.assertTrue(all(state[key] for key in longhaul.CHECKPOINT_MORE), "the example shows each list in use")
+        # The state goes on stdin in a quoted heredoc, not in a --file as on
+        # Claude Code: Codex has no Write tool and no `!` line to name the
+        # file's path (its LONGHAUL_HOME and CODEX_THREAD_ID are the shell's),
+        # and a write outside the workspace is a sandbox approval each. So
+        # one command, one approval at most, nothing left behind on a
+        # refusal, and no $ or ` in a text expanded. The chat is
+        # CODEX_THREAD_ID's, which the save reads from the shell's environment.
+        save = "../../bin/longhaul checkpoint save --agent codex <<'LONGHAUL_STATE'"
+        self.assertIn(save, body)
+        self.assertIn("\nLONGHAUL_STATE\n", body)
+        self.assertNotIn("--file", body)
+        self.assertIn("sandbox", body, "the save writes under the home folder, outside the workspace")
+        home = self.tmp / "home"
+        out = self.run_skill("checkpoint", f"{save}\n{json.dumps(example, indent=2)}\nLONGHAUL_STATE\n",
+                             LONGHAUL_HOME=str(home), CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        saved = json.loads((home / "checkpoints" / f"codex-{self.THREAD}.json").read_text())
+        self.assertEqual((saved["session_id"], saved["goal"]), (f"codex-{self.THREAD}", example["goal"]))
+        self.assertEqual(len(out.stdout.splitlines()), 1, "the one line the skill repeats")
+
+    def test_the_inspect_and_doctor_skills_run_the_shims_commands_and_show_them_as_they_are(self):
+        _, head, body = self.skill("inspect")
+        command = '../../bin/longhaul inspect --agent codex "$CODEX_THREAD_ID"'
+        self.assertIn(command, body)
+        self.assertIn("numbers", body)
+        self.assertIn("take no install step", body)
+        # Through the shim to Codex's inspect: an id with no rollout under
+        # CODEX_HOME is longhaul's answer, not the shim's refusal.
+        out = self.run_skill("inspect", command, CODEX_THREAD_ID=self.THREAD, CODEX_HOME=str(self.tmp / "codex"),
+                             LONGHAUL_HOME=str(self.tmp / "home"))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(f"no Codex rollout found for {self.THREAD}", out.stderr)
+        _, head, body = self.skill("doctor")
+        self.assertIn("`../../bin/longhaul doctor`", body, "the shim runs doctor with nothing after it")
+        self.assertIn("changes nothing", " ".join(body.split()))
+        self.assertIn("take no install step", body)
+        self.assertIn("as it is", body)
+
+
 class Plugin(unittest.TestCase):
     """The repository is also a Claude Code plugin (docs/adr/0001-plugin-layout.md)."""
 
@@ -4073,6 +4380,9 @@ class Plugin(unittest.TestCase):
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
                      "CHANGELOG.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
+                     # The Codex layer (X4): its manifest, hooks file and skills.
+                     ".codex-plugin/plugin.json", "hooks/codex-hooks.json", "codex-skills/checkpoint/SKILL.md",
+                     "codex-skills/inspect/SKILL.md", "codex-skills/doctor/SKILL.md",
                      "plugins/longhaul-advisor/.claude-plugin/plugin.json",
                      "plugins/longhaul-advisor/skills/advise/SKILL.md", "plugins/longhaul-advisor/agents/advisor.md"):
             self.assertEqual(subprocess.run(["git", "check-ignore", "-q", path], cwd=HERE, timeout=10).returncode, 1,
@@ -11344,8 +11654,9 @@ class CodexCheckpoint(unittest.TestCase):
         # additionalContextLimit (2,500 tokens unless the hooks file says)
         # to a file and gives the model a preview. The largest checkpoint
         # the save takes, with a clear's line before it, measured at four
-        # characters a token, stays under it (X4: no limit to raise for the
-        # checkpoint alone).
+        # characters a token, stays under it; hooks/codex-hooks.json raises
+        # the checkpoint's to 4,000 all the same, the owner's margin for a
+        # text that counts more (CodexPackaging).
         names = [f"f{i:02}.py" for i in range(20)]
         for name in names:
             (self.work / name).write_text(name)
@@ -12389,7 +12700,7 @@ class CodexReminder(unittest.TestCase):
     next count (docs discovery/2026-10-28-codex-hooks.md). At each 200k the
     user hears it in the systemMessage, the one place Codex shows a hook's
     words (it has no display.ts), and the model in its additionalContext,
-    in Codex's words: $checkpoint and /compact. Each multiple is said once
+    in Codex's words: $longhaul:checkpoint and /compact. Each multiple is said once
     and forgotten at each compaction, as on Claude Code. A sub-agent's own
     rollout is its transcript_path. The messages, the instructions, the
     compaction's summary and the prompt hold SECRET, which nothing
@@ -12400,10 +12711,10 @@ class CodexReminder(unittest.TestCase):
     SECRET = "SENTINEL-CODEX-" + "Q" * 40
     WRAPPER = HERE / "hooks" / "codex_hook.py"
     USER = ("Longhaul: this chat's context is about {}k tokens, and every request carries all of it again. To shrink "
-            "it without losing the thread: $checkpoint, then /compact. The checkpoint comes back.")
+            "it without losing the thread: $longhaul:checkpoint, then /compact. The checkpoint comes back.")
     MODEL = ("Longhaul: the context is about {0}k tokens. At your next natural stopping point (not in the middle of an "
-             "edit or a test run), and in any case before you end your turn, save a checkpoint with the $checkpoint "
-             "skill, then tell the user in one line: \"Saved a checkpoint (the context is about {0}k tokens). Type "
+             "edit or a test run), and in any case before you end your turn, save a checkpoint with the "
+             "$longhaul:checkpoint skill, then tell the user in one line: \"Saved a checkpoint (the context is about {0}k tokens). Type "
              "/compact to shrink it; the checkpoint comes back.\" Then continue the work. After a compaction it comes "
              "back.")
     SUB = ("Longhaul: your context as a sub-agent is about {}k tokens, and every request you make re-reads all of it. "
@@ -12625,7 +12936,7 @@ class CodexReminder(unittest.TestCase):
         for text in (self.USER, self.MODEL, self.SUB):
             self.assertNotIn("/longhaul:", text)
             self.assertNotIn("/clear", text)
-        self.assertEqual(longhaul.CODEX_CHECKPOINT_SKILL, "$checkpoint")
+        self.assertEqual(longhaul.CODEX_CHECKPOINT_SKILL, "$longhaul:checkpoint")  # Codex's name for it (X4)
         self.assertIn(longhaul.CODEX_CHECKPOINT_SKILL, self.USER)
         self.assertIn(longhaul.CODEX_CHECKPOINT_SKILL, self.MODEL)
         # Ids and numbers alone: no message, no prompt.
@@ -13840,10 +14151,11 @@ class Name(unittest.TestCase):
     # is in the signed files alone.
     EMAIL = r"[a-z0-9._%+-]+@(?!exam" + r"ple\.com\b)[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}"
     # The owner chose to keep their name, email and GitHub handle in these;
-    # the Advisor's manifest (Sprint 11, I4) repeats the name and the
-    # repository's address, and not the email (Plugin pins that).
+    # the Advisor's manifest (Sprint 11, I4) and Codex's (X4) repeat the name
+    # and the repository's address, and not the email (Plugin and
+    # CodexPackaging pin that).
     SIGNED = ("LICENSE", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
-              "plugins/longhaul-advisor/.claude-plugin/plugin.json")
+              "plugins/longhaul-advisor/.claude-plugin/plugin.json", ".codex-plugin/plugin.json")
     # The README is checked line by line (it passed whole before, so a
     # private path pasted into an example would have passed with it): its
     # one allowed match is the repository's own address, which since
