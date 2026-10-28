@@ -16661,10 +16661,12 @@ class CodexModels(unittest.TestCase):
     """Auto Model on Codex, log only (the Codex plan's X9, Phase 4): `longhaul
     models-hook --agent codex`, on PreToolUse spawn_agent, logs each pick of
     the main chat (agent type, model, reasoning effort, fork) as models_rule
-    logs Claude Code's, and never changes the call: Longhaul's table and cap
-    name Claude's models, and a Codex ladder is the owner's to choose. The
-    inputs are spawn_agent's two versions (docs/discovery/2026-10-28-codex-
-    hooks.md, 10). Claude Code keeps Auto Model in the Advisor's hook."""
+    logs Claude Code's, and each of a sub-agent's own, marked so; an
+    inherited model is the spawner's. It never changes the call: Longhaul's
+    table and cap name Claude's models, and a Codex ladder is the owner's to
+    choose. The inputs are spawn_agent's two versions (docs/discovery/
+    2026-10-28-codex-hooks.md, 10). Claude Code keeps Auto Model in the
+    Advisor's hook."""
 
     S = "SENTINEL-NARWHAL-4410"  # text of the call's, which no record may hold
     SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
@@ -16743,12 +16745,12 @@ class CodexModels(unittest.TestCase):
         # only "none" does not. v1 forks with fork_context true alone.
         self.assertEqual(self.logged(), [
             f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort high",
-            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
             f"models: worker picked gpt-5.6-terra (its call) in {sid}, effort low",
-            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
-            f"models: default on inherited (inherited) in {sid}, effort inherited"])
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited"])
         self.no_text()
 
     def test_null_and_empty_fields_are_codex_s_defaults(self):
@@ -16762,9 +16764,9 @@ class CodexModels(unittest.TestCase):
         del given["fork_context"]  # v1's fork_context defaults to false
         self.codex(self.spawn(given))
         self.assertEqual(self.logged(), [
-            f"models: default on inherited (inherited) in {sid}, effort inherited",
-            f"models: default on inherited (inherited) in {sid}, effort inherited",
-            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited",
+            f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited",
+            f"models: worker on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork",
             f"models: default picked gpt-5.6-sol (its call) in {sid}, effort inherited"])
 
     def test_a_field_of_the_wrong_shape_is_never_logged(self):
@@ -16777,18 +16779,62 @@ class CodexModels(unittest.TestCase):
         for bad in (f"the best one {self.S}", "a/b", "x" * 65, 7, ["gpt-5.6-sol"], {"model": "gpt-5.6-sol"}, False):
             self.codex(self.spawn(self.v1(agent_type="worker", model=bad, reasoning_effort=bad)))
         self.assertEqual(self.logged(), [f"models: worker picked unknown (its call) in {sid}, effort unknown"] * 7)
-        # Not a spawn of the main chat: no line.
+        # Not a spawn: no line.
         before = len(self.logged())
         for data in (self.spawn("not an object"), self.spawn([self.v1()]), self.spawn(None),
                      self.spawn(self.v1(), tool_name="Agent"), self.spawn(self.v1(), tool_name="Bash"),
                      self.spawn(self.v1(), hook_event_name="PostToolUse", tool_response="ok"),
-                     self.spawn(self.v1(), agent_id="019f9d8f-0000-7000-8000-000000000001", agent_type="worker"),
                      {}, [], "text"):
             self.assertEqual(self.codex(data), "", data)
         self.assertEqual(self.logged()[before:], [])
         # A session id no record could be named by is left out (codex_hook_input): the line says codex alone.
         self.codex(self.spawn(self.v1(agent_type="worker"), session_id="../x"))
-        self.assertEqual(self.logged()[-1], "models: worker on inherited (inherited) in codex, effort inherited")
+        self.assertEqual(self.logged()[-1], "models: worker on gpt-5.6-terra (inherited) in codex, effort inherited")
+        # A spawner's model that is not a name, or none: the inherited model unknown, as Claude Code's says it.
+        for bad in (f"the best one {self.S}", "a/b", 7, None, ""):
+            self.codex(self.spawn(self.v1(agent_type="worker"), model=bad))
+        self.assertEqual(self.logged()[-5:], [f"models: worker on unknown (inherited) in {sid}, effort inherited"] * 5)
+        data = self.spawn(self.v1(agent_type="worker"))
+        del data["model"]
+        self.codex(data)
+        self.assertEqual(self.logged()[-1], f"models: worker on unknown (inherited) in {sid}, effort inherited")
+        self.no_text()
+
+    def test_a_spawn_with_no_model_is_logged_on_the_spawners_model(self):
+        # Every Codex hook input carries `model`, the model of the chat (or
+        # sub-agent) whose call it is: a sub-agent spawned with none starts
+        # on it (codex-rs agent/child_config.rs build_agent_spawn_config),
+        # unless its role's own config file names another, which is Codex's
+        # config and not read.
+        sid = "codex-" + self.SID[:8]
+        self.codex(self.spawn(self.v2(), model="gpt-5.6-sol"))
+        self.codex(self.spawn(self.v1(agent_type="explorer", reasoning_effort="high"), model="gpt-5.6-terra"))
+        self.codex(self.spawn(self.v1(model="gpt-5.6-sol"), model="gpt-5.6-terra"))  # its own: the spawner's not named
+        self.assertEqual(self.logged(), [
+            f"models: default on gpt-5.6-sol (inherited) in {sid}, effort inherited, fork",
+            f"models: explorer on gpt-5.6-terra (inherited) in {sid}, effort high",
+            f"models: default picked gpt-5.6-sol (its call) in {sid}, effort inherited"])
+
+    def test_a_sub_agents_own_spawn_is_logged_marked_as_a_sub_agents(self):
+        # A sub-agent's hooks carry the root's session_id and its own thread
+        # as agent_id (codex_hook_input()); its `model` is its own. Its spawn
+        # is logged by the same pick, marked a sub-agent's as the guard marks
+        # one, the agent never named; and the call is never changed.
+        sid, agent = "codex-" + self.SID[:8], "019f9d8f-0000-7000-8000-000000000001"
+        self.config(models_cap="haiku")
+        for given in (self.v1(agent_type="worker", model="gpt-5.6-terra", reasoning_effort="low"), self.v2()):
+            data = self.spawn(given, agent_id=agent, agent_type="explorer", model="gpt-5.6-sol")
+            self.assertIsNone(longhaul.models_codex_check(longhaul.codex_hook_input(data)), given)
+            self.assertEqual(self.codex(data), "", given)
+        self.assertEqual(self.logged(), [
+            f"models: worker picked gpt-5.6-terra (its call) in {sid} (a sub-agent), effort low"] * 2 + [
+            f"models: default on gpt-5.6-sol (inherited) in {sid} (a sub-agent), effort inherited, fork"] * 2)
+        self.assertNotIn(agent, (self.home / "longhaul.log").read_text())
+        self.assertNotIn("019f9d8f", (self.home / "longhaul.log").read_text())
+        # Auto Model off: no line, the sub-agent's as the main chat's.
+        self.config(models="off")
+        self.codex(self.spawn(self.v2(), agent_id=agent, agent_type="explorer"))
+        self.assertEqual(len(self.logged()), 4)
         self.no_text()
 
     def test_the_call_is_never_changed_whatever_the_mode_the_table_or_the_cap(self):
@@ -16901,7 +16947,7 @@ class CodexModels(unittest.TestCase):
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), stdin)
         sid = "codex-" + self.SID[:8]
         self.assertEqual(self.logged(), [f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort medium",
-                                         f"models: default on inherited (inherited) in {sid}, effort inherited, fork"])
+                                         f"models: default on gpt-5.6-terra (inherited) in {sid}, effort inherited, fork"])
         self.no_text()
 
 

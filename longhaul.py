@@ -11062,8 +11062,8 @@ def models_rule(data: dict):
 # PreToolUse on spawn_agent (its matcher "Agent" selects it too) runs
 # `longhaul models-hook --agent codex`, a hook of its own: on Claude Code
 # Auto Model runs in the Advisor's hook, which stays off on Codex (X10).
-# Each pick of the main chat is logged as models_rule() logs Claude Code's,
-# and the call is never changed: the table and the cap name Claude's
+# Each pick is logged as models_rule() logs Claude Code's, a sub-agent's
+# own marked so, and the call is never changed: the table and the cap name Claude's
 # models, and a Codex ladder (the owner's chats run gpt-5.6-terra and
 # gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
 # (docs/discovery/2026-10-28-codex-hooks.md, 10; codex-rs rust-v0.165.0,
@@ -11079,21 +11079,24 @@ MODELS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")  # a type's, model
 
 
 def models_codex_check(data):
-    """Auto Model on Codex: the main chat's spawn_agent call logged by its
-    pick, and None always, so the call runs as it was (no updatedInput),
-    whatever the mode, the table or the cap say. The pick: the agent type
-    (Codex's default when none), the model and the reasoning effort given,
-    or "inherited" (the role's or the chat's, which Codex sets), and
-    whether it forks. A field null or empty is not given; an agent type
-    that is not a name is no line, as in models_rule(); a model or effort
-    that is not one is "unknown". Nothing with Auto Model off, or for a
-    sub-agent's own call (models_rule()'s rule: the owner, 2026-10-25).
-    Names only, never message, items or task_name (a name the model
-    wrote). The session is codex-<id> (codex_hook_input()), so the line
-    says whose it is."""
+    """Auto Model on Codex: a spawn_agent call logged by its pick, and
+    None always, so the call runs as it was (no updatedInput), whatever
+    the mode, the table or the cap say. The pick: the agent type (Codex's
+    default when none), the model and the reasoning effort given, else
+    the model the call's spawner runs on, the hook input's `model`, which
+    a sub-agent spawned with none starts on (codex-rs agent/child_config.rs,
+    unless its role's config file names another, which is Codex's and not
+    read) and "inherited" for the effort; and whether it forks. A field
+    null or empty is not given; an agent type that is not a name is no
+    line, as in models_rule(); a model or effort that is not one is
+    "unknown". A sub-agent's own call is logged too, marked a sub-agent's
+    as the guard marks one (guard_logged()), the agent never named: there
+    Claude Code's rule leaves it alone, and here nothing is changed.
+    Nothing with Auto Model off. Names only, never message, items or
+    task_name (a name the model wrote). The session is codex-<id>
+    (codex_hook_input()), so the line says whose it is."""
     if not isinstance(data, dict) or data.get("longhaul_agent") != "codex" \
-            or data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != "spawn_agent" \
-            or data.get("agent_id") is not None:
+            or data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != "spawn_agent":
         return None
     given = data.get("tool_input")
     if not isinstance(given, dict):
@@ -11109,7 +11112,9 @@ def models_codex_check(data):
     kind = named(given.get("agent_type"), MODELS_CODEX_TYPE)
     if kind is None or models_settings()[1] == "off":
         return None
-    model = named(given.get("model"), "inherited") or "unknown"
+    model = named(given.get("model"), "")  # "" when none is given: the spawner's
+    inherited = model == ""
+    model = (named(data.get("model"), None) if inherited else model) or "unknown"
     effort = named(given.get("reasoning_effort"), "inherited") or "unknown"
     if "fork_context" in given or "task_name" not in given:  # v1's (v2 refuses fork_context and needs task_name)
         fork = given.get("fork_context") is True
@@ -11118,8 +11123,9 @@ def models_codex_check(data):
         fork = not (isinstance(turns, str) and turns.strip().lower() == "none")
     sid = data.get("session_id")
     sid = sid[:14] if isinstance(sid, str) else "codex"  # "codex-" and the id's first 8, as Claude Code's 8
-    said = "on inherited (inherited)" if model == "inherited" else f"picked {model} (its call)"
-    log(f"models: {kind} {said} in {sid}, effort {effort}" + (", fork" if fork else ""))
+    said = f"on {model} (inherited)" if inherited else f"picked {model} (its call)"
+    who = " (a sub-agent)" if data.get("agent_id") is not None else ""
+    log(f"models: {kind} {said} in {sid}{who}, effort {effort}" + (", fork" if fork else ""))
     return None
 
 
