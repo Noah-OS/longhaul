@@ -6755,7 +6755,10 @@ def session_end_reason(sid, since: float):
 # read by the hook alone; the log, inspect and every line a person or the
 # model reads name it by session, size, field and reason, never by its
 # content. Like the guard, the hook prints nothing and exits 0 whatever
-# goes wrong: a session start is never stopped by its checkpoint.
+# goes wrong: a session start is never stopped by its checkpoint. Under
+# Codex (--agent codex, the Codex plan's X5) the files are the same, keyed
+# codex-<thread id>: the save takes the chat from CODEX_THREAD_ID, the hook
+# runs through hooks/codex_hook.py, and neither says anything of Claude Code.
 
 CHECKPOINT_TEXTS = ("goal", "next_action")  # texts, required
 CHECKPOINT_LISTS = ("decisions", "done", "in_progress", "blocked", "changed_files", "verification")  # lists of texts
@@ -6787,6 +6790,34 @@ CHECKPOINT_OLD = 6 * 3600
 CHECKPOINT_OLD_SAID = ("Longhaul put back a checkpoint from {ago}: it may be out of date. If it is, ask Claude to save "
                        "a fresh one with /longhaul:checkpoint.")
 CHECKPOINT_CARRY_RECORD_MAX = 4_096  # what the lookup reads of a carry record: a save writes a few hundred bytes
+# What the save and the hook say that names the agent, by agent
+# (checkpoint_agent()). A Codex chat (the Codex plan's X5) is told nothing
+# of Claude Code: a clear is said in words, and the skill is named by what it
+# is, since how a plugin's skills are named under Codex is P3's question.
+# The checkpoint's own text is the same for both.
+CHECKPOINT_WORDS = {
+    "claude": {
+        "needs": "save needs the session id: pass it, or run from inside a Claude Code session (CLAUDE_CODE_SESSION_ID)",
+        "clear": "a /clear",
+        "old": CHECKPOINT_OLD_SAID,
+        "carried": ("Carried over from the session before /clear (saved {age} ago, in this folder). "
+                    "If the user has started something new, ignore it."),
+        "restored": "Longhaul restored your checkpoint from before /clear ({age} old)."},
+    "codex": {
+        "needs": "save needs the Codex chat's id: pass it, or run from inside a Codex chat (CODEX_THREAD_ID)",
+        "clear": "a clear",
+        "old": ("Longhaul put back a checkpoint from {ago}: it may be out of date. If it is, ask Codex to save a fresh "
+                "one with Longhaul's checkpoint skill."),
+        "carried": ("Carried over from the chat before the clear (saved {age} ago, in this folder). "
+                    "If the user has started something new, ignore it."),
+        "restored": "Longhaul restored your checkpoint from before the clear ({age} old)."},
+}
+
+
+def checkpoint_agent(data) -> str:
+    """Whose chat a hook's input is: "codex" for one codex_hook_input()
+    made Longhaul's, "claude" for any other."""
+    return "codex" if isinstance(data, dict) and data.get("longhaul_agent") == "codex" else "claude"
 
 
 def checkpoint_path(sid: str | None):
@@ -6906,7 +6937,8 @@ def checkpoint_record_folder(sid: str, at: float, cwd: str) -> bool:
         return False
 
 
-def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state_file: str | None = None) -> int:
+def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state_file: str | None = None,
+                    agent: str = "claude") -> int:
     """`longhaul checkpoint save [session] [--file PATH]`: the state, JSON
     on stdin or in `state_file`, checked, capped and written whole and
     private (write_json: mkstemp, 0600, then replace, in a checkpoints/
@@ -6917,14 +6949,25 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     given, and the only one a save may name, so no session can plant a
     state for another (the skill's command passes no id for that reason).
     Saved or refused, the skill's state file goes (remove_state_file), and
-    a refusal says so: the model writes it again."""
+    a refusal says so: the model writes it again. Under Codex (`agent`
+    "codex") the session is a Codex chat's, keyed codex-<id> as
+    codex_hook_input() keys the hook's: `here` from CODEX_THREAD_ID, and a
+    session given keyed the same way, so no Codex save is ever a Claude
+    Code session's checkpoint, whatever raw id the two share."""
+    words = CHECKPOINT_WORDS[agent]
+    if agent == "codex" and sid and not sid.startswith("codex-"):
+        sid = f"codex-{sid}"
     sid = sid or here
     path = checkpoint_path(sid)
     state = problem = logged = None
     recorded = False
-    if path is None:
-        problem = ("save needs the session id: pass it, or run from inside a Claude Code session (CLAUDE_CODE_SESSION_ID)"
-                   if sid is None else "the session id must be letters, digits, - or _ (at most 100)")
+    if agent == "codex" and here is not None and checkpoint_path(here) is None:
+        # A CODEX_THREAD_ID that could not name a file (codex- and an id
+        # CODEX_ID takes make a GUARD_ID): this chat cannot be told from
+        # another, so no id given is taken either, and the value is not repeated.
+        problem = "CODEX_THREAD_ID is not a Codex chat's id: letters, digits, - or _ (at most 94)"
+    elif path is None:
+        problem = words["needs"] if sid is None else "the session id must be letters, digits, - or _ (at most 100)"
     elif here and sid != here:
         problem = f"the session id is not this session's: {sid} was given and this session is {shown(here, 100)}"
     elif not raw.strip():
@@ -6967,8 +7010,9 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
         return 2
     log(f"checkpoint for {sid} saved ({size:,} bytes)")
     hours = checkpoint_carry_hours() if recorded else 0  # the window as it is now; the hook reads it when it runs
+    carry = f", and once after {words['clear']} in this folder within {hours:g} h" if hours else ""
     print(f"longhaul checkpoint: saved for {sid} ({size:,} bytes); it comes back after a compaction or a resume"
-          f"{f', and once after a /clear in this folder within {hours:g} h' if hours else ''}{dropped}"
+          f"{carry}{dropped}"
           f"{'; the state file could not be removed' if removed is False else ''}")
     return 0
 
@@ -7162,12 +7206,17 @@ def checkpoint_carry(data: dict, now: float):
     (saved before the folder was recorded) is never carried, and one
     from another folder never comes back. The text is the compaction's,
     with one line first for the model, and the user's line says so by
-    age alone; the log names the sessions, never the text."""
+    age alone; the log names the sessions, never the text. Each agent's
+    clear carries its own chats' checkpoints alone (codex-<id> is a Codex
+    chat's): a Codex chat and a Claude Code session in one folder are two
+    pieces of work, not one before and after a clear."""
     hours = checkpoint_carry_hours()
     cwd = data.get("cwd")
     if not hours or not isinstance(cwd, str) or not os.path.isabs(cwd) or shown(cwd, 1024) != cwd:
         return None
     here, window, sid = os.path.realpath(cwd), hours * 3600, data["session_id"]
+    agent = checkpoint_agent(data)
+    words, codex = CHECKPOINT_WORDS[agent], agent == "codex"
     try:
         entries = list(os.scandir(LONGHAUL_HOME / "checkpoints"))
     except OSError:  # no folder: nothing was ever saved
@@ -7176,6 +7225,8 @@ def checkpoint_carry(data: dict, now: float):
     for entry in entries:
         old = entry.name[:-len(".carry.json")]
         if not entry.name.endswith(".carry.json") or old == sid or not re.fullmatch(GUARD_ID, old):
+            continue
+        if old.startswith("codex-") != codex:  # the other agent's
             continue
         try:
             # A record last written before the window opened holds an
@@ -7205,8 +7256,7 @@ def checkpoint_carry(data: dict, now: float):
             log(f"checkpoint for {old} not carried: {problem}")
             continue
         age = ago_text(now - at)[:-len(" ago")]
-        text = (f"Carried over from the session before /clear (saved {age} ago, in this folder). "
-                f"If the user has started something new, ignore it.\n" + checkpoint_text(kept, now))
+        text = words["carried"].format(age=age) + "\n" + checkpoint_text(kept, now)
         carried = checkpoint_carry_path(old, carried=True)
         try:
             os.rename(checkpoint_carry_path(old), carried)
@@ -7229,7 +7279,7 @@ def checkpoint_carry(data: dict, now: float):
             log(f"checkpoint for {old}: the link from {sid} was not written: {e.strerror or e}")
         log(f"checkpoint for {old} carried into {sid} after clear ({len(raw)} bytes, "
             f"written {max(0, int(now - at))} s earlier)")
-        return {"systemMessage": f"Longhaul restored your checkpoint from before /clear ({age} old).",
+        return {"systemMessage": words["restored"].format(age=age),
                 "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     return None
 
@@ -7268,7 +7318,7 @@ def checkpoint_check(data, now: float | None = None):
     log(f"checkpoint for {sid} put back after {data['source']} ({len(raw)} bytes, written {age} s earlier)")
     answer = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
     if age >= CHECKPOINT_OLD:
-        answer["systemMessage"] = CHECKPOINT_OLD_SAID.format(ago=ago_text(age))
+        answer["systemMessage"] = CHECKPOINT_WORDS[checkpoint_agent(data)]["old"].format(ago=ago_text(age))
     return answer
 
 
@@ -7277,9 +7327,12 @@ def checkpoint_answer(data):
     Auto Model's guide after it (models_guide_join(); the guard's hook gives it
     at a startup), and, for a chat that runs an older Longhaul than is
     installed, the reload line (release_reload()): a long chat updated under it
-    never starts again, so a compaction, a clear or a resume says it too."""
+    never starts again, so a compaction, a clear or a resume says it too. Not
+    under Codex: the line is about Claude Code's plugin reload. Codex's own
+    starts, startup and fork (a new thread from an old one), are Claude Code's
+    startup here: nothing to put back."""
     answer = models_guide_join(data, checkpoint_check(data), CHECKPOINT_SOURCES)
-    if not isinstance(data, dict) or data.get("source") not in CHECKPOINT_SOURCES:
+    if not isinstance(data, dict) or data.get("source") not in CHECKPOINT_SOURCES or checkpoint_agent(data) == "codex":
         return answer
     try:
         line = release_reload(data)
@@ -7294,13 +7347,25 @@ def checkpoint_answer(data):
 
 
 def checkpoint(opts) -> int:
-    """`longhaul checkpoint save [session] [--file PATH]`, or with no action
-    the hook: stdin in, JSON or nothing out, exit 0 always."""
+    """`longhaul checkpoint save [session] [--file PATH] [--agent codex]`, or
+    with no action the hook: stdin in, JSON or nothing out, exit 0 always."""
     if sys.stdin.isatty() and not (opts.action == "save" and opts.file):
         print("longhaul checkpoint: the state (save) or the hook's JSON goes on stdin; nothing to read from a terminal",
               file=sys.stderr)
         return 2
-    here = os.environ.get("CLAUDE_CODE_SESSION_ID") or None  # the session this runs in; SESSION_ENV names it
+    agent = getattr(opts, "agent", "claude")
+    # The session this runs in. Claude Code's Bash tool names it in
+    # CLAUDE_CODE_SESSION_ID (SESSION_ENV names it). Codex sets
+    # CODEX_THREAD_ID in each shell command its model runs, the hook's
+    # session_id in the main chat (docs/discovery/2026-10-28-codex-hooks.md),
+    # keyed here as codex_hook_input() keys the hook's. Whether Codex's hook
+    # processes get it too is not known yet; without it the hook works as in
+    # the engine's own case.
+    if agent == "codex":
+        thread = os.environ.get("CODEX_THREAD_ID") or None
+        here = None if thread is None else f"codex-{thread}"
+    else:
+        here = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     if opts.action == "save":
         try:
             cwd = os.getcwd()
@@ -7321,7 +7386,7 @@ def checkpoint(opts) -> int:
                 return 2
         else:
             raw = sys.stdin.read(1_000_000)
-        return checkpoint_save(opts.session, raw, cwd, here, opts.file)
+        return checkpoint_save(opts.session, raw, cwd, here, opts.file, agent)
 
     def check(data):
         # Run by hand from inside session `here` for another session's
@@ -7336,7 +7401,7 @@ def checkpoint(opts) -> int:
             raise SystemExit(2)
         return checkpoint_answer(data)
 
-    return run_hook(check, "checkpoint", getattr(opts, "agent", "claude"))
+    return run_hook(check, "checkpoint", agent)
 
 
 # -------------------------------------------------------------- advisor
@@ -13660,7 +13725,8 @@ def main(argv: list[str]) -> int:
         if cmd == "checkpoint":
             p.add_argument("action", nargs="?", choices=["save"], help="save: the state on stdin (default: the hook)")
             p.add_argument("session", nargs="?",
-                           help="the conversation the state is for (default: this one, from CLAUDE_CODE_SESSION_ID)")
+                           help="the conversation the state is for (default: this one, from CLAUDE_CODE_SESSION_ID; "
+                                "with --agent codex, the Codex chat CODEX_THREAD_ID names, keyed codex-<id>)")
             p.add_argument("--file", metavar="PATH",
                            help="save: read the state from this file instead of stdin "
                                 "(a .state.json under LONGHAUL_HOME/checkpoints is removed once saved)")
