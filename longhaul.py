@@ -5140,14 +5140,15 @@ def index_program(name: str, top: str):
 def index_plan(data: dict, index: str) -> list:
     """The (program, top, found) a session's start may build, or []: for
     a `startup` SessionStart of the main conversation (no agent_id), with
-    the index on, the session attended and the cwd in a work tree
-    index_top() accepts, each program found, with the path it was found
-    at: the runner runs that path and looks nothing up again. Whether a
-    program's map is there already is the state's question (index_due),
-    not this one's. Nothing is started or written here, and the one
-    refusal logged is the unattended session's (review, Sprint 7, F9: the
-    live check and a user's "why not" read it there); the others say
-    nothing."""
+    the index on, the session attended (under Codex, not a `codex exec`
+    run: codex_exec_run()) and the cwd in a work tree index_top()
+    accepts, each program found, with the path it was found at: the
+    runner runs that path and looks nothing up again. Whether a program's
+    map is there already is the state's question (index_due), not this
+    one's. Nothing is started or written here, and the refusals logged
+    are the unattended session's and the exec run's (review, Sprint 7,
+    F9: the live check and a user's "why not" read it there); the others
+    say nothing."""
     if index != "on" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
         return []
     if data.get("agent_id") is not None:
@@ -5155,11 +5156,37 @@ def index_plan(data: dict, index: str) -> list:
     if os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
         log("index: skipped, unattended session")  # a `-p` run (a script's, a loop's) asked for no index
         return []
+    if codex_exec_run(data):
+        log("index: skipped, a codex exec run")  # Codex's unattended run, which sets no CLAUDE_CODE_SESSION_ATTENDED
+        return []
     top = index_top(data.get("cwd"))
     if top is None:
         return []
     found = {program: index_program(program, top) for program in INDEX_COMMANDS}
     return [(program, top, found[program]) for program in INDEX_COMMANDS if found[program]]
+
+
+def codex_exec_run(data: dict) -> bool:
+    """Whether a Codex SessionStart is a `codex exec` run's, Codex's
+    unattended one: the first record of its rollout (transcript_path),
+    session_meta, which Codex writes before the hook runs, says source
+    "exec", where the terminal's says "cli" and VS Code's "vscode"
+    (codex-rs rust-v0.165.0: protocol.rs SessionSource, exec/src/lib.rs).
+    Of the rollout that line alone is read (rollout_first()), and of it
+    the label alone. No rollout (`codex exec --ephemeral` writes none),
+    a path not absolute or not a file, or a first record that is not
+    session_meta, is no sign of one. Claude Code's input never is."""
+    path = data.get("transcript_path")
+    if data.get("longhaul_agent") != "codex" or not isinstance(path, str) or not os.path.isabs(path):
+        return False
+    try:
+        if not Path(path).is_file():  # a folder, or a pipe that would hold the hook
+            return False
+    except (OSError, ValueError):
+        return False
+    first = rollout_first(Path(path))
+    return (isinstance(first, dict) and first.get("type") == "session_meta"
+            and dict_at(first, "payload").get("source") == "exec")
 
 
 def index_key(top: str) -> str:

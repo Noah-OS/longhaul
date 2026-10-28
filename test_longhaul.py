@@ -6256,6 +6256,67 @@ class Index(unittest.TestCase):
         for program in self.MAPS:
             self.assertEqual(self.wait(program)["exit"], 0, program)
 
+    def test_a_codex_exec_run_never_starts_one(self):
+        # Codex sets no CLAUDE_CODE_SESSION_ATTENDED. Its unattended run,
+        # `codex exec`, says so in the first record of its rollout, which
+        # Codex writes before the SessionStart hook runs: session_meta's
+        # source is "exec", where the terminal's is "cli" and VS Code's
+        # "vscode" (codex-rs rust-v0.165.0, protocol.rs SessionSource,
+        # exec/src/lib.rs). A synthetic rollout: of its first line the label
+        # alone is read, and nothing after it.
+        thread, secret = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f", "SECRET-INSTRUCTIONS-7731"
+        both = self.planned("codegraph", "trail")
+
+        def rollout(source, first="session_meta"):
+            path = self.tmp / "rollout-2026-10-28T10-00-00-019f9d8e.jsonl"
+            meta = {"id": thread, "session_id": thread, "cwd": str(self.repo / "src"), "originator": "codex_exec",
+                    "cli_version": "0.165.0", "base_instructions": {"text": f"You are Codex. {secret}"}}
+            if source is not None:
+                meta["source"] = source
+            path.write_text(json.dumps({"type": first, "timestamp": "2026-10-28T10:00:00.000Z", "payload": meta})
+                            + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "user_message",
+                                                                                   "message": secret}}) + "\n")
+            return str(path)
+
+        def start(transcript, **more):
+            """A Codex SessionStart for a new chat, as Codex sends it."""
+            return {"session_id": thread, "transcript_path": transcript, "cwd": str(self.repo / "src"),
+                    "hook_event_name": "SessionStart", "model": "gpt-5.6-terra", "permission_mode": "default",
+                    "source": "startup", **more}
+
+        def codex(data):
+            return self.plan(longhaul.codex_hook_input(data))
+
+        self.assertEqual(codex(start(rollout("exec"))), [], "codex exec")
+        for source in ("cli", "vscode", "mcp", {"custom": "atlas"}, None):
+            self.assertEqual(codex(start(rollout(source))), both, source)
+        # No sign of an exec run is no refusal: no rollout (`codex exec
+        # --ephemeral` writes none, and its transcript_path is null), one not
+        # there, a relative path, a folder, a first record that is not session_meta.
+        for transcript in (None, str(self.tmp / "gone.jsonl"), "rollout.jsonl", str(self.tmp), 7):
+            self.assertEqual(codex(start(transcript)), both, transcript)
+        self.assertEqual(codex(start(rollout("exec", first="turn_context"))), both, "not session_meta")
+        # Claude Code's start is never read so: its transcript is no rollout.
+        self.assertEqual(self.plan({**self.start(), "transcript_path": rollout("exec")}), both, "Claude Code's")
+        # The refusal said in the log, as the unattended session's is, once; never a word of the rollout's.
+        log = (self.home / "longhaul.log").read_text()
+        self.assertEqual(log.count("index: skipped, a codex exec run\n"), 1, log)
+        self.assertNotIn(secret, log)
+        # Through Codex's hook, as hooks/codex_hook.py runs it: nothing started or written.
+        hook = [sys.executable, "-I", str(HERE / "hooks" / "codex_hook.py"), "guard"]
+        out = subprocess.run(hook, input=json.dumps(start(rollout("exec"))), env=self.env, cwd=str(self.repo / "src"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
+        self.assertEqual(self.calls("codegraph") + self.calls("trail"), [], "nothing ran")
+        self.assertFalse((self.home / "index").exists(), "nothing written")
+        # A terminal chat's start, through the same hook: both start.
+        out = subprocess.run(hook, input=json.dumps(start(rollout("cli"))), env=self.env, cwd=str(self.repo / "src"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.context(json.loads(out.stdout)), f"{self.note('codegraph')} {self.note('trail')}")
+        for program in self.MAPS:
+            self.assertEqual(self.wait(program)["exit"], 0, program)
+
     def test_a_mapped_project_is_left_alone_per_program(self):
         top, real = str(self.repo), os.path.realpath(self.repo)
         self.assertEqual(self.plan(self.start()), self.planned("codegraph", "trail"),
