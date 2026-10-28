@@ -10595,6 +10595,340 @@ class AdviseSkill(unittest.TestCase):
                                         cwd=HERE).returncode, 1)
 
 
+class CodexCheckpoint(unittest.TestCase):
+    """The checkpoint on Codex (the Codex plan's X5): `checkpoint save
+    --agent codex` keys the state to the Codex chat CODEX_THREAD_ID names,
+    as codex-<id>, and the SessionStart hook under Codex puts it back at a
+    compaction, a clear or a resume, as on Claude Code, with nothing said
+    that names a Claude Code command. The inputs are built from Codex's
+    hook schema (docs/discovery/2026-10-28-codex-hooks.md)."""
+
+    THREAD = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"  # a Codex thread id, as a rollout's name holds it
+    OTHER = "019f9d8f-0000-7000-8000-000000000002"
+    KEY = f"codex-{THREAD}"
+    S = Checkpoint.S
+    WRAPPER = HERE / "hooks" / "codex_hook.py"
+    # What a Codex chat must never be told: Claude Code's commands, and
+    # Claude Code itself. Case matters: a temporary folder may be claude-501.
+    CLAUDE_ONLY = ("/clear", "/longhaul", "/reload-plugins", "Claude", "CLAUDE_")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what getcwd() will say
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        patcher = mock.patch.object(longhaul, "LONGHAUL_HOME", self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.work = self.tmp / "work"  # where the model's shell runs the save
+        self.work.mkdir()
+        for name in ("a.py", "b.py", "c.py"):
+            (self.work / name).write_text(name)
+        # A terminal's environment, as Checkpoint's: the suite runs inside a
+        # Claude Code session, perhaps a Codex one, whose variables name it.
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("LONGHAUL_", "CLAUDE_CODE_", "CODEX_")) and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_INDEX="off", LONGHAUL_NO_NOTIFY="1",
+                        LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"))
+        no_guide(self, self.home)
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("LONGHAUL_CHECKPOINT_CARRY_HOURS", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+                     "CLAUDE_CODE_SESSION_ATTENDED"):
+            os.environ.pop(name, None)
+
+    def state(self, **over):
+        s = {"goal": f"finish the parser {self.S}", "next_action": f"run the tests {self.S}",
+             "decisions": [f"argparse stays {self.S}"], "done": [], "in_progress": [], "blocked": [],
+             "changed_files": ["a.py", "b.py", "c.py"], "verification": [f"python3 -m unittest {self.S}"]}
+        s.update(over)
+        return s
+
+    def save(self, state, *args, **env):
+        """`longhaul checkpoint save ARGS` as the shim runs it from the
+        model's shell in the work folder, the state on stdin unless --file
+        names it, with `env` added to a terminal's environment."""
+        raw = state if isinstance(state, str) else json.dumps(state)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "checkpoint", "save", *args],
+                              input=None if "--file" in args else raw, cwd=self.work, env={**self.env, **env},
+                              capture_output=True, text=True, timeout=30)
+
+    def file(self, key=KEY):
+        return self.home / "checkpoints" / f"{key}.json"
+
+    def saved_at(self, key=KEY):
+        return json.loads(self.file(key).read_text())["written_at"]
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def start(self, source="compact", thread=THREAD, cwd=None, **extra):
+        """A Codex SessionStart input: Codex's raw ids, as its hook sends them."""
+        data = {"session_id": thread, "transcript_path": str(self.tmp / "rollout.jsonl"),
+                "cwd": str(cwd or self.tmp / "elsewhere"), "hook_event_name": "SessionStart",
+                "model": "gpt-5.6-terra", "source": source}
+        data.update(extra)
+        return data
+
+    def check(self, data, now=None):
+        """checkpoint_check() on a Codex input made Longhaul's, as run_hook() hands it over."""
+        return longhaul.checkpoint_check(longhaul.codex_hook_input(data), now)
+
+    def context(self, answer):
+        return (answer or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def hook(self, data, **env):
+        """The hook as hooks/codex_hook.py runs it, in this process: main()
+        with --agent codex, the Codex input on stdin and `env` added to the
+        environment; (the exit code, what it printed)."""
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch("sys.stdin", io.StringIO(json.dumps(data))), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+            try:
+                code = longhaul.main(["checkpoint", "--agent", "codex"])
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def wrapper(self, *args, stdin="", **env):
+        return subprocess.run([sys.executable, "-I", str(self.WRAPPER), *args], input=stdin, capture_output=True,
+                              text=True, env={**self.env, **env}, cwd=self.tmp, timeout=60)
+
+    def assertNothingClaudeOnly(self, *texts):
+        for text in texts:
+            for word in self.CLAUDE_ONLY:
+                self.assertNotIn(word, text or "")
+
+    def test_a_save_under_codex_is_keyed_codex_and_the_id_codex_thread_id_names(self):
+        # Codex sets CODEX_THREAD_ID in every shell command its model runs,
+        # and in the main chat it is the hook's session_id: the save's
+        # session, as CLAUDE_CODE_SESSION_ID is on Claude Code. The skill
+        # writes the state where the save removes it from.
+        folder = self.home / "checkpoints"
+        folder.mkdir()
+        state_file = folder / f"{self.KEY}.state.json"
+        state_file.write_text(json.dumps(self.state()))
+        out = self.save("", "--agent", "codex", "--file", str(state_file), CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        size = self.file().stat().st_size
+        self.assertEqual(out.stdout, f"longhaul checkpoint: saved for {self.KEY} ({size:,} bytes); it comes back after "
+                                     "a compaction or a resume, and once after a clear in this folder within 6 h\n")
+        record = json.loads(self.file().read_text())
+        self.assertEqual((record["session_id"], record["cwd"], record["schema_version"]), (self.KEY, str(self.work), 1))
+        self.assertEqual(oct(self.file().stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), [f"{self.KEY}.carry.json", f"{self.KEY}.json"],
+                         "the state file went, the checkpoint and its record stay")
+        self.assertIn(f"checkpoint for {self.KEY} saved (", self.log())
+        # On stdin too; the chat's own id spelled out, as the save names it
+        # or as Codex does; Codex's id over a Claude Code one in the same shell.
+        for args in ((), (self.KEY,), (self.THREAD,)):
+            out = self.save(self.state(), *args, "--agent", "codex", CODEX_THREAD_ID=self.THREAD,
+                            CLAUDE_CODE_SESSION_ID="s1")
+            self.assertEqual(out.returncode, 0, (args, out.stderr))
+            self.assertIn(f"saved for {self.KEY} (", out.stdout)
+        self.assertFalse(self.file("s1").exists(), "never the Claude Code session's")
+        self.assertFalse(self.file(self.THREAD).exists(), "never the raw id, which a Claude Code session's could be")
+        out = self.save(self.state(), self.OTHER, "--agent", "codex", CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(out.stderr, f"longhaul checkpoint: not saved: the session id is not this session's: "
+                                     f"codex-{self.OTHER} was given and this session is {self.KEY}\n")
+        self.assertFalse(self.file(f"codex-{self.OTHER}").exists(), "no chat plants a state for another")
+        # A terminal names no chat: the id given is taken, keyed as Codex's.
+        out = self.save(self.state(), self.OTHER, "--agent", "codex")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(self.file(f"codex-{self.OTHER}").read_text())["session_id"], f"codex-{self.OTHER}")
+        self.assertNothingClaudeOnly(out.stdout)
+        self.assertNotIn(self.S, self.log())
+
+    def test_a_save_under_codex_with_no_codex_chat_s_id_or_a_bad_one_is_refused(self):
+        folder = self.home / "checkpoints"
+        folder.mkdir()
+        # Claude Code's id is never taken for a Codex chat's.
+        for env in ({}, {"CODEX_THREAD_ID": ""}, {"CLAUDE_CODE_SESSION_ID": "s1"}):
+            out = self.save(self.state(), "--agent", "codex", **env)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), env)
+            self.assertEqual(out.stderr, "longhaul checkpoint: not saved: save needs the Codex chat's id: pass it, or "
+                                         "run from inside a Codex chat (CODEX_THREAD_ID)\n", env)
+        # One that could not name a file is refused whatever id is given,
+        # and the line does not repeat it.
+        for bad in ("../x", "a/b", "a b", "x" * 95, "codex-../x"):
+            for args in ((), (self.THREAD,)):
+                out = self.save(self.state(), *args, "--agent", "codex", CODEX_THREAD_ID=bad)
+                self.assertEqual((out.returncode, out.stdout), (2, ""), (bad, args))
+                self.assertEqual(out.stderr, "longhaul checkpoint: not saved: CODEX_THREAD_ID is not a Codex chat's "
+                                             "id: letters, digits, - or _ (at most 94)\n", (bad, args))
+        self.assertEqual(list(folder.iterdir()), [], "nothing was written")
+        # A refusal takes the skill's state file with it, as on Claude Code.
+        state_file = folder / f"{self.KEY}.state.json"
+        state_file.write_text(json.dumps(self.state()))
+        out = self.save("", "--agent", "codex", "--file", str(state_file))
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(out.stderr.count("\n"), 1, out.stderr)
+        self.assertTrue(out.stderr.endswith("; the state file was removed, write it again\n"), out.stderr)
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertNothingClaudeOnly(out.stderr)
+
+    def test_without_agent_codex_the_save_is_claude_code_s_as_before(self):
+        # Claude Code started from a Codex chat's shell has both variables:
+        # without --agent the session is Claude Code's, as it always was.
+        out = self.save(self.state(), CLAUDE_CODE_SESSION_ID="s1", CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, f"longhaul checkpoint: saved for s1 ({self.file('s1').stat().st_size:,} bytes); "
+                                     "it comes back after a compaction or a resume, and once after a /clear in this "
+                                     "folder within 6 h\n")
+        self.assertEqual(self.save(self.state(), "--agent", "claude", CLAUDE_CODE_SESSION_ID="s1").returncode, 0)
+        self.assertEqual(self.save(self.state(), "s3").returncode, 0, "a terminal: the id given, as it is")
+        out = self.save(self.state(), CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(out.stderr, "longhaul checkpoint: not saved: save needs the session id: pass it, or run from "
+                                     "inside a Claude Code session (CLAUDE_CODE_SESSION_ID)\n")
+        self.assertEqual(sorted(p.name for p in (self.home / "checkpoints").iterdir()),
+                         ["s1.carry.json", "s1.json", "s3.carry.json", "s3.json"])
+
+    def test_the_hook_under_codex_puts_the_checkpoint_back_at_a_compaction_a_clear_or_a_resume(self):
+        self.assertEqual(self.save(self.state(), "--agent", "codex", CODEX_THREAD_ID=self.THREAD).returncode, 0)
+        at = self.saved_at()
+        (self.work / "b.py").write_text("b, again")
+        os.utime(self.work / "b.py", (at + 5, at + 5))
+        (self.work / "c.py").unlink()
+        for source in ("compact", "clear", "resume"):
+            # Whether Codex's hook processes get CODEX_THREAD_ID is not known
+            # yet: with it or without it, the chat's own checkpoint comes back.
+            for env in ({}, {"CODEX_THREAD_ID": self.THREAD}):
+                code, printed = self.hook(self.start(source), **env)
+                self.assertEqual(code, 0, (source, env))
+                answer = json.loads(printed)
+                self.assertEqual(longhaul.codex_hook_output(answer, "SessionStart"), answer, "all of it Codex takes")
+                self.assertEqual(set(answer), {"hookSpecificOutput"}, source)
+                self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
+                text = self.context(answer)
+                self.assertTrue(text.startswith("longhaul checkpoint, written "), text)
+                self.assertIn(f"\ngoal: finish the parser {self.S}\n", text)
+                self.assertTrue(text.endswith("\nChanged since the checkpoint: b.py (changed), c.py (gone); "
+                                              "check them before trusting this."), text)
+                self.assertNothingClaudeOnly(text)
+        # A new chat's start (startup, and fork, a new thread from an old
+        # one) is Claude Code's startup: nothing. A sub-agent has no checkpoint.
+        for data in (self.start("startup"), self.start("fork"), self.start("compact", agent_id=self.OTHER,
+                                                                             agent_type="explorer")):
+            self.assertEqual(self.hook(data), (0, ""), data["source"])
+        # Through hooks/codex_hook.py, as Codex's hooks file runs it.
+        r = self.wrapper("checkpoint", stdin=json.dumps(self.start("compact")))
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertIn(self.S, self.context(json.loads(r.stdout)))
+        self.assertIn(f"checkpoint for {self.KEY} put back after compact (", self.log())
+        self.assertNotIn(self.S, self.log())
+
+    def test_the_hook_run_from_inside_another_codex_chat_gives_its_checkpoint_to_nobody(self):
+        self.assertEqual(self.save(self.state(), "--agent", "codex", CODEX_THREAD_ID=self.THREAD).returncode, 0)
+        self.assertEqual(self.hook(self.start("compact"), CODEX_THREAD_ID=self.OTHER), (2, ""))
+        self.assertIn(f"checkpoint for {self.KEY} not put back: run by hand from inside session codex-{self.OTHER}",
+                      self.log())
+        r = self.wrapper("checkpoint", stdin=json.dumps(self.start("compact")), CODEX_THREAD_ID=self.OTHER)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), "Codex blocks on an exit 2: the wrapper's is 0")
+
+    def test_a_claude_code_session_s_checkpoint_never_comes_back_into_a_codex_chat_and_the_other_way(self):
+        # The same raw id, and the same folder: each chat gets its own
+        # agent's checkpoints alone, put back or carried after a clear.
+        out = self.save(self.state(goal=f"Claude Code's {self.S}"), CLAUDE_CODE_SESSION_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(self.file(self.THREAD).is_file())
+        for source in ("compact", "clear", "resume"):
+            self.assertEqual(self.hook(self.start(source, cwd=self.work)), (0, ""), source)
+        self.assertEqual(self.hook(self.start("clear", thread=self.OTHER, cwd=self.work)), (0, ""))
+        self.assertTrue((self.home / "checkpoints" / f"{self.THREAD}.carry.json").exists(), "nothing was carried")
+        out = self.save(self.state(goal=f"Codex's {self.S}"), "--agent", "codex", CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        claude = {"session_id": "s9", "hook_event_name": "SessionStart", "source": "clear", "cwd": str(self.work),
+                  "transcript_path": "/t/s9.jsonl"}
+        self.assertIn("goal: Claude Code's", self.context(longhaul.checkpoint_check(claude)),
+                      "a Claude Code clear carries Claude Code's, the Codex chat's newer one left")
+        self.assertIsNone(longhaul.checkpoint_check({**claude, "session_id": "s10"}), "and never the Codex one")
+        self.assertTrue((self.home / "checkpoints" / f"{self.KEY}.carry.json").exists())
+        code, printed = self.hook(self.start("clear", thread=self.OTHER, cwd=self.work))
+        self.assertEqual(code, 0)
+        self.assertIn("goal: Codex's", self.context(json.loads(printed)))
+
+    def test_after_a_clear_under_codex_the_chat_before_s_checkpoint_comes_back_once_in_codex_s_words(self):
+        self.assertEqual(self.save(self.state(), "--agent", "codex", CODEX_THREAD_ID=self.THREAD).returncode, 0)
+        at = self.saved_at()
+        answer = self.check(self.start("clear", thread=self.OTHER, cwd=self.work), now=at + 125)
+        self.assertEqual(set(answer), {"systemMessage", "hookSpecificOutput"})
+        self.assertEqual(answer["systemMessage"], "Longhaul restored your checkpoint from before the clear (2 min old).")
+        first, rest = self.context(answer).split("\n", 1)
+        self.assertEqual(first, "Carried over from the chat before the clear (saved 2 min ago, in this folder). "
+                                "If the user has started something new, ignore it.")
+        self.assertEqual(rest, self.context(self.check(self.start("compact"), now=at + 125)))
+        self.assertNothingClaudeOnly(answer["systemMessage"], self.context(answer))
+        self.assertEqual(longhaul.codex_hook_output(answer, "SessionStart"), answer)
+        record = json.loads((self.home / "checkpoints" / f"{self.KEY}.carried.json").read_text())
+        self.assertEqual(record["carried_into"], f"codex-{self.OTHER}")
+        self.assertIsNone(self.check(self.start("clear", thread="019f9d8f-0000-7000-8000-000000000003",
+                                                cwd=self.work), now=at + 130), "once")
+        self.assertIn(f"checkpoint for {self.KEY} carried into codex-{self.OTHER} after clear (", self.log())
+
+    def test_under_codex_no_release_line_and_no_claude_code_command_is_said(self):
+        # The reload line is about Claude Code's plugin reload: a Codex
+        # chat is never told it, and its hook never asks for it.
+        line = "Longhaul 0.2.5 is installed; this chat runs 0.2.4. Type /reload-plugins to use it."
+        asked = []
+        with mock.patch.object(longhaul, "release_reload", lambda data: asked.append(data) or line):
+            claude = {"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact", "cwd": str(self.tmp),
+                      "transcript_path": "/t/s1.jsonl"}
+            self.assertEqual(longhaul.checkpoint_answer(claude)["systemMessage"], line, "Claude Code's chat is told")
+            for source in longhaul.CHECKPOINT_SOURCES:
+                self.assertIsNone(longhaul.checkpoint_answer(longhaul.codex_hook_input(self.start(source))), source)
+            self.assertEqual(self.save(self.state(), "--agent", "codex", CODEX_THREAD_ID=self.THREAD).returncode, 0)
+            code, printed = self.hook(self.start("resume"))
+            self.assertEqual(code, 0)
+            self.assertNotIn("systemMessage", json.loads(printed))
+        self.assertEqual(len(asked), 1, "only Claude Code's chat asked")
+        # An old checkpoint is said to the user in Codex's words: how the
+        # plugin's skills are named under Codex is P3's question, so the
+        # skill is named by what it is.
+        old = self.check(self.start("resume"), now=self.saved_at() + 27 * 3600)
+        self.assertEqual(old["systemMessage"], "Longhaul put back a checkpoint from 1 day ago: it may be out of date. "
+                                               "If it is, ask Codex to save a fresh one with Longhaul's checkpoint skill.")
+        self.assertNothingClaudeOnly(old["systemMessage"], self.context(old))
+
+    def test_the_largest_put_back_under_codex_is_within_codex_s_default_context_limit(self):
+        # Codex spills an additionalContext over the handler's
+        # additionalContextLimit (2,500 tokens unless the hooks file says)
+        # to a file and gives the model a preview. The largest checkpoint
+        # the save takes, with a clear's line before it, measured at four
+        # characters a token, stays under it (X4: no limit to raise for the
+        # checkpoint alone).
+        names = [f"f{i:02}.py" for i in range(20)]
+        for name in names:
+            (self.work / name).write_text(name)
+        lists = [k for k in longhaul.CHECKPOINT_ORDER if k not in longhaul.CHECKPOINT_TEXTS + ("changed_files",)]
+
+        def state(n):
+            return self.state(goal="g" * 1000, next_action="n" * 1000, changed_files=names,
+                              **{key: [f"{key} " + "x" * n] * 20 for key in lists})
+
+        def size(n):  # what the save measures
+            record = {"schema_version": 2, "session_id": self.KEY, "written_at": time.time(), "cwd": str(self.work),
+                      **state(n)}
+            return len(json.dumps(record, indent=2)) + 1
+
+        n = next(n for n in range(1, 1000) if size(n + 1) > longhaul.CHECKPOINT_BYTES_MAX)
+        out = self.save(state(n), "--agent", "codex", CODEX_THREAD_ID=self.THREAD)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        at = self.saved_at()
+        for name in names:
+            os.utime(self.work / name, (at + 5, at + 5))
+        compact = self.context(self.check(self.start("compact"), now=at + 10))
+        clear = self.context(self.check(self.start("clear", thread=self.OTHER, cwd=self.work), now=at + 10))
+        self.assertTrue(clear.endswith(compact))
+        for text in (compact, clear):
+            self.assertGreater(len(text), longhaul.CHECKPOINT_PUTBACK_MAX - 1_000, "the measure is of a full one")
+            self.assertLessEqual(len(text), longhaul.CHECKPOINT_PUTBACK_MAX + 200, len(text))
+            self.assertLess(len(text) / 4, 2_500, len(text))
+
+
 class CheckpointSkill(unittest.TestCase):
     """/longhaul:checkpoint (Sprint 4, C1): a plugin skill the model or the
     user invokes to save the conversation's state through the shim."""
