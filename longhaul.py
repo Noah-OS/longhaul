@@ -5624,6 +5624,12 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "what does Y depend on, where is Z defined), `codegraph explore \"<question>\"` or the "
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
+# Under Codex the index is named by its command line alone (the owner,
+# 2026-10-28, X7): CodeGraph's MCP tool is Codex's only if its own config
+# adds the server, and the program on PATH is there to run.
+GUARD_CODEGRAPH_CLI = ("This project has a CodeGraph index (.codegraph/). For a symbol, its callers or how code connects, "
+                       "run `codegraph explore \"<question>\"` in the shell: it answers in one call with the source and "
+                       "the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
 GUARD_WHOLE = ("cat", "nl")  # under Codex, the readers that print a whole file: no option of nl's prints a part
 # What a Codex user is shown of each read the rules flag, by rule and by mode (warn, block): display.ts's
@@ -5713,9 +5719,14 @@ def guard_startup(data: dict, mode: str, index: str):
     Under Codex the index's part alone: the first-chat line points to
     /longhaul:doctor, a Claude Code skill; the release's line is about
     Claude Code's plugin update; and the guard's note names CodeGraph's
-    MCP tool, which Codex has only if its own config adds the server."""
+    MCP tool, which Codex has only if its own config adds the server, so
+    Codex's model is told of the index by its command line instead
+    (GUARD_CODEGRAPH_CLI), when `codegraph` is on PATH by its absolute
+    entries and not the project's own (index_program())."""
     codex = data.get("longhaul_agent") == "codex"
-    named = not codex and mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    if named and codex:  # a program to run: the folder that holds the index is the project's top here
+        named = index_program("codegraph", os.path.dirname(map_at(data["cwd"], ".codegraph"))) is not None
     started, message, first = [], "", None
     try:  # the first chat after an install or an update: one line pointing to /longhaul:doctor (setup_line)
         first = None if codex else setup_line(data)
@@ -5735,7 +5746,7 @@ def guard_startup(data: dict, mode: str, index: str):
     notes = []
     if named:
         log(f"guard: named the CodeGraph index at {home_path(data['cwd'])} at startup")
-        notes.append(GUARD_CODEGRAPH)
+        notes.append(GUARD_CODEGRAPH_CLI if codex else GUARD_CODEGRAPH)
     notes.extend(index_note(program, top) for program, top in started)
     answer = {"systemMessage": message} if message else {}
     if notes:

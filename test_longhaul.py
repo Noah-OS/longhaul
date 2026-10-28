@@ -5279,11 +5279,14 @@ class CodexGuard(unittest.TestCase):
     def test_a_codex_startup_gives_the_index_part_alone(self):
         # The first-chat line points to /longhaul:doctor, a Claude Code skill;
         # the release's line is about Claude Code's plugin update; and the
-        # CodeGraph note names an MCP tool Codex may not have.
+        # CodeGraph note names an MCP tool Codex may not have. With no
+        # `codegraph` on PATH, no note of the index's command line either
+        # (the test below).
         (self.tmp / ".codegraph").mkdir()
         setup = mock.patch.object(longhaul, "setup_line", return_value="the first-chat line")
         release = mock.patch.object(longhaul, "release_startup", return_value="the release's line")
-        with setup as first, release as newer:
+        bare = mock.patch.dict(os.environ, {"PATH": str(self.tmp / "no-bin")})
+        with setup as first, release as newer, bare:
             claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn", index="off")
             self.assertEqual(claude["systemMessage"], "the first-chat line\nthe release's line",
                              "Claude Code's, as it was")
@@ -5301,6 +5304,69 @@ class CodexGuard(unittest.TestCase):
             self.assertEqual(answer["systemMessage"], longhaul.index_message([("codegraph", top)], []))
             self.assertEqual(self.context(answer), longhaul.index_note("codegraph", top))
             self.assertNotIn("CodeGraph index (.codegraph/)", json.dumps(answer))
+
+    def test_a_codex_main_chat_is_told_of_codegraph_by_its_command_line(self):
+        # The owner, 2026-10-28 (X7): Codex's model is told of a CodeGraph
+        # index by its command line, `codegraph explore`, when the program is
+        # on PATH, by PATH's absolute entries alone (index_program()); the
+        # MCP tool is not named. Only at the main chat's start, with the
+        # guard on and the project indexed.
+        (self.tmp / ".codegraph").mkdir()
+        tools = Path(tempfile.mkdtemp())
+        program = tools / "codegraph"
+        program.write_text("#!/bin/sh\nexit 0\n")
+        program.chmod(0o755)
+        on_path = mock.patch.dict(os.environ, {"PATH": f"{self.tmp / 'no-bin'}{os.pathsep}{tools}"})
+        cli = longhaul.GUARD_CODEGRAPH_CLI
+        self.assertIn('`codegraph explore "<question>"`', cli)
+        self.assertIn("grep and rg for plain text", cli)
+        self.assertNotIn("mcp__", cli)
+        self.assertNotIn("\n", cli)
+        with on_path:
+            for mode in ("warn", "block"):
+                answer = self.check(self.start(), mode)
+                self.assertEqual(answer, {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                                 "additionalContext": cli}}, mode)
+            self.assertIn(f"guard: named the CodeGraph index at {longhaul.home_path(str(self.tmp))} at startup",
+                          (self.home / "longhaul.log").read_text())
+            # Through Codex's hook, as hooks/codex_hook.py runs it: the note is what Codex takes back.
+            self.assertEqual(self.hook(self.start()), (0, {"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": cli}}))
+            # Beside the auto-init's note, it goes first, as Claude Code's does.
+            top = str(self.tmp)
+            with mock.patch.object(longhaul, "index_start", return_value=([("trail", top)], [])):
+                self.assertEqual(self.context(self.check(self.start(), index="on")),
+                                 f"{cli} {longhaul.index_note('trail', top)}")
+            # A sub-agent's start, the guard off, another start than startup: no note.
+            self.assertIsNone(self.check(self.start(agent=self.AGENT)), "a sub-agent's")
+            self.assertIsNone(self.check(self.start(), "off"), "the guard off")
+            for source in ("resume", "clear", "compact", "fork"):
+                self.assertIsNone(self.check(self.start(source=source)), source)
+            # Claude Code's start is unchanged: its own note, the MCP tool's.
+            claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn")
+            self.assertEqual(self.context(claude), longhaul.GUARD_CODEGRAPH)
+        # No index here: no note.
+        os.rmdir(self.tmp / ".codegraph")
+        with on_path:
+            self.assertIsNone(self.check(self.start()), "no index")
+        (self.tmp / ".codegraph").mkdir()
+        # No program: none on PATH, one by a relative entry alone, one the project holds, one that cannot run.
+        inside = self.tmp / "bin"
+        inside.mkdir()
+        shutil.copy(program, inside / "codegraph")
+        here = os.getcwd()
+        os.chdir(tools)
+        self.addCleanup(os.chdir, here)
+        for path in (str(self.tmp / "no-bin"), ".", str(inside)):
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                self.assertIsNone(self.check(self.start()), path)
+        program.chmod(0o644)
+        with on_path:
+            self.assertIsNone(self.check(self.start()), "not runnable")
+        # Claude Code's start names its index with no program on PATH, as it always did.
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "no-bin")}):
+            claude = longhaul.guard_check({k: v for k, v in self.start().items() if k != "model"}, "warn")
+            self.assertEqual(self.context(claude), longhaul.GUARD_CODEGRAPH)
 
     def test_no_wait_advice_and_no_search_nudge_under_codex(self):
         # The wait weighs a sub-agent's sleep against Claude's five-minute
