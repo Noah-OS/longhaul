@@ -12379,6 +12379,378 @@ class Reminder(unittest.TestCase):
         self.assertTrue("`LONGHAUL_SUBAGENT_AT`" in readme, "the README")
 
 
+class CodexReminder(unittest.TestCase):
+    """The context reminder on OpenAI Codex (the Codex plan's X6, Phase 2):
+    under `--agent codex` the context's size is the last token_count's
+    info.last_token_usage.total_tokens in the rollout at transcript_path,
+    read from its tail, and unknown from a `compacted` record on until the
+    next count (docs discovery/2026-10-28-codex-hooks.md). At each 200k the
+    user hears it in the systemMessage, the one place Codex shows a hook's
+    words (it has no display.ts), and the model in its additionalContext,
+    in Codex's words: $checkpoint and /compact. Each multiple is said once
+    and forgotten at each compaction, as on Claude Code. A sub-agent's own
+    rollout is its transcript_path. The messages, the instructions, the
+    compaction's summary and the prompt hold SECRET, which nothing
+    Longhaul writes may hold."""
+
+    SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+    AGENT = "019f9d8f-0000-7000-8000-000000000001"
+    SECRET = "SENTINEL-CODEX-" + "Q" * 40
+    WRAPPER = HERE / "hooks" / "codex_hook.py"
+    USER = ("Longhaul: this chat's context is about {}k tokens, and every request carries all of it again. To shrink "
+            "it without losing the thread: $checkpoint, then /compact. The checkpoint comes back.")
+    MODEL = ("Longhaul: the context is about {0}k tokens. At your next natural stopping point (not in the middle of an "
+             "edit or a test run), and in any case before you end your turn, save a checkpoint with the $checkpoint "
+             "skill, then tell the user in one line: \"Saved a checkpoint (the context is about {0}k tokens). Type "
+             "/compact to shrink it; the checkpoint comes back.\" Then continue the work. After a compaction it comes "
+             "back.")
+    SUB = ("Longhaul: your context as a sub-agent is about {}k tokens, and every request you make re-reads all of it. "
+           "Finish the step you are on, then stop and report back: what you have done, what is left, and anything the "
+           "next agent needs to know, so the main chat can hand the rest to a fresh sub-agent.")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.addCleanup(setattr, longhaul, "LONGHAUL_HOME", saved)
+        seen_this_version(self.home)
+        no_guide(self, self.home)
+        day = self.tmp / "codex" / "sessions" / "2026" / "10" / "28"
+        day.mkdir(parents=True)
+        self.rollout = day / f"rollout-2026-10-28T10-00-00-{self.SID}.jsonl"
+        self.sub = day / f"rollout-2026-10-28T10-05-00-{self.AGENT}.jsonl"
+        self.second, self.running, self.last = 0, {}, {}  # per rollout: the counts' total, the last count
+        self.grow(self.meta(self.SID), self.turn(), self.said())
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("LONGHAUL_", "CODEX_")) and k not in Checkpoint.SESSION_VARS}
+        self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        LONGHAUL_INDEX="off", CODEX_HOME=str(self.tmp / "codex"))
+
+    # ------------------------------------------------ records, as Codex writes them
+
+    def rec(self, kind, payload):
+        self.second += 1
+        when = dt.datetime(2026, 10, 28, 10, 0, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=self.second)
+        return {"timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "type": kind, "payload": payload}
+
+    def meta(self, thread, parent=None):
+        source = {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1, "agent_role": "explorer"}}} \
+            if parent else "cli"
+        return self.rec("session_meta", {"id": thread, "cli_version": "0.165.0", "source": source, "cwd": str(self.tmp),
+                                         "originator": "codex_cli_rs", "model_provider": "openai",
+                                         "base_instructions": {"text": f"You are Codex. {self.SECRET}"}})
+
+    def turn(self):
+        return self.rec("turn_context", {"turn_id": "t1", "model": "gpt-5.6-terra", "cwd": str(self.tmp)})
+
+    def said(self, text=None):
+        """A message of the chat's, its text SECRET unless given."""
+        return self.rec("response_item", {"type": "message", "role": "assistant",
+                                          "content": [{"type": "output_text", "text": text or self.SECRET}]})
+
+    def count(self, size, path=None):
+        """The token_count event Codex writes after a response whose request
+        carried `size` tokens of context: its last_token_usage (total_tokens,
+        Codex's tokens in the context window) and the total so far, grown by
+        exactly it (P1), with the allowance beside them."""
+        last = {"input_tokens": size - 500, "cached_input_tokens": size - 4_000, "output_tokens": 500,
+                "reasoning_output_tokens": 120, "total_tokens": size}
+        total = self.running.setdefault(path or self.rollout, dict.fromkeys(last, 0))
+        for k, v in last.items():
+            total[k] += v
+        payload = {"type": "token_count", "info": {
+            "last_token_usage": last, "total_token_usage": dict(total), "model_context_window": 258_400},
+            "rate_limits": {"primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": 1793116800},
+                            "limit_name": self.SECRET}}
+        self.last[path or self.rollout] = payload
+        return self.rec("event_msg", payload)
+
+    def again(self, path=None):
+        """A token_count that repeats the last count, as Codex writes one to
+        refresh the allowance: no new count."""
+        return self.rec("event_msg", self.last[path or self.rollout])
+
+    def compacted(self):
+        return self.rec("compacted", {"message": self.SECRET, "replacement_history": [self.said()["payload"]]})
+
+    def grow(self, *records, path=None):
+        """The rollout's next lines: a number is a count with that much context."""
+        with (path or self.rollout).open("a") as f:
+            for record in records:
+                f.write((record if isinstance(record, str) else
+                         json.dumps(self.count(record, path) if isinstance(record, int) else record)) + "\n")
+
+    def size(self, path=None):
+        return longhaul.reminder_rollout_size(str(path or self.rollout))
+
+    # ------------------------------------------------ the hooks, as Codex runs them
+
+    def ask(self, **fields):
+        """A UserPromptSubmit input as Codex sends it, the prompt's text holding SECRET."""
+        return {"session_id": self.SID, "turn_id": "t1", "transcript_path": str(self.rollout), "cwd": str(self.tmp),
+                "hook_event_name": "UserPromptSubmit", "model": "gpt-5.6-terra", "permission_mode": "default",
+                "prompt": f"Carry on with the parser ({self.SECRET})", **fields}
+
+    def tool(self, agent=False, **fields):
+        """A PreToolUse input on Bash as Codex sends it; a sub-agent's names its own thread and its own rollout."""
+        data = {"session_id": self.SID, "turn_id": "t1", "transcript_path": str(self.rollout), "cwd": str(self.tmp),
+                "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra", "permission_mode": "default",
+                "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "call_1"}
+        if agent:
+            data.update(agent_id=self.AGENT, agent_type="explorer", transcript_path=str(self.sub))
+        return {**data, **fields}
+
+    def start(self, source="compact"):
+        return {"session_id": self.SID, "transcript_path": str(self.rollout), "cwd": str(self.tmp),
+                "hook_event_name": "SessionStart", "model": "gpt-5.6-terra", "source": source}
+
+    def hook(self, cmd, data, agent="codex", **env):
+        """`longhaul <cmd> --agent codex`'s answer for `data`, in this process, parsed (None for nothing)."""
+        values = {k: v for k, v in {**self.env, **env}.items() if v is not None}
+        with mock.patch.dict(os.environ, values, clear=True), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = longhaul.main([cmd, "--agent", agent])
+        self.assertEqual(code, 0)
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def remind(self, data=None, **env):
+        return self.hook("reminder", self.ask() if data is None else data, **env)
+
+    def guard(self, data=None, **env):
+        return self.hook("guard", self.tool() if data is None else data, **env)
+
+    def wrapper(self, cmd, data):
+        """The hook as Codex's hooks file runs it: hooks/codex_hook.py in a process of its own."""
+        return subprocess.run([sys.executable, "-I", str(self.WRAPPER), cmd], input=json.dumps(data),
+                              capture_output=True, text=True, env=self.env, cwd=self.tmp, timeout=60)
+
+    def reminded(self, k, event="UserPromptSubmit"):
+        return {"systemMessage": self.USER.format(k),
+                "hookSpecificOutput": {"hookEventName": event, "additionalContext": self.MODEL.format(k)}}
+
+    def record(self, name=None):
+        path = self.home / "guard" / f"{name or 'codex-' + self.SID}.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def checks(self):
+        return [entry.split(" ", 2)[2] for entry in self.log().splitlines() if " reminder check: " in entry]
+
+    # ------------------------------------------------ the size
+
+    def test_the_size_is_the_last_count_s_tokens_in_the_context_window(self):
+        self.assertIsNone(self.size(), "no count yet")
+        self.grow(150_000, self.said())
+        self.assertEqual(self.size(), 150_000)
+        self.grow(205_400)
+        self.assertEqual(self.size(), 205_400, "the last count")
+        # Nothing else moves it: a count with no usage written or none at all,
+        # the same count again, a record of a type not known, a line not JSON.
+        self.grow(self.rec("event_msg", {"type": "token_count", "info": None, "rate_limits": {}}),
+                  self.rec("event_msg", {"type": "token_count", "info": {"last_token_usage": {"total_tokens": 0}}}),
+                  self.again(), self.rec("future_record", {"text": self.SECRET}), f"not json {self.SECRET}",
+                  self.rec("event_msg", {"type": "task_complete", "last_agent_message": self.SECRET}))
+        self.assertEqual(self.size(), 205_400)
+        # A message that names a record type is no such record.
+        self.grow(self.said("compacted"), self.said("token_count"))
+        self.assertEqual(self.size(), 205_400)
+
+    def test_after_a_compaction_the_size_is_unknown_until_the_next_count(self):
+        self.grow(412_000, self.compacted())
+        self.assertIsNone(self.size(), "412k is the context before the compaction")
+        # The allowance refreshed in a count that repeats the one before the
+        # compaction brings no size back; an item of the compaction is none.
+        self.grow(self.again(),
+                  self.rec("event_msg", {"type": "item_completed", "item": {"type": "ContextCompaction"}}))
+        self.assertIsNone(self.size())
+        self.grow(61_000)
+        self.assertEqual(self.size(), 61_000, "the next count")
+        self.grow(205_000, self.said())
+        self.assertEqual(self.size(), 205_000)
+
+    def test_a_compressed_missing_or_unnamed_rollout_has_no_size(self):
+        self.grow(205_000)
+        packed = self.rollout.with_name(self.rollout.name + ".zst")
+        packed.write_bytes(self.rollout.read_bytes())  # counts in it, as plain text: never read
+        folder = self.tmp / "a-folder.jsonl"
+        folder.mkdir()
+        for path in (str(packed), None, "", 7, ["x"], self.rollout.name, str(self.tmp / "gone.jsonl"), str(folder),
+                     str(self.rollout) + "\0"):
+            self.assertIsNone(longhaul.reminder_rollout_size(path), path)
+        # Through the hook: nothing said, and the check line says why.
+        self.assertIsNone(self.remind(self.ask(transcript_path=str(packed))))
+        self.assertIsNone(self.remind(self.ask(transcript_path=None)))
+        self.assertIsNone(self.guard(self.tool(transcript_path=str(packed))))
+        self.assertIsNone(self.record(), "nothing said, nothing recorded")
+        self.assertEqual(self.checks(), [f"reminder check: codex-{self.SID} context=- threshold=200000 told=- "
+                                         "no-reading"] * 2)
+        self.assertEqual(self.remind(), self.reminded(205), "the plain rollout")
+
+    def test_only_the_tail_of_a_big_rollout_is_read(self):
+        # A rollout far past the tail the hook reads: the count before it is
+        # never read, and a cut first line is no line.
+        self.grow(905_000, self.rec("response_item", {"type": "function_call_output", "call_id": "c1",
+                                                      "output": "x" * (2 * longhaul.ADVISOR_TAIL)}))
+        self.assertGreater(self.rollout.stat().st_size, 2 * longhaul.ADVISOR_TAIL)
+        self.assertIsNone(self.size(), "no count in the tail")
+        self.assertIsNone(self.remind())
+        self.grow(210_000)
+        self.assertEqual(self.size(), 210_000)
+        self.assertEqual(self.remind(), self.reminded(210))
+
+    # ------------------------------------------------ the reminder
+
+    def test_each_200k_is_said_once_in_codex_s_words(self):
+        self.grow(150_000)
+        self.assertIsNone(self.remind(), "under the threshold")
+        self.assertIsNone(self.record())
+        self.grow(205_400)
+        self.assertEqual(self.remind(), self.reminded(205), "the user's line where Codex shows it, the model's beside")
+        self.assertEqual(self.record(), {"reminder": {"at": 200_000}}, "the chat's own record, keyed codex-")
+        self.assertFalse((self.home / "guard" / f"{self.SID}.json").exists(), "never a Claude Code session's")
+        self.assertIsNone(self.remind(), "once")
+        self.grow(401_000)
+        self.assertEqual(self.remind(), self.reminded(401), "the next multiple")
+        self.assertIsNone(self.remind(LONGHAUL_CHECKPOINT_AT="off"), "off turns it off")
+        # Codex has neither /longhaul:checkpoint nor /clear's carried checkpoint.
+        for text in (self.USER, self.MODEL, self.SUB):
+            self.assertNotIn("/longhaul:", text)
+            self.assertNotIn("/clear", text)
+        self.assertEqual(longhaul.CODEX_CHECKPOINT_SKILL, "$checkpoint")
+        self.assertIn(longhaul.CODEX_CHECKPOINT_SKILL, self.USER)
+        self.assertIn(longhaul.CODEX_CHECKPOINT_SKILL, self.MODEL)
+        # Ids and numbers alone: no message, no prompt.
+        self.assertIn(f"reminder: codex-{self.SID} reminded at 200,000 tokens (the context is 205,400)", self.log())
+        self.assertEqual(self.checks()[:3], [
+            f"reminder check: codex-{self.SID} context=150000 threshold=200000 told=0 below-threshold",
+            f"reminder check: codex-{self.SID} context=205400 threshold=200000 told=0 fired",
+            f"reminder check: codex-{self.SID} context=205400 threshold=200000 told=200000 already-reminded"])
+        self.assertNotIn(self.SECRET, self.log())
+        self.assertNotIn(self.SECRET, json.dumps(self.record()))
+
+    def test_the_hook_as_codex_runs_it_says_it_and_exits_0(self):
+        self.grow(605_000)
+        r = self.wrapper("reminder", self.ask())
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(json.loads(r.stdout), self.reminded(605))
+        r = self.wrapper("reminder", self.ask())
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), "once")
+        r = self.wrapper("guard", self.tool())
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), "the guard's hook shares the record")
+
+    def test_the_guard_s_hook_says_it_too_and_a_compaction_forgets_it(self):
+        self.grow(205_000)
+        self.assertEqual(self.guard(), self.reminded(205, "PreToolUse"), "a call with no prompt: an unattended run")
+        self.assertIsNone(self.remind(), "a tool call said 200k")
+        # Codex writes the compaction to the rollout, then starts the chat again from it.
+        self.grow(self.compacted())
+        self.assertIsNone(self.guard(self.start("compact")), "the compaction's start says nothing")
+        self.assertEqual(self.record()["reminder"], {}, "200k is forgotten")
+        self.assertIn(f"reminder: codex-{self.SID} forgot the 200,000 tokens told, at a compaction", self.log())
+        self.grow(self.again())
+        self.assertIsNone(self.remind(), "no count since the compaction: 205k was the context before it")
+        self.assertIsNone(self.guard())
+        self.grow(163_000)
+        self.assertIsNone(self.remind())
+        self.grow(238_000)
+        self.assertEqual(self.remind(), self.reminded(238), "200k of the compacted context")
+        self.assertEqual(self.checks()[-3:], [
+            f"reminder check: codex-{self.SID} context=- threshold=200000 told=- no-reading",
+            f"reminder check: codex-{self.SID} context=163000 threshold=200000 told=0 below-threshold",
+            f"reminder check: codex-{self.SID} context=238000 threshold=200000 told=0 fired"])
+        for source in ("startup", "resume", "clear"):
+            self.guard(self.start(source))
+            self.assertEqual(self.record()["reminder"], {"at": 200_000}, source)
+
+    def test_a_sub_agent_hears_its_own_line_from_its_own_rollout(self):
+        self.grow(50_000)
+        self.grow(self.meta(self.AGENT, parent=self.SID), self.said(), 160_500, path=self.sub)
+        told = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": self.SUB.format(160)}}
+        self.assertEqual(self.guard(self.tool(agent=True)), told, "the model's line alone: none for the user")
+        self.assertEqual(self.record(f"codex-{self.SID}+{self.AGENT}"), {"subagent_reminder": {"at": 150_000}})
+        self.assertIsNone(self.record(), "the main chat's context is its own")
+        self.assertIsNone(self.guard(self.tool(agent=True)), "once")
+        self.assertIsNone(self.guard(), "the main chat's call: 50k")
+        self.assertIsNone(self.remind(self.ask(agent_id=self.AGENT, agent_type="explorer",
+                                               transcript_path=str(self.sub))))
+        self.assertTrue(self.checks()[-1].endswith(" subagent"), "a sub-agent's prompt hears no main reminder")
+        self.assertIn(f"reminder: codex-{self.SID} subagent {self.AGENT} (explorer) reminded at 150,000 tokens "
+                      "(the context is 160,500)", self.log())
+        # Its own compaction: unknown, then counted again from under the threshold.
+        self.grow(self.compacted(), path=self.sub)
+        self.assertIsNone(self.guard(self.tool(agent=True)))
+        self.grow(30_000, path=self.sub)
+        self.assertIsNone(self.guard(self.tool(agent=True)), "below: the mark forgotten")
+        self.grow(151_000, path=self.sub)
+        self.assertEqual(self.guard(self.tool(agent=True)), {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "additionalContext": self.SUB.format(151)}})
+        # The main rollout is never the sub-agent's: with none of its own, nothing is said.
+        self.grow(905_000)
+        for path in (None, str(self.sub.with_name(self.sub.name + ".zst")), "relative.jsonl"):
+            self.assertIsNone(self.guard(self.tool(agent=True, transcript_path=path)), path)
+        self.assertNotIn(self.SECRET, self.log())
+
+    # ------------------------------------------------ Claude Code's, unchanged
+
+    def test_a_codex_chat_s_lines_never_arm_a_claude_session_s_auto_compact(self):
+        # hooks/autocompact.ts runs /compact for the Claude Code session its
+        # log line names, and display.ts shows that line as a pop-up: a Codex
+        # chat's lines name codex-<id>, which no Claude Code session's id is,
+        # the same thread id included.
+        self.grow(205_000)
+        self.remind()
+        compact = (HERE / "hooks" / "autocompact.ts").read_text()
+        display = (HERE / "hooks" / "display.ts").read_text()
+        armed = r"^reminder: (\S+) reminded at [\d,]+ tokens"
+        shown = r"^reminder: (\S+) reminded at [\d,]+ tokens \(the context is ([\d,]+)\)"
+        self.assertIn(f"body.match(/{armed}/)) && m[1] === sid", compact)
+        self.assertIn(f"body.match(/{shown}/)) && m[1] === sid", display)
+        named = [m.group(1) for line in self.log().splitlines() for m in [re.match(armed, line.split(" ", 2)[2])] if m]
+        self.assertEqual(named, [f"codex-{self.SID}"])
+        self.assertNotRegex(named[0], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+    def test_claude_code_s_reminder_is_as_it_was(self):
+        # The same id as a Claude Code session, its transcript Claude Code's:
+        # its own record, Claude Code's words, and a rollout is no transcript.
+        transcript = self.tmp / "claude.jsonl"
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 203_000,
+                 "output_tokens": 900}
+        transcript.write_text(json.dumps({"type": "assistant", "isSidechain": False, "message": {
+            "model": "claude-opus-4-5", "role": "assistant", "content": [], "usage": usage}}) + "\n")
+        self.grow(605_000)
+        data = {"session_id": self.SID, "transcript_path": str(transcript), "cwd": str(self.tmp),
+                "hook_event_name": "UserPromptSubmit", "prompt": self.SECRET}
+        self.assertEqual(self.hook("reminder", data, agent="claude"), {
+            "systemMessage": Reminder.USER.format(205), "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": Reminder.MODEL.format(205)}})
+        self.assertEqual(self.record(self.SID), {"reminder": {"at": 200_000}})
+        self.assertIsNone(self.record(), "the Codex chat's own record, untouched")
+        self.assertIsNone(self.hook("reminder", {**data, "session_id": "s2", "transcript_path": str(self.rollout)},
+                                   agent="claude"), "Claude Code's reminder reads no rollout")
+        self.assertEqual(self.remind(), self.reminded(605), "and the Codex chat's own, at its own size")
+        self.assertEqual((longhaul.REMINDER_USER.format(k=205), longhaul.REMINDER_MODEL.format(k=205)),
+                         (Reminder.USER.format(205), Reminder.MODEL.format(205)))
+
+    def test_a_codex_chat_is_in_no_checkpoint_trial_s_arm(self):
+        # The trial's scan reads Claude Code's transcripts alone: a Codex
+        # chat's silence in its usual arm would measure nothing.
+        self.grow(205_000)
+        self.grow(self.meta(self.AGENT, parent=self.SID), 160_000, path=self.sub)
+        with mock.patch.object(longhaul, "trial_current", return_value={"kind": "checkpoint"}), \
+                mock.patch.object(longhaul, "trial_arm", return_value="usual") as arm:
+            self.assertEqual(self.remind(), self.reminded(205))
+            self.assertEqual(self.guard(self.tool(agent=True)), {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "additionalContext": self.SUB.format(160)}})
+        arm.assert_not_called()
+
+
 class SessionEnd(unittest.TestCase):
     """`longhaul session-end`, the plugin's SessionEnd hook (Sprint 10, L2):
     as a session ends, Claude Code says why, one of clear, resume, logout,

@@ -8951,6 +8951,25 @@ def advisor(opts) -> int:
 # multiple told and fired or the reason it said nothing (REMINDER_CODES),
 # numbers and codes alone, in longhaul.log under its cap. The guard's path
 # logs none: a Read or a Bash call is no prompt, and there are hundreds.
+#
+# On OpenAI Codex (the Codex plan's X6, Phase 2; hooks/codex_hook.py runs
+# both hooks with --agent codex) the same steps, records and lines hold,
+# keyed codex-<id> (codex_hook_input()). What is Codex's own: the size is
+# read from the chat's rollout at transcript_path, which Codex appends to
+# (reminder_rollout_size(); docs discovery/2026-10-28-codex-hooks.md): the
+# last token_count's last_token_usage.total_tokens, Codex's own count of
+# the context window it filled, so no hook runs on each model request. A
+# sub-agent's hooks carry the root's session_id, its own thread as agent_id
+# and its own rollout as transcript_path. The words are Codex's
+# (CODEX_REMINDER_USER, CODEX_REMINDER_MODEL, CODEX_SUBAGENT_MODEL): there
+# is no /longhaul:checkpoint, and /compact, which Codex has, brings the
+# checkpoint back (X5). There is no display.ts: the systemMessage, which
+# Codex shows the user as a warning, carries the user's line, and
+# codex_hook_output() keeps it beside the model's additionalContext. A Codex
+# chat is in no checkpoint trial's arm. And Longhaul starts no compaction
+# in Codex: hooks/autocompact.ts runs /compact in the Claude Code session
+# a "reminded at" line in the shared log names, and a Codex chat's line
+# names codex-<id>, which no Claude Code session's id is.
 
 REMINDER_AT = 200_000  # tokens: the default threshold
 SUBAGENT_AT = 150_000  # tokens: the default threshold of a subagent's own context
@@ -8968,6 +8987,24 @@ SUBAGENT_MODEL = ("Longhaul: your context as a subagent is about {k}k tokens, an
                   "of it. Finish the step you are on, then stop and report back: what you have done, what is left, "
                   "and anything the next agent needs to know, so the main conversation can hand the rest to a fresh "
                   "subagent.")
+# Codex's lines, meaning what the three above do. A Codex skill is invoked
+# as $<name>; what a plugin's skill is named there is the plan's P3, which
+# settles this name: one constant, so the lines change with it.
+CODEX_CHECKPOINT_SKILL = "$checkpoint"
+CODEX_REMINDER_USER = ("Longhaul: this chat's context is about {k}k tokens, and every request carries all of it "
+                       "again. To shrink it without losing the thread: " + CODEX_CHECKPOINT_SKILL + ", then /compact. "
+                       "The checkpoint comes back.")
+# As on Claude Code the model tells the user too: whether every Codex client
+# shows a hook's systemMessage is P2's to see.
+CODEX_REMINDER_MODEL = ("Longhaul: the context is about {k}k tokens. At your next natural stopping point (not in the "
+                        "middle of an edit or a test run), and in any case before you end your turn, save a checkpoint "
+                        "with the " + CODEX_CHECKPOINT_SKILL + " skill, then tell the user in one line: \"Saved a "
+                        "checkpoint (the context is about {k}k tokens). Type /compact to shrink it; the checkpoint "
+                        "comes back.\" Then continue the work. After a compaction it comes back.")
+CODEX_SUBAGENT_MODEL = ("Longhaul: your context as a sub-agent is about {k}k tokens, and every request you make "
+                        "re-reads all of it. Finish the step you are on, then stop and report back: what you have "
+                        "done, what is left, and anything the next agent needs to know, so the main chat can hand the "
+                        "rest to a fresh sub-agent.")
 
 
 def reminder_threshold(name: str = "LONGHAUL_CHECKPOINT_AT", default: int = REMINDER_AT) -> tuple:
@@ -9024,6 +9061,65 @@ def reminder_size(tail: list, sidechain: bool = False):
     return None
 
 
+def reminder_rollout_size(path):
+    """A Codex chat's context, in tokens, from the tail of its rollout at
+    `path`, a hook's transcript_path (advisor_tail(): this runs on every
+    prompt and every tool call): the last token_count event's
+    info.last_token_usage.total_tokens above zero, Codex's own count of
+    the context window that response filled; or None. None from a
+    `compacted` record on until the next count: the count before it is
+    the context before the compaction, as reminder_size() stops at a
+    compact_boundary. A count that repeats the one before it (the same
+    total_token_usage: Codex writes one to refresh the allowance, and
+    inspect counts none) is no new count, so it brings no size back after
+    a compaction. A rollout that is not plain .jsonl (a .zst one, which
+    Codex compressed a week after it was written), a path that is not
+    absolute, none, or a tail with no count is None. Only the records'
+    types and counts are read, never a message's text: a line that names
+    neither record type is not even parsed."""
+    if not (isinstance(path, str) and path.endswith(".jsonl") and os.path.isabs(path) and "\0" not in path):
+        return None
+    size, total = None, None
+    for raw in advisor_tail(path):
+        if b'"compacted"' not in raw and b'"token_count"' not in raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        payload = dict_at(record, "payload")
+        if record.get("type") == "compacted":
+            size = None
+        elif record.get("type") == "event_msg" and payload.get("type") == "token_count":
+            info = dict_at(payload, "info")
+            now, running = as_int(dict_at(info, "last_token_usage").get("total_tokens")), \
+                dict_at(info, "total_token_usage")
+            if now > 0 and (not running or running != total):
+                size, total = now, running
+    return size
+
+
+def reminder_context(data: dict, path, sidechain: bool = False):
+    """The context's size, in tokens, for a hook input from the transcript
+    at `path`, or None: a Codex chat's from its rollout
+    (reminder_rollout_size()), Claude Code's from the tail of its
+    transcript (reminder_size(), `sidechain` for a subagent's own)."""
+    if data.get("longhaul_agent") == "codex":
+        return reminder_rollout_size(path)
+    return reminder_size(advisor_tail(path), sidechain=sidechain)
+
+
+def reminder_texts(data: dict) -> tuple:
+    """The reminder's lines for a hook input, as format strings of k, the
+    thousands: (the user's, the model's, a subagent's), Codex's for a
+    Codex hook's input, else Claude Code's."""
+    if data.get("longhaul_agent") == "codex":
+        return CODEX_REMINDER_USER, CODEX_REMINDER_MODEL, CODEX_SUBAGENT_MODEL
+    return REMINDER_USER, REMINDER_MODEL, SUBAGENT_MODEL
+
+
 def reminder_fell(said: dict, size: int, at: int) -> bool:
     """Whether the context is more than a step of the threshold below the
     highest multiple this session was told of, or under half the threshold
@@ -9060,7 +9156,7 @@ def reminder_check(data: dict) -> dict:
     record = guard_record_path({"session_id": data.get("session_id")})
     if record is None:
         return {"at": at, "code": "no-session"}
-    size = reminder_size(advisor_tail(data.get("transcript_path")))
+    size = reminder_context(data, data.get("transcript_path"))
     if size is None:
         return {"at": at, "code": "no-reading"}
     crossed = size // at * at
@@ -9072,7 +9168,10 @@ def reminder_check(data: dict) -> dict:
     if not crossed and not junk and not reminder_fell(said, size, at):
         return {**found, "code": "below-threshold"}
     trial = trial_current()
-    if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
+    # A Codex chat is in no arm: the trial's scan reads Claude Code's
+    # transcripts alone, so its silence would measure nothing.
+    if trial and trial_kind(trial) == "checkpoint" and data.get("longhaul_agent") != "codex" \
+            and trial_arm(data.get("session_id")) == "usual":
         return {**found, "code": "trial-arm"}  # the checkpoint A/B's usual arm hears none (the trial section); a models trial's does
     with locked("guard"):  # the guard's record, written by its hook at the same moments
         kept = read_json(record)
@@ -9157,10 +9256,16 @@ def subagent_transcript(data: dict):
     file beside the session's transcript, where the advisor code finds a
     subagent's (advisor_subagents()): <transcript minus .jsonl>/subagents/
     agent-<id>.jsonl, or, for an agent a workflow ran, the same name in a
-    folder below it (Claude Code's transcriptSubdir)."""
+    folder below it (Claude Code's transcriptSubdir). A Codex sub-agent's
+    hooks give its own rollout as transcript_path (its own thread's, named
+    by its id beside the root's), so that path is taken as it is, when it
+    is absolute, and there is nothing to look for beside it."""
     agent = advisor_id(data.get("agent_id"))
     if agent is None:
         return None
+    if data.get("longhaul_agent") == "codex":
+        given = data.get("transcript_path")
+        return given if isinstance(given, str) and os.path.isabs(given) else None
     name = f"agent-{agent}.jsonl"
     for key in ("agent_transcript_path", "transcript_path"):
         given = data.get(key)
@@ -9187,7 +9292,8 @@ def subagent_due(data: dict):
     which is recorded in its own guard record (subagent_reminder, under
     the guard's lock); else None. Only for a subagent's input (agent_id):
     the main conversation's is reminder_due()'s. The size is its last
-    response's, from the tail of its own transcript (subagent_transcript()).
+    response's, from the tail of its own transcript (subagent_transcript();
+    a Codex sub-agent's is its rollout's last count, reminder_context()).
     None, and nothing recorded, in the checkpoint trial's usual half, as
     for the main reminder. A threshold that is neither a number nor off is
     logged once per subagent and kind. One line is logged each time it is
@@ -9198,7 +9304,7 @@ def subagent_due(data: dict):
     record = guard_record_path(data)
     if record is None:
         return None
-    size = reminder_size(advisor_tail(subagent_transcript(data)), sidechain=True)
+    size = reminder_context(data, subagent_transcript(data), sidechain=True)
     if size is None:
         return None
     crossed = size // at * at
@@ -9209,8 +9315,9 @@ def subagent_due(data: dict):
         if not (isinstance(kept, dict) and reminder_fell(dict_at(kept, "subagent_reminder"), size, at)):
             return None
     trial = trial_current()
-    if trial and trial_kind(trial) == "checkpoint" and trial_arm(data.get("session_id")) == "usual":
-        return None  # the checkpoint A/B's usual arm hears no reminder, a subagent's included
+    if trial and trial_kind(trial) == "checkpoint" and data.get("longhaul_agent") != "codex" \
+            and trial_arm(data.get("session_id")) == "usual":
+        return None  # the checkpoint A/B's usual arm hears no reminder, a subagent's included (Codex's: no arm)
     with locked("guard"):  # the guard's record, written by its hook at the same moments
         kept = read_json(record)
         kept = kept if isinstance(kept, dict) else {}
@@ -9270,14 +9377,14 @@ def reminder_join(data, answer):
     if size is None:
         return answer
     answer = dict(answer or {})
+    user, model, subagent = reminder_texts(data)
     out = {"hookEventName": "PreToolUse", **dict_at(answer, "hookSpecificOutput")}
     key = "permissionDecisionReason" if out.get("permissionDecision") == "deny" else "additionalContext"
-    line = (SUBAGENT_MODEL if sub else REMINDER_MODEL).format(k=size // 1000)
+    line = (subagent if sub else model).format(k=size // 1000)
     out[key] = "\n".join(filter(None, [out.get(key), line]))
     answer["hookSpecificOutput"] = out
     if not sub:  # a subagent's line is for it alone: the user hears the conversation's reminder
-        answer["systemMessage"] = "\n".join(filter(None, [answer.get("systemMessage"),
-                                                          REMINDER_USER.format(k=size // 1000)]))
+        answer["systemMessage"] = "\n".join(filter(None, [answer.get("systemMessage"), user.format(k=size // 1000)]))
     return answer
 
 
@@ -9286,7 +9393,11 @@ def reminder(opts) -> int:
     nothing out, exit 0 always. An error prints nothing and is logged by
     its kind alone, as advisor_note() does. Each call, whatever happens,
     logs one check line (reminder_check_line()): in a long chat of the owner's
-    the reminder said nothing for hours and nothing recorded why."""
+    the reminder said nothing for hours and nothing recorded why. Under
+    Codex (`--agent codex`) the input is made Longhaul's, the lines are
+    Codex's (reminder_texts()) and the answer is cut to what Codex takes
+    back on UserPromptSubmit: the user's line as the systemMessage, the
+    model's as additionalContext."""
     sid, found = None, {"code": "error"}
     try:
         raw = sys.stdin.read(ADVISOR_STDIN_MAX + 1)
@@ -9302,9 +9413,10 @@ def reminder(opts) -> int:
         sid = data.get("session_id")
         found = reminder_check(data)
         if found["code"] == "fired":
-            size = found["size"]
-            answer = {"systemMessage": REMINDER_USER.format(k=size // 1000), "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit", "additionalContext": REMINDER_MODEL.format(k=size // 1000)}}
+            k = found["size"] // 1000
+            user, model, _ = reminder_texts(data)
+            answer = {"systemMessage": user.format(k=k), "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": model.format(k=k)}}
             print(json.dumps(codex_hook_output(answer, "UserPromptSubmit") if codex else answer))
     except Exception as e:
         log(f"reminder hook: no reminder ({type(e).__name__})")
