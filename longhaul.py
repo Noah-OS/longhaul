@@ -13799,7 +13799,8 @@ def codex_version_said(quick: bool, newest: list) -> str:
 # and one never trusted. Codex 0.165 and later also pin the plugin's files
 # (trusted_content_hash, a hash of the whole installed copy), which the
 # doctor does not hash: after an update they ask for trust again.
-DOCTOR_CODEX_HOOKS = "hooks/codex-hooks.json"  # Longhaul's hooks file for Codex, from the plugin's folder: its trust keys name it
+# Longhaul's hooks file for Codex, from the plugin's folder, as its trust keys name it.
+DOCTOR_CODEX_HOOKS = "hooks/codex-hooks.json"
 DOCTOR_CODEX_HOOKS_PATH = Path(__file__).resolve().parent / DOCTOR_CODEX_HOOKS  # tests point it at their own
 # A hooks file's event names, and the labels Codex's trust keys and hashes use (hook_event_key_label()).
 CODEX_HOOK_LABELS = {"PreModelRequest": "pre_model_request", "PostModelRequest": "post_model_request",
@@ -13810,8 +13811,10 @@ CODEX_HOOK_LABELS = {"PreModelRequest": "pre_model_request", "PostModelRequest":
                      "SubagentStop": "subagent_stop", "Stop": "stop", "Interrupt": "interrupt"}
 CODEX_HOOK_MATCHED = ("PreToolUse", "PermissionRequest", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart",
                       "SubagentStop", "PreCompact", "PostCompact")  # the events whose matcher Codex keeps
-CODEX_HOOK_CONTEXT = ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "SubagentStart")  # additionalContext's
-CODEX_COMPACT_TODAY = 272_000 * 9 // 10  # Codex compacts at 90% of the window (auto_compact_token_limit()); 272k models today
+# The events that take additionalContext, and so an additionalContextLimit.
+CODEX_HOOK_CONTEXT = ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "SubagentStart")
+# Codex compacts at 90% of the model's window (auto_compact_token_limit()); today's models have 272k.
+CODEX_COMPACT_TODAY = 272_000 * 9 // 10
 CODEX_TRUST_STEP = "open /hooks in Codex and trust Longhaul's hooks: until then they do not run"
 
 
@@ -13972,11 +13975,10 @@ def codex_config_items(home: Path) -> list:
     plugin = (enabled or ours or [None])[0]
     if plugin is None:
         repo = plugin_repository()
-        items.append(("warn", f"{where}: Longhaul's plugin is not installed there, so no checkpoint, reminder, guard or "
-                              "filter in Codex",
-                      (f"in a terminal: `codex plugin marketplace add {repo}`, then " if repo else "in a terminal, after "
-                       "adding its marketplace: ") + "`codex plugin add longhaul@longhaul`; then trust its hooks in "
-                      "Codex's /hooks"))
+        add = f"`codex plugin marketplace add {repo}`, then " if repo else "after adding its marketplace, "
+        items.append(("warn", f"{where}: Longhaul's plugin is not installed there, so no checkpoint, reminder, guard "
+                              "or filter in Codex",
+                      f"in a terminal: {add}`codex plugin add longhaul@longhaul`; then trust its hooks in Codex's /hooks"))
     else:
         plain = re.fullmatch(r"longhaul@[A-Za-z0-9_.-]{1,64}", plugin)  # a marketplace's name is shown only plain
         named = f" ({plugin})" if plain else ""
