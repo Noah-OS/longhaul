@@ -2,6 +2,28 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.2 - 2026-10-28
+
+Longhaul reads OpenAI's Codex: one chat's report, Codex's allowance beside Claude Code's, and a line in the doctor. All three only read: nothing is installed in Codex and no hook runs there yet.
+
+### Added
+
+- **`longhaul inspect --agent codex [ID|PATH]`.** A Codex chat's report, from its rollout under `CODEX_HOME/sessions` (`~/.codex` by default): the newest chat, the one whose id starts with ID, or the rollout at PATH (a rollout's path needs no `--agent`). It shows:
+  - requests and tokens by kind and by model, from the usage Codex writes after each response;
+  - the sub-agent chats it started;
+  - context growth and compactions;
+  - the tool calls, the largest tool outputs, the searches and reads Codex parsed, and files read again;
+  - failures, and the allowance as the chat last read it.
+
+  Each heading names where its numbers came from and how sure they are, as for Claude Code. Codex does not record a search or a read made inside one of its code cells, and the report says so rather than showing 0. `--json` gives the numbers.
+- **Codex's allowance in `longhaul usage`.** After the Claude Code accounts, a `codex` line: each window's share used and when it resets, as Codex last read it, and how long ago. It is read from the newest chats each time; nothing is kept.
+- **A Codex line in `longhaul doctor`**, when a Codex folder is there: each folder's chats and how many are compressed, and the Codex version, from `codex --version` or as the newest chat wrote it.
+- **What Longhaul reads of Codex.** Of a Codex folder, only `sessions/`, never `auth.json` or any other file. Of a chat, only record types, numbers and names (models, tools, paths), never what was said. Codex compresses a chat after a week (`.jsonl.zst`): Python 3.14's standard library reads those, an older Python counts them and skips them, and the doctor says how many. Longhaul installs nothing.
+
+### Changed
+
+- **The README says Auto Model's effect is not measured yet.** The trial that was to measure it was stopped early.
+
 ## 0.3.1 - 2026-10-27
 
 Two small fixes after 0.3.0.

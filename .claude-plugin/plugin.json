@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Keep the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or /clear. Shows where the tokens go.",
   "author": {
     "name": "Amr Adel",
