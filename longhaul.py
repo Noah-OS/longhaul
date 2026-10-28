@@ -5918,7 +5918,7 @@ def run_hook(check, name: str, agent: str = "claude") -> int:
 # commands with --agent codex; their input is made Longhaul's and their
 # answer cut to what Codex takes back, since Codex drops an answer it
 # refuses whole, its additionalContext with it.
-CODEX_HOOK_COMMANDS = ("guard", "checkpoint", "reminder", "precompact", "filter")
+CODEX_HOOK_COMMANDS = ("guard", "checkpoint", "reminder", "precompact", "filter", "models-hook")
 CODEX_ID = re.compile(r"[A-Za-z0-9_-]{1,94}")  # a Codex thread's id; "codex-" and it make a GUARD_ID
 # By event: the hookSpecificOutput fields Codex takes beside hookEventName,
 # and whether a top-level decision "block" with a reason is one.
@@ -10634,11 +10634,13 @@ def models_guide_join(data, answer, sources: tuple):
     additionalContext, after what is there, when it applies: a start of
     one of `sources` (each hook its own, so each start has it once), of
     the main conversation (no agent_id), in a guided session; else the
-    answer as it was. What it raises is logged and costs the answer
-    nothing."""
+    answer as it was. Never on Codex: MODELS_GUIDE names Claude's models,
+    and a Codex ladder is the owner's to choose (the Codex plan's X9). What
+    it raises is logged and costs the answer nothing."""
     try:
         if not isinstance(data, dict) or data.get("hook_event_name") != "SessionStart" \
-                or data.get("source") not in sources or data.get("agent_id") is not None:
+                or data.get("source") not in sources or data.get("agent_id") is not None \
+                or data.get("longhaul_agent") == "codex":
             return answer
         if not models_guided(data.get("session_id"), models_settings()[1]):
             return answer
@@ -10731,6 +10733,81 @@ def models_rule(data: dict):
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                    "permissionDecisionReason": reason,
                                    "updatedInput": {**given, "model": to}}}
+
+
+# Auto Model on Codex, log only (the Codex plan's X9, Phase 4). Codex's
+# PreToolUse on spawn_agent (its matcher "Agent" selects it too) runs
+# `longhaul models-hook --agent codex`, a hook of its own: on Claude Code
+# Auto Model runs in the Advisor's hook, which stays off on Codex (X10).
+# Each pick of the main chat is logged as models_rule() logs Claude Code's,
+# and the call is never changed: the table and the cap name Claude's
+# models, and a Codex ladder (the owner's chats run gpt-5.6-terra and
+# gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
+# (docs/discovery/2026-10-28-codex-hooks.md, 10; codex-rs rust-v0.165.0,
+# tools/handlers/multi_agents/spawn.rs and multi_agents_v2/spawn.rs):
+# v1 {message?, items?, agent_type?, model?, reasoning_effort?,
+# fork_context}, v2 {message, task_name, agent_type?, model?,
+# reasoning_effort?, fork_turns?}. Codex trims agent_type and runs an
+# empty one as its default role. v1 forks the chat's history with
+# fork_context true; v2 refuses fork_context and forks unless fork_turns
+# is "none" (none given, or an empty one, is "all").
+MODELS_CODEX_TYPE = "default"  # Codex's role for a spawn that names none (codex-rs agent/role.rs, DEFAULT_ROLE_NAME)
+MODELS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")  # a type's, model's or effort's shape: models_rule()'s
+
+
+def models_codex_check(data):
+    """Auto Model on Codex: the main chat's spawn_agent call logged by its
+    pick, and None always, so the call runs as it was (no updatedInput),
+    whatever the mode, the table or the cap say. The pick: the agent type
+    (Codex's default when none), the model and the reasoning effort given,
+    or "inherited" (the role's or the chat's, which Codex sets), and
+    whether it forks. A field null or empty is not given; an agent type
+    that is not a name is no line, as in models_rule(); a model or effort
+    that is not one is "unknown". Nothing with Auto Model off, or for a
+    sub-agent's own call (models_rule()'s rule: the owner, 2026-10-25).
+    Names only, never message, items or task_name (a name the model
+    wrote). The session is codex-<id> (codex_hook_input()), so the line
+    says whose it is."""
+    if not isinstance(data, dict) or data.get("longhaul_agent") != "codex" \
+            or data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != "spawn_agent" \
+            or data.get("agent_id") is not None:
+        return None
+    given = data.get("tool_input")
+    if not isinstance(given, dict):
+        return None
+
+    def named(value, default):
+        """`value` if it is a name, `default` if it is not given, else None."""
+        value = value.strip() if isinstance(value, str) else value
+        if value is None or value == "":
+            return default
+        return value if isinstance(value, str) and MODELS_NAME.fullmatch(value) else None
+
+    kind = named(given.get("agent_type"), MODELS_CODEX_TYPE)
+    if kind is None or models_settings()[1] == "off":
+        return None
+    model = named(given.get("model"), "inherited") or "unknown"
+    effort = named(given.get("reasoning_effort"), "inherited") or "unknown"
+    if "fork_context" in given or "task_name" not in given:  # v1's (v2 refuses fork_context and needs task_name)
+        fork = given.get("fork_context") is True
+    else:
+        turns = given.get("fork_turns")
+        fork = not (isinstance(turns, str) and turns.strip().lower() == "none")
+    sid = data.get("session_id")
+    sid = sid[:14] if isinstance(sid, str) else "codex"  # "codex-" and the id's first 8, as Claude Code's 8
+    said = "on inherited (inherited)" if model == "inherited" else f"picked {model} (its call)"
+    log(f"models: {kind} {said} in {sid}, effort {effort}" + (", fork" if fork else ""))
+    return None
+
+
+def models_hook(opts) -> int:
+    """The PreToolUse hook command on Codex's spawn_agent, `longhaul
+    models-hook --agent codex`: stdin in, nothing out, exit 0 always
+    (models_codex_check()). Without --agent codex it does nothing: Claude
+    Code's Auto Model runs in the Advisor's hook (advisor_check())."""
+    if getattr(opts, "agent", "claude") != "codex":
+        return 0
+    return run_hook(models_codex_check, "models", "codex")
 
 
 MODELS_SAID = {"off": "nowhere", "guide": "Claude picks each subagent's model by Longhaul's guide; the table is not "
@@ -13570,7 +13647,8 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
-                            "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter"):
+                            "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
+                            "models-hook"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -13668,7 +13746,7 @@ def main(argv: list[str]) -> int:
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
-                "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd,
+                "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall}[cmd](opts)
 
     extra: list[str] = []

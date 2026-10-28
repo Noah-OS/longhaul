@@ -4317,13 +4317,14 @@ class CodexHooks(unittest.TestCase):
 
     def test_the_hook_commands_take_agent_codex_and_claude_is_the_default(self):
         for cmd, name in (("guard", "guard"), ("checkpoint", "checkpoint"), ("reminder", "reminder"),
-                          ("precompact", "precompact"), ("filter", "filter_cmd")):
+                          ("precompact", "precompact"), ("filter", "filter_cmd"), ("models-hook", "models_hook")):
             got = []
             with mock.patch.object(longhaul, name, lambda opts: got.append(opts.agent) or 0):
                 self.assertEqual(longhaul.main([cmd, "--agent", "codex"]), 0)
                 self.assertEqual(longhaul.main([cmd]), 0)
             self.assertEqual(got, ["codex", "claude"], cmd)
-        self.assertEqual(set(longhaul.CODEX_HOOK_COMMANDS), {"guard", "checkpoint", "reminder", "precompact", "filter"})
+        self.assertEqual(set(longhaul.CODEX_HOOK_COMMANDS),
+                         {"guard", "checkpoint", "reminder", "precompact", "filter", "models-hook"})
 
     def wrapper(self, *args, stdin=""):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("LONGHAUL_", "CLAUDE_CODE_", "CODEX_"))}
@@ -15337,6 +15338,254 @@ class Models(unittest.TestCase):
                               env={**env, "CLAUDECODE": "1"}, timeout=30)
         self.assertNotEqual(shim.returncode, 0)
         self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "on", "unchanged")
+
+
+class CodexModels(unittest.TestCase):
+    """Auto Model on Codex, log only (the Codex plan's X9, Phase 4): `longhaul
+    models-hook --agent codex`, on PreToolUse spawn_agent, logs each pick of
+    the main chat (agent type, model, reasoning effort, fork) as models_rule
+    logs Claude Code's, and never changes the call: Longhaul's table and cap
+    name Claude's models, and a Codex ladder is the owner's to choose. The
+    inputs are spawn_agent's two versions (docs/discovery/2026-10-28-codex-
+    hooks.md, 10). Claude Code keeps Auto Model in the Advisor's hook."""
+
+    S = "SENTINEL-NARWHAL-4410"  # text of the call's, which no record may hold
+    SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+    WRAPPER = HERE / "hooks" / "codex_hook.py"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        for patch in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                      mock.patch.object(longhaul, "CONFIG", self.home / "config.json"),
+                      mock.patch.object(longhaul, "HOME", self.tmp / "user"),
+                      mock.patch.dict(os.environ, {})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        for name in ("CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "LONGHAUL_ADVISOR"):
+            os.environ.pop(name, None)
+
+    def config(self, **values):
+        (self.home / "config.json").write_text(json.dumps(values))
+
+    def spawn(self, given, **extra):
+        """A PreToolUse hook's input for spawn_agent, as Codex sends it."""
+        data = {"session_id": self.SID, "turn_id": "turn-1", "transcript_path": str(self.tmp / "rollout.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra",
+                "permission_mode": "default", "tool_name": "spawn_agent", "tool_input": given,
+                "tool_use_id": "call_1"}
+        data.update(extra)
+        return data
+
+    def v1(self, **fields):
+        """Version 1's input: {message?, items?, agent_type?, model?, reasoning_effort?, fork_context}."""
+        return {"message": f"find the parser {self.S}", "items": [{"type": "text", "text": f"and its tests {self.S}"}],
+                "fork_context": False, **fields}
+
+    def v2(self, **fields):
+        """Version 2's input: {message, task_name, agent_type?, model?, reasoning_effort?, fork_turns?}."""
+        return {"message": f"find the parser {self.S}", "task_name": f"parser_{self.S}", **fields}
+
+    def hook(self, data, *args):
+        """What `longhaul models-hook ARGS` prints for `data`, run as main() runs it."""
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(data))), contextlib.redirect_stdout(out):
+            self.assertEqual(longhaul.main(["models-hook", *args]), 0)
+        return out.getvalue()
+
+    def codex(self, data):
+        return self.hook(data, "--agent", "codex")
+
+    def logged(self):
+        """The log's models lines, without their time."""
+        path = self.home / "longhaul.log"
+        lines = [line.split(" ", 2) for line in (path.read_text() if path.exists() else "").splitlines()]
+        return [parts[2] for parts in lines if len(parts) == 3 and parts[2].startswith("models: ")]
+
+    def no_text(self):
+        """No record under LONGHAUL_HOME holds the call's text: its message, items or task_name."""
+        for path in self.home.rglob("*"):
+            if path.is_file():
+                text = path.read_text(errors="replace")
+                for said in (self.S, "find the parser", "and its tests", "parser_"):
+                    self.assertNotIn(said, text, path)
+
+    def test_each_version_s_pick_is_logged_by_type_model_effort_and_fork(self):
+        sid = "codex-" + self.SID[:8]
+        for given in (self.v1(agent_type="explorer", model="gpt-5.6-sol", reasoning_effort="high"),
+                      self.v1(fork_context=True),
+                      self.v2(agent_type="worker", model="gpt-5.6-terra", reasoning_effort="low", fork_turns="none"),
+                      self.v2(),
+                      self.v2(agent_type="worker", fork_turns="all"),
+                      self.v2(agent_type="worker", fork_turns=" 3 "),
+                      self.v2(fork_turns="NONE")):
+            self.assertEqual(self.codex(self.spawn(given)), "", given)
+        # Codex's own reading (codex-rs multi_agents_v2/spawn.rs fork_mode): a
+        # v2 call with no fork_turns, or an empty one, forks the whole history;
+        # only "none" does not. v1 forks with fork_context true alone.
+        self.assertEqual(self.logged(), [
+            f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort high",
+            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: worker picked gpt-5.6-terra (its call) in {sid}, effort low",
+            f"models: default on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default on inherited (inherited) in {sid}, effort inherited"])
+        self.no_text()
+
+    def test_null_and_empty_fields_are_codex_s_defaults(self):
+        # A model's tool call can send null for an optional field; Codex trims
+        # agent_type and takes an empty one as its default role.
+        sid = "codex-" + self.SID[:8]
+        self.codex(self.spawn(self.v1(agent_type=None, model=None, reasoning_effort=None)))
+        self.codex(self.spawn(self.v1(agent_type="  ", model=" ", reasoning_effort="")))
+        self.codex(self.spawn(self.v2(agent_type=" worker ", fork_turns=None)))
+        given = self.v1(model="gpt-5.6-sol")
+        del given["fork_context"]  # v1's fork_context defaults to false
+        self.codex(self.spawn(given))
+        self.assertEqual(self.logged(), [
+            f"models: default on inherited (inherited) in {sid}, effort inherited",
+            f"models: default on inherited (inherited) in {sid}, effort inherited",
+            f"models: worker on inherited (inherited) in {sid}, effort inherited, fork",
+            f"models: default picked gpt-5.6-sol (its call) in {sid}, effort inherited"])
+
+    def test_a_field_of_the_wrong_shape_is_never_logged(self):
+        sid = "codex-" + self.SID[:8]
+        # An agent type that is not a name: no line, as models_rule does with a subagent_type.
+        for bad in ("../../etc/passwd", f"look at {self.S}", "x" * 65, 7, ["worker"], {"name": "worker"}, True):
+            self.assertEqual(self.codex(self.spawn(self.v1(agent_type=bad))), "", bad)
+        self.assertEqual(self.logged(), [])
+        # A model or an effort that is not a name: the pick still counted by its type, the value unknown.
+        for bad in (f"the best one {self.S}", "a/b", "x" * 65, 7, ["gpt-5.6-sol"], {"model": "gpt-5.6-sol"}, False):
+            self.codex(self.spawn(self.v1(agent_type="worker", model=bad, reasoning_effort=bad)))
+        self.assertEqual(self.logged(), [f"models: worker picked unknown (its call) in {sid}, effort unknown"] * 7)
+        # Not a spawn of the main chat: no line.
+        before = len(self.logged())
+        for data in (self.spawn("not an object"), self.spawn([self.v1()]), self.spawn(None),
+                     self.spawn(self.v1(), tool_name="Agent"), self.spawn(self.v1(), tool_name="Bash"),
+                     self.spawn(self.v1(), hook_event_name="PostToolUse", tool_response="ok"),
+                     self.spawn(self.v1(), agent_id="019f9d8f-0000-7000-8000-000000000001", agent_type="worker"),
+                     {}, [], "text"):
+            self.assertEqual(self.codex(data), "", data)
+        self.assertEqual(self.logged()[before:], [])
+        # A session id no record could be named by is left out (codex_hook_input): the line says codex alone.
+        self.codex(self.spawn(self.v1(agent_type="worker"), session_id="../x"))
+        self.assertEqual(self.logged()[-1], "models: worker on inherited (inherited) in codex, effort inherited")
+        self.no_text()
+
+    def test_the_call_is_never_changed_whatever_the_mode_the_table_or_the_cap(self):
+        for values in ({}, {"models": "guide", "models_cap": "haiku"},
+                       {"models": "on", "subagents": {"default": "haiku", "worker": "haiku"}, "models_cap": "haiku"},
+                       {"models": "trial", "subagents": {"worker": "haiku"}, "models_cap": "haiku"},
+                       {"models": "off", "models_cap": "haiku"}):
+            self.config(**values)
+            for given in (self.v1(agent_type="worker", model="opus"), self.v2(agent_type="worker", model="fable"),
+                          self.v1(model="gpt-5.6-sol", reasoning_effort="xhigh"), self.v2()):
+                data = self.spawn(given)
+                self.assertIsNone(longhaul.models_codex_check(longhaul.codex_hook_input(data)), values)
+                self.assertEqual(self.codex(data), "", values)
+        self.config(models="guide", models_cap="haiku")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.trial_start(14, time.time() - 1, "models"), 0)
+        for n in range(8):  # either half of a models trial
+            data = self.spawn(self.v1(model="opus"), session_id=f"019f9d8e-0000-7000-8000-{n:012d}")
+            self.assertEqual(self.codex(data), "")
+        self.assertTrue(all("(its call)" in line or "(inherited)" in line for line in self.logged()),
+                        "no guide is given on Codex, so no pick is guided")
+
+    def test_auto_model_off_logs_nothing(self):
+        self.config(models="off")
+        for given in (self.v1(agent_type="worker", model="gpt-5.6-sol"), self.v2(), self.v1(fork_context=True)):
+            self.assertEqual(self.codex(self.spawn(given)), "")
+        self.assertEqual(self.logged(), [])
+        self.config(models="guide")
+        self.codex(self.spawn(self.v2()))
+        self.assertEqual(len(self.logged()), 1, "on again: logged")
+
+    def test_without_agent_codex_the_command_does_nothing(self):
+        # Claude Code's Auto Model runs in the Advisor's hook; this command is Codex's.
+        claude = {"session_id": "5e0c1a2b-0000-4000-8000-000000000001", "hook_event_name": "PreToolUse",
+                  "tool_name": "Agent", "cwd": str(self.tmp),
+                  "tool_input": {"description": "Run it", "prompt": f"do the task {self.S}",
+                                 "subagent_type": "implementer", "model": "opus"}}
+        self.config(models_cap="haiku")
+        for data in (claude, self.spawn(self.v1(model="gpt-5.6-sol"))):
+            self.assertEqual(self.hook(data), "")
+            self.assertEqual(self.hook(data, "--agent", "claude"), "")
+        self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
+
+    def test_the_guide_is_not_given_on_codex(self):
+        # MODELS_GUIDE names Claude's models; a Codex start's answer is left as it was.
+        start = {"session_id": self.SID, "transcript_path": None, "cwd": str(self.tmp),
+                 "hook_event_name": "SessionStart", "model": "gpt-5.6-terra", "source": "startup"}
+        answer = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "the checkpoint"}}
+        for source in ("startup", "resume", "compact", "clear"):
+            data = longhaul.codex_hook_input({**start, "source": source})
+            self.assertIs(longhaul.models_guide_join(data, answer, (source,)), answer, source)
+            self.assertIsNone(longhaul.models_guide_join(data, None, (source,)), source)
+        self.assertEqual(self.logged(), [])
+        claude = {**start, "session_id": "5e0c1a2b-0000-4000-8000-000000000001"}
+        given = longhaul.models_guide_join(claude, None, ("startup",))
+        self.assertEqual(given["hookSpecificOutput"]["additionalContext"], longhaul.MODELS_GUIDE, "Claude Code's still")
+        # The startup and the restores' hooks, as Codex runs them: no guide in what they print.
+        os.environ.update(LONGHAUL_INDEX="off", LONGHAUL_UPDATE_CHECK="off", CLAUDE_CODE_SESSION_ATTENDED="0")
+        for name in Checkpoint.SESSION_VARS:
+            os.environ.pop(name, None)
+        for command, source in (("guard", "startup"), ("checkpoint", "resume"), ("checkpoint", "compact")):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({**start, "source": source}))), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(longhaul.main([command, "--agent", "codex"]), 0)
+            self.assertNotIn("set its `model`", out.getvalue(), (command, source))
+
+    def test_claude_code_s_auto_model_is_unchanged(self):
+        transcript = self.tmp / "t.jsonl"
+        main = {"type": "assistant", "message": {"model": "claude-opus-5-5", "content": []}}
+        transcript.write_text(json.dumps(main) + "\n")
+        sid = "5e0c1a2b-0000-4000-8000-000000000001"
+
+        def call(**extra):
+            return {"session_id": sid, "transcript_path": str(transcript), "cwd": str(self.tmp),
+                    "hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_use_id": "toolu_m1",
+                    "tool_input": {"description": "Run it", "prompt": "do the task", "subagent_type": "implementer",
+                                   **extra}}
+
+        self.assertIsNone(longhaul.advisor_check(call(model="haiku"), time.time()))
+        self.config(models_cap="sonnet")
+        out = longhaul.advisor_check(call(model="opus"), time.time())["hookSpecificOutput"]
+        self.assertEqual(out["updatedInput"]["model"], "sonnet", "the cap still lowers Claude Code's call")
+        self.assertEqual(self.logged(), [f"models: implementer picked haiku (guided) in {sid[:8]}",
+                                         f"models: implementer picked opus (guided) in {sid[:8]}",
+                                         f"models: implementer capped opus -> sonnet in {sid[:8]}"])
+        # Each rule reads its own engine's calls alone.
+        before = len(self.logged())
+        self.assertIsNone(longhaul.models_rule(self.spawn(self.v1(model="opus"))))
+        self.assertIsNone(longhaul.models_rule(longhaul.codex_hook_input(self.spawn(self.v1(model="opus")))))
+        self.assertIsNone(longhaul.models_codex_check(call(model="opus")))
+        self.assertIsNone(longhaul.models_codex_check(self.spawn(self.v1(model="opus"))), "not made Codex's")
+        self.assertEqual(self.logged()[before:], [])
+
+    def wrapper(self, *args, stdin=""):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("LONGHAUL_", "CLAUDE_CODE_", "CODEX_"))}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off",
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), CODEX_HOME=str(self.tmp / "codex"))
+        return subprocess.run([sys.executable, "-I", str(self.WRAPPER), *args], input=stdin, capture_output=True,
+                              text=True, env=env, cwd=self.tmp, timeout=60)
+
+    def test_the_hook_runs_through_codex_s_wrapper_prints_nothing_and_exits_0(self):
+        self.config(models_cap="haiku")
+        for given in (self.v1(agent_type="explorer", model="gpt-5.6-sol", reasoning_effort="medium"), self.v2()):
+            r = self.wrapper("models-hook", stdin=json.dumps(self.spawn(given)))
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), given)
+        for stdin in ("not json", "", "[]", json.dumps(self.spawn(self.v1(agent_type=7)))):
+            r = self.wrapper("models-hook", stdin=stdin)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), stdin)
+        sid = "codex-" + self.SID[:8]
+        self.assertEqual(self.logged(), [f"models: explorer picked gpt-5.6-sol (its call) in {sid}, effort medium",
+                                         f"models: default on inherited (inherited) in {sid}, effort inherited, fork"])
+        self.no_text()
 
 
 class Display(unittest.TestCase):
