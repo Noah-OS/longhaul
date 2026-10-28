@@ -22,6 +22,7 @@
 !hooks/index.ts
 !hooks/autocompact.ts
 !hooks/autocompact.test.ts
+!hooks/codex_hook.py
 !bin/
 !bin/longhaul
 !skills/

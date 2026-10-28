@@ -4070,7 +4070,7 @@ class Plugin(unittest.TestCase):
         # so each is looked for in the index too.
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
-                     "CHANGELOG.md", "hooks/hooks.json", "bin/longhaul", ".github/workflows/tests.yml",
+                     "CHANGELOG.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
                      "plugins/longhaul-advisor/.claude-plugin/plugin.json",
                      "plugins/longhaul-advisor/skills/advise/SKILL.md", "plugins/longhaul-advisor/agents/advisor.md"):
             self.assertEqual(subprocess.run(["git", "check-ignore", "-q", path], cwd=HERE, timeout=10).returncode, 1,
@@ -4195,6 +4195,160 @@ class Plugin(unittest.TestCase):
             self.assertEqual(commands[0], self.SUITE, "the README's test command is the onboarding's")
             for job in ("macos", "linux"):
                 self.assertEqual(self.runs(jobs[job]), commands, (job, "CI runs the command the README gives"))
+
+
+class CodexHooks(unittest.TestCase):
+    """The Codex adapter's shared part (Codex plan, Phases 2 to 4): a Codex
+    hook's input made Longhaul's (codex_hook_input), Longhaul's answer cut
+    to what Codex takes back (codex_hook_output; docs
+    discovery/2026-10-28-codex-hooks.md), and hooks/codex_hook.py, which
+    exits 0 whatever happens: Codex blocks a tool when its hook exits 2."""
+
+    SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+    AGENT = "019f9d8f-0000-7000-8000-000000000001"
+    WRAPPER = HERE / "hooks" / "codex_hook.py"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        saved = longhaul.LONGHAUL_HOME
+        longhaul.LONGHAUL_HOME = self.home
+        self.addCleanup(setattr, longhaul, "LONGHAUL_HOME", saved)
+
+    def pre(self, **extra):
+        data = {"session_id": self.SID, "turn_id": "turn-1", "transcript_path": str(self.tmp / "rollout.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra",
+                "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": "cat a.py"},
+                "tool_use_id": "call_1"}
+        data.update(extra)
+        return data
+
+    def hso(self, event, **fields):
+        return {"hookSpecificOutput": {"hookEventName": event, **fields}}
+
+    def out(self, answer, event="PreToolUse"):
+        return longhaul.codex_hook_output(answer, event)
+
+    def test_the_session_is_keyed_codex_and_a_sub_agent_keeps_its_own_thread_as_agent_id(self):
+        data = longhaul.codex_hook_input(self.pre())
+        self.assertEqual(data["session_id"], "codex-" + self.SID)
+        self.assertRegex(data["session_id"], f"^{longhaul.GUARD_ID}$")
+        self.assertEqual(data["longhaul_agent"], "codex")
+        self.assertEqual((data["tool_name"], data["tool_input"]), ("Bash", {"command": "cat a.py"}))
+        sub = longhaul.codex_hook_input(self.pre(agent_id=self.AGENT, agent_type="explorer"))
+        self.assertEqual((sub["session_id"], sub["agent_id"]), ("codex-" + self.SID, self.AGENT))
+        self.assertNotIn("longhaul_agent", self.pre(), "the input given is not changed")
+
+    def test_an_id_no_record_could_be_named_by_is_left_out(self):
+        for bad in ("../../etc", "a/b", "", "x" * 101, 7, None, ["x"]):
+            data = longhaul.codex_hook_input(self.pre(session_id=bad, agent_id=bad))
+            self.assertNotIn("session_id", data, bad)
+            self.assertNotIn("agent_id", data, bad)
+        # "codex-" takes six of a record name's 100 characters
+        self.assertEqual(longhaul.codex_hook_input(self.pre(session_id="x" * 94))["session_id"], "codex-" + "x" * 94)
+        self.assertNotIn("session_id", longhaul.codex_hook_input(self.pre(session_id="x" * 95)))
+        for nothing in ("text", [], None, 3):
+            self.assertEqual(longhaul.codex_hook_input(nothing), {})
+
+    def test_a_warning_and_a_denial_pass_as_they_are(self):
+        warn = self.hso("PreToolUse", additionalContext="already in the context")
+        self.assertEqual(self.out(warn), warn)
+        deny = {"systemMessage": "Longhaul: blocked",
+                **self.hso("PreToolUse", permissionDecision="deny", permissionDecisionReason="read again")}
+        self.assertEqual(self.out(deny), deny)
+        rewrite = self.hso("PreToolUse", permissionDecision="allow", permissionDecisionReason="longhaul models: capped",
+                           updatedInput={"message": "m", "model": "gpt-5.6-terra"})
+        self.assertEqual(self.out(rewrite), rewrite)
+
+    def test_what_codex_would_refuse_is_left_out_so_the_rest_still_reaches_it(self):
+        # Codex drops a refused answer whole, its additionalContext with it.
+        allow = self.hso("PreToolUse", permissionDecision="allow", permissionDecisionReason="longhaul models: kept",
+                         additionalContext="note")
+        self.assertEqual(self.out(allow), self.hso("PreToolUse", additionalContext="note"))
+        self.assertIsNone(self.out(self.hso("PreToolUse", permissionDecision="ask", permissionDecisionReason="why")))
+        reason_only = self.hso("PreToolUse", permissionDecisionReason="why", additionalContext="c")
+        self.assertEqual(self.out(reason_only), self.hso("PreToolUse", additionalContext="c"))
+        stops = {"continue": False, "stopReason": "x", "suppressOutput": True, "decision": "approve", "reason": "r",
+                 **self.hso("PreToolUse", additionalContext="c")}
+        self.assertEqual(self.out(stops), self.hso("PreToolUse", additionalContext="c"))
+        # A denial that lost its reason still denies: dropped, it would let the call run.
+        bare = self.out(self.hso("PreToolUse", permissionDecision="deny", permissionDecisionReason=" "))
+        self.assertEqual(bare["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(bare["hookSpecificOutput"]["permissionDecisionReason"].strip())
+
+    def test_post_tool_use_never_replaces_an_output_and_a_reason_goes_only_with_a_block(self):
+        replaced = self.hso("PostToolUse", updatedToolOutput={"stdout": "short"}, additionalContext="cut")
+        self.assertEqual(self.out(replaced, "PostToolUse"), self.hso("PostToolUse", additionalContext="cut"))
+        self.assertIsNone(self.out({"reason": "no decision", "suppressOutput": True}, "PostToolUse"))
+        block = {"decision": "block", "reason": "the short text"}
+        self.assertEqual(self.out(block, "PostToolUse"), block)
+        self.assertIsNone(self.out({"decision": "block", "reason": "  "}, "PostToolUse"))
+
+    def test_starts_and_prompts_keep_their_context_and_compactions_only_a_message(self):
+        start = {"systemMessage": "restored", **self.hso("SessionStart", additionalContext="the checkpoint")}
+        self.assertEqual(self.out(start, "SessionStart"), start)
+        prompt = {"decision": "block", "reason": "wrong account", **self.hso("UserPromptSubmit", additionalContext="c")}
+        self.assertEqual(self.out(prompt, "UserPromptSubmit"), prompt)
+        self.assertEqual(self.out({"systemMessage": "m", **self.hso("PreCompact", additionalContext="c")}, "PreCompact"),
+                         {"systemMessage": "m"})
+        self.assertEqual(self.out(self.hso("PreToolUse", additionalContext="c"), "SessionStart"),
+                         self.hso("SessionStart", additionalContext="c"), "the event's own name")
+        for nothing in (None, {}, "text", [], {"hookSpecificOutput": "x"}, {"systemMessage": " "}):
+            self.assertIsNone(self.out(nothing, "SessionStart"), nothing)
+        self.assertIsNone(self.out({"systemMessage": "m"}, "NoSuchEvent"))
+        self.assertIsNone(self.out({"systemMessage": "m"}, None))
+
+    def test_run_hook_hands_the_check_longhaul_s_input_and_prints_what_codex_takes(self):
+        seen = []
+
+        def check(data):
+            seen.append(data)
+            return self.hso("PreToolUse", permissionDecision="allow", additionalContext="note")
+
+        for agent, sid, printed in (("codex", "codex-" + self.SID, self.hso("PreToolUse", additionalContext="note")),
+                                    ("claude", self.SID, check({}))):
+            seen.clear()
+            out = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(self.pre()))), mock.patch("sys.stdout", out):
+                self.assertEqual(longhaul.run_hook(check, "guard", agent), 0)
+            self.assertEqual(seen[0]["session_id"], sid, agent)
+            self.assertEqual(json.loads(out.getvalue()), printed, agent)
+
+    def test_the_hook_commands_take_agent_codex_and_claude_is_the_default(self):
+        for cmd, name in (("guard", "guard"), ("checkpoint", "checkpoint"), ("reminder", "reminder"),
+                          ("precompact", "precompact"), ("filter", "filter_cmd")):
+            got = []
+            with mock.patch.object(longhaul, name, lambda opts: got.append(opts.agent) or 0):
+                self.assertEqual(longhaul.main([cmd, "--agent", "codex"]), 0)
+                self.assertEqual(longhaul.main([cmd]), 0)
+            self.assertEqual(got, ["codex", "claude"], cmd)
+        self.assertEqual(set(longhaul.CODEX_HOOK_COMMANDS), {"guard", "checkpoint", "reminder", "precompact", "filter"})
+
+    def wrapper(self, *args, stdin=""):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("LONGHAUL_", "CLAUDE_CODE_", "CODEX_"))}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off",
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), CODEX_HOME=str(self.tmp / "codex"))
+        return subprocess.run([sys.executable, "-I", str(self.WRAPPER), *args], input=stdin, capture_output=True,
+                              text=True, env=env, cwd=self.tmp, timeout=60)
+
+    def test_the_wrapper_exits_0_whatever_it_is_given_and_runs_no_other_command(self):
+        # argparse exits 2 on a bad argument; under Codex that would block the tool.
+        for args, stdin in (((), "{}"), (("no-such-command",), "{}"), (("guard",), "not json"),
+                            (("guard", "--bogus"), "{}"), (("usage",), "{}"), (("",), "")):
+            r = self.wrapper(*args, stdin=stdin)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), args)
+        self.assertFalse((self.home / "ledger.jsonl").exists(), "no command but a hook's runs")
+
+    def test_the_wrapper_runs_the_hook_as_codex_s(self):
+        read = self.tmp / "a.py"
+        read.write_text("x = 1\n")
+        r = self.wrapper("guard", stdin=json.dumps(self.pre(tool_input={"command": f"cat {read}"})))
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        record = json.loads((self.home / "guard" / f"codex-{self.SID}.json").read_text())
+        self.assertIn(str(read), record["reads"])
+        self.assertFalse((self.home / "guard" / f"{self.SID}.json").exists())
 
 
 class Guard(unittest.TestCase):

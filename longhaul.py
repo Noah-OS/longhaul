@@ -5885,15 +5885,23 @@ def guard_counts(sid: str):
     return total if found else None
 
 
-def run_hook(check, name: str) -> int:
+def run_hook(check, name: str, agent: str = "claude") -> int:
     """A hook command: the engine's JSON on stdin, `check`'s answer as
     JSON on stdout or nothing, exit 0 always: a hook must never stop
     what it did not mean to. `check` takes the input as an object ({}
     for none); what it raises is logged under `name`, and the engine
-    goes on. A SystemExit is not an Exception and ends the command."""
+    goes on. A SystemExit is not an Exception and ends the command.
+    Under Codex (`agent` "codex") `check` gets the input made Longhaul's
+    and its answer is cut to what Codex takes back (codex_hook_input(),
+    codex_hook_output())."""
     try:
         raw = sys.stdin.read(1_000_000)
-        answer = check(json.loads(raw) if raw.strip() else {})
+        data = json.loads(raw) if raw.strip() else {}
+        if agent == "codex":
+            event = data.get("hook_event_name") if isinstance(data, dict) else None
+            answer = codex_hook_output(check(codex_hook_input(data)), event)
+        else:
+            answer = check(data)
         if answer:
             print(json.dumps(answer))
     except Exception as e:
@@ -5904,7 +5912,83 @@ def run_hook(check, name: str) -> int:
     return 0
 
 
-def guard(_opts) -> int:
+# Codex's hooks (the Codex plan's Phases 2 to 4): the same events and
+# fields as Claude Code's, read from Codex's source in
+# docs/discovery/2026-10-28-codex-hooks.md. hooks/codex_hook.py runs these
+# commands with --agent codex; their input is made Longhaul's and their
+# answer cut to what Codex takes back, since Codex drops an answer it
+# refuses whole, its additionalContext with it.
+CODEX_HOOK_COMMANDS = ("guard", "checkpoint", "reminder", "precompact", "filter")
+CODEX_ID = re.compile(r"[A-Za-z0-9_-]{1,94}")  # a Codex thread's id; "codex-" and it make a GUARD_ID
+# By event: the hookSpecificOutput fields Codex takes beside hookEventName,
+# and whether a top-level decision "block" with a reason is one.
+CODEX_HOOK_ANSWERS = {
+    "PreToolUse": ({"additionalContext", "permissionDecision", "permissionDecisionReason", "updatedInput"}, False),
+    "PostToolUse": ({"additionalContext"}, True),
+    "SessionStart": ({"additionalContext"}, False),
+    "SubagentStart": ({"additionalContext"}, False),
+    "UserPromptSubmit": ({"additionalContext"}, True),
+    "PreCompact": (set(), False),
+    "PostCompact": (set(), False),
+    "Stop": (set(), True),
+    "SubagentStop": (set(), True),
+}
+CODEX_DENIED = "Longhaul stopped this call."  # a deny's reason when it had none: Codex refuses a deny without one
+
+
+def codex_hook_input(data) -> dict:
+    """A Codex hook's input as Longhaul's handlers read Claude Code's: the
+    same fields, the session keyed `codex-<id>` so that no record of it
+    can be a Claude Code session's (the plan's Shape), an id that could
+    not name a file left out, and `longhaul_agent` saying whose it is.
+    Codex's session_id is the root thread's; a sub-agent's hooks carry its
+    own thread as agent_id, as Claude Code's do."""
+    if not isinstance(data, dict):
+        return {}
+    data = {**data, "longhaul_agent": "codex"}
+    sid, agent = data.pop("session_id", None), data.pop("agent_id", None)
+    if isinstance(sid, str) and CODEX_ID.fullmatch(sid):
+        data["session_id"] = f"codex-{sid}"
+    if isinstance(agent, str) and re.fullmatch(GUARD_ID, agent):
+        data["agent_id"] = agent
+    return data
+
+
+def codex_hook_output(answer, event):
+    """`answer`, a Claude Code hook's, cut to what Codex takes back for
+    `event` (CODEX_HOOK_ANSWERS), or None when nothing is left: allow
+    only with updatedInput, no ask, no reason without a decision, and on
+    PostToolUse no replaced output (the filter stays in shadow on Codex,
+    X8). A deny keeps one reason or Longhaul's own: dropped, it would let
+    the call run."""
+    if not isinstance(answer, dict) or event not in CODEX_HOOK_ANSWERS:
+        return None
+    fields, blocks = CODEX_HOOK_ANSWERS[event]
+    out = {}
+    said, reason = answer.get("systemMessage"), answer.get("reason")
+    if isinstance(said, str) and said.strip():
+        out["systemMessage"] = said
+    if blocks and answer.get("decision") == "block" and isinstance(reason, str) and reason.strip():
+        out["decision"], out["reason"] = "block", reason
+    given = answer.get("hookSpecificOutput")
+    given = {k: v for k, v in given.items() if k in fields} if isinstance(given, dict) else {}
+    hso = {}
+    context, why = given.get("additionalContext"), given.get("permissionDecisionReason")
+    if isinstance(context, str) and context.strip():
+        hso["additionalContext"] = context
+    why = why if isinstance(why, str) and why.strip() else None
+    if given.get("permissionDecision") == "deny":
+        hso.update(permissionDecision="deny", permissionDecisionReason=why or CODEX_DENIED)
+    elif given.get("permissionDecision") == "allow" and isinstance(given.get("updatedInput"), dict):
+        hso.update(permissionDecision="allow", updatedInput=given["updatedInput"])
+        if why:
+            hso["permissionDecisionReason"] = why
+    if hso:
+        out["hookSpecificOutput"] = {"hookEventName": event, **hso}
+    return out or None
+
+
+def guard(opts) -> int:
     """The hook command: stdin in, JSON or nothing out, exit 0 always. On
     PreToolUse the reminder joins the answer when it is due, in any mode:
     LONGHAUL_GUARD=off stops the rules, not the reminder. At a startup,
@@ -5920,7 +6004,7 @@ def guard(_opts) -> int:
         return reminder_join(data, models_guide_join(
             data, guard_check(data, guard_mode(), index=index_mode()), ("startup",)))
 
-    return run_hook(check, "guard")
+    return run_hook(check, "guard", getattr(opts, "agent", "claude"))
 
 
 # --------------------------------------------------------------- filter
@@ -6576,12 +6660,12 @@ def filter_counts(sid: str):
     return {"modes": {k: dict(v) for k, v in modes.items()}, "fetched": fetched, "ms": sorted(ms)}
 
 
-def filter_cmd(_opts) -> int:
+def filter_cmd(opts) -> int:
     """The PostToolUse hook command on Bash: stdin in, JSON or nothing
     out, exit 0 always. It answers first and logs after (RTK's hook
     hygiene), so the log never holds the output back."""
     notes = []
-    code = run_hook(lambda data: filter_check(data, filter_mode(), notes), "filter")
+    code = run_hook(lambda data: filter_check(data, filter_mode(), notes), "filter", getattr(opts, "agent", "claude"))
     sys.stdout.flush()
     try:
         filter_logged(notes)
@@ -7252,7 +7336,7 @@ def checkpoint(opts) -> int:
             raise SystemExit(2)
         return checkpoint_answer(data)
 
-    return run_hook(check, "checkpoint")
+    return run_hook(check, "checkpoint", getattr(opts, "agent", "claude"))
 
 
 # -------------------------------------------------------------- advisor
@@ -9040,7 +9124,7 @@ def reminder_join(data, answer):
     return answer
 
 
-def reminder(_opts) -> int:
+def reminder(opts) -> int:
     """The UserPromptSubmit hook command: stdin in, the reminder's JSON or
     nothing out, exit 0 always. An error prints nothing and is logged by
     its kind alone, as advisor_note() does. Each call, whatever happens,
@@ -9055,12 +9139,16 @@ def reminder(_opts) -> int:
             return 0
         data = json.loads(raw) if raw.strip() else {}
         data = data if isinstance(data, dict) else {}
+        codex = getattr(opts, "agent", "claude") == "codex"
+        if codex:
+            data = codex_hook_input(data)
         sid = data.get("session_id")
         found = reminder_check(data)
         if found["code"] == "fired":
             size = found["size"]
-            print(json.dumps({"systemMessage": REMINDER_USER.format(k=size // 1000), "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit", "additionalContext": REMINDER_MODEL.format(k=size // 1000)}}))
+            answer = {"systemMessage": REMINDER_USER.format(k=size // 1000), "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": REMINDER_MODEL.format(k=size // 1000)}}
+            print(json.dumps(codex_hook_output(answer, "UserPromptSubmit") if codex else answer))
     except Exception as e:
         log(f"reminder hook: no reminder ({type(e).__name__})")
         found = {**found, "code": "error"}
@@ -9222,14 +9310,15 @@ def precompact_note(data, now: float | None = None) -> None:
     log(PRECOMPACT_LOGGED.format(sid=sid, trigger=trigger, by=by, age=age))
 
 
-def precompact(_opts) -> int:
+def precompact(opts) -> int:
     """The PreCompact hook command: stdin in, nothing out, exit 0 always,
     so it never blocks a compaction. An error is logged by its kind alone,
     as stop_hook() does: the input holds text."""
     try:
         raw = sys.stdin.read(STOPS_STDIN_MAX + 1)
         if len(raw) <= STOPS_STDIN_MAX:
-            precompact_note(json.loads(raw) if raw.strip() else {})
+            data = json.loads(raw) if raw.strip() else {}
+            precompact_note(codex_hook_input(data) if getattr(opts, "agent", "claude") == "codex" else data)
     except Exception as e:
         log(f"precompact hook: nothing logged ({type(e).__name__})")
     return 0
@@ -13484,6 +13573,10 @@ def main(argv: list[str]) -> int:
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
+        if cmd in CODEX_HOOK_COMMANDS:
+            p.add_argument("--agent", choices=["claude", "codex"], default="claude",
+                           help="whose hook this is: claude (the default) or codex, OpenAI Codex's, as "
+                                "hooks/codex_hook.py runs it")
         if cmd == "usage":
             p.add_argument("--days", type=float, default=1, help="how far back (default: 1 day)")
         if cmd == "checkpoint":
