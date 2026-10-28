@@ -6043,6 +6043,9 @@ def guard(opts) -> int:
 # time, over FILTER_MIN_DROPS drops, stops (inspect says "watch" from
 # FILTER_WATCH_AT). inspect replays a conversation's Bash output through
 # both levels: shadow mode's measure.
+# Under Codex (the Codex plan's X8) the same hook only measures: shadow
+# whatever LONGHAUL_FILTERS says but off, its log keyed codex-<id> and
+# marked "codex" (filter_check() says why).
 # Learned from RTK (github.com/rtk-ai/rtk, whose CLI is Apache-2.0) and
 # caveman (github.com/juliusbrussee/caveman): their rules, rebuilt here
 # in Python; none of their code.
@@ -6514,12 +6517,27 @@ def filter_check(data, mode: str, notes: list):
     """The hook's answer to one PostToolUse input: Bash's output with each
     stream filtered at `mode`'s level, in the shape it came in, or None
     to keep it as it is. What was done goes into `notes`, to log after
-    the answer is out."""
+    the answer is out.
+    Under Codex (`longhaul_agent` "codex"; the Codex plan's X8) the output
+    is one string, the model's view already cut to Codex's limit, measured
+    as Claude Code's stdout with an empty stderr. Every mode but off is
+    shadow there, and nothing is answered: Codex replaces a result only by
+    handing the model a hook's reason as the tool's error
+    (docs/discovery/2026-10-28-codex-hooks.md), so whether the filter ever
+    cuts on Codex is the owner's decision 4, made on these numbers. RTK's
+    hook in Claude Code's settings filters Claude Code's output, not
+    Codex's, so it is not looked for."""
     started = time.perf_counter()
     if mode == "off" or not isinstance(data, dict) or data.get("hook_event_name") != "PostToolUse" \
             or data.get("tool_name") != "Bash":
         return None
-    args, out = dict_at(data, "tool_input"), dict_at(data, "tool_response")
+    codex = data.get("longhaul_agent") == "codex"
+    if codex:
+        mode, response = "shadow", data.get("tool_response")
+        out = {"stdout": response, "stderr": ""} if isinstance(response, str) else {}
+    else:
+        out = dict_at(data, "tool_response")
+    args = dict_at(data, "tool_input")
     command, sid, tid = args.get("command"), data.get("session_id"), data.get("tool_use_id")
     if not isinstance(command, str) or not all(isinstance(x, str) and re.fullmatch(GUARD_ID, x) for x in (sid, tid)):
         return None
@@ -6528,7 +6546,7 @@ def filter_check(data, mode: str, notes: list):
         return None
     streams = {k: out[k] for k in ("stdout", "stderr") if isinstance(out.get(k), str)}
     if not any(len(t) >= FILTER_SMALL for t in streams.values()) or any(root in command for root in filter_roots()) \
-            or filter_rtk(data.get("cwd")):
+            or (not codex and filter_rtk(data.get("cwd"))):
         return None
     try:  # a lone surrogate (an emoji cut in half) cannot be saved or logged safely: leave it be
         for text in streams.values():
@@ -6545,6 +6563,8 @@ def filter_check(data, mode: str, notes: list):
             "kind": filter_kind(command), "chars": chars, "lossless": sum(map(len, lossless.values())),
             "on": sum(len(s) for s, _ in on.values()), "dropped": sum(d["dropped"] for _, d in on.values()),
             "steps": sorted({s for _, d in on.values() for s in d["steps"]} - {"lossless"})}
+    if codex:  # whose chat it is; "agent" says a sub-agent's call
+        note["codex"] = True
     shown = dict(lossless) if mode == "lossless" else {k: s for k, (s, _) in on.items()} if mode == "on" else streams
     cut = [k for k, (_, d) in on.items() if d["dropped"]] if mode == "on" else []
     if cut and not filter_store(sid, {saved[k]: streams[k] for k in cut}):
@@ -6663,7 +6683,9 @@ def filter_counts(sid: str):
 def filter_cmd(opts) -> int:
     """The PostToolUse hook command on Bash: stdin in, JSON or nothing
     out, exit 0 always. It answers first and logs after (RTK's hook
-    hygiene), so the log never holds the output back."""
+    hygiene), so the log never holds the output back. Under Codex
+    (--agent codex) it only measures and logs: filter_check() keeps it
+    in shadow there."""
     notes = []
     code = run_hook(lambda data: filter_check(data, filter_mode(), notes), "filter", getattr(opts, "agent", "claude"))
     sys.stdout.flush()

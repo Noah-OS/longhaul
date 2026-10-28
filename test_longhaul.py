@@ -5461,6 +5461,202 @@ class Filter(unittest.TestCase):
         self.assertEqual((odd.returncode, odd.stdout, odd.stderr), (0, b"", b""), "review, Phase 3: not UTF-8")
 
 
+class CodexFilter(unittest.TestCase):
+    """`longhaul filter` under Codex (the Codex plan's X8, Phase 3). Codex's
+    PostToolUse on a shell command gives the output as one string, already
+    cut to Codex's limit, and Codex replaces a result only by handing the
+    model a hook's reason as the tool's error (decision "block"; docs
+    discovery/2026-10-28-codex-hooks.md). So on Codex the filter stays in
+    shadow whatever LONGHAUL_FILTERS says, but off: it measures and logs by
+    size, and changes, saves and answers nothing. Decision 4 is the
+    owner's, later, on these numbers."""
+
+    SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
+    AGENT = "019f9d8f-0000-7000-8000-000000000001"
+    WRAPPER = HERE / "hooks" / "codex_hook.py"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        saved = {k: getattr(longhaul, k) for k in ("LONGHAUL_HOME", "DEFAULT_CONFIG")}
+        longhaul.LONGHAUL_HOME, longhaul.DEFAULT_CONFIG = self.home, self.tmp / "claude"
+        for k, v in saved.items():
+            self.addCleanup(setattr, longhaul, k, v)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)  # the user's own settings are not this test's
+        os.environ.pop("LONGHAUL_FILTERS", None)
+
+    def grep(self):
+        """grep's matches: lossless would cut them, on no more."""
+        return "".join(f"/work/project/src/service/mod_{f}.py:{10 + i}:    total_{f}_{i} = compute_value({i})\n"
+                       for f in range(6) for i in range(15))
+
+    def build_log(self):
+        """A long build: on would leave its middle out."""
+        return "\n".join(f"step {i:04d} of the build: wrote artifact_{i}.o" for i in range(2000)) + "\n"
+
+    def post(self, command, output, **extra):
+        """A Codex PostToolUse input for a shell command (the generated schema, rust-v0.165.0)."""
+        data = {"session_id": self.SID, "turn_id": "turn-1", "transcript_path": str(self.tmp / "rollout.jsonl"),
+                "cwd": str(self.tmp), "hook_event_name": "PostToolUse", "model": "gpt-5.6-terra",
+                "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": command},
+                "tool_use_id": "call_1", "tool_response": output}
+        data.update(extra)
+        return data
+
+    def hook(self, data, filters=None):
+        """What `longhaul filter --agent codex` prints for `data`, as hooks/codex_hook.py runs it."""
+        out = io.StringIO()
+        env = {} if filters is None else {"LONGHAUL_FILTERS": filters}
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(data))), contextlib.redirect_stdout(out), \
+                mock.patch.dict(os.environ, env):
+            self.assertEqual(longhaul.main(["filter", "--agent", "codex"]), 0)
+        return out.getvalue()
+
+    def logged(self):
+        path = self.home / "filters" / f"codex-{self.SID}.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_the_output_string_is_measured_in_shadow_as_claude_code_s_stdout_would_be(self):
+        for command, text, steps in (("grep -rn compute_value src/service", self.grep(), []),
+                                     ("./build.sh", self.build_log(), ["cap"])):
+            with self.subTest(command=command):
+                for path in (self.home / "filters").glob("*"):
+                    path.unlink()
+                self.assertEqual(self.hook(self.post(command, text)), "", "no answer: Codex is never given one")
+                [note] = self.logged()
+                self.assertEqual({k: note[k] for k in ("mode", "applied", "id", "agent", "codex", "steps")},
+                                 {"mode": "shadow", "applied": False, "id": "call_1", "agent": False, "codex": True,
+                                  "steps": steps})
+                self.assertEqual((note["chars"], note["shown"]), (len(text), len(text)))
+                self.assertEqual(note["lossless"], len(longhaul.filter_output(command, text, "lossless")[0]))
+                self.assertLessEqual(note["on"], note["lossless"])
+                self.assertLess(min(note["lossless"], note["on"]), note["chars"], "something would be cut")
+                # The same output on Claude Code, as its stdout with an empty stderr: measured the same.
+                claude = {"session_id": f"codex-{self.SID}", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                          "tool_use_id": "call_1", "cwd": str(self.tmp), "tool_input": {"command": command},
+                          "tool_response": {"stdout": text, "stderr": "", "interrupted": False, "isImage": False}}
+                notes = []
+                longhaul.filter_check(claude, "shadow", notes)
+                drop = lambda n: {k: v for k, v in n.items() if k not in ("at", "ms", "codex")}
+                self.assertEqual(drop(notes[0]["note"]), drop(note))
+        self.assertFalse((self.home / "filters" / f"{self.SID}.jsonl").exists(), "keyed codex-<id>, never the bare id")
+        self.assertFalse((self.home / "outputs").exists(), "shadow saves nothing")
+        sub = self.post("./build.sh", self.build_log(), agent_id=self.AGENT, agent_type="explorer",
+                        tool_use_id="call_2")
+        self.assertEqual(self.hook(sub), "")
+        self.assertEqual([n["agent"] for n in self.logged()], [False, True], "a sub-agent's call, as on Claude Code")
+
+    def test_off_means_nothing_at_all(self):
+        self.assertEqual(self.hook(self.post("./build.sh", self.build_log()), "off"), "")
+        notes = []
+        data = longhaul.codex_hook_input(self.post("./build.sh", self.build_log()))
+        self.assertIsNone(longhaul.filter_check(data, "off", notes))
+        self.assertEqual(notes, [])
+        self.assertFalse((self.home / "filters").exists())
+        self.assertFalse((self.home / "outputs").exists())
+
+    def test_lossless_and_on_stay_shadow_under_codex_and_give_no_answer(self):
+        # A cut would reach the model as the tool's error, so none is made (decision 4, the owner's).
+        values = ("lossless", "on", "shadow", "bogus", "")
+        for i, value in enumerate(values):
+            with self.subTest(value=value):
+                data = self.post("./build.sh", self.build_log(), tool_use_id=f"call_{i}")
+                self.assertEqual(self.hook(data, value), "")
+        self.assertEqual([(n["id"], n["mode"], n["applied"]) for n in self.logged()],
+                         [(f"call_{i}", "shadow", False) for i in range(len(values))])
+        self.assertTrue(all(n["shown"] == n["chars"] and n["dropped"] > 0 for n in self.logged()))
+        data = longhaul.codex_hook_input(self.post("grep -rn compute_value src/service", self.grep()))
+        for mode in ("lossless", "on"):
+            notes = []
+            self.assertIsNone(longhaul.filter_check(data, mode, notes), mode)
+            self.assertEqual((notes[0]["note"]["mode"], notes[0]["drops"]), ("shadow", []), mode)
+        self.assertFalse((self.home / "outputs").exists(), "nothing saved")
+        self.assertFalse((self.home / "filters" / "stats.json").exists(), "no drop counted")
+
+    def test_claude_code_s_settings_are_not_read_for_rtk_under_codex(self):
+        # RTK's hook in Claude Code's settings filters Claude Code's output, not Codex's.
+        longhaul.DEFAULT_CONFIG.mkdir()
+        (longhaul.DEFAULT_CONFIG / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}]}}))
+        claude = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t1",
+                  "cwd": str(self.tmp), "tool_input": {"command": "./build.sh"},
+                  "tool_response": {"stdout": self.build_log(), "stderr": ""}}
+        notes = []
+        self.assertIsNone(longhaul.filter_check(claude, "shadow", notes))
+        self.assertEqual(notes, [], "on Claude Code, Longhaul steps aside")
+        with mock.patch.object(longhaul, "filter_rtk", side_effect=AssertionError("Claude Code's settings read")):
+            self.assertEqual(self.hook(self.post("./build.sh", self.build_log())), "")
+        [note] = self.logged()
+        self.assertEqual(note["mode"], "shadow")
+        self.assertFalse((self.home / "longhaul.log").exists(), "nothing went wrong")
+
+    def test_the_log_holds_sizes_and_ids_never_the_command_or_the_output(self):
+        command = "grep -rn compute_value /work/SECRET_PROJECT --include=*.py"
+        text = self.grep().replace("total_", "TOKEN_abc123_")
+        self.assertEqual(self.hook(self.post(command, text)), "")
+        raw = (self.home / "filters" / f"codex-{self.SID}.jsonl").read_text()
+        for word in ("SECRET_PROJECT", "compute_value", "TOKEN_abc123", "/work/", "grep -rn"):
+            self.assertNotIn(word, raw)
+        [note] = self.logged()
+        self.assertEqual(set(note), {"at", "id", "agent", "codex", "mode", "kind", "chars", "lossless", "on",
+                                     "dropped", "steps", "shown", "applied", "ms"})
+        self.assertEqual(note["kind"], "grep")
+        self.assertEqual(oct((self.home / "filters" / f"codex-{self.SID}.jsonl").stat().st_mode & 0o777), "0o600")
+        # inspect reads a Codex chat's log as it reads Claude Code's.
+        self.assertEqual(longhaul.filter_counts(f"codex-{self.SID}")["modes"]["shadow"]["calls"], 1)
+
+    def test_what_is_never_measured_under_codex(self):
+        big = self.build_log()
+        for data in (self.post("grep x y", "a:1:b\n" * 20),  # under FILTER_SMALL
+                     self.post("./build.sh", {"stdout": big}), self.post("./build.sh", None),
+                     self.post("./build.sh", [big]),
+                     self.post("./build.sh", big, tool_name="apply_patch"),
+                     self.post("./build.sh", big, tool_name="mcp__fs__read"),
+                     self.post("./build.sh", big, hook_event_name="PreToolUse"),
+                     self.post("./build.sh", big, session_id="../../etc"),  # left out by codex_hook_input
+                     self.post("./build.sh", big, tool_use_id="a/b"),
+                     {**self.post("./build.sh", big), "tool_input": {"cmd": "./build.sh"}},
+                     self.post(f"sed -n '1,9p' {self.home}/outputs/s1/toolu_01.txt", big)):
+            with self.subTest(data=json.dumps(data)[-160:]):
+                self.assertEqual(self.hook(data, "on"), "")
+        self.assertEqual(self.logged(), [])
+        self.assertFalse((self.home / "filters").exists())
+
+    def test_claude_code_s_filter_is_unchanged(self):
+        data = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_01A",
+                "cwd": str(self.tmp), "tool_input": {"command": "grep -rn compute_value src/service"},
+                "tool_response": {"stdout": self.grep(), "stderr": "", "interrupted": False, "isImage": False}}
+        out = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(data))), contextlib.redirect_stdout(out), \
+                mock.patch.dict(os.environ, LONGHAUL_FILTERS="lossless"):
+            self.assertEqual(longhaul.main(["filter"]), 0)
+        answer = json.loads(out.getvalue())
+        self.assertEqual(answer["hookSpecificOutput"]["updatedToolOutput"]["stdout"],
+                         longhaul.filter_output("grep -rn x", self.grep(), "lossless")[0])
+        [line] = (self.home / "filters" / "s1.jsonl").read_text().splitlines()
+        self.assertEqual(json.loads(line)["mode"], "lossless")
+        self.assertNotIn("codex", json.loads(line), "a Claude Code chat's line is as before")
+        # A string tool_response on Claude Code is no Bash output it knows: left alone, as before.
+        self.assertIsNone(longhaul.filter_check({**data, "tool_response": self.grep()}, "lossless", []))
+
+    def test_the_wrapper_measures_and_prints_nothing(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("LONGHAUL_", "CLAUDE_CODE_", "CODEX_"))}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off", LONGHAUL_FILTERS="on",
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), CODEX_HOME=str(self.tmp / "codex"))
+        for output in (self.build_log(), "a:1:b\n"):
+            r = subprocess.run([sys.executable, "-I", str(self.WRAPPER), "filter"], input=json.dumps(
+                self.post("./build.sh", output)), capture_output=True, text=True, env=env, cwd=self.tmp, timeout=60)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        [note] = self.logged()
+        self.assertEqual((note["mode"], note["applied"], note["codex"]), ("shadow", False, True))
+        self.assertFalse((self.home / "outputs").exists())
+
+
 class Index(unittest.TestCase):
     """The auto-init (Sprint 7, G4): at a new session's start in a git work
     tree with no code map, the guard's startup hook starts `codegraph init`
