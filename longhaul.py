@@ -8983,9 +8983,10 @@ SUBAGENT_MODEL = ("Longhaul: your context as a subagent is about {k}k tokens, an
                   "and anything the next agent needs to know, so the main conversation can hand the rest to a fresh "
                   "subagent.")
 # Codex's lines, meaning what the three above do. A Codex skill is invoked
-# as $<name>; what a plugin's skill is named there is the plan's P3, which
-# settles this name: one constant, so the lines change with it.
-CODEX_CHECKPOINT_SKILL = "$checkpoint"
+# as $<name>, and Codex names a plugin's skill <plugin>:<skill> (X4: the
+# skill is codex-skills/checkpoint, which .codex-plugin/plugin.json names):
+# one constant, so the lines change with it.
+CODEX_CHECKPOINT_SKILL = "$longhaul:checkpoint"
 CODEX_REMINDER_USER = ("Longhaul: this chat's context is about {k}k tokens, and every request carries all of it "
                        "again. To shrink it without losing the thread: " + CODEX_CHECKPOINT_SKILL + ", then /compact. "
                        "The checkpoint comes back.")

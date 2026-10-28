@@ -1,0 +1,14 @@
+{
+  "name": "longhaul",
+  "version": "0.3.2",
+  "description": "Keep the thread in long Codex chats: Codex saves where it is, and the work picks up after a compaction, a resume or a clear. Shows where the tokens go.",
+  "keywords": ["sessions", "usage", "supervisor"],
+  "hooks": "./hooks/codex-hooks.json",
+  "skills": "./codex-skills/",
+  "interface": {
+    "displayName": "Longhaul",
+    "shortDescription": "Keep the thread in long Codex chats",
+    "developerName": "Amr Adel",
+    "websiteURL": "https://github.com/Noah-OS/longhaul"
+  }
+}
