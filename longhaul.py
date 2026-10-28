@@ -3745,13 +3745,21 @@ def program(command) -> str:
 
 
 def bash_reads(command, cwd) -> list:
-    """The files a Bash command prints, whole or in part (inferred): the
-    file arguments of cat, head, tail, nl or sed (not sed -i) in each step
-    joined by &&, ||, ; or a new line, after a `cd` among those steps. A
-    step with a pipe, a redirection or a subshell is left alone, as is a
-    word with a variable or a quote the shell could not close, and what
-    follows a heredoc. A relative path needs the folder the command ran
-    in, `cwd`. Only the paths are kept, never the command."""
+    """The files a Bash command prints, whole or in part (inferred), by
+    path: shell_reads()'s, without the program that prints each."""
+    return [path for _, path in shell_reads(command, cwd)]
+
+
+def shell_reads(command, cwd) -> list:
+    """(program, path) for each file a Bash command prints, whole or in
+    part (inferred): the file arguments of cat, head, tail, nl or sed (not
+    sed -i) in each step joined by &&, ||, ; or a new line, after a `cd`
+    among those steps. A step with a pipe, a redirection or a subshell is
+    left alone, as is a word with a variable or a quote the shell could
+    not close, and what follows a heredoc. A relative path needs the
+    folder the command ran in, `cwd`. Only the paths are kept, never the
+    command. The program is what tells a whole read from a part, for the
+    guard on Codex (guard_targets)."""
     text = str(command)
     if "<<" in text:  # a heredoc's body is data, not steps
         end = text.find("\n", text.find("<<"))
@@ -3819,7 +3827,7 @@ def bash_reads(command, cwd) -> list:
                     files.append(a)
             else:
                 files = files if script else files[1:]
-        found.extend(p for p in map(resolve, files) if p)
+        found.extend((name, p) for p in map(resolve, files) if p)
     return found[:20]
 
 
@@ -5530,6 +5538,17 @@ def index_note(program: str, top: str) -> str:
 # without the index it says nothing of it. At startup the same hook
 # also runs the auto-init (the index region above) when LONGHAUL_INDEX
 # is on, whatever LONGHAUL_GUARD says: the two switches are independent.
+# On Codex (the Codex plan's X7) the same hook runs through
+# hooks/codex_hook.py, on Bash: Codex has no Read tool, and every shell
+# command reaches PreToolUse as Bash, each one a code cell runs included
+# (docs/discovery/2026-10-28-codex-hooks.md). A read there is the shell's:
+# cat and nl whole, head, tail and sed a part (shell_reads, inspect's
+# parse), in any step of a command. Codex runs no display.ts, so the
+# user's pop-up is the answer's systemMessage, which Codex shows as a
+# warning entry. What is Claude Code's alone stays out: the wait advice
+# (Claude's prompt cache), the CodeGraph note and its nudge (they name an
+# MCP tool that Codex's own config may not have), and at startup the
+# first-chat line and the release's line.
 
 
 GUARD_BIG = setting("LONGHAUL_GUARD_BIG", 20_000, int, 1)  # bytes: a whole read above this is waste
@@ -5552,6 +5571,14 @@ GUARD_CODEGRAPH = ("This project has a CodeGraph index (.codegraph/). For a symb
                    "codegraph_explore MCP tool (`mcp__codegraph__codegraph_explore`) answers in one call with the "
                    "source and the call paths; keep grep and rg for plain text.")
 GUARD_SEARCHES = 20  # a context's searches before the index is named to it, once
+GUARD_WHOLE = ("cat", "nl")  # under Codex, the readers that print a whole file: no option of nl's prints a part
+# What a Codex user is shown of each read the rules flag, by rule and by mode (warn, block): display.ts's
+# pop-ups for Claude Code, which Codex does not run, as the answer's systemMessage (guard_popups).
+GUARD_SHOWN = {
+    "whole": ("Longhaul: told Codex {name} is {kb} KB; reading only the part it needs keeps the context small.",
+              "Longhaul: refused a whole read of {name} ({kb} KB); Codex reads a part instead."),
+    "repeat": ("Longhaul: told Codex {name} hasn't changed since it last read it.",
+               "Longhaul: refused a repeat read of {name}; it hasn't changed since Codex last read it.")}
 # A record's keys that are not the guard's (the reminders', and why the session
 # ended: session_end_check()): every rewrite of the guard's keeps them.
 GUARD_KEPT = ("reminder", "subagent_reminder", "session_end")
@@ -5581,7 +5608,12 @@ def guard_targets(data: dict) -> list:
     put into the context. Of a Bash command only its first program and
     that program's file arguments are looked at; the command itself is
     never kept. A first line with a shell operator is left alone: a piped
-    cat is filtered, a redirected one is a write."""
+    cat is filtered, a redirected one is a write. Under Codex, where every
+    read is the shell's, each file shell_reads() finds a step of the
+    command printing, by its program: whole for cat and nl (GUARD_WHOLE),
+    a part for head, tail and sed. A relative path is the hook's cwd's,
+    as on Claude Code, and needs it absolute: Codex can run a command in
+    another folder, and its hook input does not say which."""
     tool, args = data.get("tool_name"), dict_at(data, "tool_input")
     if tool == "Read":
         path = args.get("file_path")
@@ -5590,6 +5622,9 @@ def guard_targets(data: dict) -> list:
         part = any(args.get(k) for k in ("offset", "limit", "pages"))
         return [("Read", Path(path), not part)]
     if tool == "Bash" and isinstance(args.get("command"), str):
+        if data.get("longhaul_agent") == "codex":
+            cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and os.path.isabs(data["cwd"]) else None
+            return [(name, Path(path), name in GUARD_WHOLE) for name, path in shell_reads(args["command"], cwd)]
         line = args["command"].split("\n", 1)[0]
         if re.search(r"[|><;&]", line):
             return []
@@ -5620,11 +5655,16 @@ def guard_startup(data: dict, mode: str, index: str):
     None. A subagent's start is not the session's, and without the index
     there is nothing to say of it: the install advice is the inspect
     report's, not every session's. What the index's part, the first-chat
-    line or the release's part raises is logged and costs nothing else."""
-    named = mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
+    line or the release's part raises is logged and costs nothing else.
+    Under Codex the index's part alone: the first-chat line points to
+    /longhaul:doctor, a Claude Code skill; the release's line is about
+    Claude Code's plugin update; and the guard's note names CodeGraph's
+    MCP tool, which Codex has only if its own config adds the server."""
+    codex = data.get("longhaul_agent") == "codex"
+    named = not codex and mode != "off" and data.get("agent_id") is None and codegraph_index_at(data.get("cwd"))
     started, message, first = [], "", None
     try:  # the first chat after an install or an update: one line pointing to /longhaul:doctor (setup_line)
-        first = setup_line(data)
+        first = None if codex else setup_line(data)
     except Exception as e:
         log(f"setup: no line ({type(e).__name__})")
     try:  # the index's part: whatever it raises (a full disk, a home it cannot write), the guard's note goes
@@ -5635,7 +5675,7 @@ def guard_startup(data: dict, mode: str, index: str):
         log(f"index: not started ({e!r})")
     message = "\n".join(filter(None, (first, message)))
     try:  # the release's part (release_startup): its one line goes last, on its own; what it raises costs the rest nothing
-        message = "\n".join(part for part in (message, release_startup(data)) if part)
+        message = "\n".join(part for part in (message, "" if codex else release_startup(data)) if part)
     except Exception as e:
         log(f"release: nothing said at startup ({e!r})")
     notes = []
@@ -5655,9 +5695,13 @@ def guard_wait(data: dict) -> bool:
     (BASH_DEFAULT_TIMEOUT_MS) over it, a sleep of that or more, or a loop
     that sleeps. Not a call in the background or one its own timeout ends
     first, and not the main conversation's, whose cache lasts an hour. Of
-    the command its shape alone is looked at, and nothing of it is kept."""
+    the command its shape alone is looked at, and nothing of it is kept.
+    Never under Codex: the cache it weighs is Claude's, and a Codex shell
+    call carries neither a timeout nor run_in_background."""
     args = dict_at(data, "tool_input")
     if data.get("tool_name") != "Bash" or data.get("agent_id") is None or args.get("run_in_background") is True:
+        return False
+    if data.get("longhaul_agent") == "codex":
         return False
     command, limit = args.get("command"), as_number(args.get("timeout"))
     if not isinstance(command, str):
@@ -5675,7 +5719,7 @@ def guard_wait(data: dict) -> bool:
     return any(s >= WAIT_MAX for s in sleeps) or bool(re.search(r"\b(?:until|while|for)\b.*\bsleep\b", command, re.S))
 
 
-def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float):
+def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float, codex: bool = False):
     """The three rules (GUARD_RULES) over the files a call would put into
     the context: a repeat is a whole read of a file read in full before
     and unchanged since; a cat and a big are a whole cat or Read of a
@@ -5684,8 +5728,11 @@ def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float)
     Returns the notes for the model; for each file read whole, the stamp
     to record (whether a denied call's reads are kept is the caller's);
     and each firing as (rule, the file by home_path, its size), for the
-    caller's log line."""
+    caller's log line. Under Codex (`codex`) a whole nl is a cat, by its
+    own name in the note, and a part is advised as the shell reads one:
+    Codex has no Read tool."""
     notes, seen, flagged = [], {}, []
+    part = "sed -n with a range" if codex else "Read with offset and limit"
     for how, path, whole in targets:
         try:
             if not path.is_file():
@@ -5709,13 +5756,13 @@ def guard_rules(targets: list, reads: dict, fired: dict, cost: dict, now: float)
                 ago = max(0, int(now - at))
                 when = f"{ago // 60} min ago" if ago >= 60 else f"{ago} s ago"
             notes.append(f"{shown} ({size:,} bytes) was read in full {when} and has not changed since: "
-                         "it is already in the context. For a part of it, use Read with offset and limit, or "
+                         f"it is already in the context. For a part of it, use {part}, or "
                          "grep -n for the lines you need.")
             flagged.append(("repeat", shown, size))
-        elif whole and size > GUARD_BIG and how == "cat":
+        elif whole and size > GUARD_BIG and how in GUARD_WHOLE:  # a cat, or under Codex an nl
             fired["cat"] += 1
             cost["cat"] += size
-            notes.append(f"`cat` of {shown} ({size:,} bytes) puts the whole file into the context. "
+            notes.append(f"`{how}` of {shown} ({size:,} bytes) puts the whole file into the context. "
                          "Use head, sed -n with a range, or grep -n for the part you need.")
             flagged.append(("cat", shown, size))
         elif whole and size > GUARD_BIG and path.suffix.lower() not in GUARD_NO_PART:
@@ -5740,7 +5787,10 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     recorded; a Bash search is counted and, once the context's count
     reaches GUARD_SEARCHES in an indexed project, answered once with the
     index. Each read a rule flags is one line in the log (guard_logged),
-    which the display turns into a pop-up for the user."""
+    which the display turns into a pop-up for the user. Under Codex the
+    main chat's pop-ups are the answer's systemMessage (guard_popups),
+    since Codex runs no display, and a search is neither counted nor
+    nudged: the nudge names CodeGraph's MCP tool (guard_startup)."""
     if not isinstance(data, dict):
         return None
     if data.get("hook_event_name") == "SessionStart":
@@ -5759,7 +5809,10 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
     # A search is a Bash whose first program is one of inspect's; its
     # program is not cat, so it has no targets. Of its command line only
     # the program is looked at, and the record keeps the count alone.
-    search = data.get("tool_name") == "Bash" and program(dict_at(data, "tool_input").get("command")) in SEARCH_PROGRAMS
+    # The count is the nudge's alone, so under Codex it is not kept.
+    codex = data.get("longhaul_agent") == "codex"
+    search = not codex and data.get("tool_name") == "Bash" and (
+        program(dict_at(data, "tool_input").get("command")) in SEARCH_PROGRAMS)
     targets, wait = guard_targets(data), guard_wait(data)
     record = guard_record_path(data) if targets or search or wait else None
     if record is None:
@@ -5779,7 +5832,7 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
         if search and searches >= GUARD_SEARCHES and not nudged and codegraph_index_at(data.get("cwd")):
             nudged = True  # once per context: the count goes on, the note does not
             nudge = f"{GUARD_CODEGRAPH} (This context has made {searches} searches so far.)"
-        notes, seen, flagged = guard_rules(targets, reads, fired, cost, now)
+        notes, seen, flagged = guard_rules(targets, reads, fired, cost, now, codex)
         waits = as_int(kept.get("waits")) + (1 if wait else 0)
         if not (mode == "block" and notes):  # a denied call read nothing
             reads.update(seen)
@@ -5798,12 +5851,29 @@ def guard_check(data, mode: str, now: float | None = None, index: str = "off"):
                                        "additionalContext": " ".join(filter(None, (nudge, advice)))}}
     if mode == "block" and notes:  # how to turn the guard off is for the user, not the model
         text = "longhaul guard blocked this call. " + " ".join(notes) + " Make the narrower call instead."
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": text}}
-    if not (notes or wait):
+        answer = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                         "permissionDecisionReason": text}}
+    elif notes or wait:
+        text = "longhaul guard (advice; the call went ahead): " + " ".join(notes + ([GUARD_WAIT] if wait else []))
+        answer = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+    else:
         return None
-    text = "longhaul guard (advice; the call went ahead): " + " ".join(notes + ([GUARD_WAIT] if wait else []))
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+    shown = guard_popups(flagged, mode) if codex and data.get("agent_id") is None else ""
+    return {"systemMessage": shown, **answer} if shown else answer
+
+
+def guard_popups(flagged: list, mode: str) -> str:
+    """What a Codex user is shown of the reads the rules flagged, a line
+    each (GUARD_SHOWN), for the answer's systemMessage, or "": on Claude
+    Code hooks/display.ts turns guard_logged()'s lines into these pop-ups,
+    and Codex runs no display. The file by its name and a whole read's
+    size in KB, as the display gives them. A subagent's reads are not the
+    main chat's, and the caller shows none, as the display does."""
+    said = []
+    for rule, shown, size in flagged:
+        text = GUARD_SHOWN["repeat" if rule == "repeat" else "whole"][mode == "block"]
+        said.append(text.format(name=shown.rsplit("/", 1)[-1] or shown, kb=(size + 500) // 1000))
+    return "\n".join(said)
 
 
 def guard_logged(data: dict, mode: str, flagged: list) -> None:
