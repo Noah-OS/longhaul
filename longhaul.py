@@ -2753,8 +2753,9 @@ def usage(opts) -> int:
 # here is counted, never an error.
 # Read from the owner's 21 rollouts (the 0.146 to 0.154 alphas, P1) and
 # Codex's source at eec8bde, structure only. Under CODEX_HOME (and the
-# doctor's ~/.codex) only sessions/ is read: never auth.json or any other
-# file there.
+# doctor's ~/.codex) only sessions/ is read, and by the doctor a few keys
+# of config.toml (codex_config_items()): never auth.json or any other file
+# there.
 
 try:
     from compression import zstd
@@ -13039,8 +13040,10 @@ def uninstall(opts) -> int:
 # processes it reads, with ps and lsof, only what a chat is (its program
 # and its own flags, never printed), its folder, and its CLAUDE_CONFIG_DIR,
 # never another variable. It names accounts, never their emails. Of
-# Codex's folders (X3) it lists sessions/ alone, and of the chats there it
-# reads the newest one's first record, for its version and where it ran.
+# Codex's folders (X3) it lists sessions/, and of the chats there it reads
+# the newest one's first record, for its version and where it ran; of each
+# folder's config.toml it reads only the keys its Codex items need
+# (codex_config_items()), and never auth.json.
 #
 # The first chat after an install or an update (the plugin's version is
 # not the one LONGHAUL_HOME/seen.json records) is told, by the guard's
@@ -13765,17 +13768,263 @@ def codex_version_said(quick: bool, newest: list) -> str:
     return "version not known: " + (f"{program}, and " if program else "") + why
 
 
+# Each Codex folder's config.toml (X3's second half), for what matters
+# once Codex runs Longhaul's hooks: [features] hooks (on by Codex's
+# default; codex_hooks is its old name, and hooks wins when both are set),
+# Longhaul's plugin ([plugins."longhaul@<marketplace>"], on unless enabled
+# = false), its hooks' trust in /hooks ([hooks.state."<plugin>:<file>:
+# <event>:<group>:<handler>"] trusted_hash), the MCP servers for the code
+# index ([mcp_servers.<name>], a codegraph or trail in the name) and
+# model_auto_compact_token_limit. Read from Codex's source at
+# rust-v0.165.0 (features/src/lib.rs, core-plugins/src/loader.rs,
+# hooks/src/engine/discovery.rs, protocol/src/openai_models.rs).
+# config.toml can hold secrets (an MCP server's env and headers, a
+# provider's key): only those keys are looked at, and only booleans,
+# counts, plugin and server names and numbers are shown; nothing is
+# written, and auth.json is never opened. Compaction is Codex's own point
+# (the owner's decision 3 of the Codex plan): no line to paste, only where
+# Codex compacts beside Longhaul's reminder. Nor is there a compact prompt
+# to paste: Codex's compact_prompt replaces its whole summary prompt, not
+# adds to it as Claude Code's Compact instructions do, and Codex's own
+# provider compacts on OpenAI's side without reading it.
+#
+# Codex trusts a hook by a hash of its declaration (hook_hash(), the same
+# from 0.151 to 0.165): the handler as Codex normalizes it (a timeout of
+# 600 when unset, at least 1, SessionEnd's and Interrupt's 1 to 3; no
+# commandWindows; additionalContextLimit only for an event that takes one
+# and not at its default, 2,500) with the event's key label and its
+# matcher, for an event that matches on one; keys sorted, compact JSON,
+# SHA-256. So the doctor recomputes each of Longhaul's handlers' hashes
+# from its own hooks file and tells a trusted hook from one changed since
+# and one never trusted. Codex 0.165 and later also pin the plugin's files
+# (trusted_content_hash, a hash of the whole installed copy), which the
+# doctor does not hash: after an update they ask for trust again.
+DOCTOR_CODEX_HOOKS = "hooks/codex-hooks.json"  # Longhaul's hooks file for Codex, from the plugin's folder: its trust keys name it
+DOCTOR_CODEX_HOOKS_PATH = Path(__file__).resolve().parent / DOCTOR_CODEX_HOOKS  # tests point it at their own
+# A hooks file's event names, and the labels Codex's trust keys and hashes use (hook_event_key_label()).
+CODEX_HOOK_LABELS = {"PreModelRequest": "pre_model_request", "PostModelRequest": "post_model_request",
+                     "PreToolUse": "pre_tool_use", "PermissionRequest": "permission_request",
+                     "PostToolUse": "post_tool_use", "PreCompact": "pre_compact", "PostCompact": "post_compact",
+                     "SessionStart": "session_start", "SessionEnd": "session_end",
+                     "UserPromptSubmit": "user_prompt_submit", "SubagentStart": "subagent_start",
+                     "SubagentStop": "subagent_stop", "Stop": "stop", "Interrupt": "interrupt"}
+CODEX_HOOK_MATCHED = ("PreToolUse", "PermissionRequest", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart",
+                      "SubagentStop", "PreCompact", "PostCompact")  # the events whose matcher Codex keeps
+CODEX_HOOK_CONTEXT = ("PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "SubagentStart")  # additionalContext's
+CODEX_COMPACT_TODAY = 272_000 * 9 // 10  # Codex compacts at 90% of the window (auto_compact_token_limit()); 272k models today
+CODEX_TRUST_STEP = "open /hooks in Codex and trust Longhaul's hooks: until then they do not run"
+
+
+def codex_hook_hash(event: str, matcher, handler):
+    """The trusted_hash Codex gives a command handler of `event` (a hooks
+    file's name, such as PreToolUse) under `matcher`, or None for what
+    Codex skips or cannot read: another type, an empty command, a value of
+    the wrong kind, an event it does not know."""
+    label = CODEX_HOOK_LABELS.get(event)
+    if label is None or not isinstance(handler, dict) or handler.get("type") != "command":
+        return None
+    command, timeout, limit = handler.get("command"), handler.get("timeout"), handler.get("additionalContextLimit")
+    runs_async, status = handler.get("async", False), handler.get("statusMessage")
+    if not (isinstance(command, str) and command.strip() and isinstance(runs_async, bool)
+            and all(v is None or (type(v) is int and v >= 0) for v in (timeout, limit))
+            and (status is None or isinstance(status, str)) and (matcher is None or isinstance(matcher, str))):
+        return None
+    if event in ("SessionEnd", "Interrupt"):
+        timeout = min(max(1 if timeout is None else timeout, 1), 3)
+    else:
+        timeout = max(600 if timeout is None else timeout, 1)
+    hook = {"type": "command", "command": command, "timeout": timeout, "async": runs_async}
+    if status is not None:
+        hook["statusMessage"] = status
+    if event in CODEX_HOOK_CONTEXT and limit is not None and limit != 2_500:
+        hook["additionalContextLimit"] = limit
+    identity = {"event_name": label, "hooks": [hook]}
+    if event in CODEX_HOOK_MATCHED and matcher is not None:
+        identity["matcher"] = matcher
+    import hashlib  # here, not at the top: see index_key()
+    text = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def codex_hooks_declared(path=None):
+    """Longhaul's own hooks for Codex, from its hooks file (by default
+    DOCTOR_CODEX_HOOKS_PATH): [(the end of each handler's trust key, such
+    as hooks/codex-hooks.json:pre_tool_use:0:0, its trusted_hash)], each
+    handler's place counted as Codex counts it, the ones it skips
+    included; None when the file is missing, not Codex's shape, or holds
+    no handler."""
+    found = read_json(path or DOCTOR_CODEX_HOOKS_PATH)
+    events = found.get("hooks") if isinstance(found, dict) else None
+    if not isinstance(events, dict):
+        return None
+    declared = []
+    for event, groups in events.items():
+        if event not in CODEX_HOOK_LABELS:
+            continue  # Codex reads no event it does not know
+        if not isinstance(groups, list):
+            return None
+        for g, group in enumerate(groups):
+            handlers = group.get("hooks", []) if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                return None
+            for n, handler in enumerate(handlers):
+                hashed = codex_hook_hash(event, group.get("matcher"), handler)
+                if hashed:
+                    declared.append((f"{DOCTOR_CODEX_HOOKS}:{CODEX_HOOK_LABELS[event]}:{g}:{n}", hashed))
+    return declared or None
+
+
+def codex_trust_item(where: str, plugin: str, states: dict) -> tuple:
+    """The trust item for Longhaul's plugin `plugin` (its key, such as
+    longhaul@longhaul) from config.toml's [hooks.state] `states`: each of
+    the handlers its hooks file declares trusted, changed since trusted
+    (another hash), not trusted yet (none) or turned off in /hooks, by
+    count. Without a hooks file to check against, the trust entries under
+    the plugin's key, counted and not judged."""
+    declared = codex_hooks_declared()
+    if declared is None:
+        n = sum(isinstance(key, str) and key.startswith(f"{plugin}:")
+                and isinstance(dict_at(states, key).get("trusted_hash"), str) for key in states)
+        if not n:
+            return "warn", f"{where}: none of Longhaul's hooks is trusted yet, so none runs", CODEX_TRUST_STEP
+        return None, (f"{where}: {n} of Longhaul's hooks {'has' if n == 1 else 'have'} a trust entry, not checked: "
+                      f"this Longhaul has no readable {DOCTOR_CODEX_HOOKS} to check them against, and an update may "
+                      "need trusting again in /hooks"), None
+    counts, pinned = collections.Counter(), False
+    for tail, hashed in declared:
+        state = dict_at(states, f"{plugin}:{tail}")
+        trusted = state.get("trusted_hash")
+        if state.get("enabled") is False:
+            counts["off"] += 1
+        elif trusted == hashed:
+            counts["trusted"] += 1
+            pinned = pinned or isinstance(state.get("trusted_content_hash"), str)
+        else:
+            counts["changed" if isinstance(trusted, str) else "new"] += 1
+    n = len(declared)
+    if counts["trusted"] == n:
+        return "ok", (f"{where}: Longhaul's {n} hooks trusted in /hooks"
+                      + ("; Codex also checks the plugin's files (trusted_content_hash), which the doctor does not: "
+                         "after an update it asks for trust again" if pinned else "")), None
+    if counts["new"] == n:
+        return "warn", f"{where}: none of Longhaul's {n} hooks is trusted yet, so none runs", CODEX_TRUST_STEP
+    parts = [f"{counts[kind]} {said}" for kind, said in (
+        ("trusted", "trusted"), ("changed", "changed since trusted (an update can change one)"),
+        ("new", "not trusted yet"), ("off", "turned off in /hooks")) if counts[kind]]
+    step = CODEX_TRUST_STEP if counts["changed"] or counts["new"] else "turn Longhaul's hooks back on in Codex's /hooks"
+    return "warn", f"{where}: of Longhaul's {n} hooks, {', '.join(parts)}", step
+
+
+def codex_config_items(home: Path) -> list:
+    """The doctor's items for the Codex folder `home`'s config.toml (see
+    above): hooks on or off, Longhaul's plugin, its hooks' trust when it is
+    installed, the MCP servers for the code index, and where Codex
+    compacts; Codex's defaults with no config.toml; a ⚠ alone when it
+    cannot be read, or this Python has no tomllib."""
+    where, path = home_path(str(home)), home / "config.toml"
+    unchecked = "so the hooks, the plugin, its trust and the MCP servers are not checked"
+    # tomllib is Python 3.11's, imported here, not at the top (see
+    # index_key()): before 3.11 (3.10 is Longhaul's floor, and macOS's own
+    # python3 is 3.9) config.toml is not read, and the doctor says which
+    # Python would, as it does for compressed chats; a TOML reader of
+    # Longhaul's own would be one more parser to get right, for what a
+    # newer python3 already reads.
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    found = {}
+    if tomllib is None and os.path.lexists(path):
+        return [("warn", f"{where}: config.toml not read: this Python ({sys.version.split()[0]}) has no TOML reader "
+                         f"(tomllib, Python 3.11 and later), {unchecked}",
+                 "Python 3.11 or later reads it when it is the `python3` on PATH; Longhaul installs nothing")]
+    if tomllib is not None:
+        try:
+            found = tomllib.loads(path.read_bytes().decode("utf-8"))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return [("warn", f"{where}: config.toml could not be read ({e.strerror or type(e).__name__})",
+                     f"check that you can open {where}/config.toml")]
+        except (ValueError, RecursionError):  # TOMLDecodeError and UnicodeDecodeError are ValueErrors
+            return [("warn", f"{where}: config.toml is not valid TOML, {unchecked}",
+                     f"fix the TOML in {where}/config.toml")]
+
+    def turn_on(key):
+        return (f"set `{key} = true` under [features] in {where}/config.toml, or remove the line (on is Codex's "
+                "default); Longhaul never writes it")
+
+    items, features = [], dict_at(found, "features")
+    hooks = next((key for key in ("hooks", "codex_hooks") if isinstance(features.get(key), bool)), None)
+    if hooks is None:
+        items.append(("ok", f"{where}: hooks on (Codex's default)", None))
+    elif features[hooks]:
+        items.append(("ok", f"{where}: hooks on ([features] {hooks} = true)", None))
+    else:
+        items.append(("bad", f"{where}: hooks off ([features] {hooks} = false), so none of Longhaul's hooks runs there",
+                      turn_on(hooks)))
+    if features.get("plugins") is False:
+        items.append(("bad", f"{where}: Codex's plugins are off ([features] plugins = false), so Longhaul's plugin "
+                             "does not run there", turn_on("plugins")))
+    plugins = dict_at(found, "plugins")
+    ours = sorted(key for key in plugins if isinstance(key, str) and key.startswith("longhaul@"))
+    enabled = [key for key in ours if dict_at(plugins, key).get("enabled") is not False]
+    plugin = (enabled or ours or [None])[0]
+    if plugin is None:
+        repo = plugin_repository()
+        items.append(("warn", f"{where}: Longhaul's plugin is not installed there, so no checkpoint, reminder, guard or "
+                              "filter in Codex",
+                      (f"in a terminal: `codex plugin marketplace add {repo}`, then " if repo else "in a terminal, after "
+                       "adding its marketplace: ") + "`codex plugin add longhaul@longhaul`; then trust its hooks in "
+                      "Codex's /hooks"))
+    else:
+        plain = re.fullmatch(r"longhaul@[A-Za-z0-9_.-]{1,64}", plugin)  # a marketplace's name is shown only plain
+        named = f" ({plugin})" if plain else ""
+        if enabled:
+            items.append(("ok", f"{where}: Longhaul's plugin installed and enabled{named}", None))
+        else:
+            table = f'[plugins."{plugin}"]' if plain else "Longhaul's [plugins] table"
+            items.append(("bad", f"{where}: Longhaul's plugin is installed but turned off{named}",
+                          f"set `enabled = true` under {table} in {where}/config.toml; Longhaul never writes it"))
+        items.append(codex_trust_item(where, plugin, dict_at(dict_at(found, "hooks"), "state")))
+    servers = dict_at(found, "mcp_servers")
+    index = [name + (" (turned off)" if dict_at(servers, name).get("enabled") is False else "")
+             for name in sorted(n for n in servers if isinstance(n, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", n)
+                                and re.search(r"codegraph|trail", n, re.IGNORECASE))]
+    items.append(("ok", f"{where}: MCP server{'s' * (len(index) > 1)} for the code index: {', '.join(index)}", None)
+                 if index else
+                 (None, f"{where}: no MCP server for the code index; Longhaul tells Codex of a CodeGraph index by its "
+                        "command line (`codegraph explore`), which needs none", None))
+    limit = found.get("model_auto_compact_token_limit")
+    if type(limit) is int:  # it can only lower Codex's point: Codex takes the lower of it and 90%
+        said, point = (f"Codex compacts at {limit:,} tokens (model_auto_compact_token_limit), or at 90% of the model's "
+                       "context window if that is lower"), limit
+    else:
+        said, point = ("Codex compacts at its default, 90% of the model's context window (about 245k tokens on today's "
+                       "272k models)"), CODEX_COMPACT_TODAY
+    at = reminder_threshold()[0]
+    if at is None:
+        reminder = "Longhaul's reminder is off (LONGHAUL_CHECKPOINT_AT=off)"
+    elif at < point:
+        reminder = f"Longhaul's reminder asks for a checkpoint at {at:,} tokens, before that"
+    else:
+        reminder = f"Longhaul's reminder, at {at:,} tokens, comes after that"
+    items.append((None, f"{where}: {said}; {reminder}", None))
+    return items
+
+
 def doctor_codex(quick: bool = False):
     """11. Codex (docs plans/2026-10-27-codex.md, X3): what Longhaul reads of
-    it in Phase 1, its chats, for `inspect --agent codex` and `usage`;
-    nothing is installed in Codex and no hook runs there yet. An item per
-    Codex folder (codex_folders()) with its chats and how many are
-    compressed; the version, unmarked, since no Codex range is checked yet
-    (codex_version_said()); and a ⚠ for CODEX_HOME's compressed chats, a
-    week old and more, that this Python cannot read. None (not shown, not
-    counted) with no Codex folder. Of a folder only sessions/ is listed; of
-    the chats only the newest one's first record is read, and that only
-    without a version from `codex --version`."""
+    it, its chats, for `inspect --agent codex` and `usage`, and how its
+    hooks stand there. An item per Codex folder (codex_folders()) with its
+    chats and how many are compressed; the version, unmarked, since no
+    Codex range is checked yet (codex_version_said()); each folder's
+    config.toml items (codex_config_items()); and a ⚠ for CODEX_HOME's
+    compressed chats, a week old and more, that this Python cannot read.
+    None (not shown, not counted) with no Codex folder. Of a folder only
+    sessions/ is listed and config.toml read; of the chats only the newest
+    one's first record is read, and that only without a version from
+    `codex --version`."""
     folders = codex_folders(quick)
     if not folders:
         return None
@@ -13793,14 +14042,16 @@ def doctor_codex(quick: bool = False):
         compressed = packed + sum(path.name.endswith(".zst") for path in paths)
         items.append(("ok", codex_folder_said(home, len(paths) + packed, compressed), None))
     items.append((None, codex_version_said(quick, newest), None))
+    for home in folders:
+        items += codex_config_items(home)
     if unread:
         them = "it" if unread == 1 else "them"
         items.append(("warn", f"{unread:,} compressed chat{'s' * (unread != 1)} (a week old and more) that this "
                               f"Python ({sys.version.split()[0]}) cannot read: `inspect --agent codex` and `usage` "
                               "see only the newer ones",
                       f"Python 3.14 or later reads {them} when it is the `python3` on PATH; Longhaul installs nothing"))
-    return doctor_result("Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and installs nothing "
-                         "in Codex yet", items)
+    return doctor_result("Longhaul reads Codex's chats for `inspect --agent codex` and `usage`, and runs in Codex "
+                         "through its plugin's hooks", items)
 
 
 def doctor_checks(quick: bool = False, processes=None) -> list:
