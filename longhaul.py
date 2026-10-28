@@ -11074,9 +11074,9 @@ def models_rule(data: dict):
 # `longhaul models-hook --agent codex`, a hook of its own: on Claude Code
 # Auto Model runs in the Advisor's hook, which stays off on Codex (X10).
 # Each pick is logged as models_rule() logs Claude Code's, a sub-agent's
-# own marked so, and the call is never changed: the table and the cap name Claude's
-# models, and a Codex ladder (the owner's chats run gpt-5.6-terra and
-# gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
+# own marked so, and the call is never changed: the table and the cap
+# name Claude's models, and a Codex ladder (the owner's chats run
+# gpt-5.6-terra and gpt-5.6-sol) is the owner's to choose. The input, from Codex's source
 # (docs/discovery/2026-10-28-codex-hooks.md, 10; codex-rs rust-v0.165.0,
 # tools/handlers/multi_agents/spawn.rs and multi_agents_v2/spawn.rs):
 # v1 {message?, items?, agent_type?, model?, reasoning_effort?,
@@ -11101,8 +11101,7 @@ def models_codex_check(data):
     null or empty is not given; an agent type that is not a name is no
     line, as in models_rule(); a model or effort that is not one is
     "unknown". A sub-agent's own call is logged too, marked a sub-agent's
-    as the guard marks one (guard_logged()), the agent never named: there
-    Claude Code's rule leaves it alone, and here nothing is changed.
+    as the guard marks one (guard_logged()), the agent never named.
     Nothing with Auto Model off. Names only, never message, items or
     task_name (a name the model wrote). The session is codex-<id>
     (codex_hook_input()), so the line says whose it is."""
