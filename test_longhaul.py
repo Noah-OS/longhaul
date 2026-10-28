@@ -1908,9 +1908,12 @@ class CodexInspect(unittest.TestCase):
         self.home = self.tmp / "codex"
         self.day = self.home / "sessions" / "2026" / "10" / "27"
         self.day.mkdir(parents=True)
-        patcher = mock.patch.object(longhaul, "CODEX_HOME", self.home)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Longhaul's own home, where its Codex hooks keep their records: the
+        # one cli() hands the command, so a report made here reads the same.
+        for patcher in (mock.patch.object(longhaul, "CODEX_HOME", self.home),
+                        mock.patch.object(longhaul, "LONGHAUL_HOME", self.tmp / "relay")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.second = 0
         self.running = dict.fromkeys(self.six(0), 0)  # the token_counts' total so far: count() adds to it
 
@@ -2397,6 +2400,8 @@ class CodexInspect(unittest.TestCase):
             heads = [l for l in out[1:] if l.strip() and not l.startswith(" ")]
             self.assertGreaterEqual(len(heads), 10, out)
             for head in heads:
+                if head.startswith("Guard ["):  # Longhaul's own record, headed as Claude Code's (the tests below)
+                    continue
                 self.assertRegex(head, r"\[rollout, (measured|counted|inferred)[^\]]*\]$", head)
 
     def test_json_gives_every_number_its_source_and_confidence_in_claudes_shape(self):
@@ -2443,6 +2448,106 @@ class CodexInspect(unittest.TestCase):
             self.assertIn(f"  {tool}: ", out.stdout, "the report ran over the tools")
             self.assertNotIn("SECRET", out.stdout + out.stderr + records.stdout + records.stderr)
         self.assertIn("rg", self.cli(self.MAIN).stdout, "a command's program, which the report may name")
+
+    # ------------------------------------------------ what Longhaul's own Codex hooks kept
+
+    GUARD = "Guard [longhaul guard, counted: calls it warned about or blocked]"
+    FILTER = "Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]"
+
+    def hooked(self):
+        """What Longhaul's own Codex hooks keep of the chat, made as they
+        make it: the guard's catches through guard_check() (a whole cat of a
+        big file and a repeat read in the main chat, a whole nl of the big
+        file in its sub-agent), and the shadow filter's log, two notes in
+        the shape filter_check() writes under Codex. Beside them another
+        chat's, and a Claude Code session's under the bare id, which are not
+        this chat's."""
+        big, small = self.tmp / "big.py", self.tmp / f"small-{self.SECRET}.py"
+        big.write_text("x" * 30_000)
+        small.write_text("y" * 300)
+
+        def pre(command, thread=self.MAIN, agent=None, caught=True):
+            data = {"session_id": thread, "turn_id": "t1", "transcript_path": None, "cwd": str(self.tmp),
+                    "hook_event_name": "PreToolUse", "model": "gpt-5.6-terra", "permission_mode": "default",
+                    "tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "call_1"}
+            if agent:
+                data["agent_id"], data["agent_type"] = agent, "explorer"
+            answer = longhaul.guard_check(longhaul.codex_hook_input(data), "warn")
+            self.assertEqual(answer is not None, caught, command)
+
+        pre(f"cat {big}")
+        pre(f"cat {small}", caught=False)
+        pre(f"cat {small}")  # read again, unchanged
+        pre(f"nl -ba {big}", agent=self.CHILD)
+        pre(f"cat {big}", thread=self.OTHER)
+        longhaul.guard_check({"session_id": self.MAIN, "hook_event_name": "PreToolUse", "tool_name": "Read",
+                              "tool_input": {"file_path": str(big)}}, "warn")  # Claude Code's, keyed by the bare id
+        folder = longhaul.LONGHAUL_HOME / "filters"
+        folder.mkdir(parents=True)
+        note = {"at": 1793116800.0, "agent": False, "codex": True, "mode": "shadow", "kind": "grep", "steps": [],
+                "applied": False}
+        notes = [{**note, "id": "call_1", "chars": 9000, "lossless": 8000, "on": 3000, "dropped": 5000,
+                  "steps": ["cap"], "shown": 9000, "ms": 2.0},
+                 {**note, "id": "call_2", "agent": True, "chars": 5000, "lossless": 4000, "on": 4000, "dropped": 0,
+                  "shown": 5000, "ms": 4.0}]
+        (folder / f"codex-{self.MAIN}.jsonl").write_text("".join(json.dumps(n) + "\n" for n in notes))
+        for name in (f"codex-{self.OTHER}", self.MAIN):
+            (folder / f"{name}.jsonl").write_text(json.dumps({**notes[0], "chars": 99999}) + "\n")
+
+    def test_the_guards_catches_and_the_shadow_filters_measure_come_from_longhauls_own_records(self):
+        # As Claude Code's inspect reads them for its sessions (guard_counts(),
+        # filter_counts()), keyed codex-<id> as codex_hook_input() keys the
+        # hooks': the chat's guard record and its sub-agents', and its filter log.
+        self.chat()
+        self.hooked()
+        out = self.cli(self.MAIN)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertEqual(self.section(lines, "Guard ["), [
+            self.GUARD,
+            "  read again unchanged: 1 (300 bytes)",
+            "  cat or nl of a big file: 2 (60,000 bytes)"])
+        self.assertEqual(self.section(lines, "Output filter log ["), [
+            self.FILTER,
+            "  shadow (changes nothing): 2 outputs; lossless would cut 2,000 chars, on 7,000, lines of 1 output "
+            "among them",
+            "  the hook's own time: median 2.0 ms, longest 4.0 ms"])
+        self.assertLess(lines.index(self.FILTER), lines.index("Failures [rollout, counted]"), "Claude Code's order")
+        self.assertLess(lines.index(self.GUARD), lines.index(self.FILTER))
+        self.assertNotIn("SECRET", out.stdout + out.stderr, "numbers alone: no path the guard's record holds")
+        # The same numbers in --json, as Claude Code's (its source the guard, counted).
+        out = self.cli(self.MAIN, "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = {(x["metric"], x["item"]): (x["value"], x["scope"], x["source"], x["confidence"], x["session"])
+               for x in map(json.loads, out.stdout.splitlines()) if x["metric"].startswith("guard_")}
+        self.assertEqual(got, {("guard_fired", "repeat"): (1, "all", "guard", "counted", self.MAIN),
+                               ("guard_fired", "big"): (0, "all", "guard", "counted", self.MAIN),
+                               ("guard_fired", "cat"): (2, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "repeat"): (300, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "big"): (0, "all", "guard", "counted", self.MAIN),
+                               ("guard_bytes", "cat"): (60000, "all", "guard", "counted", self.MAIN)})
+        # Another chat's records are its own: one catch, and its filter log.
+        lines = self.cli(self.OTHER).stdout.splitlines()
+        self.assertEqual(self.section(lines, "Guard [")[1:], ["  cat or nl of a big file: 1 (30,000 bytes)"])
+        self.assertIn("  shadow (changes nothing): 1 output; lossless would cut 91,999 chars, on 96,999, lines of 1 "
+                      "output among them", lines)
+
+    def test_with_no_record_of_longhauls_hooks_the_guard_says_so_and_the_filter_log_is_not_shown(self):
+        # A chat Longhaul's hooks never saw (Codex's hooks off, or Longhaul
+        # not installed in Codex): as Claude Code's, the guard's line says why
+        # there is none, and the filter log's section is left out.
+        self.chat()
+        out = self.cli(self.MAIN)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Guard [longhaul guard: no record: the hook was off, or saw no read by cat, nl, head, tail or "
+                      "sed]", out.stdout.splitlines())
+        self.assertNotIn("Output filter log [", out.stdout)
+        self.assertNotIn("guard_", self.cli(self.MAIN, "--json").stdout)
+        # A record with the reminder's keys alone is no record of the guard's (guard_counts()).
+        folder = longhaul.LONGHAUL_HOME / "guard"
+        folder.mkdir(parents=True)
+        (folder / f"codex-{self.MAIN}.json").write_text(json.dumps({"reminder": {"at": 200000}}))
+        self.assertIn("Guard [longhaul guard: no record", self.cli(self.MAIN).stdout)
 
     # ------------------------------------------------ the command line
 

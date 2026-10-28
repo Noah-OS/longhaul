@@ -3389,6 +3389,11 @@ def inspect_rollout(path: Path, home: Path | None = None) -> dict:
         "allowance": allowance,
         "tool_errors": dict(failed.most_common()),
         "unknown": dict(unknown.most_common()),
+        # What Longhaul's own Codex hooks kept of the chat, keyed codex-<id> as
+        # codex_hook_input() keys them: the guard's records (its sub-agents'
+        # among them) and the filter's log, read as Claude Code's are.
+        "guard": guard_counts(f"codex-{sid}") if sid != "?" else None,
+        "filter": filter_counts(f"codex-{sid}") if sid != "?" else None,
     }
 
 
@@ -3498,6 +3503,10 @@ def rollout_lines(r: dict) -> list[str]:
         section("Allowance [rollout, measured: the last rate_limits reading"
                 + (f", {clock(a['at'])}]" if a["at"] else "]"), rows)
 
+    # Longhaul's own records, as Claude Code's report gives them and in its order: the guard's, the filter's log.
+    out.extend(inspect_guard_lines(r.get("guard"), codex=True))
+    out.extend(inspect_filter_lines(r.get("filter")))
+
     out.append("Failures [rollout, counted]")
     out.append("  tool errors: " + (", ".join(f"{t} {c:,}" for t, c in r["tool_errors"].items()) or "none"))
     out.append("  record types not known here: " + (", ".join(f"{t} {c:,}" for t, c in r["unknown"].items()) or "none"))
@@ -3514,8 +3523,9 @@ def rollout_lines(r: dict) -> list[str]:
 def rollout_metrics(r: dict) -> list[dict]:
     """The same numbers as flat records, shaped as inspect_records()'s: one
     number each, with the chat's id as its session, what it is of (`item`,
-    `kind`), where it came from (the rollout, or an estimate) and how sure it
-    is. No totals, and no search counts where the rollout recorded none."""
+    `kind`), where it came from (the rollout, an estimate, or the guard's
+    own record) and how sure it is. No totals, and no search counts where
+    the rollout recorded none."""
     out = []
 
     def add(metric, value, unit, scope, confidence, item=None, kind=None, source="rollout"):
@@ -3567,6 +3577,9 @@ def rollout_metrics(r: dict) -> list[dict]:
     for w in (r["allowance"] or {}).get("windows", []):
         add("allowance_used_percent", w["used"], "percent", "all", "measured", w["label"])
         add("allowance_resets_at", w["resets"], "epoch_seconds", "all", "measured", w["label"])
+    for k in GUARD_RULES if r.get("guard") else ():  # Longhaul's own record, as inspect_records() gives it
+        add("guard_fired", r["guard"][k], "calls", "all", "counted", k, source="guard")
+        add("guard_bytes", r["guard"]["bytes"][k], "bytes", "all", "counted", k, source="guard")
     for tool, n in r["tool_errors"].items():
         add("tool_errors", n, "errors", "all", "counted", tool)
     for kind, n in r["unknown"].items():
@@ -4613,6 +4626,54 @@ def find_transcript(target: str | None) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
+def inspect_guard_lines(g, codex: bool = False) -> list[str]:
+    """The guard's section of the report, from guard_counts(): what its
+    hook warned about or blocked, by rule, or why it kept no record.
+    Claude Code's and Codex's alike (rollout_lines()); under Codex
+    (`codex`) every read is the shell's, so its no-record line and its cat
+    rule name the readers the guard sees there (guard_targets())."""
+    if g is None:
+        seen = "read by cat, nl, head, tail or sed" if codex else "whole Read, cat or search"
+        return [f"Guard [longhaul guard: no record: the hook was off, or saw no {seen}]"]
+    labels = (("repeat", "read again unchanged"), ("big", "whole read of a big file"),
+              ("cat", "cat or nl of a big file" if codex else "cat of a big file"))
+    rows = [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in labels if g[k]]
+    rows += [f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []
+    return ["Guard [longhaul guard, counted: calls it warned about or blocked]"] + (rows or ["  none"])
+
+
+def inspect_filter_lines(fl) -> list[str]:
+    """The output filter's log section of the report, from filter_counts():
+    what its hook did, or in shadow would have done, by mode; nothing when
+    it logged nothing for the conversation. Claude Code's and Codex's
+    alike (rollout_lines()): on Codex the filter is in shadow alone."""
+    if not fl:
+        return []
+    rows = []
+    for mode in ("shadow", "lossless", "on"):
+        m = fl["modes"].get(mode)
+        if not m:
+            continue
+        if mode == "shadow":
+            rows.append(f"  shadow (changes nothing): {m['calls']:,} output{'s' * (m['calls'] != 1)}; lossless would "
+                        f"cut {m['lossless_cut']:,} chars, on {m['on_cut']:,}"
+                        + (f", lines of {m['would_drop']:,} output{'s' * (m['would_drop'] != 1)} among them"
+                           if m.get("would_drop") else ""))
+            continue
+        row = (f"  {mode}: {m.get('applied', 0):,} output{'s' * (m.get('applied', 0) != 1)} shortened, "
+               f"{m.get('cut', 0):,} chars cut")
+        if mode == "on" and m.get("dropped"):
+            row += f", lines of {m['dropped']:,} among them, read back after {fl['fetched']:,}"
+        if m.get("full"):
+            row += f"; {m['full']:,} left whole, the store of saved outputs being full"
+        rows.append(row)
+    if fl["ms"]:
+        rows.append(f"  the hook's own time: median {fl['ms'][(len(fl['ms']) - 1) // 2]:.1f} ms, "
+                    f"longest {fl['ms'][-1]:.1f} ms")
+    return (["Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]"]
+            + (rows or ["  none"]))
+
+
 def inspect_lines(r: dict) -> list[str]:
     """The report as text. Each heading names where its numbers came from."""
     def where(item):
@@ -4765,15 +4826,7 @@ def inspect_lines(r: dict) -> list[str]:
         section("Memory and instructions [files on disk now, counted: what Claude Code loads at a session's start, "
                 "and the paths they name that are gone]", rows)
 
-    g = r["guard"]
-    if g is None:
-        out.append("Guard [longhaul guard: no record: the hook was off, or saw no whole Read, cat or search]")
-    else:
-        section("Guard [longhaul guard, counted: calls it warned about or blocked]",
-                [f"  {label}: {g[k]} ({g['bytes'][k]:,} bytes)" for k, label in
-                 (("repeat", "read again unchanged"), ("big", "whole read of a big file"), ("cat", "cat of a big file"))
-                 if g[k]]
-                + ([f"  a subagent's call that could outlast its 5-minute cache: {g['wait']}"] if g.get("wait") else []))
+    out.extend(inspect_guard_lines(r["guard"]))
     f = r.get("filter_replay") or {}
     if f.get("lossless", 0) < f.get("chars", 0) or f.get("on", 0) < f.get("chars", 0):  # else nothing to cut: no section
         def cut(n):
@@ -4791,31 +4844,7 @@ def inspect_lines(r: dict) -> list[str]:
                 "as they stand now]",
                 [f"  Bash output: {f['outputs']:,} output{'s' * (f['outputs'] != 1)}, {f['chars']:,} chars",
                  f"  lossless would cut {cut(f['chars'] - f['lossless'])}, dropping nothing", on])
-    fl = r.get("filter")
-    if fl:  # else the hook logged nothing for this conversation: no section
-        rows = []
-        for mode in ("shadow", "lossless", "on"):
-            m = fl["modes"].get(mode)
-            if not m:
-                continue
-            if mode == "shadow":
-                rows.append(f"  shadow (changes nothing): {m['calls']:,} output{'s' * (m['calls'] != 1)}; lossless would "
-                            f"cut {m['lossless_cut']:,} chars, on {m['on_cut']:,}"
-                            + (f", lines of {m['would_drop']:,} output{'s' * (m['would_drop'] != 1)} among them"
-                               if m.get("would_drop") else ""))
-                continue
-            row = (f"  {mode}: {m.get('applied', 0):,} output{'s' * (m.get('applied', 0) != 1)} shortened, "
-                   f"{m.get('cut', 0):,} chars cut")
-            if mode == "on" and m.get("dropped"):
-                row += f", lines of {m['dropped']:,} among them, read back after {fl['fetched']:,}"
-            if m.get("full"):
-                row += f"; {m['full']:,} left whole, the store of saved outputs being full"
-            rows.append(row)
-        if fl["ms"]:
-            rows.append(f"  the hook's own time: median {fl['ms'][(len(fl['ms']) - 1) // 2]:.1f} ms, "
-                        f"longest {fl['ms'][-1]:.1f} ms")
-        section("Output filter log [longhaul filter, counted: what its hook did, or in shadow would have done, by size]",
-                rows)
+    out.extend(inspect_filter_lines(r.get("filter")))
     s = r.get("subagent_reminders") or {}
     if s.get("subagents"):  # else none was told: no section
         out.append("Subagent reminders [longhaul guard records, counted]")
