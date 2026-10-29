@@ -11512,6 +11512,38 @@ class Launcher(unittest.TestCase):
             self.assertIn("already exists and is not longhaul; left it alone", " ".join(said), other)
         self.assertEqual(os.readlink(self.target), str(self.tmp / "other-tool"))
 
+    def test_the_launcher_is_known_by_its_second_line_whatever_the_length_of_its_first(self):
+        # Until Sprint 12 the name was looked for anywhere in a file's first
+        # 200 bytes: a longer #! line hid a launcher, and a file of your own
+        # that names it was taken for one, written over by setup and removed
+        # by uninstall. Its second line names it and its version (LAUNCHER_TAG).
+        text = longhaul.launcher_text()
+        rest = text.split("\n", 1)[1]
+        self.target.parent.mkdir(parents=True)
+        ours = {"today's": text, "an older one": text.replace("longhaul-launcher 1:", "longhaul-launcher 0:"),
+                "a long #! line": "#!/opt/" + "python" * 40 + "/bin/python3 -I\n" + rest}
+        for name, body in ours.items():
+            with self.subTest(name):
+                self.target.write_text(body)
+                self.assertTrue(longhaul.launcher_at(self.target))
+                self.assertTrue(longhaul.command_is_longhauls(self.target))
+        theirs = {"named in a later line": "#!/bin/sh\necho mine\n" + rest,
+                  "named inside the second line": "#!/bin/sh\n# mine; not the # longhaul-launcher 1: setup writes\n",
+                  "named in the first line": "# longhaul-launcher 1: my notes\n#!/bin/sh\n",
+                  "no #! line": "\n" + rest,
+                  "no version": "#!/bin/sh\n# longhaul-launchers I keep: none\n",
+                  "a #! line with no end": "#!" + "x" * 5000 + "\n" + rest}
+        cache = self.copy("0.2.8") / "longhaul.py"
+        for name, body in theirs.items():
+            with self.subTest(name):
+                self.target.write_text(body)
+                self.assertFalse(longhaul.launcher_at(self.target))
+                self.assertFalse(longhaul.command_is_longhauls(self.target), "uninstall leaves it")
+                said = []
+                self.assertFalse(self.link_command(cache, said))
+                self.assertIn("already exists and is not longhaul; left it alone", " ".join(said))
+                self.assertEqual(self.target.read_text(), body, "setup leaves it")
+
     def test_setup_run_from_the_installed_copy_gives_a_command_that_runs_it(self):
         # The whole route a user takes: the line the doctor gives, then `longhaul`.
         copy = self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / "0.2.8"

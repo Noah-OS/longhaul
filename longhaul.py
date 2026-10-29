@@ -12278,14 +12278,20 @@ def launcher_text() -> str:
 
 def launcher_at(path) -> bool:
     """Whether `path` is a launcher setup wrote, of any version: a file, not
-    a link, whose start names it."""
+    a link, whose first line is a #! line, of any length up to 4 KB, and
+    whose second line starts with its name and version ("# longhaul-launcher
+    1:"). The name anywhere else is not enough: a file of your own that
+    names it is yours, and setup would write over it and uninstall remove it
+    (until Sprint 12 the name was looked for in the first 200 bytes)."""
     try:
         if os.path.islink(path) or not os.path.isfile(path):
             return False
         with open(path, "rb") as f:
-            return LAUNCHER_TAG.encode() in f.read(200)
+            first, second = f.readline(4096), f.readline(4096)
     except OSError:
         return False
+    return (first.startswith(b"#!") and first.endswith(b"\n")
+            and re.match(re.escape(LAUNCHER_TAG.encode()) + rb" \d+:", second) is not None)
 
 
 def config_folders() -> list:
