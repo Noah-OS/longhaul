@@ -1,13 +1,15 @@
 ---
 name: doctor
-description: "Show what of Longhaul is set up on this machine and what to do next: the plugin, the terminal command, Claude Code's version, updates, the status line, the VS Code panel, the accounts, the chats running now, the code maps, the features and what it reads of Codex, each marked ✔, ✘ or ⚠ with one next step. A read-only checklist: it changes nothing."
+description: "Show what of Longhaul is set up on this machine and what to do next: the plugin, the terminal command, Claude Code's version, updates, the status line, the VS Code panel, the accounts, the chats running now, the code maps, the features, the hooks each event runs and what it reads of Codex, each marked ✔, ✘ or ⚠ with one next step. A read-only checklist: it changes nothing."
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor)
 ---
 
 The checklist below is Longhaul's reading of this machine: its own files,
 Claude Code's and VS Code's settings, the programs on PATH, the chats
-running now (each one's folder and account, never what it says), and
-Codex's chats when Codex is here (how many, and Codex's version, from
+running now (each one's folder and account, never what it says), the
+hooks that the settings and the plugins add (how many and from where, never
+their commands) with the times Claude Code recorded for Longhaul's own in
+this folder's newest chat, and Codex's chats when Codex is here (how many, and Codex's version, from
 `codex --version` or the newest chat, never what they say). It names
 accounts, never their emails. The doctor changes nothing.
 
