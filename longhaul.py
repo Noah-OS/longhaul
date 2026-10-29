@@ -11291,6 +11291,19 @@ SIGN_IN = ("claude_authenticate", "claude_oauth_callback")
 SIGN_IN_JOBS = (["auth", "login"], ["auth", "logout"], ["setup-token"])
 HOLD_MAX = setting("LONGHAUL_HOLD_MAX_SECONDS", 20, float)
 INIT_WAIT = setting("LONGHAUL_INIT_WAIT_SECONDS", 90, float)
+# A limit stop in the conversation's file is this relay's own only when its
+# own claude's stream showed one too (Relay.limit_ours()): the file is the
+# chat's, and another process of the same chat, a terminal `claude --resume`
+# on another account, writes its stops there as well. On 2026-10-29 hermes
+# 703eb707's terminal copy on personal-1 hit its weekly limit two minutes
+# after the panel copy moved to personal-2; the panel took those stops for
+# personal-2's, recorded personal-2 as limited and left the chat where it
+# was. The stream's line and the file's are matched by uuid where the
+# stream gives one, else by time: one of the stream's stops within
+# OWN_STOP_WINDOW of the file's. The file can be read before the stream's
+# line arrives, so a stop with no match yet waits OWN_STOP_WAIT for it.
+OWN_STOP_WAIT = setting("LONGHAUL_OWN_STOP_SECONDS", 10, float)
+OWN_STOP_WINDOW = 120  # seconds
 RELAY_DEBUG = bool(os.environ.get("LONGHAUL_RELAY_DEBUG"))
 # A line's "type" is not always its first field: a 2.1.300 result line
 # starts with "duration_api_ms" and has "type":"result" 1,600 bytes in.
@@ -11772,6 +11785,7 @@ class Relay:
         self.queue: collections.deque = collections.deque()
         self.paused = False
         self.held_since = None
+        self.own_stops: collections.deque = collections.deque(maxlen=20)  # (pid, uuid, time): limit_ours()
         self.swap_started = None
         self.panel_closed = False
         self.swapping = False
@@ -11938,11 +11952,39 @@ class Relay:
                 and not msg.get("parent_tool_use_id")) or (
                 msg.get("type") == "rate_limit_event" and info.get("status") == "rejected")
         if stop:
+            self.own_stops.append((self.child.pid if self.child else None, msg.get("uuid"), time.time()))
             with self.cond:
                 self.paused = True
                 self.held_since = time.time()
             if RELAY_DEBUG:
                 log("relay HOLD: a rate_limit stop in the stream")
+
+    def limit_ours(self, limit) -> bool | None:
+        """Whether the conversation file's limit stop `limit` is this relay's
+        own claude's (OWN_STOP_WAIT's comment): True when its stream showed
+        the same stop, by uuid, or one within OWN_STOP_WINDOW; None while
+        the stream's line may still come; False after that."""
+        if not limit:
+            return True
+        now, pid = time.time(), self.child.pid if self.child else None
+        mine = [(u, at) for p, u, at in self.own_stops if p == pid]
+        if (limit.get("uuid") and any(u == limit["uuid"] for u, _ in mine)) \
+                or any(now - at <= OWN_STOP_WINDOW for _, at in mine):
+            return True
+        return None if now - (self.watch.limit_seen_at or now) < OWN_STOP_WAIT else False
+
+    def foreign_limit(self) -> None:
+        """A limit stop in the conversation's file that this relay's claude
+        never showed: another process of the same chat wrote it. Nothing is
+        marked limited and nothing moves; the stop is not looked at again."""
+        here, limit = self.accounts[self.idx], self.watch.limit
+        log(f"panel: a limit stop in {(self.watch.sid or '?')[:8]}'s file came from another process of the same chat, "
+            f"not this panel's claude on {here['name']}: left alone (the chat is open twice?)")
+        notify(f"This chat seems open twice: another copy of it hit a limit. This panel's stays on {here['name']}; "
+               "close the other copy (a terminal `claude --resume`?), as two copies write the same conversation.")
+        if limit.get("uuid"):
+            self.watch.handled.add(limit["uuid"])
+        self.watch.limit = None
 
     def note_reading(self, info: dict) -> None:
         """A panel chat's usage, from the rate_limit_event claude sends with
@@ -12096,7 +12138,12 @@ class Relay:
                     break
                 try:
                     self.watch.step()
-                    if self.watch.should_switch():
+                    ours = self.limit_ours(self.watch.limit) if self.watch.should_switch() else True
+                    if ours is False:
+                        self.foreign_limit()
+                    elif ours is None:
+                        pass  # the stream's line may still be on its way: looked at again next round
+                    elif self.watch.should_switch():
                         # No one can be asked here, so "ask" never moves.
                         if decide_move(self.mode, consent=self.swap, can_ask=False) == "move":
                             self.switch()

@@ -15708,6 +15708,36 @@ class Panel(StreamHarness):
         self.assertEqual(got[1]["type"], "user")
         self.assertIn("the panel chat carries on with Pro", (self.relay / "longhaul.log").read_text())
 
+    def test_a_limit_stop_another_process_of_the_chat_wrote_moves_nothing_and_marks_nothing(self):
+        # 2026-10-29: hermes 703eb707 was open in the panel and, as a plain
+        # `claude --resume`, in a terminal on another account. The terminal
+        # copy's limit stops, written to the same file, were taken for the
+        # panel's account, which was then recorded as limited.
+        self.plan(["reply", "reply"])
+        p = self.start(LONGHAUL_OWN_STOP_SECONDS="1")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.wait_for(self.result_for(self.user(p, "first")))
+        foreign = {"type": "assistant", "isSidechain": False, "isApiErrorMessage": True, "error": "rate_limit",
+                   # A second ahead: whole seconds could fall before the relay's start, which Watch skips.
+                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1)),
+                   "sessionId": "sid-1",
+                   "uuid": "terminal-copy-limit",
+                   "quotaLimits": {"status": "rejected", "resetsAt": time.time() + 3600, "rateLimitType": "seven_day"},
+                   "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "limit"}]}}
+        with (self.max / "projects" / "-tmp-proj" / "sid-1.jsonl").open("a") as f:
+            f.write(json.dumps(foreign) + "\n")
+        log = self.relay / "longhaul.log"
+        deadline = time.time() + 15
+        while time.time() < deadline and "came from another process" not in (log.read_text() if log.exists() else ""):
+            time.sleep(0.1)
+        self.assertIn("came from another process of the same chat, not this panel's claude on Max", log.read_text())
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "second")))["is_error"])
+        self.assertEqual(len(self.calls()), 1, "the chat stays on Max, with no switch")
+        state = json.loads((self.relay / "state.json").read_text()) if (self.relay / "state.json").exists() else {}
+        self.assertNotIn("Max", state.get("limited_until", {}), "Max is not recorded as limited")
+        self.assertNotIn("hit its", log.read_text())
+
     def test_a_panel_chat_records_its_usage_for_its_account(self):
         self.plan(["reply"])
         p = self.start()
