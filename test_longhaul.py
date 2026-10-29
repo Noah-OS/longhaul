@@ -53,6 +53,18 @@ os.environ.pop("CLAUDE_CONFIG_DIR", None)
 # Codex's folder: an empty one of the suite's own, so that no test reads the
 # machine's ~/.codex; the Codex tests point CODEX_HOME at their own.
 os.environ["CODEX_HOME"] = tempfile.mkdtemp(prefix="longhaul-test-codex-")
+# Apple's /usr/bin/python3 (3.9) run with -I, as the hooks run, writes no
+# bytecode (and without -I writes it under ~/Library/Caches), so each child
+# of the suite's that imported longhaul that way compiled its 600 KB again,
+# a quarter of a second apiece. Compiled once here, into the __pycache__ a
+# child looks in, and checked against the source's hash at each import, it
+# is read as any import reads one. Test speed only (Sprint 12): longhaul
+# runs as before, and on a Python that writes its own this is the same file.
+with contextlib.suppress(Exception):
+    import py_compile
+    py_compile.compile(str(HERE / "longhaul.py"), doraise=True,
+                       cfile=str(HERE / "__pycache__" / f"longhaul.{sys.implementation.cache_tag}.pyc"),
+                       invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
 sys.path.insert(0, str(HERE))
 import longhaul  # noqa: E402
 
