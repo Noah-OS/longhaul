@@ -13848,8 +13848,10 @@ def codex_version_said(quick: bool, newest: list) -> str:
 # Longhaul's plugin ([plugins."longhaul@<marketplace>"], on unless enabled
 # = false), its hooks' trust in /hooks ([hooks.state."<plugin>:<file>:
 # <event>:<group>:<handler>"] trusted_hash), the MCP servers for the code
-# index ([mcp_servers.<name>], a codegraph or trail in the name) and
-# model_auto_compact_token_limit. Read from Codex's source at
+# index ([mcp_servers.<name>], a codegraph or trail in the name),
+# model_auto_compact_token_limit, and whether the model's checkpoint save
+# may write Longhaul's folder without asking (sandbox_mode,
+# [sandbox_workspace_write] writable_roots: codex_sandbox_item()). Read from Codex's source at
 # rust-v0.165.0 (features/src/lib.rs, core-plugins/src/loader.rs,
 # hooks/src/engine/discovery.rs, protocol/src/openai_models.rs).
 # config.toml can hold secrets (an MCP server's env and headers, a
@@ -13992,6 +13994,31 @@ def codex_trust_item(where: str, plugin: str, states: dict) -> tuple:
     return "warn", f"{where}: of Longhaul's {n} hooks, {', '.join(parts)}", step
 
 
+def codex_sandbox_item(where: str, found: dict):
+    """Whether the model's checkpoint save (codex-skills/checkpoint) can
+    write LONGHAUL_HOME without asking, or None when nothing asks (Codex's
+    sandbox off: sandbox_mode = "danger-full-access"). Codex's usual
+    sandbox lets the model write only in the project, so each save asks
+    once, unless config.toml's [sandbox_workspace_write] writable_roots, a
+    list of absolute paths (codex-rs config/src/types.rs), holds Longhaul's
+    folder or one above it. Not covered, an unmarked line with what to
+    paste (the owner, 2026-10-29: a choice, and Longhaul never writes
+    config.toml); of the list only whether it covers the folder is said,
+    never its other paths."""
+    if found.get("sandbox_mode") == "danger-full-access":
+        return None
+    ours = Path(os.path.abspath(LONGHAUL_HOME))
+    roots = dict_at(found, "sandbox_workspace_write").get("writable_roots")
+    roots = roots if isinstance(roots, list) else []
+    if any(isinstance(r, str) and os.path.isabs(r) and (Path(os.path.abspath(r)) == ours
+                                                         or Path(os.path.abspath(r)) in ours.parents) for r in roots):
+        return "ok", f"{where}: Codex lets the model write {home_path(str(ours))}, so a checkpoint save asks nothing", None
+    paste = f'writable_roots = ["{ours}"]' if not roots else f'"{ours}" in its writable_roots list'
+    return None, (f"{where}: each checkpoint save asks once, as Codex's sandbox lets the model write only in the "
+                  f"project; to save without asking, put {paste} under [sandbox_workspace_write] in "
+                  f"{where}/config.toml (Longhaul never writes it)"), None
+
+
 def codex_config_items(home: Path) -> list:
     """The doctor's items for the Codex folder `home`'s config.toml (see
     above): hooks on or off, Longhaul's plugin, its hooks' trust when it is
@@ -14064,6 +14091,9 @@ def codex_config_items(home: Path) -> list:
             items.append(("bad", f"{where}: Longhaul's plugin is installed but turned off{named}",
                           f"set `enabled = true` under {table} in {where}/config.toml; Longhaul never writes it"))
         items.append(codex_trust_item(where, plugin, dict_at(dict_at(found, "hooks"), "state")))
+        sandbox = codex_sandbox_item(where, found)
+        if sandbox:
+            items.append(sandbox)
     servers = dict_at(found, "mcp_servers")
     index = [name + (" (turned off)" if dict_at(servers, name).get("enabled") is False else "")
              for name in sorted(n for n in servers if isinstance(n, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", n)

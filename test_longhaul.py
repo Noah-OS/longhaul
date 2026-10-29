@@ -21236,6 +21236,33 @@ class CodexDoctorConfig(unittest.TestCase):
                 self.assertEqual((c["mark"], c["step"]), ("bad", self.item(": hooks o")[2]))
 
     @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_whether_a_checkpoint_save_can_write_longhauls_folder_without_asking(self):
+        # The owner, 2026-10-29: Codex's sandbox asks for each save outside the project; the doctor
+        # offers the line to paste, unmarked, and never writes it.
+        ours = self.user / ".longhaul"
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", ours):
+            self.config()
+            self.assertEqual([t for _, t in self.items() if "checkpoint save" in t], [], "no plugin: nothing to say")
+            self.config(*self.PLUGIN)
+            self.assertEqual(self.item("checkpoint save"), (
+                None, "~/.codex: each checkpoint save asks once, as Codex's sandbox lets the model write only in the "
+                      f'project; to save without asking, put writable_roots = ["{ours}"] under '
+                      "[sandbox_workspace_write] in ~/.codex/config.toml (Longhaul never writes it)", None))
+            other = str(self.tmp / "private-work")
+            self.config(*self.PLUGIN, "[sandbox_workspace_write]", f'writable_roots = ["{other}"]')
+            said = self.item("checkpoint save")[1]
+            self.assertIn(f'put "{ours}" in its writable_roots list under [sandbox_workspace_write]', said)
+            self.assertNotIn("private-work", said, "the list's other paths are never shown")
+            for root in (ours, self.user):  # the folder, or one above it
+                with self.subTest(root=root):
+                    self.config(*self.PLUGIN, "[sandbox_workspace_write]", f'writable_roots = ["{other}", "{root}"]')
+                    self.assertEqual(self.item("checkpoint save"), (
+                        "ok", "~/.codex: Codex lets the model write ~/.longhaul, so a checkpoint save asks nothing",
+                        None))
+            self.config('sandbox_mode = "danger-full-access"', *self.PLUGIN)
+            self.assertEqual([t for _, t in self.items() if "checkpoint save" in t], [], "no sandbox: nothing asks")
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
     def test_the_plugin_is_installed_and_enabled_turned_off_or_missing(self):
         repo = longhaul.plugin_repository()
         self.assertEqual(self.item("plugin"), (None, "~/.codex: Longhaul's plugin is not installed there (to use it in "
@@ -21407,7 +21434,8 @@ class CodexDoctorConfig(unittest.TestCase):
         texts = [text for _, text, _ in c["items"]]
         self.assertTrue(texts[0].startswith("~/work-codex (CODEX_HOME): ") and texts[1].startswith("~/.codex: no chats"))
         self.assertTrue(texts[2].startswith("version not known"))
-        self.assertEqual([t.split(":")[0] for t in texts[3:]], ["~/work-codex"] * 5 + ["~/.codex"] * 4)
+        # The plugin's folder has its sandbox line too (codex_sandbox_item()).
+        self.assertEqual([t.split(":")[0] for t in texts[3:]], ["~/work-codex"] * 6 + ["~/.codex"] * 4)
         self.assertIn(("ok", "~/work-codex: Longhaul's 6 hooks trusted in /hooks"), self.items(work))
         self.assertIn("~/.codex: Longhaul's plugin is not installed there", str(c["items"]))
         self.assertNotIn("~/.codex", str(quick["items"]), "quick: CODEX_HOME's alone")
