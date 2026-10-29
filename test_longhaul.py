@@ -53,6 +53,12 @@ os.environ.pop("CLAUDE_CONFIG_DIR", None)
 # Codex's folder: an empty one of the suite's own, so that no test reads the
 # machine's ~/.codex; the Codex tests point CODEX_HOME at their own.
 os.environ["CODEX_HOME"] = tempfile.mkdtemp(prefix="longhaul-test-codex-")
+# VS Code's settings: a file of the suite's own, set over any value, so that
+# no test reads or writes the machine's: on 2026-10-29 a probe ran
+# `uninstall --yes` in a fixture that did not point it elsewhere, and took
+# the panel's wrapper line out of the owner's real settings.json. A test
+# that needs its own still passes LONGHAUL_VSCODE_SETTINGS to its child.
+os.environ["LONGHAUL_VSCODE_SETTINGS"] = str(Path(tempfile.mkdtemp(prefix="longhaul-test-vscode-")) / "settings.json")
 # Apple's /usr/bin/python3 (3.9) run with -I, as the hooks run, writes no
 # bytecode (and without -I writes it under ~/Library/Caches), so each child
 # of the suite's that imported longhaul that way compiled its 600 KB again,
@@ -10195,6 +10201,19 @@ class Settings(unittest.TestCase):
                              env={**self.env, **dict.fromkeys(names, "abc")}, capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.split(), ["2.0", "5", "20000"], "the defaults are in force")
+
+    def test_the_suite_never_reaches_the_real_vscode_settings(self):
+        # 2026-10-29: a probe's `uninstall --yes` in a fixture that set no
+        # LONGHAUL_VSCODE_SETTINGS took the wrapper line out of the owner's
+        # real settings.json. The suite points it at its own file, in this
+        # process and in every child that keeps os.environ.
+        real = {Path.home() / "Library" / "Application Support" / "Code" / "User" / "settings.json",
+                Path.home() / ".config" / "Code" / "User" / "settings.json"}
+        self.assertNotIn(longhaul.VSCODE_SETTINGS, real)
+        self.assertTrue(str(longhaul.VSCODE_SETTINGS).startswith(tempfile.gettempdir()), longhaul.VSCODE_SETTINGS)
+        out = subprocess.run([sys.executable, "-I", "-c", "import os; print(os.environ['LONGHAUL_VSCODE_SETTINGS'])"],
+                             env=dict(os.environ), capture_output=True, text=True, timeout=30)
+        self.assertEqual(Path(out.stdout.strip()), longhaul.VSCODE_SETTINGS, "a child given os.environ gets the same")
 
     def test_the_suite_never_runs_the_real_claude(self):
         # R3 (Sprint 5): a test that runs `status` with no LONGHAUL_CLAUDE_BIN
