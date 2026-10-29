@@ -363,6 +363,30 @@ class Loop(unittest.TestCase):
         self.assertIn("Pro ended: completed", log)
         self.assertNotIn("not a limit stop", log)
 
+    def test_the_fake_has_taken_its_next_step_when_longhaul_stops_it_on_a_hooks_row(self):
+        # CI on 0.2.9's main (2026-10-27), the test above: longhaul stopped
+        # Max on the hook's row while the fake was still writing the plan
+        # left, and Pro read an empty plan and crashed ("Pro ended: crashed
+        # (session None, exit 1)"); stopped before the write, Max left its
+        # "stay" to Pro, 20 seconds late. As stop() does, SIGTERM the moment
+        # the row is there: the plan must already be the next launch's.
+        (self.home / "plan.json").write_text(json.dumps(["quota_note:quota_auto_resume_disabled", "stay", "exit"]))
+        env = dict(os.environ, LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.max),
+                   LONGHAUL_NO_NOTIFY="1")
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        proc = subprocess.Popen([sys.executable, str(HERE / "fake_claude.py")], env=env, cwd=self.tmp)
+        try:
+            deadline = time.time() + 30
+            while not (self.home / "stops.json").exists() and proc.poll() is None and time.time() < deadline:
+                time.sleep(0.001)
+            proc.terminate()
+            self.assertEqual(proc.wait(timeout=15), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertTrue((self.home / "stops.json").exists(), "the hook ran")
+        self.assertEqual(json.loads((self.home / "plan.json").read_text()), ["exit"])
+
     def test_a_quota_disabled_notification_below_the_limit_is_logged_once_and_is_not_a_limit_stop(self):
         self.reading("Max", five=60, week=90)
         out, calls = self.run_longhaul(["quota_note:quota_auto_resume_disabled", "exit"], "--account", "Max")

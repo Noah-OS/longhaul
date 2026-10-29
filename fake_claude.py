@@ -62,9 +62,20 @@ with (home / "calls.jsonl").open("a") as f:
                         "api_key": os.environ.get("ANTHROPIC_API_KEY")}) + "\n")
 
 plan_file = home / "plan.json"
+
+
+def save_plan() -> None:
+    """The steps left, written whole: longhaul stops a launch with SIGTERM
+    at any moment, and a plan cut off mid-write crashed the next launch on
+    an empty file (CI, 2026-10-27)."""
+    tmp = plan_file.with_name(f".plan.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(plan))
+    os.replace(tmp, plan_file)
+
+
 plan = json.loads(plan_file.read_text())
 step = plan.pop(0) if plan else "exit"
-plan_file.write_text(json.dumps(plan))
+save_plan()
 
 sid = args[args.index("--resume") + 1] if "--resume" in args else "sid-1"
 sessions = cfg / "sessions"
@@ -109,15 +120,17 @@ def quota_note(step: str) -> None:
 while step.startswith(("stop_failure:", "quota_note:")):
     # The turn ends on an API error: Claude Code runs StopFailure's hooks;
     # or a moment of its wait at a usage limit: Notification's. The launch
-    # goes on with the plan's next step.
+    # goes on with the plan's next step, taken before the hooks run:
+    # longhaul may stop this launch the moment a hook's row is there, and
+    # the next launch must not get this one's step (CI, 2026-10-27).
     time.sleep(max(0.0, math.floor(born) + 1 - time.time()))
-    if step.startswith("quota_note:"):
-        quota_note(step)
+    hooked, step = step, (plan.pop(0) if plan else "exit")
+    save_plan()
+    if hooked.startswith("quota_note:"):
+        quota_note(hooked)
     else:
-        _, error, *named = step.split(":", 2)
+        _, error, *named = hooked.split(":", 2)
         run_hooks("StopFailure", session_id=named[0] if named else sid, error=error)
-    step = plan.pop(0) if plan else "exit"
-    plan_file.write_text(json.dumps(plan))
 
 if step.startswith(("limit:", "limit_busy:")):
     resets = float(step.split(":", 1)[1])
@@ -134,7 +147,7 @@ if step.startswith(("limit:", "limit_busy:")):
     if step.startswith("limit_busy:") and plan and plan[0].startswith("quota_note:"):
         # The wait ends a second on, the watcher holding off meanwhile.
         ended = plan.pop(0)
-        plan_file.write_text(json.dumps(plan))
+        save_plan()
         time.sleep(1)
         quota_note(ended)
     while True:
