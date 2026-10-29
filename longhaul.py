@@ -2506,7 +2506,7 @@ def statusline_install(assume_yes: bool) -> int:
     changed. A status line of the user's own is shown, and replaced only
     after a yes in a terminal (No unless typed); without a terminal only
     with --yes (exit 2 otherwise). The file is copied beside itself first
-    (no copy when there was none), and the line is test-run: a run that
+    (an empty copy when there was none), and the line is test-run: a run that
     fails puts the file back, removes the copy and says why (exit 1). A
     file that is not a JSON object is left alone (exit 2), and so is
     everything while the terminal command is missing."""
@@ -2547,7 +2547,11 @@ def statusline_install(assume_yes: bool) -> int:
             return 1
     kept = None
     try:
-        kept = statusline_keep(path, raw, STATUSLINE_KEPT) if raw is not None else None
+        # No file is kept too, as an empty copy: uninstall takes the newest
+        # copy for the file before this install, and an older install's,
+        # kept from before the file was deleted, put back a line this one
+        # never replaced (Sprint 12).
+        kept = statusline_keep(path, raw if raw is not None else b"", STATUSLINE_KEPT)
         statusline_write(path, {**data, "statusLine": {"type": "command", "command": STATUSLINE_COMMAND}}, raw, mode)
     except (OSError, ValueError) as e:  # written whole or not at all: only the copy to remove
         if kept:
@@ -2559,13 +2563,13 @@ def statusline_install(assume_yes: bool) -> int:
         stuck = statusline_undo(path, raw, mode, kept)
         if stuck:
             say(f"The test run of `{STATUSLINE_COMMAND}` {problem}, and {where} could not be put back ({stuck}): "
-                f"the file as it was is {home_path(str(kept)) if kept else 'none (there was no file)'}.")
+                f"the file as it was is {home_path(str(kept)) if raw is not None else 'none (there was no file)'}.")
         else:
             say(f"Not changed: the test run of `{STATUSLINE_COMMAND}` {problem}, so {where} is as it was. "
                 "`longhaul doctor` checks the terminal command.")
         return 1
     say(f"Done: Claude Code's status line runs `{STATUSLINE_COMMAND}`, set in {where}"
-        + (f"; the file as it was is kept as {home_path(str(kept))}" if kept else " (a new file)")
+        + (f"; the file as it was is kept as {home_path(str(kept))}" if raw is not None else " (a new file)")
         + ". `longhaul statusline uninstall` undoes it.")
     return 0
 
@@ -2575,10 +2579,10 @@ def statusline_uninstall(link: Path | None = None) -> int:
     settings.json at `link` (by default the chat's, statusline_file())
     sets Longhaul's status line. The file is copied beside itself first;
     then the line is the one in the newest copy install kept, or none when
-    that copy had none or there is no copy, and every other key stays as
-    it is now. It asks nothing: it changes Longhaul's own line alone. Any
-    other line, or none, is said and left alone. `longhaul uninstall`
-    runs it on each config folder's."""
+    that copy had none, is empty (there was no file) or there is no copy,
+    and every other key stays as it is now. It asks nothing: it changes
+    Longhaul's own line alone. Any other line, or none, is said and left
+    alone. `longhaul uninstall` runs it on each config folder's."""
     path, where = statusline_file(link)
     try:
         raw, data, mode = statusline_read(path)
@@ -2596,7 +2600,8 @@ def statusline_uninstall(link: Path | None = None) -> int:
     before, old, unread = statusline_kept(path), None, ""
     if before:
         try:
-            found = json.loads(before.read_bytes())
+            found = before.read_bytes()
+            found = json.loads(found) if found else {}  # empty: install found no file
         except (OSError, ValueError):
             found = None
         if isinstance(found, dict):

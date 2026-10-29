@@ -19660,7 +19660,36 @@ class StatuslineInstall(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.path.read_text(), json.dumps({"statusLine": self.LINE}, indent=2) + "\n")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "a new file only you can read")
-        self.assertEqual(self.copies(), [], "nothing to keep a copy of")
+        self.assertIn("(a new file)", out)
+        # An empty copy: there was no file. Uninstall takes the newest copy
+        # as the file before this install (the test below).
+        [copy] = self.copies()
+        self.assertEqual((copy.read_bytes(), copy.stat().st_mode & 0o777), (b"", 0o600))
+        self.assertNotIn(copy.name, out, "no copy of a file to point to")
+
+    def test_uninstall_after_the_file_was_deleted_and_made_again_puts_back_no_older_installs_line(self):
+        # Sprint 11's "second uninstall after settings.json was deleted":
+        # install, uninstall, the file deleted, install again (a new file),
+        # uninstall again. The first install's copy is still there, and the
+        # second uninstall put its line back, which this install never replaced.
+        self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.THEIRS, "theme": "dark"})
+        self.path.unlink()
+        self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.path.read_text()), {}, "no line: there was no file before this install")
+        self.assertIn("it sets no status line now", out)
+        self.assertNotIn("could not be read", out)
+        self.assertNotIn("my-status", out)
+        self.path.unlink()  # and once more with no file: nothing made, nothing kept
+        before = sorted(p.name for p in self.claude.iterdir())
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Nothing to undo: there is no ~/.claude/settings.json", out)
+        self.assertEqual(sorted(p.name for p in self.claude.iterdir()), before)
 
     def test_the_folder_is_the_chats_own(self):
         other = self.user / ".claude-pro"
@@ -19975,6 +20004,32 @@ class Uninstall(unittest.TestCase):
         self.assertFalse(self.home.exists(), "gone, and not made again by a log line")
         self.assertNotIn(longhaul.home_path(str(self.home)), out[out.index("What stays"):], "it is not what stays")
         self.assertTrue(self.user.is_dir())
+
+    def test_a_second_run_after_settings_json_was_deleted_is_clean(self):
+        # Sprint 11's "a second uninstall after settings.json was deleted".
+        self.everything()
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        for folder in (self.claude, self.pro):
+            (folder / "settings.json").unlink()
+        for args in (("--dry-run",), ("--yes",)):
+            with self.subTest(args=args):
+                before = self.tree()
+                code, out = self.run_cli(*args)
+                self.assertEqual(code, 0, out)
+                self.assertIn("Nothing of Longhaul's to remove", out)
+                self.assertNotIn("settings.json", out[:out.index("What stays")])
+                self.assertEqual(self.tree(), before, "nothing written: no file made, no copy, no log line")
+        # Longhaul's line set again in a new file (the terminal command a
+        # fake): the second run takes it out, and puts back no line from the
+        # first install's copy, which this install never replaced.
+        self.launcher.write_text('#!/bin/sh\n[ "$1" = statusline ] || exit 9\ncat >/dev/null\necho main\n')
+        self.launcher.chmod(0o755)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(longhaul.main(["statusline", "install", "--yes"]), 0, said.getvalue())
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.json_at(self.claude / "settings.json"), {}, "no line: there was no file")
+        self.assertNotIn("my-status", out)
 
     def test_purge_refuses_a_home_that_is_your_home_a_link_or_no_folder(self):
         cases = {"your home": lambda: self.user, "above it": lambda: self.tmp,
