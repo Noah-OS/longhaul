@@ -53,6 +53,18 @@ os.environ.pop("CLAUDE_CONFIG_DIR", None)
 # Codex's folder: an empty one of the suite's own, so that no test reads the
 # machine's ~/.codex; the Codex tests point CODEX_HOME at their own.
 os.environ["CODEX_HOME"] = tempfile.mkdtemp(prefix="longhaul-test-codex-")
+# Apple's /usr/bin/python3 (3.9) run with -I, as the hooks run, writes no
+# bytecode (and without -I writes it under ~/Library/Caches), so each child
+# of the suite's that imported longhaul that way compiled its 600 KB again,
+# a quarter of a second apiece. Compiled once here, into the __pycache__ a
+# child looks in, and checked against the source's hash at each import, it
+# is read as any import reads one. Test speed only (Sprint 12): longhaul
+# runs as before, and on a Python that writes its own this is the same file.
+with contextlib.suppress(Exception):
+    import py_compile
+    py_compile.compile(str(HERE / "longhaul.py"), doraise=True,
+                       cfile=str(HERE / "__pycache__" / f"longhaul.{sys.implementation.cache_tag}.pyc"),
+                       invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
 sys.path.insert(0, str(HERE))
 import longhaul  # noqa: E402
 
@@ -6471,7 +6483,9 @@ class Index(unittest.TestCase):
         failed init leaves a half-built map); with `.child`, it leaves a
         child of its own running first and records its pid. Its own PATH:
         sh has no mkdir or sleep of its own, and the test's PATH holds the
-        fakes alone."""
+        fakes alone. Slow is until wait() lets it go (`.go`), at most 30 s:
+        running for as long as the test looks, never a fixed 3 s waited
+        out (test speed, Sprint 12)."""
         seen = " ".join(f'"${{{name}-unset}}"' for name in self.SEEN)
         path.write_text("#!/bin/sh\n"
                         "PATH=/bin:/usr/bin\n"
@@ -6480,7 +6494,8 @@ class Index(unittest.TestCase):
                         f"echo SECRET-OUTPUT-{name}\n"
                         f"echo SECRET-OUTPUT-{name} >&2\n"
                         f"[ -e '{self.tmp}/{name}.child' ] && {{ sleep 30 & echo $! > '{self.tmp}/{name}.child.pid'; }}\n"
-                        f"[ -e '{self.tmp}/{name}.slow' ] && sleep 3\n"
+                        f"[ -e '{self.tmp}/{name}.slow' ] && {{ i=0; while [ ! -e '{self.tmp}/{name}.go' ] && "
+                        f"[ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; }}\n"
                         f"[ -e '{self.tmp}/{name}.hang' ] && sleep 30\n"
                         f"mkdir -p {self.MAPS[name]}\n"
                         f"[ -e '{self.tmp}/{name}.fail' ] && exit 1\n"
@@ -6546,10 +6561,14 @@ class Index(unittest.TestCase):
         return json.loads(self.state_path(top).read_text())
 
     def wait(self, program, top=None):
-        """The program's entry once its runner has written `ended`, within 20 s."""
+        """The program's entry once its runner has written `ended`, within 20 s;
+        a slow fake of the program is let go first, and the next one is slow again."""
+        go = self.tmp / f"{program}.go"
+        go.touch()
         for _ in range(400):
             entry = dict((longhaul.read_json(self.state_path(top)) or {}).get("runs", {}).get(program) or {})
             if entry.get("ended") is not None:
+                go.unlink()
                 return entry
             time.sleep(0.05)
         self.fail(f"{program}'s run did not end within 20 s")
@@ -7441,7 +7460,7 @@ class Index(unittest.TestCase):
                              timeout=10)
         took = time.time() - started
         self.assertEqual(out.returncode, 0, out.stderr)
-        # Under the fake's 3 s sleep, so the hook did not wait for it; the
+        # Under 3 s, with the fake held until wait() below, so the hook did not wait for it; the
         # proof is the exit still None below, not a tighter figure, which
         # a loaded machine's slow start would break (review, Sprint 7, F15).
         self.assertLess(took, 3, "the hook returned with the init running on")
