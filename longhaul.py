@@ -2192,13 +2192,19 @@ UNREADABLE_SAID: set = set()
 # prompt refused (ACCOUNT_REFUSED, which the user reads and the model never
 # does) and logged (ACCOUNT_LOGGED, which the display module's pop-up
 # reads), so no tokens are spent on the wrong account. Of the input only
-# session_id and cwd are used: the prompt's text is never used, logged,
-# kept or said. It fails open: no accounts.json, one it cannot read, input
-# it cannot read or any error lets the prompt through, and a folder no
-# account keeps is never refused.
+# session_id, cwd and whether transcript_path is a file are used: the
+# prompt's text is never used, logged, kept or said. It fails open: no
+# accounts.json, one it cannot read, input it cannot read or any error
+# lets the prompt through, and a folder no account keeps is never refused.
+# A chat allowed there (allowed.json, below) goes through on the account
+# it was allowed on.
 
 ACCOUNT_REFUSED = ("Longhaul: {where} is kept for {names}, and this chat runs on {label}. Nothing was sent. Close "
-                   "this chat and open it again (in a terminal: longhaul -r {short}), so it starts on {first}.")
+                   "this chat and open it again (in a terminal: longhaul -r {short}), so it starts on {first}{allow}.")
+# The refusal's second way (the ask-first plan of 2026-10-29): a plain
+# `claude` cannot be asked, so the refusal names the one command that
+# allows the chat, run in a terminal.
+ACCOUNT_ALLOW = ", or allow this chat on {label} here: longhaul allow {short} (in a terminal)"
 ACCOUNT_LOGGED = "account: refused a prompt in {sid}: {where} is kept for {names}; the chat runs on {label}"
 # The hook's input holds the prompt, and the bigger the prompt the more a
 # wrong account costs: a prompt that fits a 1M-token context is well under
@@ -2235,14 +2241,82 @@ def chat_label(on: list[dict], folder: str) -> str:
     return f"an account Longhaul doesn't know ({home_path(folder)})"
 
 
+# A chat allowed on an account in a folder other accounts keep (the
+# ask-first plan of 2026-10-29, A3 and A4): `longhaul allow`, or a yes to
+# the terminal's question before a launch (run()), records it in
+# LONGHAUL_HOME/allowed.json as {chat id: {"account", "folder" (the
+# repository's top), "at"}}, and the account check lets that chat's
+# prompts through there on that account. Per chat, never per folder: that
+# stays the accounts file's job. An entry older than ALLOWED_DAYS is read
+# as none and dropped at the next write, which keeps the newest
+# ALLOWED_KEEP.
+ALLOWED = "allowed.json"
+ALLOWED_DAYS = 30
+ALLOWED_KEEP = 200
+
+
+def allowance_fresh(entry, now: float) -> bool:
+    """Whether `entry` of allowed.json is an allowance still in force: an
+    account's name, an absolute folder, and a time (a number) less than
+    ALLOWED_DAYS ago. Anything else a hand or a crash left is none."""
+    if not isinstance(entry, dict):
+        return False
+    account, folder, at = entry.get("account"), entry.get("folder"), entry.get("at")
+    return (isinstance(account, str) and bool(account) and isinstance(folder, str) and os.path.isabs(folder)
+            and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < ALLOWED_DAYS * 86400)
+
+
+def allowances(now: float | None = None) -> dict:
+    """allowed.json's allowances in force, by chat id (a plain one,
+    GUARD_ID, alone); {} for no file or one that cannot be read."""
+    now = time.time() if now is None else now
+    found = read_json(LONGHAUL_HOME / ALLOWED)
+    if not isinstance(found, dict):
+        return {}
+    return {sid: entry for sid, entry in found.items()
+            if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and allowance_fresh(entry, now)}
+
+
+def allow_chat(sid: str, account: str, folder: str, now: float | None = None) -> None:
+    """Record that chat `sid` may run on `account` in the repository
+    `folder`, in place of any allowance it had. Under the "allowed" lock,
+    written whole and private (write_json(): 0600), the stale and the
+    junk dropped and the newest ALLOWED_KEEP kept, the newest last.
+    OSError when it cannot be written: each caller says so."""
+    now = time.time() if now is None else now
+    with locked("allowed"):
+        kept = allowances(now)
+        kept.pop(sid, None)
+        kept[sid] = {"account": account, "folder": folder, "at": round(now, 1)}
+        newest = sorted(kept.items(), key=lambda item: item[1]["at"])[-ALLOWED_KEEP:]
+        write_json(LONGHAUL_HOME / ALLOWED, dict(newest))
+
+
+def chat_allowed(sid: str, on: list[dict], top: str) -> bool:
+    """Whether chat `sid` has an allowance for an account in `on` (the
+    accounts its config folder is) in the repository `top`, by real path
+    on both sides, and that account may be used there at all: one since
+    restricted to other repositories is not, allowed or not."""
+    entry = allowances().get(sid)
+    acct = next((a for a in on if entry and a["name"] == entry["account"]), None)
+    return (acct is not None and account_allowed(acct, top)
+            and os.path.realpath(entry["folder"]) == os.path.realpath(top))
+
+
 def account_refusal(data: dict):
     """The hook's answer refusing the prompt in `data` (a UserPromptSubmit
     input), logged, or None to let it through: None unless the session
     has an id, its cwd is an absolute path whose repository
-    (repository_of()) some accounts keep, and the chat's config folder is
-    none of theirs. The reason names the folder, the accounts that keep it
-    in the file's order, the chat's account, and how to open the chat
-    again on the first of them."""
+    (repository_of()) some accounts keep, the chat's config folder is
+    none of theirs, and the chat has no allowance there for its account
+    (chat_allowed()). The reason names the folder, the accounts that keep
+    it in the file's order, the chat's account, and how to open the chat
+    again on the first of them; and, for a chat on an account Longhaul
+    knows that may be used there, whose transcript is there to name its
+    folder, the command that allows it (ACCOUNT_ALLOW). A refusal notes
+    that account in the chat's record (note_session_account()), for
+    `longhaul allow` to find: a chat whose claude has no status line of
+    Longhaul's has none otherwise."""
     sid, cwd = data.get("session_id"), data.get("cwd")
     if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and isinstance(cwd, str) and os.path.isabs(cwd)):
         return None
@@ -2255,12 +2329,17 @@ def account_refusal(data: dict):
         return None
     folder = chat_config_dir()
     on = accounts_on(accounts, folder)
-    if any(a["name"] in kept for a in on):
+    if any(a["name"] in kept for a in on) or chat_allowed(sid, on, top):
         return None
     label, where = chat_label(on, folder), home_path(top)
     log(ACCOUNT_LOGGED.format(sid=sid, where=where, names=", ".join(kept), label=label))
+    allow, path = "", data.get("transcript_path")
+    if on:
+        note_session_account(sid, on[0]["name"])
+        if account_allowed(on[0], top) and isinstance(path, str) and os.path.isfile(path):
+            allow = ACCOUNT_ALLOW.format(label=label, short=sid[:8])
     return {"decision": "block", "reason": ACCOUNT_REFUSED.format(
-        where=where, names=" or ".join(kept), label=label, short=sid[:8], first=kept[0])}
+        where=where, names=" or ".join(kept), label=label, short=sid[:8], first=kept[0], allow=allow)}
 
 
 def account_check(_opts) -> int:
