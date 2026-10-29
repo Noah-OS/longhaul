@@ -15738,6 +15738,51 @@ class Panel(StreamHarness):
         self.assertNotIn("Max", state.get("limited_until", {}), "Max is not recorded as limited")
         self.assertNotIn("hit its", log.read_text())
 
+    def test_the_ask_probe_shows_one_card_holds_the_first_message_and_logs_the_answer(self):
+        # Ask first, A0 (docs plans/2026-10-29-ask-first.md): does the panel show a card Longhaul sends?
+        self.plan(["reply", "reply"])
+        (self.relay / "ask-probe").touch()
+        p = self.start()
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        u = self.user(p, "first")
+        card = self.wait_for(lambda m: m.get("type") == "control_request")
+        self.assertEqual(card["request_id"], "longhaul-ask-probe-1")
+        self.assertEqual((card["request"]["subtype"], card["request"]["tool_name"]), ("can_use_tool", "Longhaul"))
+        self.assertFalse((self.relay / "ask-probe").exists(), "one card, one chat")
+        [call] = self.calls()
+        self.assertFalse([m for m in self.received(call["pid"]) if m.get("type") == "user"], "the message waits")
+        self.send(p, {"type": "control_response", "response": {
+            "subtype": "success", "request_id": "longhaul-ask-probe-1",
+            "response": {"behavior": "allow", "updatedInput": {}}}})
+        self.assertFalse(self.wait_for(self.result_for(u))["is_error"], "then it goes on")
+        got = self.received(call["pid"])
+        self.assertFalse([m for m in got if m.get("type") == "control_response"
+                          and "longhaul-ask" in json.dumps(m)], "the answer never reaches claude")
+        self.assertIn("ask probe: the panel answered the card (success, behavior 'allow')", self.log_text())
+        u2 = self.user(p, "second")
+        self.wait_for(self.result_for(u2))
+        self.assertEqual(sum(1 for m in self.seen if m.get("type") == "control_request"), 1, "no second card")
+
+    def test_with_no_answer_the_probes_message_goes_on_after_its_wait(self):
+        self.plan(["reply"])
+        (self.relay / "ask-probe").touch()
+        p = self.start(LONGHAUL_ASK_PROBE_SECONDS="1")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        u = self.user(p, "first")
+        self.wait_for(lambda m: m.get("type") == "control_request")
+        self.assertFalse(self.wait_for(self.result_for(u))["is_error"])
+        self.assertIn("ask probe: no answer to the card in 1 s", self.log_text())
+
+    def test_without_the_probe_file_no_card_is_sent(self):
+        self.plan(["reply"])
+        p = self.start()
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.wait_for(self.result_for(self.user(p, "first")))
+        self.assertFalse([m for m in self.seen if m.get("type") == "control_request"])
+
     def test_a_panel_chat_records_its_usage_for_its_account(self):
         self.plan(["reply"])
         p = self.start()

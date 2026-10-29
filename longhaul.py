@@ -11304,6 +11304,18 @@ INIT_WAIT = setting("LONGHAUL_INIT_WAIT_SECONDS", 90, float)
 # line arrives, so a stop with no match yet waits OWN_STOP_WAIT for it.
 OWN_STOP_WAIT = setting("LONGHAUL_OWN_STOP_SECONDS", 10, float)
 OWN_STOP_WINDOW = 120  # seconds
+# Ask first (docs plans/2026-10-29-ask-first.md, A0): whether the VS Code
+# panel shows a permission card that Longhaul, not Claude, sends, and gives
+# the answer back. With this file present, the next panel chat's first
+# message waits while the relay sends Claude Code's own permission request
+# (control_request, can_use_tool) under a tool name of Longhaul's; the
+# panel's answer is logged (the behaviour and the field names, nothing
+# typed) and never reaches Claude. The message goes on after the answer,
+# or after ASK_PROBE_WAIT with none. The file is removed as the card goes:
+# one card, one chat.
+ASK_PROBE = LONGHAUL_HOME / "ask-probe"
+ASK_PROBE_WAIT = setting("LONGHAUL_ASK_PROBE_SECONDS", 120, float)
+ASK_ID = "longhaul-ask-"  # the request ids of Longhaul's own cards
 RELAY_DEBUG = bool(os.environ.get("LONGHAUL_RELAY_DEBUG"))
 # A line's "type" is not always its first field: a 2.1.300 result line
 # starts with "duration_api_ms" and has "type":"result" 1,600 bytes in.
@@ -11786,6 +11798,7 @@ class Relay:
         self.paused = False
         self.held_since = None
         self.own_stops: collections.deque = collections.deque(maxlen=20)  # (pid, uuid, time): limit_ours()
+        self.asked: dict = {}  # a card's request id -> when it was sent (ASK_PROBE)
         self.swap_started = None
         self.panel_closed = False
         self.swapping = False
@@ -11850,6 +11863,11 @@ class Relay:
     def from_panel(self) -> None:
         for line in sys.stdin.buffer:
             trace("panel>", "-", line)
+            if self.asked and has_type(line, "control_response") and ASK_ID.encode() in line:
+                self.card_answered(line)  # Longhaul's own card: the answer is not Claude's
+                continue
+            if not self.asked and ASK_PROBE.exists() and self.probe_card(line):
+                continue
             if has_type(line, "control_request"):
                 try:
                     self.remember(json.loads(line))
@@ -11861,6 +11879,63 @@ class Relay:
         with self.cond:
             self.panel_closed = True
             self.cond.notify_all()
+
+    def probe_card(self, line: bytes) -> bool:
+        """ASK_PROBE: at the chat's first message, hold it and send the
+        panel one test card; True when the line was taken (it is queued
+        and goes on after the answer, or after ASK_PROBE_WAIT)."""
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return False
+        if not (isinstance(msg, dict) and msg.get("type") == "user"):
+            return False
+        rid = f"{ASK_ID}probe-1"
+        with self.cond:
+            self.queue.append(line)
+            self.paused = True
+        self.asked[rid] = time.time()
+        try:
+            ASK_PROBE.unlink()
+        except OSError:
+            pass
+        card = {"type": "control_request", "request_id": rid, "request": {
+            "subtype": "can_use_tool", "tool_name": "Longhaul", "tool_use_id": rid, "permission_suggestions": [],
+            "input": {"question": "Longhaul test card: can you see this? Allow or Deny; your message is sent "
+                                  "either way, right after."}}}
+        with self.out_lock:
+            sys.stdout.buffer.write(json.dumps(card).encode() + b"\n")
+            sys.stdout.buffer.flush()
+        log("ask probe: a test card sent to the panel; the chat's first message waits for the answer")
+        timer = threading.Timer(ASK_PROBE_WAIT, self.card_timeout, [rid])
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def card_answered(self, line: bytes) -> None:
+        """The panel's answer to a card of Longhaul's: logged by its kind,
+        its behaviour and its field names, and the held lines let go."""
+        try:
+            resp = json.loads(line).get("response") or {}
+        except (ValueError, AttributeError):
+            resp = {}
+        rid, inner = resp.get("request_id"), resp.get("response") if isinstance(resp.get("response"), dict) else {}
+        sent = self.asked.pop(rid, None)
+        if sent is None:
+            return
+        log(f"ask probe: the panel answered the card ({resp.get('subtype')}, behavior {inner.get('behavior')!r}) "
+            f"after {time.time() - sent:.0f} s; its fields: {sorted(inner)}")
+        with self.cond:
+            self.paused = False
+            self.cond.notify_all()
+
+    def card_timeout(self, rid: str) -> None:
+        if self.asked.pop(rid, None) is not None:
+            log(f"ask probe: no answer to the card in {ASK_PROBE_WAIT:g} s (the panel may not show Longhaul's "
+                "cards); the message goes on")
+            with self.cond:
+                self.paused = False
+                self.cond.notify_all()
 
     def to_claude(self) -> None:
         while True:
