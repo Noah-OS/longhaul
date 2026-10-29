@@ -20834,18 +20834,18 @@ class HookBudget(unittest.TestCase):
         installed["plugins"].setdefault(key, []).append(entry)
         self.write(path, installed)
         if enabled is not None:
-            found = json.loads((self.claude / "settings.json").read_text()) if (self.claude / "settings.json").exists() else {}
-            self.settings(self.claude / "settings.json", enabledPlugins={**found.get("enabledPlugins", {}), key: enabled})
+            settings = self.claude / "settings.json"
+            found = json.loads(settings.read_text()) if settings.exists() else {}
+            self.settings(settings, enabledPlugins={**found.get("enabledPlugins", {}), key: enabled})
         return root
 
     def longhaul_plugin(self):
-        return self.plugin("longhaul@longhaul", self.hooks(self.hook("PreToolUse", self.GUARD, "Read|Bash"),
-                                                           self.hook("SessionStart", self.CHECKPOINT, "compact|clear|resume"),
-                                                           self.hook("SessionStart", "Looking for a code index (longhaul guard)",
-                                                                     "startup"),
-                                                           self.hook("UserPromptSubmit", "Checking the context's size "
-                                                                                          "(longhaul checkpoint)", n=2)),
-                           modules=True)
+        """Longhaul's own, its status messages as hooks.json gives them, and its hooks module."""
+        hooks = self.hooks(self.hook("PreToolUse", self.GUARD, "Read|Bash"),
+                           self.hook("SessionStart", self.CHECKPOINT, "compact|clear|resume"),
+                           self.hook("SessionStart", "Looking for a code index (longhaul guard)", "startup"),
+                           self.hook("UserPromptSubmit", "Checking the context's size (longhaul checkpoint)", n=2))
+        return self.plugin("longhaul@longhaul", hooks, modules=True)
 
     def chats(self) -> Path:
         """This project's folder of transcripts, as Claude Code names it."""
@@ -20878,8 +20878,9 @@ class HookBudget(unittest.TestCase):
         self.plugin("off@market", self.hook("PreToolUse", n=4), enabled=False)  # turned off: none of its hooks run
         self.plugin("far@market", self.hook("PreToolUse", n=4), scope="project", project=self.tmp / "elsewhere")
         near = self.plugin("near@market", self.hook("PostToolUse", matcher=""), scope="local", project=self.project,
-                           manifest={"hooks": "./more/hooks.json"})
+                           manifest={"hooks": ["./more/hooks.json", "../outside.json", "./hooks/hooks.json"]})
         self.write(near / "more" / "hooks.json", {"hooks": self.hook("Stop")})  # the manifest's own file adds to it
+        self.write(near.parent / "outside.json", {"hooks": self.hook("Stop", n=5)})  # outside the plugin: not its own
         c = longhaul.doctor_hooks(str(self.project))
         self.assertEqual((c["mark"], c["step"]), ("ok", None))
         self.assertEqual(c["said"], "12 hooks on 6 events, from user settings, project settings, longhaul and near")

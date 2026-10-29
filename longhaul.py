@@ -13140,7 +13140,10 @@ def uninstall(opts) -> int:
 # Codex's folders (X3) it lists sessions/, and of the chats there it reads
 # the newest one's first record, for its version and where it ran; of each
 # folder's config.toml it reads only the keys its Codex items need
-# (codex_config_items()), and never auth.json.
+# (codex_config_items()), and never auth.json. Of Claude Code's settings
+# and plugins it reads the hooks, and of this folder's newest chat only the
+# lines that record a hook's run (the hook budget, below), and it prints no
+# hook's command.
 #
 # The first chat after an install or an update (the plugin's version is
 # not the one LONGHAUL_HOME/seen.json records) is told, by the guard's
@@ -13797,9 +13800,10 @@ def doctor_features() -> dict:
 # (hook_cancelled; timedOut when its timeout ended it), with its
 # durationMs and, as its `command`, the hook's status message or else its
 # command; and a stop_hook_summary line at each stop with each Stop hook's
-# durationMs. A run that printed nothing is not recorded: on the owner's
-# chats 15,093 Bash calls left 214 of the guard's PreToolUse runs (10-29).
-# So the times are of the runs that did something, the slower ones. They
+# durationMs. A run that printed nothing is not recorded: 60 of the owner's
+# chats held 249 PreToolUse runs against 15,093 Bash calls (10-29), and a
+# 520 MB chat is read for them in under a second. So the times are of the
+# runs that did something, the slower ones. They
 # include the program's start, which is what a hook costs. Longhaul's own
 # are known by the tag each of its status messages ends with ("(longhaul
 # guard)"), whichever copy ran them; a median is judged against the
@@ -13869,23 +13873,25 @@ def hook_entries(found, source: str, root=None, cwd=None) -> list:
 
 
 def hook_file(path: Path, source: str, unread: list):
-    """A settings or hooks file's object; None when it is not there, and
-    then also when it cannot be read or is not JSON, which `unread` gets."""
+    """A settings or hooks file's object, or None: when it is not there, and
+    when it cannot be read or is not JSON, which `unread` records."""
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, RecursionError) as e:
-        unread.append((source, path, "is not JSON" if isinstance(e, (ValueError, RecursionError)) else "could not be read"))
-        return None
+    except (ValueError, RecursionError):
+        unread.append((source, path, "is not JSON"))
+    except OSError:
+        unread.append((source, path, "could not be read"))
+    return None
 
 
 def hook_plugins(config: Path, cwd, enabled: dict) -> list:
     """The plugins whose hooks run for a chat at `cwd`, as (name, folder),
-    once each, by key: each the config folder's installed_plugins.json
-    records (either shape) that the settings do not turn off, a user's
-    anywhere and a project's or a local one at its projectPath and below,
-    whose folder is there."""
+    in key order: each one the config folder's installed_plugins.json
+    records (either shape) and the settings do not turn off, once, by its
+    first install that loads here (a user's anywhere, a project's or a
+    local one at its projectPath and below) whose folder is there."""
     here = os.path.realpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
     plugins = []
     for key, entries in sorted(dict_at(read_json(config / "plugins" / "installed_plugins.json"), "plugins").items()):
@@ -13917,7 +13923,8 @@ def hooks_configured(cwd, config=None) -> dict:
     hooks, modules, unread, enabled = [], [], [], {}
     files = [("user settings", config / "settings.json"), ("user settings", config / "settings.local.json")]
     if isinstance(cwd, str) and os.path.isabs(cwd):
-        files += [("project settings", Path(cwd) / ".claude" / name) for name in ("settings.json", "settings.local.json")]
+        files += [("project settings", Path(cwd) / ".claude" / name)
+                  for name in ("settings.json", "settings.local.json")]
     for source, path in files:  # the project's local file last: its switches win
         found = hook_file(path, source, unread)
         hooks += hook_entries(dict_at(found, "hooks"), source, cwd=cwd)
@@ -14092,9 +14099,9 @@ def doctor_hooks(cwd=None) -> dict:
               for source, path, why in found["unread"]]
     if found["modules"]:
         one = len(found["modules"]) == 1
-        items.append((None, f"{hook_and(found['modules'])} also load{'s' * one} {'a hooks module' if one else 'hooks modules'}, "
-                            f"which run{'s' * one} inside Claude Code: no process of {'its' if one else 'their'} own, "
-                            "and no time recorded", None))
+        items.append((None, f"{hook_and(found['modules'])} also load{'s' * one} "
+                            f"{'a hooks module' if one else 'hooks modules'}, which run{'s' * one} inside Claude Code: "
+                            f"no process of {'its' if one else 'their'} own, and no time recorded", None))
     chat = hook_chat(cwd, config)
     rows = [r for r in hook_rows(hook_runs([chat] + files_of(chat.with_suffix("").glob("subagents/agent-*.jsonl"))),
                                  found["hooks"]) if r["own"] and r["timed"]] if chat else []
