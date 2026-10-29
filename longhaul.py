@@ -4231,6 +4231,7 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
     order, began, ended, owner, called, answered, heard, told = [], {}, {}, {}, {}, {}, set(), set()
     ran_in: dict = {}  # tool_use id -> the folder its line says it ran in (bash_reads)
     hook_added: dict = {}  # (scope, event) -> [additions, characters] of what hooks put into the context
+    hook_timed: dict = {}  # (event, what the transcript records as the hook's command) -> its runs (hook_add())
     # Phase 3: each Bash output replayed through the filter's levels (filter_replay); after one `on` would cut
     # lines of, its file's next FILTER_NEXT calls, [words only the cut lines held, calls left, used?], in `pending`.
     commands, pending = {}, collections.defaultdict(list)
@@ -4267,6 +4268,12 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
                         text = added.get("content")  # a list of strings as Claude Code 2.1.310 writes it
                         row[1] += sum(len(t) for t in text if isinstance(t, str)) if isinstance(text, list) \
                             else len(text) if isinstance(text, str) else 0
+                if kind == "attachment" or line.get("subtype") == "stop_hook_summary":
+                    # A hook's run Claude Code timed (the hook budget, ADR-0005 rule 4), main's and subagents' alike:
+                    # by event and the hook it was, matched to where it is configured below; it moves no time on.
+                    at = parse_ts(line.get("timestamp")) or when
+                    if window is None or window[0] <= at < window[1]:
+                        hook_add(hook_timed, line)
                 if kind not in ("assistant", "user", "system"):
                     continue
                 when = parse_ts(line.get("timestamp")) or when
@@ -4577,6 +4584,9 @@ def inspect_transcript(path: Path, window: tuple | None = None, offset: int = 0)
         "reread_after_compaction": sorted(after.values(), key=lambda x: (-x["chars"], -x["reads"], x["path"])),
         "hook_context": [{"event": e, "times": t, "chars": c, "scope": s}
                          for (s, e), (t, c) in sorted(hook_added.items(), key=lambda kv: (-kv[1][1], kv[0]))],
+        # Matched to the hooks configured now for the chat's folder, in the config folder its transcript is under.
+        "hooks": hook_rows(hook_timed, hooks_configured(cwd, path.parent.parent.parent if path.parent.parent.name
+                                                         == "projects" else None)["hooks"]) if hook_timed else [],
         "search": search_stats(events, calls, results, cwd),
         "tool_errors": dict(collections.Counter(calls.get(tid, ("?",))[0]
                                                 for tid, (_, _, error, _) in results.items() if error).most_common()),
@@ -4810,6 +4820,10 @@ def inspect_lines(r: dict) -> list[str]:
             [f"  {x['event']}: {x['times']} time{'s' * (x['times'] != 1)}, {x['chars']:,} chars "
              f"≈ {x['chars'] // 4:,} tokens" + ("  (subagents)" if x["scope"] != "main" else "")
              for x in r["hook_context"]])
+    if r.get("hooks"):  # else Claude Code timed no hook's run: no section
+        section("Hook times [transcript, measured: what Claude Code timed, a hook's run when it printed something or "
+                "was stopped and every Stop hook's, by event and where the hook is configured now]",
+                [f"  {x['event']}, {x['source']}: {hook_row_said(x)}" for x in r["hooks"]])
     m = r.get("memory")
     if m is not None:  # else a window's figures (trial_figures), which read no file on disk
         def lines_of(n):
@@ -4967,6 +4981,15 @@ def inspect_records(r: dict) -> list[dict]:
     for x in r["hook_context"]:
         add("hook_context", x["times"], "additions", x["scope"], "transcript", "counted", x["event"])
         add("hook_context_chars", x["chars"], "chars", x["scope"], "transcript", "counted", x["event"])
+    for x in r.get("hooks") or ():  # the item: the event and the hook's source, a space between
+        item = f"{x['event']} {x['source']}"
+        add("hook_runs", x["runs"], "runs", "all", "transcript", "counted", item)
+        if x["timed"]:
+            add("hook_median_ms", x["median_ms"], "ms", "all", "transcript", "measured", item)
+            add("hook_longest_ms", x["longest_ms"], "ms", "all", "transcript", "measured", item)
+        for key in ("timed_out", "cancelled"):
+            if x[key]:
+                add(f"hook_{key}", x[key], "runs", "all", "transcript", "counted", item)
     m = r.get("memory") or {}
     if m.get("index"):
         add("memory_index_lines", m["index"]["lines"], "lines", "main", "files", "counted", "MEMORY.md")
@@ -13134,7 +13157,7 @@ DOCTOR_CHECKS = (("Plugin", "doctor_plugin"), ("Terminal command", "doctor_comma
                  ("Updates", "doctor_updates"), ("Status line", "doctor_statusline"),
                  ("VS Code panel", "doctor_vscode"), ("Accounts", "doctor_accounts"),
                  ("Chats running now", "doctor_chats"), ("Code maps", "doctor_maps"), ("Features", "doctor_features"),
-                 ("Codex", "doctor_codex"))
+                 ("Hooks", "doctor_hooks"), ("Codex", "doctor_codex"))
 DOCTOR_UPDATE = "`claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`"
 DOCTOR_STATUS_LINE = '"statusLine": {"type": "command", "command": "~/.local/bin/longhaul statusline"}'
 # The first word after the program (`claude auth ...`): a job, not a chat.
@@ -13752,6 +13775,356 @@ def doctor_features() -> dict:
     return doctor_result("the switches in force here", items)
 
 
+# ---------------------------------------------------------------- hook budget
+#
+# ADR-0005, rule 4 (the hook budget): `doctor` and `inspect` show every
+# hook every tool adds to each event, with its count and measured time,
+# and Longhaul's own stay within ADR-0004's 100 ms. The hooks are the ones
+# Claude Code runs for a chat in a folder: the user's settings (the chat's
+# config folder's settings.json and settings.local.json, as filter_rtk()
+# reads them), the project's (the folder's .claude/settings.json and
+# settings.local.json), and each enabled plugin's: its hooks/hooks.json and
+# what its manifest's "hooks" names. A plugin is one installed_plugins.json
+# records, a user's anywhere and a project's or a local one at its
+# projectPath and below (release_installed()), and enabled unless the
+# settings turn it off (enabledPlugins false, as doctor_plugin() reads
+# it). Of a hook only its event, whether it runs at every tool call, its
+# source and what a transcript records of it are kept, the last to match a
+# timed run to where it is configured; a command is never printed.
+#
+# The times are Claude Code's own, as 2.1.310 writes them: an attachment
+# for a hook's run that printed something (hook_success) or was stopped
+# (hook_cancelled; timedOut when its timeout ended it), with its
+# durationMs and, as its `command`, the hook's status message or else its
+# command; and a stop_hook_summary line at each stop with each Stop hook's
+# durationMs. A run that printed nothing is not recorded: on the owner's
+# chats 15,093 Bash calls left 214 of the guard's PreToolUse runs (10-29).
+# So the times are of the runs that did something, the slower ones. They
+# include the program's start, which is what a hook costs. Longhaul's own
+# are known by the tag each of its status messages ends with ("(longhaul
+# guard)"), whichever copy ran them; a median is judged against the
+# budget from HOOK_BUDGET_RUNS timed runs on, since one cold start can
+# take seconds.
+
+HOOK_BUDGET_MS = 100  # ADR-0004: each of Longhaul's own hooks, per event, measured
+HOOK_BUDGET_RUNS = 3  # timed runs before a median is judged
+HOOK_EVERY_CALL = 3   # sources with a hook at every tool call that make an event's line ⚠
+HOOK_TOOL_EVENTS = ("PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure")  # matched by tool
+HOOK_EVERY = (None, "", "*", ".*")  # a tool event's matcher that matches every tool
+# Claude Code's events in the order a session meets them; any other comes after them, by name.
+HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse",
+               "PostToolUseFailure", "Notification", "SubagentStart", "SubagentStop", "Stop", "StopFailure",
+               "PreCompact", "PostCompact", "SessionEnd")
+HOOK_TAG = re.compile(r"\((longhaul [a-z-]{1,30})\)$")  # how each of Longhaul's status messages ends
+HOOK_UNKNOWN = "not configured now"  # the source of a timed run no hook here matches
+HOOK_MARKS = (b'"hook_success"', b'"hook_cancelled"', b'"stop_hook_summary"')  # the only lines hook_runs() parses
+HOOK_EVERY_STEP = ("each of these starts a program at every tool call; `/hooks` in Claude Code lists them: remove "
+                   "the ones you do not use")
+
+
+def hook_event(name) -> str:
+    """An event's name as a file or a transcript gives it, safe to print:
+    "other" for anything but a plain word."""
+    return name if isinstance(name, str) and re.fullmatch(r"[A-Za-z]{1,40}", name) else "other"
+
+
+def hook_event_order(event: str) -> tuple:
+    return (HOOK_EVENTS.index(event), "") if event in HOOK_EVENTS else (len(HOOK_EVENTS), event)
+
+
+def hook_and(names: list) -> str:
+    """a; a and b; a, b and c."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def hook_said(hook: dict, root=None, cwd=None) -> set:
+    """What a transcript may record of a hook as its `command`: its status
+    message when it has one, else its command, as written and with the
+    plugin's folder and the project's put in for their variables."""
+    said = hook.get("statusMessage")
+    if isinstance(said, str) and said:
+        return {said}
+    command = hook.get("command")
+    if not isinstance(command, str) or not command:
+        return set()
+    forms = {command}
+    for name, value in (("CLAUDE_PLUGIN_ROOT", root), ("CLAUDE_PROJECT_DIR", cwd)):
+        if value:
+            forms |= {f.replace("${" + name + "}", str(value)).replace("$" + name, str(value)) for f in forms}
+    return forms
+
+
+def hook_entries(found, source: str, root=None, cwd=None) -> list:
+    """The hooks in one hooks object ({event: [{matcher, hooks: [...]}]}),
+    one dict each: its event, its source, whether it runs at every tool
+    call (`every`), and what a transcript may record of it (`said`)."""
+    entries = []
+    for event, groups in found.items() if isinstance(found, dict) else ():
+        for group in groups if isinstance(groups, list) else ():
+            hooks = group.get("hooks") if isinstance(group, dict) else None
+            every = event in HOOK_TOOL_EVENTS and group.get("matcher") in HOOK_EVERY if hooks else False
+            entries += [{"event": hook_event(event), "source": source, "every": every, "said": hook_said(h, root, cwd)}
+                        for h in hooks if isinstance(h, dict)] if isinstance(hooks, list) else []
+    return entries
+
+
+def hook_file(path: Path, source: str, unread: list):
+    """A settings or hooks file's object; None when it is not there, and
+    then also when it cannot be read or is not JSON, which `unread` gets."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, RecursionError) as e:
+        unread.append((source, path, "is not JSON" if isinstance(e, (ValueError, RecursionError)) else "could not be read"))
+        return None
+
+
+def hook_plugins(config: Path, cwd, enabled: dict) -> list:
+    """The plugins whose hooks run for a chat at `cwd`, as (name, folder),
+    once each, by key: each the config folder's installed_plugins.json
+    records (either shape) that the settings do not turn off, a user's
+    anywhere and a project's or a local one at its projectPath and below,
+    whose folder is there."""
+    here = os.path.realpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    plugins = []
+    for key, entries in sorted(dict_at(read_json(config / "plugins" / "installed_plugins.json"), "plugins").items()):
+        if enabled.get(key) is False:
+            continue
+        for entry in entries if isinstance(entries, list) else [entries]:
+            path = entry.get("installPath") if isinstance(entry, dict) else None
+            path = os.path.expanduser(path) if isinstance(path, str) else ""
+            if not (os.path.isabs(path) and os.path.isdir(path)):
+                continue
+            if entry.get("scope") in ("project", "local"):
+                project = entry.get("projectPath")
+                project = os.path.realpath(project) if isinstance(project, str) and os.path.isabs(project) else None
+                if not (here and project and (here == project or inside(here, project))):
+                    continue
+            plugins.append((shown(key.split("@", 1)[0], 60), Path(path)))
+            break
+    return plugins
+
+
+def hooks_configured(cwd, config=None) -> dict:
+    """Every hook Claude Code runs for a chat at `cwd` on `config` (the
+    chat's config folder by default): {"hooks": hook_entries()'s, the
+    user's settings first, then the project's, then each plugin's by name;
+    "modules": the plugins that also load a hooks module, which runs in
+    Claude Code's own process; "unread": (source, path, why) of each file
+    there that could not be read}."""
+    config = Path(config or chat_config_dir())
+    hooks, modules, unread, enabled = [], [], [], {}
+    files = [("user settings", config / "settings.json"), ("user settings", config / "settings.local.json")]
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        files += [("project settings", Path(cwd) / ".claude" / name) for name in ("settings.json", "settings.local.json")]
+    for source, path in files:  # the project's local file last: its switches win
+        found = hook_file(path, source, unread)
+        hooks += hook_entries(dict_at(found, "hooks"), source, cwd=cwd)
+        enabled.update(dict_at(found, "enabledPlugins"))
+    for name, root in hook_plugins(config, cwd, enabled):
+        named = plugin_manifest(root).get("hooks")  # a file in the plugin, a list of them, or the hooks themselves
+        paths, objects = [root / "hooks" / "hooks.json"], []
+        for item in named if isinstance(named, list) else [named]:
+            path = Path(os.path.realpath(root / item)) if isinstance(item, str) else None
+            if path and inside(str(path), os.path.realpath(root)) and path not in map(Path.resolve, paths):
+                paths.append(path)
+            elif isinstance(item, dict):
+                objects.append(item if isinstance(item.get("hooks"), dict) else {"hooks": item})
+        found = [hook_file(path, name, unread) for path in paths] + objects
+        hooks += [h for f in found for h in hook_entries(dict_at(f, "hooks"), name, root, cwd)]
+        if any(isinstance(f, dict) and f.get("modules") for f in found):
+            modules.append(name)
+    return {"hooks": hooks, "modules": modules, "unread": unread}
+
+
+def hook_ms(value):
+    """A run's durationMs, or None for none or junk."""
+    value = as_number(value)
+    return value if value is not None and value >= 0 else None
+
+
+def hook_runs_of(line: dict) -> list:
+    """The hook runs one transcript line records, as (event, said, ms,
+    outcome): an attachment for a run that printed something (hook_success:
+    "ok") or was stopped (hook_cancelled: "timed out" when its timeout
+    ended it, else "cancelled"), or a stop's summary with a run of each Stop
+    hook (SubagentStop in a subagent's). `said` is what it records as the
+    hook's command, its status message or its command, to match and never
+    to print; ms is its durationMs, None without one."""
+    if line.get("type") == "attachment":
+        added = dict_at(line, "attachment")
+        if added.get("type") not in ("hook_success", "hook_cancelled"):
+            return []
+        outcome = ("ok" if added["type"] == "hook_success" else "timed out" if added.get("timedOut") is True
+                   else "cancelled")
+        said = added.get("command")
+        return [(hook_event(added.get("hookEvent")), said if isinstance(said, str) else "",
+                 hook_ms(added.get("durationMs")), outcome)]
+    infos = line.get("hookInfos")
+    if line.get("type") != "system" or line.get("subtype") != "stop_hook_summary" or not isinstance(infos, list):
+        return []
+    event = "SubagentStop" if line.get("isSidechain") else "Stop"
+    return [(event, i["command"] if isinstance(i.get("command"), str) else "", hook_ms(i.get("durationMs")), "ok")
+            for i in infos if isinstance(i, dict)]
+
+
+def hook_add(runs: dict, line: dict):
+    """One line's hook runs (hook_runs_of()) into `runs`, by (event, said):
+    {"runs": the runs that ended, "ms": their times, "cancelled", "timed_out"}."""
+    for event, said, ms, outcome in hook_runs_of(line):
+        row = runs.setdefault((event, said), {"runs": 0, "ms": [], "cancelled": 0, "timed_out": 0})
+        if outcome == "ok":
+            row["runs"] += 1
+            row["ms"] += [ms] if ms is not None else []
+        else:
+            row["timed_out" if outcome == "timed out" else "cancelled"] += 1
+
+
+def hook_runs(paths) -> dict:
+    """hook_add()'s runs in transcript files; only a line that names a
+    hook's record is parsed, so a long chat reads fast."""
+    runs = {}
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                for raw in f:
+                    if any(mark in raw for mark in HOOK_MARKS):
+                        try:
+                            line = json.loads(raw)
+                        except (ValueError, RecursionError):
+                            continue
+                        if isinstance(line, dict):
+                            hook_add(runs, line)
+        except OSError:  # a file gone or unreadable: the others still count
+            continue
+    return runs
+
+
+def hook_rows(runs: dict, hooks: list) -> list:
+    """hook_add()'s runs by event and source, matched to the hooks
+    configured (hooks_configured()) by what the transcript records:
+    Longhaul's own (`own`) named by their tag, a run no hook here matches
+    HOOK_UNKNOWN. Each with its runs, how many were timed, the median (the
+    lower one, as the filter's) and longest time, and the stopped ones; in
+    event order, the most runs first."""
+    where = {}
+    for h in hooks:
+        for said in h["said"]:
+            where.setdefault(said, h["source"])
+    groups = {}
+    for (event, said), run in runs.items():
+        source, tag = where.get(said), HOOK_TAG.search(said)
+        own = bool(tag) and source in (None, "longhaul")
+        source = tag.group(1) if own else source or HOOK_UNKNOWN
+        g = groups.setdefault((event, source), {"event": event, "source": source, "own": own, "runs": 0, "ms": [],
+                                                "cancelled": 0, "timed_out": 0})
+        for key in ("runs", "ms", "cancelled", "timed_out"):
+            g[key] += run[key]
+    rows = []
+    for g in groups.values():
+        ms = sorted(g.pop("ms"))
+        rows.append({**g, "timed": len(ms), "median_ms": ms[(len(ms) - 1) // 2] if ms else None,
+                     "longest_ms": ms[-1] if ms else None})
+    return sorted(rows, key=lambda r: (hook_event_order(r["event"]), -r["runs"], r["source"]))
+
+
+def hook_over(row: dict) -> bool:
+    """Whether one of Longhaul's own hooks is over the budget: its median,
+    once HOOK_BUDGET_RUNS runs are timed."""
+    return row["own"] and row["timed"] >= HOOK_BUDGET_RUNS and row["median_ms"] > HOOK_BUDGET_MS
+
+
+def hook_times_said(row: dict) -> str:
+    """median 95 ms, longest 3,000 ms."""
+    return f"median {row['median_ms']:,.0f} ms, longest {row['longest_ms']:,.0f} ms"
+
+
+def hook_row_said(row: dict) -> str:
+    """inspect's line of one event's runs from one source, after its names."""
+    runs, timed = row["runs"], row["timed"]
+    said = f"{runs:,} run{'s' * (runs != 1)}"
+    if timed:
+        said += f", {hook_times_said(row)}" if timed == runs else f", {timed:,} timed: {hook_times_said(row)}"
+    elif runs:
+        said += ", none timed"
+    if hook_over(row):
+        said += f": over ADR-0004's {HOOK_BUDGET_MS} ms"
+    stopped = [f"{row[k]:,} {what}" for k, what in (("timed_out", "timed out"), ("cancelled", "cancelled")) if row[k]]
+    return said + (f"; {', '.join(stopped)}" if stopped else "")
+
+
+def hook_chat(cwd: str, config: Path):
+    """The newest chat at `cwd`: the main transcript last written in its
+    folder under the config folder's projects/, which Claude Code names
+    after the path, each character but a letter or a digit a "-"; or None."""
+    try:
+        paths = files_of((config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)).glob("*.jsonl"))
+        return max(paths, key=lambda p: (p.stat().st_mtime, p.name)) if paths else None
+    except OSError:
+        return None
+
+
+def doctor_hooks(cwd=None) -> dict:
+    """11. The hook budget (ADR-0005, rule 4): how many hooks each event
+    runs here and from where (hooks_configured(), for this folder and the
+    chat's config folder), a ⚠ for a tool event that runs a hook at every
+    tool call from HOOK_EVERY_CALL sources or more; then the times Claude
+    Code recorded for Longhaul's own in the newest chat here (hook_chat()),
+    a ⚠ for one whose median is over HOOK_BUDGET_MS. Every hook's times are
+    inspect's. Not a quick check: the first-chat line reads no hooks file
+    and no transcript. Never a hook's command."""
+    cwd = cwd or os.getcwd()
+    config = Path(chat_config_dir())
+    found = hooks_configured(cwd, config)
+    counts, every = {}, {}  # event -> {source: hooks}; event -> the sources with a hook at every tool call
+    for h in found["hooks"]:
+        counts.setdefault(h["event"], collections.Counter())[h["source"]] += 1
+        if h["every"] and h["source"] not in every.setdefault(h["event"], []):
+            every[h["event"]].append(h["source"])
+    items = []
+    for event in sorted(counts, key=hook_event_order):
+        text = f"{event}: {sum(counts[event].values())} ({', '.join(f'{s} {n}' for s, n in counts[event].items())})"
+        text += f"; on every tool call: {hook_and(every[event])}" if every.get(event) else ""
+        many = len(every.get(event, [])) >= HOOK_EVERY_CALL
+        items.append(("warn" if many else None, text, HOOK_EVERY_STEP if many else None))
+    items += [(None, f"{source}: {home_path(str(path))} {why}, so its hooks are not counted here", None)
+              for source, path, why in found["unread"]]
+    if found["modules"]:
+        one = len(found["modules"]) == 1
+        items.append((None, f"{hook_and(found['modules'])} also load{'s' * one} {'a hooks module' if one else 'hooks modules'}, "
+                            f"which run{'s' * one} inside Claude Code: no process of {'its' if one else 'their'} own, "
+                            "and no time recorded", None))
+    chat = hook_chat(cwd, config)
+    rows = [r for r in hook_rows(hook_runs([chat] + files_of(chat.with_suffix("").glob("subagents/agent-*.jsonl"))),
+                                 found["hooks"]) if r["own"] and r["timed"]] if chat else []
+    name = shown(chat.stem, 100) if chat else ""
+    if chat is None:
+        items.append((None, "times: no chat in this folder yet", None))
+    elif not rows:
+        items.append((None, f"times: none recorded for Longhaul's hooks in the newest chat here, {name}; Claude Code "
+                            "times a run only when the hook prints something or is stopped", None))
+    else:
+        how = f"`longhaul inspect {name}`" if re.fullmatch(GUARD_ID, chat.stem) else "`longhaul inspect` with its path"
+        items.append((None, f"times: Longhaul's own in the newest chat here, {name}, as Claude Code recorded them (a "
+                            f"run that prints nothing has none); {how} shows every hook's", None))
+        repo = plugin_repository()
+        step = (f"Longhaul's own hooks should take under {HOOK_BUDGET_MS} ms each (ADR-0004): if `longhaul inspect` "
+                "shows it over in the next chat too, report it at "
+                + (f"https://github.com/{repo}/issues" if repo else "Longhaul's repository"))
+        for r in rows:
+            over = hook_over(r)
+            items.append(("warn" if over else "ok" if r["timed"] >= HOOK_BUDGET_RUNS else None,
+                          f"{r['source']} on {r['event']}: {hook_times_said(r)}, of {r['timed']:,} timed "
+                          f"run{'s' * (r['timed'] != 1)}" + (f": over ADR-0004's {HOOK_BUDGET_MS} ms" if over else ""),
+                          step if over else None))
+    total = len(found["hooks"])
+    said = (f"{total} hook{'s' * (total != 1)} on {len(counts)} event{'s' * (len(counts) != 1)}, from "
+            f"{hook_and(list(dict.fromkeys(h['source'] for h in found['hooks'])))}" if total
+            else "no hooks run here: none in the settings or an enabled plugin")
+    return doctor_result(said, items)
+
+
 # The Codex program, run for its version alone, as PATH's absolute entries
 # find it (doctor_path_hits): never a `codex` in the folder the doctor runs
 # in. Tests put a fake on PATH.
@@ -14173,6 +14546,8 @@ def doctor_checks(quick: bool = False, processes=None) -> list:
                 result = check(quick)
             elif function == "doctor_chats":
                 result = None if quick else check(doctor_processes() if processes is None else processes)
+            elif function == "doctor_hooks":  # files and a transcript: not for the first-chat line
+                result = None if quick else check()
             else:
                 result = check()
         except Exception as e:

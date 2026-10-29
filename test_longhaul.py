@@ -4051,6 +4051,80 @@ class Inspect(unittest.TestCase):
         self.assertEqual(got[("hook_context", "SessionStart")], (1, "additions", "counted"))
         self.assertNotIn("SECRET", "\n".join(out) + records.stdout + records.stderr)
 
+    def test_each_hooks_times_by_event_and_where_it_is_configured(self):
+        # ADR-0005, rule 4: what Claude Code timed of each hook's run (an
+        # attachment with its time, for a run that printed something or was
+        # stopped; a summary line with every Stop hook's), by event and by
+        # where the hook is configured now, matched by its status message or
+        # its command, which is never shown; Longhaul's own by its status
+        # message's tag, and marked when its median is over ADR-0004's 100 ms.
+        secret = "SECRET-" + "k" * 20
+        cwd, guard, mine = self.tmp / "app", "Checking this call (longhaul guard)", f"/opt/{secret}/hook --key {secret}"
+        self.claude.mkdir(parents=True, exist_ok=True)
+        (self.claude / "settings.json").write_text(json.dumps(
+            {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": mine}]}]}}))
+        (cwd / ".claude").mkdir(parents=True)
+        (cwd / ".claude" / "settings.local.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": f"trail {secret} stop"}]}]}}))
+        root = self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / "1.0.0"
+        (root / "hooks").mkdir(parents=True)
+        (root / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "python3", "statusMessage": guard}]}]}}))
+        (self.claude / "plugins" / "installed_plugins.json").write_text(json.dumps(
+            {"version": 2, "plugins": {"longhaul@longhaul": [{"scope": "user", "installPath": str(root), "version": "1.0.0"}]}}))
+
+        def ran(event, said, ms, kind="hook_success", **more):
+            """A hook's run as Claude Code 2.1.310 records it."""
+            attachment = {"type": kind, "hookName": f"{event}:Bash", "toolUseID": "toolu_1", "hookEvent": event,
+                          "command": said, "durationMs": ms, **more}
+            if kind == "hook_success":
+                attachment.update(content=secret, stdout=secret, stderr="", exitCode=0)
+            return {"type": "attachment", "attachment": attachment, "cwd": str(cwd)}
+
+        stop = {"type": "system", "subtype": "stop_hook_summary", "hookCount": 2, "level": "suggestion", "cwd": str(cwd),
+                "hookInfos": [{"command": f"trail {secret} stop", "durationMs": 149}, {"command": "gone", "durationMs": 20}],
+                "hookErrors": [], "preventedContinuation": False, "stopReason": "", "hasOutput": False}
+        self.write([{"type": "user", "cwd": str(cwd), "message": {"role": "user", "content": "go"}}] + self.reply()
+                   + [ran("PreToolUse", guard, ms) for ms in (90, 130, 140)]
+                   + [ran("UserPromptSubmit", mine, ms) for ms in (2000, 2400)]
+                   + [ran("UserPromptSubmit", mine, 5000, "hook_cancelled", timedOut=True, timeoutMs=5000),
+                      ran("UserPromptSubmit", mine, 700, "hook_cancelled", timedOut=False)]
+                   + [stop, {**stop, "hookCount": 1, "hookInfos": [{"command": f"trail {secret} stop"}]}])
+        self.agent(self.reply() + [ran("PreToolUse", guard, 150)])
+        r = longhaul.inspect_transcript(self.path)
+        zero = {"cancelled": 0, "timed_out": 0}
+        self.assertEqual(r["hooks"], [
+            {"event": "UserPromptSubmit", "source": "user settings", "own": False, "runs": 2, "timed": 2,
+             "median_ms": 2000, "longest_ms": 2400, "cancelled": 1, "timed_out": 1},
+            {"event": "PreToolUse", "source": "longhaul guard", "own": True, "runs": 4, "timed": 4,
+             "median_ms": 130, "longest_ms": 150, **zero},
+            {"event": "Stop", "source": "project settings", "own": False, "runs": 2, "timed": 1,
+             "median_ms": 149, "longest_ms": 149, **zero},
+            {"event": "Stop", "source": "not configured now", "own": False, "runs": 1, "timed": 1,
+             "median_ms": 20, "longest_ms": 20, **zero}])
+        out = longhaul.inspect_lines(r)
+        head = ("Hook times [transcript, measured: what Claude Code timed, a hook's run when it printed something or "
+                "was stopped and every Stop hook's, by event and where the hook is configured now]")
+        self.assertEqual(out[out.index(head) + 1:out.index(head) + 5], [
+            "  UserPromptSubmit, user settings: 2 runs, median 2,000 ms, longest 2,400 ms; 1 timed out, 1 cancelled",
+            "  PreToolUse, longhaul guard: 4 runs, median 130 ms, longest 150 ms: over ADR-0004's 100 ms",
+            "  Stop, project settings: 2 runs, 1 timed: median 149 ms, longest 149 ms",
+            "  Stop, not configured now: 1 run, median 20 ms, longest 20 ms"])
+        self.assertLess(out.index(head), out.index("Failures [transcript, counted]"))
+        got = {(x["metric"], x["item"]): (x["value"], x["unit"], x["confidence"]) for x in self.records("s1")}
+        self.assertEqual(got[("hook_runs", "PreToolUse longhaul guard")], (4, "runs", "counted"))
+        self.assertEqual(got[("hook_median_ms", "PreToolUse longhaul guard")], (130, "ms", "measured"))
+        self.assertEqual(got[("hook_longest_ms", "UserPromptSubmit user settings")], (2400, "ms", "measured"))
+        self.assertEqual(got[("hook_timed_out", "UserPromptSubmit user settings")], (1, "runs", "counted"))
+        self.assertEqual(got[("hook_cancelled", "UserPromptSubmit user settings")], (1, "runs", "counted"))
+        self.assertNotIn(("hook_cancelled", "Stop project settings"), got, "a zero is not a record")
+        self.assertNotIn("SECRET", "\n".join(out) + json.dumps(r) + json.dumps(list(got)))
+        # With no run timed, no section.
+        shutil.rmtree(self.path.with_suffix(""))
+        self.write(self.reply())
+        self.assertFalse([l for l in longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+                          if l.startswith("Hook times [")])
+
     def test_the_input_cost_after_caching_is_a_share_of_its_fresh_price(self):
         # The input at the
         # API's price ratios (a cache read 0.1, a write 1.25 at five minutes
@@ -11177,7 +11251,7 @@ class Shim(unittest.TestCase):
         self.assertIn("Chats running now: none running", out.stdout)
         # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
         self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
-                         r"^\d+ of 10 set up\. Next: ")
+                         r"^\d+ of 11 set up\. Next: ")
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
         for args in (("doctor", "--fix"), ("doctor", "-h")):  # nothing after it: the skill's rule names it alone
             out = self.shim(*args, **env)
@@ -18798,7 +18872,7 @@ class PreCompact(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
         self.assertEqual(lines[-len(block):], block)
-        self.assertRegex(lines[-len(block) - 1], r"^\d+ of 10 set up\. Next: ", "after the checklist's count")
+        self.assertRegex(lines[-len(block) - 1], r"^\d+ of 11 set up\. Next: ", "after the checklist's count")
         self.assertEqual(out.stdout.count("# Compact instructions"), 1)
         self.assertEqual(list(self.tmp.rglob("CLAUDE.md")), [], "printed, never written")
         self.assertFalse(self.home.exists(), "the doctor writes nothing")
@@ -20532,10 +20606,10 @@ class Doctor(unittest.TestCase):
         heads = [l for l in lines[1:-1] if not l.startswith(" ")]
         self.assertEqual([h.split(":", 1)[0][2:] for h in heads],
                          ["Plugin", "Terminal command", "Claude Code", "Updates", "Status line", "VS Code panel",
-                          "Accounts", "Chats running now", "Code maps", "Features"])
+                          "Accounts", "Chats running now", "Code maps", "Features", "Hooks"])
         self.assertTrue(all(h[0] in "✔✘⚠" and h[1] == " " for h in heads), heads)
         n = sum(h.startswith("✔") for h in heads)
-        self.assertEqual(lines[-1], f"{n} of 10 set up. Next: {longhaul.doctor_plugin()['step']}",
+        self.assertEqual(lines[-1], f"{n} of 11 set up. Next: {longhaul.doctor_plugin()['step']}",
                          "the first ✘'s step: the plugin is not installed")
         self.assertEqual(sorted(self.home.rglob("*")), before, "nothing written")
         # Every line set up.
@@ -20547,7 +20621,7 @@ class Doctor(unittest.TestCase):
         with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]), \
                 mock.patch.object(longhaul, "release_status", return_value=status):
             code, lines = self.doctor()
-        self.assertEqual(lines[-1], "10 of 10 set up.", lines)
+        self.assertEqual(lines[-1], "11 of 11 set up.", lines)
         self.assertFalse([l for l in lines if "Next:" in l])
 
     def test_a_check_that_raises_is_a_warning_and_the_rest_go_on(self):
@@ -20556,7 +20630,7 @@ class Doctor(unittest.TestCase):
             code, lines = self.doctor()
         self.assertEqual(code, 0)
         self.assertIn("⚠ VS Code panel: could not be checked (RuntimeError)", lines)
-        self.assertRegex(lines[-1], r"^\d+ of 10 set up\. Next: ")
+        self.assertRegex(lines[-1], r"^\d+ of 11 set up\. Next: ")
 
     def test_doctor_runs_from_the_terminal_and_writes_nothing(self):
         fake = self.tmp / "fakes"
@@ -20578,7 +20652,7 @@ class Doctor(unittest.TestCase):
             self.assertIn("Chats running now: none running", out.stdout)
             # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
             self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
-                             r"^\d+ of 10 set up\. Next: ")
+                             r"^\d+ of 11 set up\. Next: ")
             self.assertFalse(home.exists(), "nothing written")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
                              timeout=60)
@@ -20680,6 +20754,258 @@ class Doctor(unittest.TestCase):
         self.assertEqual(len(said), 2)
         self.assertTrue(said[0].startswith(f"Longhaul {self.VERSION} is on: "))
         self.assertEqual(said[1], "longhaul: the index's line")
+
+
+class HookBudget(unittest.TestCase):
+    """ADR-0005, rule 4 (the hook budget): the doctor's Hooks line shows
+    every hook each tool adds to each Claude Code event, by where it comes
+    from (the user's settings, the project's, each enabled plugin's hooks
+    file), and the times Claude Code recorded for Longhaul's own in the
+    newest chat here, a ⚠ when one's median is over ADR-0004's 100 ms.
+    Every path is scratch: Claude Code's folder, its plugins and settings,
+    the project and its transcripts. Every hook's command, and every
+    output a transcript records, holds SECRET, which no line may show."""
+
+    SECRET = "SECRET-sk-0123456789"
+    GUARD, CHECKPOINT = "Checking this call (longhaul guard)", "Looking for a checkpoint (longhaul checkpoint)"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # /var is /private/var: what realpath() will say
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.claude, self.project = self.user / ".claude", self.tmp / "project"
+        for folder in (self.claude, self.project):
+            folder.mkdir(parents=True)
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+    # ---------------------------------------------------------- scratch setups
+
+    def write(self, path: Path, data) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def hook(self, event, said=None, matcher=None, n=1) -> dict:
+        """A hooks file's `hooks`: one group of n command hooks on `event`,
+        each command holding SECRET; `said`, its status message."""
+        entry = {"type": "command", "command": f"/opt/{self.SECRET}/run --key {self.SECRET}", "timeout": 5}
+        if said:
+            entry["statusMessage"] = said
+        group = {"hooks": [dict(entry) for _ in range(n)]}
+        if matcher is not None:
+            group["matcher"] = matcher
+        return {event: [group]}
+
+    @staticmethod
+    def hooks(*parts) -> dict:
+        merged = {}
+        for part in parts:
+            for event, groups in part.items():
+                merged.setdefault(event, []).extend(groups)
+        return merged
+
+    def settings(self, path: Path, hooks=None, **keys):
+        """A settings file, these keys merged into what it holds."""
+        found = json.loads(path.read_text()) if path.exists() else {}
+        self.write(path, {**found, **({"hooks": hooks} if hooks is not None else {}), **keys})
+
+    def plugin(self, key, hooks, scope="user", project=None, enabled=True, manifest=None, modules=False) -> Path:
+        """A plugin installed as Claude Code records it: its folder with
+        hooks/hooks.json, its entry in installed_plugins.json, and its switch
+        in the user's settings (none for enabled=None)."""
+        root = self.claude / "plugins" / "cache" / key.replace("@", "-") / "1.0.0"
+        found = {"hooks": hooks}
+        if modules:
+            found["modules"] = ["./index.ts"]
+        self.write(root / "hooks" / "hooks.json", found)
+        if manifest is not None:
+            self.write(root / ".claude-plugin" / "plugin.json", {"name": key.split("@")[0], **manifest})
+        path = self.claude / "plugins" / "installed_plugins.json"
+        installed = json.loads(path.read_text()) if path.exists() else {"version": 2, "plugins": {}}
+        entry = {"scope": scope, "installPath": str(root), "version": "1.0.0"}
+        if project:
+            entry["projectPath"] = str(project)
+        installed["plugins"].setdefault(key, []).append(entry)
+        self.write(path, installed)
+        if enabled is not None:
+            found = json.loads((self.claude / "settings.json").read_text()) if (self.claude / "settings.json").exists() else {}
+            self.settings(self.claude / "settings.json", enabledPlugins={**found.get("enabledPlugins", {}), key: enabled})
+        return root
+
+    def longhaul_plugin(self):
+        return self.plugin("longhaul@longhaul", self.hooks(self.hook("PreToolUse", self.GUARD, "Read|Bash"),
+                                                           self.hook("SessionStart", self.CHECKPOINT, "compact|clear|resume"),
+                                                           self.hook("SessionStart", "Looking for a code index (longhaul guard)",
+                                                                     "startup"),
+                                                           self.hook("UserPromptSubmit", "Checking the context's size "
+                                                                                          "(longhaul checkpoint)", n=2)),
+                           modules=True)
+
+    def chats(self) -> Path:
+        """This project's folder of transcripts, as Claude Code names it."""
+        return self.claude / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.project))
+
+    def ran(self, event, said, ms, kind="hook_success", **more) -> dict:
+        """A hook's run as Claude Code 2.1.310 records it: an attachment with
+        its event, its status message or command, and its time."""
+        attachment = {"type": kind, "hookName": f"{event}:Bash", "toolUseID": "toolu_1", "hookEvent": event,
+                      "command": said, "durationMs": ms, **more}
+        if kind == "hook_success":
+            attachment.update(content=self.SECRET, stdout=self.SECRET, stderr="", exitCode=0)
+        return {"type": "attachment", "attachment": attachment, "isSidechain": False, "uuid": f"u{ms}",
+                "timestamp": "2026-10-29T10:00:00.000Z", "cwd": str(self.project), "sessionId": "s1"}
+
+    def transcript(self, name, lines, at=None) -> Path:
+        path = self.write(self.chats() / f"{name}.jsonl", "".join(json.dumps(l) + "\n" for l in lines))
+        if at is not None:
+            os.utime(path, (at, at))
+        return path
+
+    # ------------------------------------------------------------- the counts
+
+    def test_the_doctor_counts_each_events_hooks_by_where_they_come_from(self):
+        self.settings(self.claude / "settings.json", self.hook("UserPromptSubmit"))
+        self.settings(self.claude / "settings.local.json", self.hook("Notification"))
+        self.settings(self.project / ".claude" / "settings.json", self.hook("SessionStart"))
+        self.settings(self.project / ".claude" / "settings.local.json", self.hook("PostToolUse", matcher="Bash|Read", n=2))
+        self.longhaul_plugin()
+        self.plugin("off@market", self.hook("PreToolUse", n=4), enabled=False)  # turned off: none of its hooks run
+        self.plugin("far@market", self.hook("PreToolUse", n=4), scope="project", project=self.tmp / "elsewhere")
+        near = self.plugin("near@market", self.hook("PostToolUse", matcher=""), scope="local", project=self.project,
+                           manifest={"hooks": "./more/hooks.json"})
+        self.write(near / "more" / "hooks.json", {"hooks": self.hook("Stop")})  # the manifest's own file adds to it
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual((c["mark"], c["step"]), ("ok", None))
+        self.assertEqual(c["said"], "12 hooks on 6 events, from user settings, project settings, longhaul and near")
+        self.assertEqual(c["items"], [
+            (None, "SessionStart: 3 (project settings 1, longhaul 2)", None),
+            (None, "UserPromptSubmit: 3 (user settings 1, longhaul 2)", None),
+            (None, "PreToolUse: 1 (longhaul 1)", None),
+            (None, "PostToolUse: 3 (project settings 2, near 1); on every tool call: near", None),
+            (None, "Notification: 1 (user settings 1)", None),
+            (None, "Stop: 1 (near 1)", None),
+            (None, "longhaul also loads a hooks module, which runs inside Claude Code: no process of its own, "
+                   "and no time recorded", None),
+            (None, "times: no chat in this folder yet", None)])
+        self.assertNotIn(self.SECRET, json.dumps(c))
+        # A settings file that is not JSON is said, not counted.
+        self.write(self.project / ".claude" / "settings.json", "{not json")
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertIn((None, f"project settings: {self.project}/.claude/settings.json is not JSON, so its hooks are "
+                             "not counted here", None), c["items"])
+        self.assertTrue(c["said"].startswith("11 hooks on 6 events, "), c["said"])
+
+    def test_no_hook_at_all_is_said_and_set_up(self):
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual((c["mark"], c["said"]), ("ok", "no hooks run here: none in the settings or an enabled plugin"))
+
+    def test_a_hook_on_every_tool_call_from_three_sources_is_a_warning(self):
+        # Each starts a program at every tool call; two sources are not "many".
+        self.settings(self.claude / "settings.json", self.hooks(self.hook("PreToolUse", matcher=""),
+                                                                self.hook("UserPromptSubmit")))
+        self.settings(self.project / ".claude" / "settings.json", self.hooks(self.hook("PreToolUse", matcher="*"),
+                                                                             self.hook("UserPromptSubmit")))
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual(c["mark"], "ok", "two sources")
+        self.plugin("near@market", self.hooks(self.hook("PreToolUse"), self.hook("UserPromptSubmit")))
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn(("warn", "PreToolUse: 3 (user settings 1, project settings 1, near 1); on every tool call: "
+                               "user settings, project settings and near", c["step"]), c["items"])
+        self.assertIn((None, "UserPromptSubmit: 3 (user settings 1, project settings 1, near 1)", None), c["items"],
+                      "every prompt runs them too, and that is no warning")
+        self.assertEqual(c["step"], "each of these starts a program at every tool call; `/hooks` in Claude Code lists "
+                                    "them: remove the ones you do not use")
+
+    # -------------------------------------------------------------- the times
+
+    def test_longhauls_own_times_come_from_the_newest_chat_here(self):
+        self.longhaul_plugin()
+        self.settings(self.claude / "settings.json", self.hook("UserPromptSubmit"))
+        old = time.time() - 3600
+        self.transcript("old", [self.ran("PreToolUse", self.GUARD, 900) for _ in range(3)], at=old)
+        new = self.transcript("new", [self.ran("PreToolUse", self.GUARD, ms) for ms in (90, 99, 95, 3000)]
+                              + [self.ran("SessionStart", self.CHECKPOINT, ms) for ms in (120, 140, 130)]
+                              + [self.ran("UserPromptSubmit", f"/opt/{self.SECRET}/run --key {self.SECRET}", 5000)])
+        self.write(new.with_suffix("") / "subagents" / "agent-a1.jsonl",
+                   json.dumps({**self.ran("PreToolUse", self.GUARD, 80), "isSidechain": True}) + "\n")
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual(c["mark"], "warn")
+        at = c["items"].index((None, "times: Longhaul's own in the newest chat here, new, as Claude Code recorded them "
+                                     "(a run that prints nothing has none); `longhaul inspect new` shows every hook's",
+                               None))
+        step = (f"Longhaul's own hooks should take under 100 ms each (ADR-0004): if `longhaul inspect` shows it over "
+                f"in the next chat too, report it at https://github.com/{longhaul.plugin_repository()}/issues")
+        self.assertEqual(c["items"][at + 1:], [
+            ("warn", "longhaul checkpoint on SessionStart: median 130 ms, longest 140 ms, of 3 timed runs: over "
+                     "ADR-0004's 100 ms", step),
+            ("ok", "longhaul guard on PreToolUse: median 95 ms, longest 3,000 ms, of 5 timed runs", None)])
+        self.assertEqual(c["step"], step)
+        self.assertNotIn(self.SECRET, json.dumps(c))
+        # Fewer than three timed runs are said and not judged.
+        self.transcript("newer", [self.ran("SessionStart", self.CHECKPOINT, ms) for ms in (300, 400)], at=time.time() + 10)
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual(c["mark"], "ok")
+        self.assertIn((None, "longhaul checkpoint on SessionStart: median 300 ms, longest 400 ms, of 2 timed runs",
+                       None), c["items"])
+        # A chat with no time for Longhaul's hooks says so.
+        self.transcript("newest", [self.ran("UserPromptSubmit", "other", 50)], at=time.time() + 20)
+        c = longhaul.doctor_hooks(str(self.project))
+        self.assertEqual(c["items"][-1], (None, "times: none recorded for Longhaul's hooks in the newest chat here, "
+                                                "newest; Claude Code times a run only when the hook prints something "
+                                                "or is stopped", None))
+
+    def test_the_hooks_line_comes_before_codex_and_is_not_a_quick_check(self):
+        names = [name for name, _ in longhaul.DOCTOR_CHECKS]
+        self.assertEqual(names[names.index("Features") + 1:], ["Hooks", "Codex"])
+        self.assertEqual(longhaul.DOCTOR_CHECKS[names.index("Hooks")], ("Hooks", "doctor_hooks"))
+        with mock.patch.object(longhaul, "DOCTOR_CHECKS", [("Hooks", "doctor_hooks")]), \
+                mock.patch.object(longhaul, "doctor_hooks", side_effect=AssertionError("not quick")):
+            self.assertEqual(longhaul.doctor_checks(quick=True), [], "the first-chat line reads no hooks file")
+
+    def test_the_doctor_prints_the_line_on_both_pythons_and_no_command(self):
+        self.longhaul_plugin()
+        self.settings(self.project / ".claude" / "settings.local.json", self.hook("Stop"))
+        self.transcript("s1", [self.ran("PreToolUse", self.GUARD, ms) for ms in (40, 50, 60)])
+        fake = self.tmp / "fakes"
+        for name in ("ps", "lsof"):  # the process list is never the real one
+            self.write(fake / name, "#!/bin/sh\nexit 0\n").chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")
+               and k not in Checkpoint.SESSION_VARS + ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
+        env.update(PATH=f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", HOME=str(self.user), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.user / ".claude.json"),
+                   LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"), LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
+                   LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off", CODEX_HOME=str(self.tmp / "no-codex"))
+        for python in (sys.executable, "/usr/bin/python3"):
+            if not os.path.exists(python):
+                continue
+            with self.subTest(python=python):
+                out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, cwd=self.project,
+                                     capture_output=True, text=True, timeout=60)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                lines = out.stdout.splitlines()
+                at = lines.index("✔ Hooks: 6 hooks on 4 events, from project settings and longhaul")
+                self.assertEqual(lines[at + 1:at + 9], [
+                    "      SessionStart: 2 (longhaul 2)",
+                    "      UserPromptSubmit: 2 (longhaul 2)",
+                    "      PreToolUse: 1 (longhaul 1)",
+                    "      Stop: 1 (project settings 1)",
+                    "      longhaul also loads a hooks module, which runs inside Claude Code: no process of its own, "
+                    "and no time recorded",
+                    "      times: Longhaul's own in the newest chat here, s1, as Claude Code recorded them (a run that "
+                    "prints nothing has none); `longhaul inspect s1` shows every hook's",
+                    "    ✔ longhaul guard on PreToolUse: median 50 ms, longest 60 ms, of 3 timed runs",
+                    lines[at + 8]])
+                self.assertFalse(lines[at + 8].startswith("    "), "the next line")
+                self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
+                self.assertNotIn(self.SECRET, out.stdout + out.stderr)
+                self.assertFalse(self.home.exists(), "nothing written")
 
 
 class CodexDoctor(unittest.TestCase):
@@ -21058,7 +21384,7 @@ class CodexDoctor(unittest.TestCase):
                                                         "      version 0.164.0, from `codex --version`"])
                 self.assertIn("\n      ~/.codex: Longhaul's plugin is not installed there (to use it in Codex", out.stdout)
                 self.assertEqual("that this Python" in out.stdout, not self.zstd_in(python))
-                self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
+                self.assertRegex(out.stdout, r"\n\d+ of 12 set up\.")
                 self.assertNotIn("SECRET", out.stdout)
                 self.assertFalse(home.exists(), "nothing written")
                 self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*")), before)
