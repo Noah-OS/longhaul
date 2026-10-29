@@ -11249,8 +11249,11 @@ class Shim(unittest.TestCase):
     def test_the_shim_refuses_the_supervisor_and_anything_that_changes_state(self):
         # From the Bash tool a plain `longhaul` would start a second claude
         # under a session, with Remote Control and caffeinate.
+        # `allow` too (the ask-first plan, 2026-10-29): whether a chat may
+        # allow itself is the owner's decision 2, not taken.
         for args in ((), ("-c",), ("-r", "x"), ("setup",), ("add", "A", "a@b"), ("remove", "A"), ("clear",),
-                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto")):
+                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto"),
+                     ("allow", "1b2c3d4e"), ("allow", "1b2c3d4e", "--account", "A")):
             out = self.shim(*args)
             self.assertEqual(out.returncode, 2, args)
             self.assertIn("run it in a terminal", out.stderr, args)
@@ -19752,6 +19755,176 @@ class AccountCheck(unittest.TestCase):
         found = json.loads(path.read_text())
         self.assertEqual(found[self.SID]["account"], "spare")
         self.assertEqual(list(found)[-1], self.SID, "the newest last")
+
+    # `longhaul allow ID [--account NAME]`: the terminal's way to allow a
+    # chat, in the folder it last ran in (its transcript's cwd), on the
+    # account its record names (the status line's, the relay's, the
+    # supervisor's or the refusal's note).
+
+    def chat(self, sid=None, cwds=None, account="personal"):
+        """Chat `sid` (default SID): a transcript under the shared projects
+        folder whose lines ran in `cwds` (default: a folder of ~/zain's work
+        tree), and a record of `account` (None: no record)."""
+        sid = sid or self.SID
+        path = self.tmp / ".claude" / "projects" / "-zain" / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [{"type": "user", "cwd": str(cwd), "sessionId": sid} for cwd in (cwds or [self.zain / "src" / "app"])]
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        if account:
+            (self.home / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+            (self.home / "usage" / "sessions" / f"{sid}.json").write_text(json.dumps({"account": account}))
+        return path
+
+    def allow_cmd(self, *args, **env):
+        """`longhaul allow ARGS` in this process, in a terminal's environment
+        (no Claude Code session's variables) with `env` over it: (exit code,
+        stdout, stderr)."""
+        base = {k: v for k, v in self.env.items() if k not in longhaul.SESSION_ENV}
+        with mock.patch.dict(os.environ, {**base, **env}, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = longhaul.main(["allow", *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def allowed(self):
+        path = self.home / "allowed.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_longhaul_allow_records_the_chat_on_its_account_in_its_repository_and_its_prompts_go_through(self):
+        self.chat()
+        self.assertEqual(self.check(config=str(self.personal)), self.refused("personal"))
+        code, out, err = self.allow_cmd("1b2c3d4e")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out, "Allowed chat 1b2c3d4e on personal in ~/zain: its prompts go through there for 30 days "
+                              "(this chat only; ~/zain stays kept for zain-work).\n")
+        entry = self.allowed()[self.SID]
+        self.assertEqual((entry["account"], entry["folder"]), ("personal", str(self.zain)), "the repository's top")
+        self.assertAlmostEqual(entry["at"], time.time(), delta=60)
+        self.assertEqual(oct((self.home / "allowed.json").stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(self.check(config=str(self.personal)), "")
+        self.assertEqual(self.check(config=str(self.tmp / ".claude-old")),
+                         self.refused("an account Longhaul doesn't know (~/.claude-old)"), "on its account only")
+        self.assertIn(f"allow: {self.SID} may run on personal in ~/zain", self.log())
+        # The whole id, and --account naming another account allowed there.
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "spare", "config_dir": "~/.claude-spare"},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]})
+        code, out, _ = self.allow_cmd(self.SID, "--account", "spare")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("Allowed chat 1b2c3d4e on spare in ~/zain"), out)
+        self.assertEqual(self.allowed()[self.SID]["account"], "spare", "in place of the one before")
+
+    def test_longhaul_allow_takes_the_folder_the_chat_last_ran_in(self):
+        tools = self.zain / "tools"
+        (tools / ".git").mkdir(parents=True)
+        path = self.chat(cwds=[self.tmp / "other", tools])
+        with path.open("a") as f:
+            f.write(json.dumps({"type": "summary", "summary": "no cwd on this line"}) + "\n")
+            f.write("not json, a line cut off\n")
+        code, out, _ = self.allow_cmd("1b2c3d4e")
+        self.assertEqual(code, 0, out)
+        self.assertIn("in ~/zain/tools:", out)
+        self.assertEqual(self.allowed()[self.SID]["folder"], str(tools))
+        # A long transcript is read back from its end, a block at a time: the
+        # newest line that names a folder, megabytes of lines that name none
+        # after it.
+        filler = json.dumps({"type": "assistant", "text": "x" * 4000}) + "\n"
+        path.write_text("".join(json.dumps({"type": "user", "cwd": str(cwd)}) + "\n" for cwd in (tools, self.zain))
+                        + filler * 600)
+        self.assertEqual(self.allow_cmd("1b2c3d4e")[0], 0)
+        self.assertEqual(self.allowed()[self.SID]["folder"], str(self.zain))
+
+    def test_longhaul_allow_refuses_an_unknown_chat_or_account_and_writes_nothing(self):
+        self.chat()
+        cases = {"too short": (("1b2c3d4",), "give the chat's id, or its first 8 characters or more, as the "
+                                             "refusal names it"),
+                 "not an id": (("../1b2c3d4e",), "give the chat's id, or its first 8 characters or more, as the "
+                                                 "refusal names it"),
+                 "unknown": (("9f9f9f9f",), "no chat 9f9f9f9f is known: no transcript or record of one starts with it"),
+                 "no such account": (("1b2c3d4e", "--account", "nope"),
+                                     "no account called nope; the accounts are personal, zain-work")}
+        for case, (args, said) in cases.items():
+            with self.subTest(case):
+                code, out, err = self.allow_cmd(*args)
+                self.assertEqual((code, out), (2, ""), err)
+                self.assertEqual(err, f"longhaul allow: {said}\n")
+        # Two chats start with the same eight characters.
+        self.chat(sid="1b2c3d4e-0000-4000-8000-000000000000")
+        code, _, err = self.allow_cmd("1b2c3d4e")
+        self.assertEqual((code, err), (2, "longhaul allow: 2 chats start with 1b2c3d4e; give more of its id\n"))
+        self.assertEqual(self.allow_cmd("1b2c3d4e-5f")[0], 0, "more of it is one chat")
+        (self.home / "allowed.json").unlink()
+        # No record of its account, and none named.
+        other = "2c3d4e5f-0000-4000-8000-000000000000"
+        self.chat(sid=other, account=None)
+        code, _, err = self.allow_cmd("2c3d4e5f")
+        self.assertEqual((code, err), (2, "longhaul allow: no record of which account 2c3d4e5f runs on; name it: "
+                                          "longhaul allow 2c3d4e5f --account NAME\n"))
+        # A record but no transcript: nothing names its folder.
+        third = "3d4e5f60-0000-4000-8000-000000000000"
+        (self.home / "usage" / "sessions" / f"{third}.json").write_text(json.dumps({"account": "personal"}))
+        code, _, err = self.allow_cmd("3d4e5f60")
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "longhaul allow: no transcript of 3d4e5f60 names the folder it ran in; a chat that has "
+                              "sent nothing has none: open a new one on the account that keeps the folder\n")
+        self.assertEqual(self.allowed(), {}, "nothing written")
+
+    def test_longhaul_allow_refuses_an_account_that_may_not_be_used_there_and_allows_nothing_needless(self):
+        self.chat()
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal", "repositories": ["~/other"]},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]})
+        code, out, err = self.allow_cmd("1b2c3d4e")
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err, "longhaul allow: personal may not be used in ~/zain (its repositories: ~/other); "
+                              "not allowed\n")
+        # The account that keeps the folder, and a folder no account keeps:
+        # nothing to allow, said, exit 0.
+        code, out, _ = self.allow_cmd("1b2c3d4e", "--account", "zain-work")
+        self.assertEqual((code, out), (0, "zain-work keeps ~/zain, so its chats go through there already; "
+                                          "nothing to allow.\n"))
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "zain-work", "config_dir": "~/.claude-zain", "repositories": ["~/zain"]})
+        self.chat(cwds=[self.tmp / "other"])
+        code, out, _ = self.allow_cmd("1b2c3d4e")
+        self.assertEqual((code, out), (0, "No account keeps ~/other, so every chat's prompts go through there; "
+                                          "nothing to allow.\n"))
+        self.assertEqual(self.allowed(), {}, "nothing written")
+
+    def test_longhaul_allow_runs_in_a_terminal_of_your_own_only(self):
+        # Decision 2 of the ask-first plan (may the shim run it from inside a
+        # chat) is the owner's, not taken: from inside a session it refuses,
+        # whatever runs it.
+        self.chat()
+        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+            with self.subTest(name):
+                code, out, err = self.allow_cmd("1b2c3d4e", **{name: "1"})
+                self.assertEqual((code, out), (2, ""))
+                self.assertEqual(err, f"longhaul allow: not allowed: it runs inside a Claude Code session ({name} set); "
+                                      "run it in a terminal of your own\n")
+        path = self.home / "accounts.json"
+        for case, text in unreadable_accounts({"name": "personal", "config_dir": "~/.claude-personal"}).items():
+            with self.subTest(case):
+                path.write_text(text)
+                code, _, err = self.allow_cmd("1b2c3d4e")
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith("longhaul allow: accounts.json is not readable: "), err)
+        self.assertEqual(self.allowed(), {}, "nothing written")
+
+    def test_the_refusal_then_longhaul_allow_in_a_terminal_then_the_prompt_goes_through(self):
+        # As the user meets it: a plain claude in ~/zain on personal, with no
+        # status line of Longhaul's (no record), its refusal, the command it
+        # names run as a terminal runs it, and the next prompt.
+        transcript = self.chat(account=None)
+        data = self.ask(transcript_path=str(transcript))
+        out = self.run_hook(self.hook(), data, config=str(self.personal))
+        self.assertEqual((out.returncode, out.stdout), (0, self.refused("personal", allow="personal")))
+        env = {k: v for k, v in self.env.items() if k not in longhaul.SESSION_ENV}
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "allow", "1b2c3d4e"], env=env, cwd=self.tmp,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertTrue(out.stdout.startswith("Allowed chat 1b2c3d4e on personal in ~/zain"), out.stdout)
+        out = self.run_hook(self.hook(), data, config=str(self.personal))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+        self.assertNotIn(self.S, self.log())
 
     def hook(self, root=None):
         """The check's hook as the plugin registers it, with `root` as the plugin's root (default: this checkout)."""

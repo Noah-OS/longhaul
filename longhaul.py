@@ -207,8 +207,14 @@ Usage:
                           refuses each prompt of a chat on any other account (by
                           its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
                           is sent on the wrong one; whatever it cannot read lets
-                          the prompt through
-  longhaul session-end          the plugin's SessionEnd hook: keeps why the session
+                          the prompt through, and a chat allowed there goes through
+  longhaul allow ID [--account NAME]
+                          lets one chat's prompts through on its account (or NAME)
+                          in the folder it last ran in, where other accounts keep
+                          it, for 30 days (LONGHAUL_HOME/allowed.json); ID is the
+                          chat's id or its first 8 characters, as the refusal names
+                          it. In a terminal of your own, never from inside a chat
+  longhaul session-end         the plugin's SessionEnd hook: keeps why the session
                           ended (clear, resume, logout, prompt_input_exit or
                           other) and when, nothing else, so that a non-zero exit
                           after you closed the chat or signed out is no crash
@@ -2357,6 +2363,102 @@ def account_check(_opts) -> int:
             print(json.dumps(answer))
     except Exception as e:
         log(f"account-check hook: no check ({type(e).__name__})")
+    return 0
+
+
+def last_cwd(path: Path):
+    """The folder a transcript last ran in: the top-level cwd, an absolute
+    path, of its newest line that has one; None for none, or a file that
+    cannot be read. Read back from its end a block at a time, so a long
+    transcript is never read or parsed whole."""
+    try:
+        with path.open("rb") as f:
+            pos, cut = f.seek(0, os.SEEK_END), b""
+            while pos > 0:
+                step = min(1 << 20, pos)
+                pos -= step
+                f.seek(pos)
+                lines = (f.read(step) + cut).split(b"\n")
+                cut = lines.pop(0) if pos > 0 else b""  # the block's first line may begin in the one before
+                for raw in reversed(lines):
+                    if b'"cwd"' not in raw:
+                        continue
+                    try:
+                        line = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    cwd = line.get("cwd") if isinstance(line, dict) else None
+                    if isinstance(cwd, str) and os.path.isabs(cwd):
+                        return cwd
+    except OSError:
+        return None
+    return None
+
+
+def allow_cmd(opts) -> int:
+    """`longhaul allow ID [--account NAME]` (the ask-first plan of
+    2026-10-29, A3): the terminal's way to let a chat's prompts through in
+    a folder other accounts keep, which the account check's refusal names
+    for a plain `claude` that cannot be asked. ID is the chat's id, or its
+    first 8 characters or more when only one chat's transcript or record
+    starts with them. The folder is the one it last ran in (its newest
+    transcript's last cwd, by repository: repository_of()); the account is
+    NAME, else the one its record names (last_account(): the status
+    line's, the relay's, the supervisor's or the refusal's note). Refused,
+    with nothing written, from inside a Claude Code session (any
+    SESSION_ENV variable set): whether a chat may allow itself is the
+    owner's decision 2 of that plan, not taken; and for an unknown chat or
+    account, or one that may not be used there. A folder no account keeps,
+    or one the account keeps itself, needs nothing: said, exit 0."""
+    def refuse(why: str) -> int:
+        print(f"longhaul allow: {why}", file=sys.stderr)
+        return 2
+    inside = [name for name in SESSION_ENV if name in os.environ]
+    if inside:
+        return refuse(f"not allowed: it runs inside a Claude Code session ({', '.join(inside)} set); "
+                      "run it in a terminal of your own")
+    accounts, problem = read_accounts_file()
+    if problem:
+        return refuse(unreadable_text(problem))
+    target, names = opts.chat, [a["name"] for a in accounts]
+    if not re.fullmatch(GUARD_ID, target) or len(target) < 8:
+        return refuse("give the chat's id, or its first 8 characters or more, as the refusal names it")
+    known = ({p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{target}*.jsonl"))}
+             | {p.stem for p in files_of((USAGE_DIR / "sessions").glob(f"{target}*.json"))})
+    if target not in known and len(known) > 1:
+        return refuse(f"{len(known)} chats start with {target}; give more of its id")
+    if not known:
+        return refuse(f"no chat {target} is known: no transcript or record of one starts with it")
+    sid = target if target in known else known.pop()
+    short = sid[:8]
+    if opts.account is not None and opts.account not in names:
+        return refuse(f"no account called {opts.account}; the accounts are {', '.join(names) or 'none'}")
+    name = opts.account or last_account(sid, accounts)
+    if not name:
+        return refuse(f"no record of which account {short} runs on; name it: longhaul allow {short} --account NAME")
+    hits = transcript_hits(sid)
+    cwd = last_cwd(max(hits, key=lambda p: p.stat().st_mtime)) if hits else None
+    if cwd is None:
+        return refuse(f"no transcript of {short} names the folder it ran in; a chat that has sent nothing has none: "
+                      "open a new one on the account that keeps the folder")
+    top = repository_of(cwd)
+    where, kept = home_path(top), [a["name"] for a in accounts if covers(a, top)]
+    if not kept:
+        print(f"No account keeps {where}, so every chat's prompts go through there; nothing to allow.")
+        return 0
+    if name in kept:
+        print(f"{name} keeps {where}, so its chats go through there already; nothing to allow.")
+        return 0
+    acct = accounts[names.index(name)]
+    if not account_allowed(acct, top):
+        return refuse(f"{may_not_text(acct, top)}; not allowed")
+    try:
+        allow_chat(sid, name, top)
+    except OSError as e:
+        return refuse(f"could not write {home_path(str(LONGHAUL_HOME / ALLOWED))}: {e.strerror or e}")
+    log(f"allow: {sid} may run on {name} in {where}")
+    print(f"Allowed chat {short} on {name} in {where}: its prompts go through there for {ALLOWED_DAYS} days "
+          f"(this chat only; {where} stays kept for {' and '.join(kept)}).")
     return 0
 
 
@@ -14888,7 +14990,7 @@ def main(argv: list[str]) -> int:
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook"):
+                            "models-hook", "allow"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -14945,6 +15047,12 @@ def main(argv: list[str]) -> int:
                                 "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "allow":
+            p.add_argument("chat", metavar="ID",
+                           help="the chat: its id, or its first 8 characters or more (the account check's refusal "
+                                "names them)")
+            p.add_argument("--account", metavar="NAME",
+                           help="the account to allow it on (default: the one its record says it runs on)")
         if cmd == "models":
             p.add_argument("args", nargs="*", metavar="guide|on|off|trial | cap MODEL|off | TYPE MODEL",
                            help="nothing: the mode, the guide, the cap and the table; guide (the default), on, off "
@@ -14988,7 +15096,7 @@ def main(argv: list[str]) -> int:
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
-                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall}[cmd](opts)
+                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
