@@ -2506,7 +2506,7 @@ def statusline_install(assume_yes: bool) -> int:
     changed. A status line of the user's own is shown, and replaced only
     after a yes in a terminal (No unless typed); without a terminal only
     with --yes (exit 2 otherwise). The file is copied beside itself first
-    (no copy when there was none), and the line is test-run: a run that
+    (an empty copy when there was none), and the line is test-run: a run that
     fails puts the file back, removes the copy and says why (exit 1). A
     file that is not a JSON object is left alone (exit 2), and so is
     everything while the terminal command is missing."""
@@ -2547,7 +2547,11 @@ def statusline_install(assume_yes: bool) -> int:
             return 1
     kept = None
     try:
-        kept = statusline_keep(path, raw, STATUSLINE_KEPT) if raw is not None else None
+        # No file is kept too, as an empty copy: uninstall takes the newest
+        # copy for the file before this install, and an older install's,
+        # kept from before the file was deleted, put back a line this one
+        # never replaced (Sprint 12).
+        kept = statusline_keep(path, raw if raw is not None else b"", STATUSLINE_KEPT)
         statusline_write(path, {**data, "statusLine": {"type": "command", "command": STATUSLINE_COMMAND}}, raw, mode)
     except (OSError, ValueError) as e:  # written whole or not at all: only the copy to remove
         if kept:
@@ -2559,13 +2563,13 @@ def statusline_install(assume_yes: bool) -> int:
         stuck = statusline_undo(path, raw, mode, kept)
         if stuck:
             say(f"The test run of `{STATUSLINE_COMMAND}` {problem}, and {where} could not be put back ({stuck}): "
-                f"the file as it was is {home_path(str(kept)) if kept else 'none (there was no file)'}.")
+                f"the file as it was is {home_path(str(kept)) if raw is not None else 'none (there was no file)'}.")
         else:
             say(f"Not changed: the test run of `{STATUSLINE_COMMAND}` {problem}, so {where} is as it was. "
                 "`longhaul doctor` checks the terminal command.")
         return 1
     say(f"Done: Claude Code's status line runs `{STATUSLINE_COMMAND}`, set in {where}"
-        + (f"; the file as it was is kept as {home_path(str(kept))}" if kept else " (a new file)")
+        + (f"; the file as it was is kept as {home_path(str(kept))}" if raw is not None else " (a new file)")
         + ". `longhaul statusline uninstall` undoes it.")
     return 0
 
@@ -2575,10 +2579,10 @@ def statusline_uninstall(link: Path | None = None) -> int:
     settings.json at `link` (by default the chat's, statusline_file())
     sets Longhaul's status line. The file is copied beside itself first;
     then the line is the one in the newest copy install kept, or none when
-    that copy had none or there is no copy, and every other key stays as
-    it is now. It asks nothing: it changes Longhaul's own line alone. Any
-    other line, or none, is said and left alone. `longhaul uninstall`
-    runs it on each config folder's."""
+    that copy had none, is empty (there was no file) or there is no copy,
+    and every other key stays as it is now. It asks nothing: it changes
+    Longhaul's own line alone. Any other line, or none, is said and left
+    alone. `longhaul uninstall` runs it on each config folder's."""
     path, where = statusline_file(link)
     try:
         raw, data, mode = statusline_read(path)
@@ -2596,7 +2600,8 @@ def statusline_uninstall(link: Path | None = None) -> int:
     before, old, unread = statusline_kept(path), None, ""
     if before:
         try:
-            found = json.loads(before.read_bytes())
+            found = before.read_bytes()
+            found = json.loads(found) if found else {}  # empty: install found no file
         except (OSError, ValueError):
             found = None
         if isinstance(found, dict):
@@ -12278,14 +12283,20 @@ def launcher_text() -> str:
 
 def launcher_at(path) -> bool:
     """Whether `path` is a launcher setup wrote, of any version: a file, not
-    a link, whose start names it."""
+    a link, whose first line is a #! line, of any length up to 4 KB, and
+    whose second line starts with its name and version ("# longhaul-launcher
+    1:"). The name anywhere else is not enough: a file of your own that
+    names it is yours, and setup would write over it and uninstall remove it
+    (until Sprint 12 the name was looked for in the first 200 bytes)."""
     try:
         if os.path.islink(path) or not os.path.isfile(path):
             return False
         with open(path, "rb") as f:
-            return LAUNCHER_TAG.encode() in f.read(200)
+            first, second = f.readline(4096), f.readline(4096)
     except OSError:
         return False
+    return (first.startswith(b"#!") and first.endswith(b"\n")
+            and re.match(re.escape(LAUNCHER_TAG.encode()) + rb" \d+:", second) is not None)
 
 
 def config_folders() -> list:
@@ -12953,14 +12964,34 @@ def clear(_opts) -> int:
 # Longhaul set up outside the plugin, listed, then removed after a yes. The
 # plugin itself is Claude Code's to remove; what stays is said.
 
+ADVISOR_PLUGIN = "longhaul-advisor@longhaul"  # the Advisor's own plugin since 0.2.9 (I4), from the same marketplace
 UNINSTALL_STAYS = (
-    "the plugin itself: `claude plugin uninstall longhaul@longhaul`, then `claude plugin marketplace remove "
-    "longhaul` (Claude Code keeps its cache for about 14 days)",
     "the code index's lines in each repository's .git/info/exclude (.codegraph/, .trail/)",
     "the hook Trail's init wrote into a repository's .claude/settings.json",
     "your account folders and their sign-ins",
     "the .before-longhaul-* copies of the files Longhaul changed",
 )
+
+
+def advisor_installed() -> bool:
+    """Whether Claude Code has longhaul-advisor installed in any of
+    config_folders(), in either shape installed_plugins.json has had. It
+    only reads."""
+    for folder in config_folders():
+        entries = dict_at(read_json(folder / "plugins" / "installed_plugins.json"), "plugins").get(ADVISOR_PLUGIN)
+        if any(isinstance(e, dict) for e in (entries if isinstance(entries, list) else [entries])):
+            return True
+    return False
+
+
+def uninstall_plugins_stay() -> str:
+    """What stays first: the plugins, Claude Code's to remove. The Advisor's
+    is named where it is installed, and first: it depends on Longhaul's (the
+    wiki's order)."""
+    advisor = f"`claude plugin uninstall {ADVISOR_PLUGIN}`, then " if advisor_installed() else ""
+    return (f"{'the plugins themselves' if advisor else 'the plugin itself'}: {advisor}`claude plugin uninstall "
+            f"{RELEASE_PLUGIN}`, then `claude plugin marketplace remove longhaul` (Claude Code keeps its cache for "
+            "about 14 days)")
 
 
 def command_is_longhauls(path: Path) -> bool:
@@ -13063,6 +13094,7 @@ def uninstall(opts) -> int:
     included. Then what stays. Exit 0 when all of it is done, 1 when any
     of it is not (a --purge refused among them)."""
     todo, refused, theirs = uninstall_plan(opts.purge)
+    plugins = uninstall_plugins_stay()  # before --purge takes the accounts list that names folders to look in
     if todo:
         print(f"Longhaul {'would remove' if opts.dry_run else 'removes'}:")
         print("\n".join(f"  - {what}" for what, _ in todo))
@@ -13087,7 +13119,7 @@ def uninstall(opts) -> int:
         for _what, remove in todo:
             failed = remove() != 0 or failed
             purged = purged or (remove is uninstall_purge and not os.path.lexists(LONGHAUL_HOME))
-    stays = list(UNINSTALL_STAYS)
+    stays = [plugins, *UNINSTALL_STAYS]
     if not purged:
         stays.append(f"{home_path(str(LONGHAUL_HOME))}, Longhaul's own records (`longhaul uninstall --purge` "
                      "removes it)")

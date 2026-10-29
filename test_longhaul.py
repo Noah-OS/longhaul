@@ -363,6 +363,30 @@ class Loop(unittest.TestCase):
         self.assertIn("Pro ended: completed", log)
         self.assertNotIn("not a limit stop", log)
 
+    def test_the_fake_has_taken_its_next_step_when_longhaul_stops_it_on_a_hooks_row(self):
+        # CI on 0.2.9's main (2026-10-27), the test above: longhaul stopped
+        # Max on the hook's row while the fake was still writing the plan
+        # left, and Pro read an empty plan and crashed ("Pro ended: crashed
+        # (session None, exit 1)"); stopped before the write, Max left its
+        # "stay" to Pro, 20 seconds late. As stop() does, SIGTERM the moment
+        # the row is there: the plan must already be the next launch's.
+        (self.home / "plan.json").write_text(json.dumps(["quota_note:quota_auto_resume_disabled", "stay", "exit"]))
+        env = dict(os.environ, LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.max),
+                   LONGHAUL_NO_NOTIFY="1")
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        proc = subprocess.Popen([sys.executable, str(HERE / "fake_claude.py")], env=env, cwd=self.tmp)
+        try:
+            deadline = time.time() + 30
+            while not (self.home / "stops.json").exists() and proc.poll() is None and time.time() < deadline:
+                time.sleep(0.001)
+            proc.terminate()
+            self.assertEqual(proc.wait(timeout=15), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertTrue((self.home / "stops.json").exists(), "the hook ran")
+        self.assertEqual(json.loads((self.home / "plan.json").read_text()), ["exit"])
+
     def test_a_quota_disabled_notification_below_the_limit_is_logged_once_and_is_not_a_limit_stop(self):
         self.reading("Max", five=60, week=90)
         out, calls = self.run_longhaul(["quota_note:quota_auto_resume_disabled", "exit"], "--account", "Max")
@@ -11488,6 +11512,38 @@ class Launcher(unittest.TestCase):
             self.assertIn("already exists and is not longhaul; left it alone", " ".join(said), other)
         self.assertEqual(os.readlink(self.target), str(self.tmp / "other-tool"))
 
+    def test_the_launcher_is_known_by_its_second_line_whatever_the_length_of_its_first(self):
+        # Until Sprint 12 the name was looked for anywhere in a file's first
+        # 200 bytes: a longer #! line hid a launcher, and a file of your own
+        # that names it was taken for one, written over by setup and removed
+        # by uninstall. Its second line names it and its version (LAUNCHER_TAG).
+        text = longhaul.launcher_text()
+        rest = text.split("\n", 1)[1]
+        self.target.parent.mkdir(parents=True)
+        ours = {"today's": text, "an older one": text.replace("longhaul-launcher 1:", "longhaul-launcher 0:"),
+                "a long #! line": "#!/opt/" + "python" * 40 + "/bin/python3 -I\n" + rest}
+        for name, body in ours.items():
+            with self.subTest(name):
+                self.target.write_text(body)
+                self.assertTrue(longhaul.launcher_at(self.target))
+                self.assertTrue(longhaul.command_is_longhauls(self.target))
+        theirs = {"named in a later line": "#!/bin/sh\necho mine\n" + rest,
+                  "named inside the second line": "#!/bin/sh\n# mine; not the # longhaul-launcher 1: setup writes\n",
+                  "named in the first line": "# longhaul-launcher 1: my notes\n#!/bin/sh\n",
+                  "no #! line": "\n" + rest,
+                  "no version": "#!/bin/sh\n# longhaul-launchers I keep: none\n",
+                  "a #! line with no end": "#!" + "x" * 5000 + "\n" + rest}
+        cache = self.copy("0.2.8") / "longhaul.py"
+        for name, body in theirs.items():
+            with self.subTest(name):
+                self.target.write_text(body)
+                self.assertFalse(longhaul.launcher_at(self.target))
+                self.assertFalse(longhaul.command_is_longhauls(self.target), "uninstall leaves it")
+                said = []
+                self.assertFalse(self.link_command(cache, said))
+                self.assertIn("already exists and is not longhaul; left it alone", " ".join(said))
+                self.assertEqual(self.target.read_text(), body, "setup leaves it")
+
     def test_setup_run_from_the_installed_copy_gives_a_command_that_runs_it(self):
         # The whole route a user takes: the line the doctor gives, then `longhaul`.
         copy = self.claude / "plugins" / "cache" / "longhaul" / "longhaul" / "0.2.8"
@@ -19604,7 +19660,36 @@ class StatuslineInstall(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.path.read_text(), json.dumps({"statusLine": self.LINE}, indent=2) + "\n")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "a new file only you can read")
-        self.assertEqual(self.copies(), [], "nothing to keep a copy of")
+        self.assertIn("(a new file)", out)
+        # An empty copy: there was no file. Uninstall takes the newest copy
+        # as the file before this install (the test below).
+        [copy] = self.copies()
+        self.assertEqual((copy.read_bytes(), copy.stat().st_mode & 0o777), (b"", 0o600))
+        self.assertNotIn(copy.name, out, "no copy of a file to point to")
+
+    def test_uninstall_after_the_file_was_deleted_and_made_again_puts_back_no_older_installs_line(self):
+        # Sprint 11's "second uninstall after settings.json was deleted":
+        # install, uninstall, the file deleted, install again (a new file),
+        # uninstall again. The first install's copy is still there, and the
+        # second uninstall put its line back, which this install never replaced.
+        self.settings({"statusLine": self.THEIRS, "theme": "dark"})
+        self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        self.assertEqual(self.run_cli("uninstall")[0], 0)
+        self.assertEqual(json.loads(self.path.read_text()), {"statusLine": self.THEIRS, "theme": "dark"})
+        self.path.unlink()
+        self.assertEqual(self.run_cli("install", "--yes")[0], 0)
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.path.read_text()), {}, "no line: there was no file before this install")
+        self.assertIn("it sets no status line now", out)
+        self.assertNotIn("could not be read", out)
+        self.assertNotIn("my-status", out)
+        self.path.unlink()  # and once more with no file: nothing made, nothing kept
+        before = sorted(p.name for p in self.claude.iterdir())
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Nothing to undo: there is no ~/.claude/settings.json", out)
+        self.assertEqual(sorted(p.name for p in self.claude.iterdir()), before)
 
     def test_the_folder_is_the_chats_own(self):
         other = self.user / ".claude-pro"
@@ -19867,6 +19952,33 @@ class Uninstall(unittest.TestCase):
                       "14 days", ".git/info/exclude", ".codegraph/", ".trail/", ".claude/settings.json",
                       "account folders", ".before-longhaul-", "--purge"):
             self.assertIn(stays, out[out.index("What stays"):], stays)
+        self.assertNotIn("longhaul-advisor", out, "not installed: not named")
+
+    def installed(self, folder, **plugins):
+        """installed_plugins.json in `folder`, each plugin's entries by scope."""
+        (folder / "plugins").mkdir(exist_ok=True)
+        (folder / "plugins" / "installed_plugins.json").write_text(json.dumps({"version": 2, "plugins": {
+            key: [{"scope": "user", "version": "0.2.9", "installPath": str(folder / "plugins" / "cache" / key)}]
+            for key in plugins.values()}}))
+
+    def test_what_stays_names_the_advisors_plugin_first_where_it_is_installed(self):
+        # longhaul-advisor, the Advisor's own plugin since 0.2.9 (I4), from
+        # the same marketplace and depending on Longhaul's: the wiki's order.
+        self.everything()
+        # In ~/.claude, or in an account's folder alone; that one also with
+        # --purge, which takes the accounts list that names the folder.
+        for folder, args in ((self.claude, ["--dry-run"]), (self.pro, ["--dry-run"]), (self.pro, ["--purge", "--yes"])):
+            with self.subTest(folder=folder.name, args=args):
+                self.installed(self.claude, main="longhaul@longhaul")
+                self.installed(folder, main="longhaul@longhaul", advisor="longhaul-advisor@longhaul")
+                code, out = self.run_cli(*args)
+                self.assertEqual(code, 0, out)
+                stays = out[out.index("What stays"):]
+                self.assertIn("`claude plugin uninstall longhaul-advisor@longhaul`, then `claude plugin uninstall "
+                              "longhaul@longhaul`, then `claude plugin marketplace remove longhaul`", stays)
+                self.assertNotIn("longhaul-advisor", out[:out.index("What stays")], "Claude Code's to remove")
+                (folder / "plugins" / "installed_plugins.json").unlink()
+        self.assertFalse(self.home.exists(), "purged")
 
     def test_it_asks_first_in_a_terminal_and_refuses_without_one(self):
         self.everything()
@@ -19892,6 +20004,32 @@ class Uninstall(unittest.TestCase):
         self.assertFalse(self.home.exists(), "gone, and not made again by a log line")
         self.assertNotIn(longhaul.home_path(str(self.home)), out[out.index("What stays"):], "it is not what stays")
         self.assertTrue(self.user.is_dir())
+
+    def test_a_second_run_after_settings_json_was_deleted_is_clean(self):
+        # Sprint 11's "a second uninstall after settings.json was deleted".
+        self.everything()
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        for folder in (self.claude, self.pro):
+            (folder / "settings.json").unlink()
+        for args in (("--dry-run",), ("--yes",)):
+            with self.subTest(args=args):
+                before = self.tree()
+                code, out = self.run_cli(*args)
+                self.assertEqual(code, 0, out)
+                self.assertIn("Nothing of Longhaul's to remove", out)
+                self.assertNotIn("settings.json", out[:out.index("What stays")])
+                self.assertEqual(self.tree(), before, "nothing written: no file made, no copy, no log line")
+        # Longhaul's line set again in a new file (the terminal command a
+        # fake): the second run takes it out, and puts back no line from the
+        # first install's copy, which this install never replaced.
+        self.launcher.write_text('#!/bin/sh\n[ "$1" = statusline ] || exit 9\ncat >/dev/null\necho main\n')
+        self.launcher.chmod(0o755)
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(longhaul.main(["statusline", "install", "--yes"]), 0, said.getvalue())
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.json_at(self.claude / "settings.json"), {}, "no line: there was no file")
+        self.assertNotIn("my-status", out)
 
     def test_purge_refuses_a_home_that_is_your_home_a_link_or_no_folder(self):
         cases = {"your home": lambda: self.user, "above it": lambda: self.tmp,
