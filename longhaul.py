@@ -11294,10 +11294,10 @@ INIT_WAIT = setting("LONGHAUL_INIT_WAIT_SECONDS", 90, float)
 # A limit stop in the conversation's file is this relay's own only when its
 # own claude's stream showed one too (Relay.limit_ours()): the file is the
 # chat's, and another process of the same chat, a terminal `claude --resume`
-# on another account, writes its stops there as well. On 2026-10-29 hermes
-# 703eb707's terminal copy on personal-1 hit its weekly limit two minutes
-# after the panel copy moved to personal-2; the panel took those stops for
-# personal-2's, recorded personal-2 as limited and left the chat where it
+# on another account, writes its stops there as well. On 2026-10-29 one
+# chat's terminal copy hit its weekly limit two minutes after the panel
+# copy had moved off that account; the panel took those stops for its new
+# account's, recorded that account as limited and left the chat where it
 # was. The stream's line and the file's are matched by uuid where the
 # stream gives one, else by time: one of the stream's stops within
 # OWN_STOP_WINDOW of the file's. The file can be read before the stream's

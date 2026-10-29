@@ -15709,7 +15709,7 @@ class Panel(StreamHarness):
         self.assertIn("the panel chat carries on with Pro", (self.relay / "longhaul.log").read_text())
 
     def test_a_limit_stop_another_process_of_the_chat_wrote_moves_nothing_and_marks_nothing(self):
-        # 2026-10-29: hermes 703eb707 was open in the panel and, as a plain
+        # 2026-10-29: one chat was open in the panel and, as a plain
         # `claude --resume`, in a terminal on another account. The terminal
         # copy's limit stops, written to the same file, were taken for the
         # panel's account, which was then recorded as limited.
