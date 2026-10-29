@@ -12953,14 +12953,34 @@ def clear(_opts) -> int:
 # Longhaul set up outside the plugin, listed, then removed after a yes. The
 # plugin itself is Claude Code's to remove; what stays is said.
 
+ADVISOR_PLUGIN = "longhaul-advisor@longhaul"  # the Advisor's own plugin since 0.2.9 (I4), from the same marketplace
 UNINSTALL_STAYS = (
-    "the plugin itself: `claude plugin uninstall longhaul@longhaul`, then `claude plugin marketplace remove "
-    "longhaul` (Claude Code keeps its cache for about 14 days)",
     "the code index's lines in each repository's .git/info/exclude (.codegraph/, .trail/)",
     "the hook Trail's init wrote into a repository's .claude/settings.json",
     "your account folders and their sign-ins",
     "the .before-longhaul-* copies of the files Longhaul changed",
 )
+
+
+def advisor_installed() -> bool:
+    """Whether Claude Code has longhaul-advisor installed in any of
+    config_folders(), in either shape installed_plugins.json has had. It
+    only reads."""
+    for folder in config_folders():
+        entries = dict_at(read_json(folder / "plugins" / "installed_plugins.json"), "plugins").get(ADVISOR_PLUGIN)
+        if any(isinstance(e, dict) for e in (entries if isinstance(entries, list) else [entries])):
+            return True
+    return False
+
+
+def uninstall_plugins_stay() -> str:
+    """What stays first: the plugins, Claude Code's to remove. The Advisor's
+    is named where it is installed, and first: it depends on Longhaul's (the
+    wiki's order)."""
+    advisor = f"`claude plugin uninstall {ADVISOR_PLUGIN}`, then " if advisor_installed() else ""
+    return (f"{'the plugins themselves' if advisor else 'the plugin itself'}: {advisor}`claude plugin uninstall "
+            f"{RELEASE_PLUGIN}`, then `claude plugin marketplace remove longhaul` (Claude Code keeps its cache for "
+            "about 14 days)")
 
 
 def command_is_longhauls(path: Path) -> bool:
@@ -13063,6 +13083,7 @@ def uninstall(opts) -> int:
     included. Then what stays. Exit 0 when all of it is done, 1 when any
     of it is not (a --purge refused among them)."""
     todo, refused, theirs = uninstall_plan(opts.purge)
+    plugins = uninstall_plugins_stay()  # before --purge takes the accounts list that names folders to look in
     if todo:
         print(f"Longhaul {'would remove' if opts.dry_run else 'removes'}:")
         print("\n".join(f"  - {what}" for what, _ in todo))
@@ -13087,7 +13108,7 @@ def uninstall(opts) -> int:
         for _what, remove in todo:
             failed = remove() != 0 or failed
             purged = purged or (remove is uninstall_purge and not os.path.lexists(LONGHAUL_HOME))
-    stays = list(UNINSTALL_STAYS)
+    stays = [plugins, *UNINSTALL_STAYS]
     if not purged:
         stays.append(f"{home_path(str(LONGHAUL_HOME))}, Longhaul's own records (`longhaul uninstall --purge` "
                      "removes it)")

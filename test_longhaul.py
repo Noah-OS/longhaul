@@ -19891,6 +19891,33 @@ class Uninstall(unittest.TestCase):
                       "14 days", ".git/info/exclude", ".codegraph/", ".trail/", ".claude/settings.json",
                       "account folders", ".before-longhaul-", "--purge"):
             self.assertIn(stays, out[out.index("What stays"):], stays)
+        self.assertNotIn("longhaul-advisor", out, "not installed: not named")
+
+    def installed(self, folder, **plugins):
+        """installed_plugins.json in `folder`, each plugin's entries by scope."""
+        (folder / "plugins").mkdir(exist_ok=True)
+        (folder / "plugins" / "installed_plugins.json").write_text(json.dumps({"version": 2, "plugins": {
+            key: [{"scope": "user", "version": "0.2.9", "installPath": str(folder / "plugins" / "cache" / key)}]
+            for key in plugins.values()}}))
+
+    def test_what_stays_names_the_advisors_plugin_first_where_it_is_installed(self):
+        # longhaul-advisor, the Advisor's own plugin since 0.2.9 (I4), from
+        # the same marketplace and depending on Longhaul's: the wiki's order.
+        self.everything()
+        # In ~/.claude, or in an account's folder alone; that one also with
+        # --purge, which takes the accounts list that names the folder.
+        for folder, args in ((self.claude, ["--dry-run"]), (self.pro, ["--dry-run"]), (self.pro, ["--purge", "--yes"])):
+            with self.subTest(folder=folder.name, args=args):
+                self.installed(self.claude, main="longhaul@longhaul")
+                self.installed(folder, main="longhaul@longhaul", advisor="longhaul-advisor@longhaul")
+                code, out = self.run_cli(*args)
+                self.assertEqual(code, 0, out)
+                stays = out[out.index("What stays"):]
+                self.assertIn("`claude plugin uninstall longhaul-advisor@longhaul`, then `claude plugin uninstall "
+                              "longhaul@longhaul`, then `claude plugin marketplace remove longhaul`", stays)
+                self.assertNotIn("longhaul-advisor", out[:out.index("What stays")], "Claude Code's to remove")
+                (folder / "plugins" / "installed_plugins.json").unlink()
+        self.assertFalse(self.home.exists(), "purged")
 
     def test_it_asks_first_in_a_terminal_and_refuses_without_one(self):
         self.everything()
