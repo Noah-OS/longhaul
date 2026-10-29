@@ -14050,9 +14050,10 @@ def codex_config_items(home: Path) -> list:
     if plugin is None:
         repo = plugin_repository()
         add = f"`codex plugin marketplace add {repo}`, then " if repo else "after adding its marketplace, "
-        items.append(("warn", f"{where}: Longhaul's plugin is not installed there, so no checkpoint, reminder, guard "
-                              "or filter in Codex",
-                      f"in a terminal: {add}`codex plugin add longhaul@longhaul`; then trust its hooks in Codex's /hooks"))
+        # Unmarked: Longhaul in Codex is a choice, not a fault (the owner, 2026-10-29), so a Claude Code
+        # user who also has Codex is not warned; the marks are for an installed plugin's problems.
+        items.append((None, f"{where}: Longhaul's plugin is not installed there (to use it in Codex, in a terminal: "
+                            f"{add}`codex plugin add longhaul@longhaul`; then trust its hooks in Codex's /hooks)", None))
     else:
         plain = re.fullmatch(r"longhaul@[A-Za-z0-9_.-]{1,64}", plugin)  # a marketplace's name is shown only plain
         named = f" ({plugin})" if plain else ""

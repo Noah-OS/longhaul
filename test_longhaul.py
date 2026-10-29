@@ -21051,11 +21051,12 @@ class CodexDoctor(unittest.TestCase):
                 lines = out.stdout.splitlines()
                 [head] = [l for l in lines if l[2:].startswith("Codex: ")]
                 at = lines.index(head)
-                # ⚠: no config.toml, so Longhaul's plugin is not installed in this Codex (CodexDoctorConfig).
-                self.assertEqual(head, f"⚠ Codex: {self.SAID}")
+                # No config.toml: Longhaul's plugin is not installed in this Codex, an unmarked line
+                # (CodexDoctorConfig); the ⚠ left is the compressed chats', where this Python cannot read them.
+                self.assertEqual(head, f"{'✔' if self.zstd_in(python) else '⚠'} Codex: {self.SAID}")
                 self.assertEqual(lines[at + 1:at + 3], ["    ✔ ~/.codex: 2 chats, 1 of them compressed",
                                                         "      version 0.164.0, from `codex --version`"])
-                self.assertIn("    ⚠ ~/.codex: Longhaul's plugin is not installed there", out.stdout)
+                self.assertIn("\n      ~/.codex: Longhaul's plugin is not installed there (to use it in Codex", out.stdout)
                 self.assertEqual("that this Python" in out.stdout, not self.zstd_in(python))
                 self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
                 self.assertNotIn("SECRET", out.stdout)
@@ -21237,12 +21238,12 @@ class CodexDoctorConfig(unittest.TestCase):
     @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
     def test_the_plugin_is_installed_and_enabled_turned_off_or_missing(self):
         repo = longhaul.plugin_repository()
-        self.assertEqual(self.item("plugin")[:2], ("warn", "~/.codex: Longhaul's plugin is not installed there, so no "
-                                                           "checkpoint, reminder, guard or filter in Codex"))
-        self.assertEqual(self.item("plugin")[2], f"in a terminal: `codex plugin marketplace add {repo}`, then `codex "
-                                                 "plugin add longhaul@longhaul`; then trust its hooks in Codex's /hooks")
+        self.assertEqual(self.item("plugin"), (None, "~/.codex: Longhaul's plugin is not installed there (to use it in "
+                                                     f"Codex, in a terminal: `codex plugin marketplace add {repo}`, then "
+                                                     "`codex plugin add longhaul@longhaul`; then trust its hooks in "
+                                                     "Codex's /hooks)", None), "a choice, not a fault: unmarked")
         c = longhaul.doctor_codex()
-        self.assertEqual((c["mark"], c["step"]), ("warn", self.item("plugin")[2]))
+        self.assertEqual((c["mark"], c["step"]), ("ok", None), "a Codex without Longhaul's plugin is no ⚠")
         installed = ("ok", "~/.codex: Longhaul's plugin installed and enabled (longhaul@longhaul)", None)
         for lines in (self.PLUGIN, ('[plugins."longhaul@longhaul"]',), ('plugins."longhaul@longhaul".enabled = true',)):
             with self.subTest(lines=lines):
@@ -21258,7 +21259,7 @@ class CodexDoctorConfig(unittest.TestCase):
         self.config('[plugins."longhaul@a"]', "enabled = false", '[plugins."longhaul@b"]', "enabled = true")
         self.assertIn("(longhaul@b)", self.item("plugin")[1])
         self.config('[plugins."longhauler@longhaul"]', '[plugins."other@longhaul"]', "enabled = true")
-        self.assertEqual(self.item("plugin")[0], "warn")
+        self.assertIn("not installed there", self.item("plugin")[1], "longhauler@ and other plugins are not Longhaul's")
         # A marketplace's name that is not plain is not shown.
         self.config(f'[plugins."longhaul@{self.SECRET}"]', "enabled = false")
         self.assertEqual(self.item("plugin")[:2], ("bad", "~/.codex: Longhaul's plugin is installed but turned off"))
@@ -21385,8 +21386,10 @@ class CodexDoctorConfig(unittest.TestCase):
         python = sys.version.split()[0]
         with mock.patch.dict(sys.modules, {"tomllib": None}):  # `import tomllib` raises, as before 3.11
             self.assertEqual(self.items()[:2], [("ok", "~/.codex: hooks on (Codex's default)"),
-                                                ("warn", "~/.codex: Longhaul's plugin is not installed there, so no "
-                                                         "checkpoint, reminder, guard or filter in Codex")],
+                                                (None, "~/.codex: Longhaul's plugin is not installed there (to use "
+                                                       "it in Codex, in a terminal: `codex plugin marketplace add "
+                                                       f"{longhaul.plugin_repository()}`, then `codex plugin add "
+                                                       "longhaul@longhaul`; then trust its hooks in Codex's /hooks)")],
                              "no config.toml: Codex's defaults, read with no TOML reader")
             self.config(*self.PLUGIN)
             self.assertEqual(longhaul.codex_config_items(self.codex), [
