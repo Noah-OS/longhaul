@@ -4566,8 +4566,9 @@ class CodexPackaging(unittest.TestCase):
                 self.assertIn("`../../bin/longhaul`", body)
                 self.assertEqual((self.SKILLS / name / "../../bin/longhaul").resolve(), HERE / "bin" / "longhaul")
                 self.assertIn("relative to the folder this SKILL.md is in", " ".join(body.split()))
-        # Claude Code's own skills stay where its manifest's default reads them.
-        self.assertEqual(sorted(p.name for p in (HERE / "skills").iterdir()), ["checkpoint", "doctor", "inspect"])
+        # Claude Code's own skills stay where its manifest's default reads them;
+        # manage (the chat-commands plan, 2026-10-30) is Claude Code's alone.
+        self.assertEqual(sorted(p.name for p in (HERE / "skills").iterdir()), ["checkpoint", "doctor", "inspect", "manage"])
 
     def run_skill(self, name, command, stdin=None, **extra):
         """`command` as the model runs it: the shim by the skill folder's
@@ -4720,6 +4721,9 @@ class Plugin(unittest.TestCase):
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
                      "CHANGELOG.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
+                     # Claude Code's skills.
+                     "skills/checkpoint/SKILL.md", "skills/doctor/SKILL.md", "skills/inspect/SKILL.md",
+                     "skills/manage/SKILL.md",
                      # The Codex layer (X4): its manifest, hooks file and skills.
                      ".codex-plugin/plugin.json", "hooks/codex-hooks.json", "codex-skills/checkpoint/SKILL.md",
                      "codex-skills/inspect/SKILL.md", "codex-skills/doctor/SKILL.md",
@@ -12452,6 +12456,94 @@ class CheckpointSkill(unittest.TestCase):
         self.assertTrue(all(state[key] for key in longhaul.CHECKPOINT_MORE), "the example shows each new list in use")
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/checkpoint/SKILL.md"], cwd=HERE).returncode, 1)
+
+
+class ManageSkill(unittest.TestCase):
+    """/longhaul:manage (C3 of the chat-commands plan; the owner,
+    2026-10-30, "every terminal action from the VS Code chat"): the one
+    place that lists the setup actions a chat may take, each with its exact
+    command, and the rule that Claude asks first, in the chat, for each one
+    that changes something."""
+
+    ROOT = "${CLAUDE_PLUGIN_ROOT}/bin/longhaul"
+    # The forms that only read: the only ones the skill's rule may approve by itself.
+    READS = ("status", "switch", "models", "update status", "uninstall --dry-run")
+
+    def skill(self):
+        text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        return text, head, body
+
+    def commands(self, body):
+        """Each command the body names by the shim's full path, its words after it."""
+        return [c[len(self.ROOT):].split() for c in re.findall(r"`([^`]+)`", body) if c.startswith(self.ROOT + " ")]
+
+    def through_the_shim(self, words):
+        """The shim given `words`, a stand-in python3 first on PATH that only
+        says what it was handed: whether the shim lets them through, and
+        nothing of Longhaul's runs."""
+        fake = Path(tempfile.mkdtemp())
+        (fake / "python3").write_text('#!/bin/sh\nshift\necho "ran $*"\n')
+        (fake / "python3").chmod(0o755)
+        return subprocess.run([str(HERE / "bin" / "longhaul"), *words], capture_output=True, text=True, timeout=30,
+                              env={"PATH": f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(fake)})
+
+    def test_the_description_is_short_and_the_rule_approves_only_what_reads(self):
+        _, head, _ = self.skill()
+        self.assertIn("name: manage\n", head)
+        [description] = re.findall(r'(?m)^description: "(.+)"$', head)
+        # The description loads in every chat until the skill is used: a few dozen tokens.
+        self.assertLessEqual(len(description), 240, description)
+        self.assertLessEqual(len(re.findall(r"[.!?](?:\s|$)", description)), 2, "one or two sentences")
+        self.assertIn("yes", description, "it says the user decides")
+        [tools] = [line for line in head.splitlines() if line.startswith("allowed-tools:")]
+        rules = re.findall(r"Bash\(([^)]*)\)", tools)
+        self.assertEqual(tools, "allowed-tools: " + " ".join(f"Bash({r})" for r in rules), "Bash rules alone")
+        self.assertEqual(sorted(rules), sorted(f"{self.ROOT} {form}" for form in self.READS),
+                         "exact read-only forms only, so Claude Code's own prompt shows for every change too")
+        self.assertNotIn("*", tools)
+
+    def test_the_body_asks_first_names_what_purge_deletes_and_each_actions_exact_command(self):
+        _, _, body = self.skill()
+        flat = " ".join(body.split())
+        for rule in ("show the user the exact command", "say in plain words what it changes",
+                     "run it only after their yes in this chat", "not enough",
+                     "approves Bash by itself"):
+            self.assertIn(rule, flat)
+        self.assertIn("say first that it deletes ~/.longhaul: the checkpoints, the usage ledger and the accounts list",
+                      flat)
+        self.assertIn("Cmd+Shift+P, then Developer: Reload Window", flat, "after vscode on or off")
+        self.assertIn("the sign-in opens in the browser", flat)
+        self.assertIn("with that account's email", flat)
+        self.assertIn("Never ask for a password, a code or a token in the chat", flat)
+        for terminal_only in ("`longhaul trial ...`", "`longhaul advisor record-probe`", "`longhaul`, `-c`, `-r`"):
+            self.assertIn(terminal_only, flat)
+        named = {" ".join(words) for words in self.commands(body)}
+        for action in ("status", "add NAME EMAIL", "setup NAME --relogin", "setup NAME", "remove NAME", "switch",
+                       "switch MODE", "models", "models MODE", "models cap MODEL", "models TYPE MODEL", "vscode on --yes",
+                       "vscode off", "statusline install --yes", "statusline uninstall", "update status",
+                       "update on --yes", "update off --yes", "clear", "uninstall --dry-run", "uninstall --dry-run --purge",
+                       "uninstall --yes", "uninstall --yes --purge"):
+            self.assertIn(action, named)
+        self.assertNotIn("bin/longhaul trial", body)
+        self.assertNotIn("record-probe", " ".join(" ".join(w) for w in self.commands(body)))
+
+    def test_every_command_it_names_is_one_the_shim_lets_through_and_the_terminal_ones_are_not(self):
+        _, _, body = self.skill()
+        values = {"NAME": "Work", "EMAIL": "work@example.com", "MODEL": "sonnet", "TYPE": "implementer"}
+        for words in self.commands(body):
+            words = [values.get(w, w) for w in words]
+            words = [("auto" if words[0] == "switch" else "off") if w == "MODE" else w for w in words]
+            out = self.through_the_shim(words)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), words)
+            self.assertTrue(out.stdout.startswith(f"ran {' '.join(words)}"), (words, out.stdout))
+        for words in (("trial", "status"), ("advisor", "record-probe", "x.json"), (), ("-c",), ("-r", "x")):
+            out = self.through_the_shim(words)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), words)
+
+    def test_the_skill_ships(self):
+        requires_git(self)
+        self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/manage/SKILL.md"], cwd=HERE).returncode, 1)
 
 
 class Reminder(unittest.TestCase):
