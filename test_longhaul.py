@@ -1290,60 +1290,20 @@ class Loop(unittest.TestCase):
         self.assertEqual(calls[-1]["config"], str(self.pro), "a session started through a link to it")
 
     # The ask-first plan of 2026-10-29, A4: in "ask" the terminal asks before
-    # an early move, and before running a conversation on another account
-    # in a folder whose own accounts are all at their limit. "auto" stays a
-    # silent mode for those who choose it (the owner's decision 1); "never"
-    # never moves. No answer never moves anything.
+    # running a conversation on another account in a folder whose own
+    # accounts are all at their limit, and at a limit as ever; it never
+    # moves early (the owner, 2026-10-29: to ask, it would close Claude, and
+    # a chat followed from a phone would be gone while it waited). "auto"
+    # stays a silent mode for those who choose it (the owner's decision 1);
+    # "never" never moves. No answer never moves anything.
 
-    EARLY = "Max is at 96% of its allowance, and this conversation is idle. Move it to Pro now?"
-
-    def test_in_ask_mode_a_nearly_full_idle_session_moves_early_only_after_a_yes(self):
+    def test_in_ask_mode_a_nearly_full_idle_session_is_neither_asked_nor_moved_nor_closed(self):
         self.reading("Max", five=96)
         out, calls = self.run_longhaul(["idle_wait", "exit"], "--account", "Max", LONGHAUL_IDLE_MOVE_SECONDS="0",
                                        LONGHAUL_SWITCH="ask", answer=b"y")
-        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
-        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
-        self.assertFalse(calls[1]["args"][-1].startswith("The "), "idle: no carry-on message")
-        self.assertIn(f"{self.EARLY} (y: move to Pro, n: stay on Max, q: stop). With no answer longhaul reopens it "
-                      "on Max at ", out.stdout)
-        self.assertIn("Moving to Pro: reopening this conversation there.", out.stdout)
-        log = (self.home / "longhaul.log").read_text()
-        self.assertIn("Max ended: move", log)
-        self.assertIn("asked to move early to Pro: yes", log)
-
-    def test_in_ask_mode_a_no_to_the_early_move_reopens_on_the_same_account_and_is_not_asked_again(self):
-        self.reading("Max", five=96)
-        out, calls = self.run_longhaul(["idle_wait", "idle_wait", "exit"], "--account", "Max", runs=3,
-                                       LONGHAUL_IDLE_MOVE_SECONDS="0", LONGHAUL_SWITCH="ask", answer=b"n")
-        self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
-        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
-        self.assertEqual(out.stdout.count(self.EARLY), 1, out.stdout)
-        self.assertIn("Staying on Max: reopening this conversation there; longhaul asks again at its limit.", out.stdout)
-        log = (self.home / "longhaul.log").read_text()
-        self.assertEqual(log.count("ended: move"), 1)
-        self.assertIn("Max ended: completed", log, "the second idle wait: not asked again, not moved")
-
-    def test_in_ask_mode_no_answer_to_the_early_move_reopens_on_the_same_account(self):
-        self.reading("Max", five=96)
-        out, calls = self.run_longhaul(["idle_wait", "exit"], "--account", "Max", LONGHAUL_IDLE_MOVE_SECONDS="0",
-                                       LONGHAUL_SWITCH="ask", LONGHAUL_EARLY_ASK_SECONDS="1", answer=b"")
-        self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
-        self.assertIn("No answer, so longhaul reopens this conversation on Max.", out.stdout)
-        (self.home / "calls.jsonl").unlink()
-        out, calls = self.run_longhaul(["idle_wait", "exit"], "--account", "Max", LONGHAUL_IDLE_MOVE_SECONDS="0",
-                                       LONGHAUL_SWITCH="ask", answer=b"q")
-        self.assertEqual((out.returncode, len(calls)), (0, 1), out.stderr)
-        self.assertIn("Stopped at your request. The conversation is saved. `longhaul -r sid-1` opens it again.",
-                      out.stdout)
-
-    def test_in_ask_mode_the_early_move_never_offers_an_account_signed_in_as_someone_else(self):
-        self.pin_emails()
-        self.reading("Max", five=96)
-        out, calls = self.run_longhaul(["idle_wait", "exit"], "--account", "Max", LONGHAUL_IDLE_MOVE_SECONDS="0",
-                                       LONGHAUL_SWITCH="ask", answer=b"y", FAKE_EMAIL_MAX="first@example.com",
-                                       FAKE_EMAIL_PRO="stranger@example.com")
-        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout)
-        self.assertNotIn(self.EARLY, out.stdout)
+        self.assertEqual([c["config"] for c in calls], [None], out.stderr)
+        self.assertNotIn("Move it to Pro now?", out.stdout)
+        self.assertNotIn("ended: move", (self.home / "longhaul.log").read_text())
 
     def kept_work(self, pro_until):
         """Work, kept for Pro, with Pro at its limit until `pro_until`: Max may

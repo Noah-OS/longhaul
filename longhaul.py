@@ -20,10 +20,10 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   asking: that is now `--switch auto` (or LONGHAUL_SWITCH=auto). `longhaul pipe` and
   the VS Code panel cannot ask, so there "ask" acts as "never": they move
   only in auto (an unattended move is never made without an explicit yes).
-  In "ask" this terminal asks too before an early move (an account nearly
-  full while Claude is idle), and, in a folder kept for accounts that are
-  all at their limit, before running the conversation on another account,
-  which allows the chat there (`longhaul allow`); no answer never moves it;
+  In "ask" this terminal never moves early (to ask it would close Claude),
+  and, in a folder kept for accounts that are all at their limit, it asks
+  before running the conversation on another account, which allows the
+  chat there (`longhaul allow`); no answer never moves it;
 - Remote Control lost while Claude sits idle: longhaul reopens the conversation,
   which connects it again (Claude Code reconnects short drops itself; this
   is for the ones it gives up on, after a VPN change or a long outage). A
@@ -753,10 +753,6 @@ def load_state() -> dict:
 # while idle.
 NEAR_FULL = setting("LONGHAUL_NEAR_FULL", 95, float)
 IDLE_MOVE = setting("LONGHAUL_IDLE_MOVE_SECONDS", 120, float)
-# In "ask", how long the terminal's question before an early move waits for
-# an answer (Claude is closed meanwhile); with none, the conversation
-# reopens where it was.
-EARLY_ASK = setting("LONGHAUL_EARLY_ASK_SECONDS", 300, float)
 
 
 def windows(reading, now: float):
@@ -1374,8 +1370,8 @@ def countdown(seconds: int, text: str) -> bool:
 # switch_mid_session). The owner's decision record on switching without a
 # terminal says why (not shipped).
 SWITCH_MODES = {
-    "ask": "at a limit, and before an early move, longhaul asks in its terminal before it moves a conversation to "
-           "another account",
+    "ask": "at a limit, longhaul asks in its terminal before it moves a conversation to another account; it never "
+           "moves one early",
     "auto": "longhaul moves a conversation to another account at a limit, and early when one is nearly full",
     "never": "longhaul waits for the reset and never moves a conversation to another account",
 }
@@ -1436,18 +1432,6 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                     f"longhaul waits and carries on with {here} at {clock(resets_at)}", resets_at,
                     f"move to {there}", f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}?",
                     f"No answer by the reset, so longhaul carries on with {here}.")
-
-
-def ask_early_move(here: str, used: float, there: str, until: float) -> str:
-    """In "ask", before an early move (Watch.should_move(): `here` nearly
-    full, at `used`%, and Claude idle, so closed to ask; the ask-first plan
-    of 2026-10-29, A4): ask_here()'s answer to moving this conversation to
-    `there`, asked until `until`; with none it reopens on `here`."""
-    return ask_here(f"{here} is at {used:g}% of its allowance, and this conversation is idle. Move it to {there} now?",
-                    f"y: move to {there}, n: stay on {here}, q: stop",
-                    f"longhaul reopens it on {here} at {clock(until)}", until, f"move early to {there}",
-                    f"{here} is at {used:g}% of its allowance. Answer in longhaul's terminal: move this conversation "
-                    f"to {there}?", f"No answer, so longhaul reopens this conversation on {here}.")
 
 
 def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, there: str) -> str:
@@ -1961,13 +1945,11 @@ def run(opts) -> int:
     # its id before the launch, or as Claude names it (claim()) for -c, the
     # picker and a /clear: `allowing` holds the accounts a yes was for,
     # `allowed_ids` the ids recorded. `carry` is the limit waited out last
-    # (account, kind), for the carry-on after such a yes. And "ask" asks
-    # before an early move; a no is not asked again of that account until
-    # its full windows reset (`declined`).
+    # (account, kind), for the carry-on after such a yes. "ask" never moves
+    # early here (the owner, 2026-10-29): it asks at the limit.
     kept_here = [a["name"] for a in accounts if covers(a, top)]
     allowing: set[str] = set()
     allowed_ids: set[str] = set()
-    declined: dict[str, float] = {}
     carry, new_id = None, None
 
     def stopped() -> int:
@@ -2147,9 +2129,6 @@ def run(opts) -> int:
                        and st["limited_until"].get(a["name"], 0) <= now
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
-        def early(here=acct["name"]) -> bool:
-            return declined.get(here, 0) <= time.time() and other_has_room()
-
         def claim(sid: str, here=acct["name"]) -> bool:
             """guard()'s lock on the conversation Claude names; on an account
             a yes allowed this conversation on in this kept folder, that id
@@ -2163,13 +2142,12 @@ def run(opts) -> int:
             return guard(sid, later)
 
         try:
-            # The early move to an account with room: in "auto" at once; in
-            # "ask" after a yes in this terminal (A4), so only with one to
-            # answer in: Claude is closed to ask, and without a terminal it
-            # would be closed and reopened for nothing.
-            room = (other_has_room if mode == "auto" else early if mode == "ask" and terminal_fd() is not None
-                    else (lambda: False))
-            why = supervise(proc, w, room, may_reconnect, claim=claim)
+            # The early move to an account with room happens in "auto" only:
+            # to ask, the terminal would close Claude first, and a chat
+            # followed from a phone would be gone while it waited (the owner,
+            # 2026-10-29: in "ask", ask at the limit and never early here).
+            why = supervise(proc, w, other_has_room if mode == "auto" else (lambda: False), may_reconnect,
+                            claim=claim)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -2254,37 +2232,17 @@ def run(opts) -> int:
                 log(msg)  # the wait at the top of the loop says it, with the time
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
-            # carry on, and your next message goes to the new account.
+            # carry on, and your next message goes to the new account. Only
+            # "auto" moves early (the supervise() call above).
             prompt = None
-            reading = readings(accounts).get(acct["name"])
-            used = max((u for u, _ in windows(reading, time.time())), default=0)
-            nxt, wait = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
-                             seen=readings(accounts))
-            there = accounts[nxt]["name"]
-            # In "ask" the question first; an account signed in as someone
-            # else, or no account with room by now, is never offered.
-            answer = "yes" if mode == "auto" else "no"
-            if mode == "ask" and nxt != idx and not wait and signed_in_as_expected(accounts[nxt]):
-                answer = ask_early_move(acct["name"], used, there, time.time() + EARLY_ASK)
-            if answer == "stop":
-                return stopped()
-            if mode == "auto":
-                msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
-                       f"longhaul moved it to {there}.")
-                say(msg)
-                notify(msg)
-                idx = nxt
-            elif answer == "yes":
-                msg = f"Moving to {there}: reopening this conversation there."
-                idx, stay = nxt, there
-                say(msg)
-                notify(msg)
-            else:
-                # Not asked again of this account until the windows that
-                # make it nearly full reset; its limit asks as ever.
-                declined[acct["name"]] = max((r for u, r in windows(reading, time.time()) if u >= NEAR_FULL),
-                                             default=time.time() + EARLY_ASK)
-                say(f"Staying on {acct['name']}: reopening this conversation there; longhaul asks again at its limit.")
+            used = max((u for u, _ in windows(readings(accounts).get(acct["name"]), time.time())), default=0)
+            nxt, _ = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
+                          seen=readings(accounts))
+            msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
+                   f"longhaul moved it to {accounts[nxt]['name']}.")
+            say(msg)
+            notify(msg)
+            idx = nxt
         elif why == "reconnect":
             prompt = None
             reconnects.append(time.time())
