@@ -81,8 +81,9 @@ Usage:
   longhaul -- --model opus      anything after -- goes to claude on every launch
   longhaul add                  a new account, guided: it asks for each part and
                           explains it, then signs it in (in a terminal)
-  longhaul add NAME EMAIL [--repo PATH]...
-                          the same in one line: its own folder, one browser
+  longhaul add NAME EMAIL [--dir DIR] [--repo PATH]...
+                          the same in one line: its own folder (--dir: another
+                          than ~/.claude-NAME), one browser
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
@@ -107,8 +108,10 @@ Usage:
                           (on), or its own sign-in again (off); it edits VS
                           Code's settings for you, a copy kept, on after a yes
                           in a terminal (--yes: without asking)
-  longhaul setup [NAME]         sign each account in to its own folder (a browser
-                          sign-in); only the emails in accounts.json count. It
+  longhaul setup [NAME] [--relogin]
+                          sign each account in to its own folder (a browser
+                          sign-in; --relogin: again, even if signed in); only
+                          the emails in accounts.json count. It
                           sets up the `longhaul` command too: run from the
                           installed plugin (the line `longhaul doctor` gives),
                           it writes ~/.local/bin/longhaul, a launcher that runs
@@ -118,7 +121,8 @@ Usage:
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
                           the status line, the VS Code panel, the accounts, the
-                          chats running now, the code maps and the features; it
+                          chats running now, the code maps, the features, the
+                          hooks and their time, and Codex if it is there; it
                           only reads (/longhaul:doctor runs it in a chat)
   longhaul usage [--days N]     each account's allowance; work per task and account
   longhaul inspect [ID|PATH] [--json]
@@ -174,8 +178,8 @@ Usage:
   longhaul checkpoint save [ID] [--file PATH]
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
-                          private under LONGHAUL_HOME/checkpoints; 8,000 bytes in
-                          all. The /longhaul:checkpoint skill writes the file
+                          private under LONGHAUL_HOME/checkpoints; 16,000 bytes
+                          in all. The /longhaul:checkpoint skill writes the file
                           there as <ID>.state.json, removed once read, saved or
                           refused
   longhaul checkpoint           the plugin's SessionStart hook: puts that state back
@@ -14587,7 +14591,7 @@ def hook_row_said(row: dict) -> str:
     elif runs:
         said += ", none timed"
     if hook_over(row):
-        said += f": over ADR-0004's {HOOK_BUDGET_MS} ms"
+        said += f": over its {HOOK_BUDGET_MS} ms budget"
     stopped = [f"{row[k]:,} {what}" for k, what in (("timed_out", "timed out"), ("cancelled", "cancelled")) if row[k]]
     return said + (f"; {', '.join(stopped)}" if stopped else "")
 
@@ -14647,14 +14651,14 @@ def doctor_hooks(cwd=None) -> dict:
         items.append((None, f"times: Longhaul's own in the newest chat here, {name}, as Claude Code recorded them (a "
                             f"run that prints nothing has none); {how} shows every hook's", None))
         repo = plugin_repository()
-        step = (f"Longhaul's own hooks should take under {HOOK_BUDGET_MS} ms each (ADR-0004): if `longhaul inspect` "
+        step = (f"Longhaul's own hooks should take under {HOOK_BUDGET_MS} ms each: if `longhaul inspect` "
                 "shows it over in the next chat too, report it at "
                 + (f"https://github.com/{repo}/issues" if repo else "Longhaul's repository"))
         for r in rows:
             over = hook_over(r)
             items.append(("warn" if over else "ok" if r["timed"] >= HOOK_BUDGET_RUNS else None,
                           f"{r['source']} on {r['event']}: {hook_times_said(r)}, of {r['timed']:,} timed "
-                          f"run{'s' * (r['timed'] != 1)}" + (f": over ADR-0004's {HOOK_BUDGET_MS} ms" if over else ""),
+                          f"run{'s' * (r['timed'] != 1)}" + (f": over its {HOOK_BUDGET_MS} ms budget" if over else ""),
                           step if over else None))
     total = len(found["hooks"])
     said = (f"{total} hook{'s' * (total != 1)} on {len(counts)} event{'s' * (len(counts) != 1)}, from "

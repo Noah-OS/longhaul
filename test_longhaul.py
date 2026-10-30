@@ -4268,7 +4268,7 @@ class Inspect(unittest.TestCase):
                 "was stopped and every Stop hook's, by event and where the hook is configured now]")
         self.assertEqual(out[out.index(head) + 1:out.index(head) + 5], [
             "  UserPromptSubmit, user settings: 2 runs, median 2,000 ms, longest 2,400 ms; 1 timed out, 1 cancelled",
-            "  PreToolUse, longhaul guard: 4 runs, median 130 ms, longest 150 ms: over ADR-0004's 100 ms",
+            "  PreToolUse, longhaul guard: 4 runs, median 130 ms, longest 150 ms: over its 100 ms budget",
             "  Stop, project settings: 2 runs, 1 timed: median 149 ms, longest 149 ms",
             "  Stop, not configured now: 1 run, median 20 ms, longest 20 ms"])
         self.assertLess(out.index(head), out.index("Failures [transcript, counted]"))
@@ -22009,11 +22009,11 @@ class HookBudget(unittest.TestCase):
         at = c["items"].index((None, "times: Longhaul's own in the newest chat here, new, as Claude Code recorded them "
                                      "(a run that prints nothing has none); `longhaul inspect new` shows every hook's",
                                None))
-        step = (f"Longhaul's own hooks should take under 100 ms each (ADR-0004): if `longhaul inspect` shows it over "
+        step = (f"Longhaul's own hooks should take under 100 ms each: if `longhaul inspect` shows it over "
                 f"in the next chat too, report it at https://github.com/{longhaul.plugin_repository()}/issues")
         self.assertEqual(c["items"][at + 1:], [
             ("warn", "longhaul checkpoint on SessionStart: median 130 ms, longest 140 ms, of 3 timed runs: over "
-                     "ADR-0004's 100 ms", step),
+                     "its 100 ms budget", step),
             ("ok", "longhaul guard on PreToolUse: median 95 ms, longest 3,000 ms, of 5 timed runs", None)])
         self.assertEqual(c["step"], step)
         self.assertNotIn(self.SECRET, json.dumps(c))
