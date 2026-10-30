@@ -4566,8 +4566,9 @@ class CodexPackaging(unittest.TestCase):
                 self.assertIn("`../../bin/longhaul`", body)
                 self.assertEqual((self.SKILLS / name / "../../bin/longhaul").resolve(), HERE / "bin" / "longhaul")
                 self.assertIn("relative to the folder this SKILL.md is in", " ".join(body.split()))
-        # Claude Code's own skills stay where its manifest's default reads them.
-        self.assertEqual(sorted(p.name for p in (HERE / "skills").iterdir()), ["checkpoint", "doctor", "inspect"])
+        # Claude Code's own skills stay where its manifest's default reads them;
+        # manage (the chat-commands plan, 2026-10-30) is Claude Code's alone.
+        self.assertEqual(sorted(p.name for p in (HERE / "skills").iterdir()), ["checkpoint", "doctor", "inspect", "manage"])
 
     def run_skill(self, name, command, stdin=None, **extra):
         """`command` as the model runs it: the shim by the skill folder's
@@ -4720,6 +4721,9 @@ class Plugin(unittest.TestCase):
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
                      "CHANGELOG.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
+                     # Claude Code's skills.
+                     "skills/checkpoint/SKILL.md", "skills/doctor/SKILL.md", "skills/inspect/SKILL.md",
+                     "skills/manage/SKILL.md",
                      # The Codex layer (X4): its manifest, hooks file and skills.
                      ".codex-plugin/plugin.json", "hooks/codex-hooks.json", "codex-skills/checkpoint/SKILL.md",
                      "codex-skills/inspect/SKILL.md", "codex-skills/doctor/SKILL.md",
@@ -11345,13 +11349,25 @@ class Shim(unittest.TestCase):
         # A terminal's environment (the suite runs from inside a session too).
         self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         # Every data path in scratch: `usage` and `inspect` read the config
-        # folder, which must never be the real one (review, Sprint 3).
+        # folder, which must never be the real one (review, Sprint 3). Since
+        # the setup commands run from here (the owner, 2026-10-30) HOME and
+        # VS Code's settings are scratch too: the filter above drops the
+        # suite's own LONGHAUL_VSCODE_SETTINGS with the other LONGHAUL_ ones.
         self.env.update(LONGHAUL_HOME=str(self.tmp / "home"), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
-                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        HOME=str(self.tmp), LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode" / "settings.json"))
 
     def shim(self, *args, input=None, **env):
         return subprocess.run([str(HERE / "bin" / "longhaul"), *args], input=input, capture_output=True, text=True,
                               env={**self.env, **env}, timeout=30)
+
+    def chat(self, *args, **env):
+        """The shim as a chat's Bash tool runs it: inside a Claude Code
+        session (its variables set, its account's folder the scratch one),
+        no terminal, an empty stdin, the stand-in claude for any sign-in."""
+        return self.shim(*args, input="", CLAUDECODE="1", CLAUDE_CODE_ENTRYPOINT="claude-vscode",
+                         CLAUDE_CODE_SESSION_ID="s1", CLAUDE_CONFIG_DIR=str(self.tmp / "claude"),
+                         LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), **env)
 
     def test_the_shim_runs_the_read_only_commands_of_the_checkout_it_sits_in(self):
         out = self.shim("-h")
@@ -11365,17 +11381,188 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("Allowance", out.stdout)
 
-    def test_the_shim_refuses_the_supervisor_and_anything_that_changes_state(self):
+    def test_the_shim_refuses_the_supervisor_and_the_hooks(self):
         # From the Bash tool a plain `longhaul` would start a second claude
-        # under a session, with Remote Control and caffeinate.
-        for args in ((), ("-c",), ("-r", "x"), ("setup",), ("add", "A", "a@b"), ("remove", "A"), ("clear",),
-                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto")):
-            out = self.shim(*args)
+        # under a session, with Remote Control and caffeinate; pipe and wrap
+        # start one too, and the hooks are the engine's. Bare `statusline`
+        # is the status line Claude Code runs itself.
+        for args in ((), ("-c",), ("-r", "x"), ("--account", "Max"), ("--name", "x"), ("--no-rc",), ("--first", "f"),
+                     ("--switch", "auto"), ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",),
+                     ("account-check",), ("session-end",), ("filter",), ("models-hook",), ("trial", "status")):
+            out = self.chat(*args)
             self.assertEqual(out.returncode, 2, args)
             self.assertIn("run it in a terminal", out.stderr, args)
             self.assertEqual(out.stdout, "", args)
         self.assertIn("nothing to run", self.shim().stderr)
+        self.assertIn("starts a Claude of its own, or it is a hook", self.shim("wrap").stderr)
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
+    def test_the_shim_lets_each_setup_command_through_in_its_own_forms_alone(self):
+        # The owner, 2026-10-30 (the chat-commands plan, C2): each with the
+        # arguments it needs and no more. A bare `add` is the guided form,
+        # which waits for typed answers; `setup` without a NAME signs in
+        # every account at once; where a command asks in a terminal, the
+        # chat's --yes stands for the user's yes in the chat.
+        refused = {
+            ("add", "`add NAME EMAIL [--dir DIR] [--repo PATH]...`"): (
+                ("add",), ("add", "A"), ("add", "-h", "a@example.com"), ("add", "A", "--repo"), ("add", "A", "a@b", "x"),
+                ("add", "A", "a@b", "--repo"), ("add", "A", "a@b", "--force", "x"), ("add", "--repo", "/x", "A", "a@b"),
+                ("add", "A", "a@b", "--dir=x")),
+            ("setup", "`setup NAME [--relogin]`"): (("setup",), ("setup", "--relogin"), ("setup", "Max", "-h"),
+                                         ("setup", "Max", "Pro"), ("setup", "Max", "--relogin", "x")),
+            ("remove", "`remove NAME`"): (("remove",), ("remove", "-h"), ("remove", "A", "B")),
+            ("switch", "`switch [ask|auto|never]`"): (("switch", "sometimes"), ("switch", "-h"), ("switch", "auto", "never")),
+            ("vscode", "`vscode on --yes` or `vscode off`"): (("vscode",), ("vscode", "on"), ("vscode", "--yes", "on"),
+                                                   ("vscode", "off", "x"), ("vscode", "--yes")),
+            ("statusline", "`statusline install --yes` or `statusline uninstall`"): (
+                ("statusline", "install"), ("statusline", "install", "--yes", "x"), ("statusline", "--yes", "install"),
+                ("statusline", "uninstall", "x")),
+            ("update", "`update [status]`, `update on --yes` or `update off --yes`"): (
+                ("update", "on"), ("update", "off"), ("update", "--yes"), ("update", "status", "--yes"),
+                ("update", "on", "--yes", "x"), ("update", "-h")),
+            ("clear", "`clear` with nothing after it"): (("clear", "x"), ("clear", "-h")),
+            ("uninstall", "`uninstall --dry-run [--purge]` or `uninstall --yes [--purge]`"): (
+                ("uninstall",), ("uninstall", "--purge"), ("uninstall", "--purge", "--yes"),
+                ("uninstall", "--dry-run", "--yes"), ("uninstall", "--yes", "--purge", "x"), ("uninstall", "-h")),
+        }
+        for (command, forms), cases in refused.items():
+            for args in cases:
+                out = self.chat(*args)
+                self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+                self.assertIn(f"longhaul: from here `{command}` runs only as {forms}", out.stderr, args)
+                self.assertIn("run it in a terminal", out.stderr, args)
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+        self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
+        self.assertFalse((self.tmp / "vscode").exists(), "nor of VS Code's")
+        # Each form that runs reaches longhaul itself: its own answer, never the shim's.
+        for args, said in ((("add", "bad name!", "a@example.com"), "a name is letters and digits"),
+                           (("add", "A", "not-an-email", "--dir", "/x", "--repo", "/y", "--repo", "/z"),
+                            "does not look like an email"),
+                           (("setup", "Max"), "no account called Max"), (("setup", "Max", "--relogin"), "no account called Max"),
+                           (("remove", "Max"), "no account called Max"), (("switch",), "Switching: ask (the default)"),
+                           (("models",), "Where it applies:"), (("update",), "Running here:"),
+                           (("update", "status"), "Running here:"),
+                           (("vscode", "on", "--yes"), "VS Code's user settings are not at ~/vscode/settings.json"),
+                           (("vscode", "off"), "VS Code's settings are not on this machine; nothing to change."),
+                           (("statusline", "install", "--yes"), "Not changed: the status line runs ~/.local/bin/longhaul"),
+                           (("statusline", "uninstall"), "Nothing to undo"),
+                           (("statusline", "uninstall", "--yes"), "Nothing to undo"),
+                           (("update", "on", "--yes"), "list of marketplaces is not at"),
+                           (("update", "off", "--yes"), "list of marketplaces is not at"),
+                           (("uninstall", "--dry-run"), "What stays:"), (("uninstall", "--dry-run", "--purge"), "What stays:")):
+            out = self.chat(*args)
+            self.assertNotIn("runs only as", out.stderr, args)
+            self.assertNotIn("does not run from inside a session", out.stderr, args)
+            self.assertNotIn("Traceback", out.stderr, args)
+            self.assertIn(said, out.stdout + out.stderr, args)
+        for runs in ("add NAME EMAIL", "setup NAME", "remove", "models", "switch", "vscode", "statusline install",
+                     "update", "clear", "uninstall"):
+            self.assertIn(runs, self.shim().stderr, "the refusal names what does run")
+            self.assertIn(runs, self.shim("nope").stderr)
+
+    def test_from_a_chat_the_account_commands_sign_in_through_the_browser_and_write_the_list(self):
+        # add NAME EMAIL and setup NAME --relogin run the browser sign-in
+        # (here the stand-in claude records it) with the session's variables
+        # dropped, as from a terminal; remove takes an account off the list.
+        team, pro = self.tmp / "team", self.tmp / "pro"
+        emails = json.dumps({str(team): "team@example.com", str(pro): "pro@example.com"})
+        out = self.chat("add", "Team", "team@example.com", "--dir", str(team), "--repo", str(self.tmp / "work"),
+                        FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        home = self.tmp / "home"
+        accounts = json.loads((home / "accounts.json").read_text())
+        self.assertEqual(accounts, [{"name": "Team", "config_dir": str(team), "email": "team@example.com",
+                                     "repositories": [str(self.tmp / "work")]}])
+        logins = [json.loads(l) for l in (home / "logins.jsonl").read_text().splitlines()]
+        self.assertEqual([(l["config"], l["args"]) for l in logins],
+                         [(str(team), ["auth", "login", "--email", "team@example.com"])], "the browser, the email filled in")
+        self.assertIn("Team: team@example.com (max)", out.stdout)
+        self.assertTrue((self.tmp / ".local" / "bin" / "longhaul").is_symlink(), "setup's command, in the scratch HOME")
+        out = self.chat("setup", "Team", "--relogin", FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(len((home / "logins.jsonl").read_text().splitlines()), 2, "signed in again")
+        out = self.chat("add", "Pro", "pro@example.com", "--dir", str(pro), FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out = self.chat("remove", "Pro")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual([a["name"] for a in json.loads((home / "accounts.json").read_text())], ["Team"])
+        self.assertTrue(pro.is_dir(), "its folder kept")
+
+    def test_from_a_chat_switch_models_and_clear_write_longhauls_own_config(self):
+        home = self.tmp / "home"
+        out = self.chat("switch", "auto")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Switching: auto (saved in ~/home/config.json)", self.chat("switch").stdout)
+        out = self.chat("models", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.chat("models", "cap", "sonnet").returncode, 0)
+        self.assertEqual(self.chat("models", "implementer", "sonnet").returncode, 0)
+        self.assertEqual(json.loads((home / "config.json").read_text()),
+                         {"switch": "auto", "models": "off", "models_cap": "sonnet", "subagents": {"implementer": "sonnet"}})
+        self.assertEqual(self.chat("models", "bogus", "x").returncode, 2, "longhaul's own refusal")
+        (home / "state.json").write_text(json.dumps({"limited_until": {"Max": time.time() + 3600}}))
+        out = self.chat("clear")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("forgot the recorded limits", out.stdout)
+        self.assertEqual(json.loads((home / "state.json").read_text())["limited_until"], {})
+
+    def test_from_a_chat_vscode_statusline_and_update_edit_the_scratch_settings_a_copy_kept(self):
+        settings = self.tmp / "vscode" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{\n    "a": 1\n}\n')
+        out = self.chat("vscode", "on", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text())["claudeCode.claudeProcessWrapper"],
+                         str((HERE / "longhaul-vscode").resolve()))
+        self.assertIn("Developer: Reload Window", out.stdout)
+        out = self.chat("vscode", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1})
+        # The status line: the terminal command a fake at the scratch
+        # ~/.local/bin/longhaul, the chat's settings.json the scratch one.
+        launcher = self.tmp / ".local" / "bin" / "longhaul"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('#!/bin/sh\n[ "$1" = statusline ] || exit 9\ncat >/dev/null\necho main\n')
+        launcher.chmod(0o755)
+        claude = self.tmp / "claude"
+        claude.mkdir()
+        mine = {"type": "command", "command": "~/bin/my-status"}
+        (claude / "settings.json").write_text(json.dumps({"theme": "dark", "statusLine": mine}))
+        out = self.chat("statusline", "install", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads((claude / "settings.json").read_text())["statusLine"]["command"],
+                         "~/.local/bin/longhaul statusline")
+        out = self.chat("statusline", "uninstall")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads((claude / "settings.json").read_text()), {"theme": "dark", "statusLine": mine})
+        # Claude Code's auto-update for Longhaul's marketplace.
+        (claude / "plugins").mkdir()
+        markets = claude / "plugins" / "known_marketplaces.json"
+        markets.write_text(json.dumps({"longhaul": {"source": {"source": "github", "repo": "example/longhaul"},
+                                                    "autoUpdate": False}}))
+        out = self.chat("update", "on", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIs(json.loads(markets.read_text())["longhaul"]["autoUpdate"], True)
+        self.assertIn("Auto-update: on for Longhaul's marketplace", self.chat("update", "status").stdout)
+        self.assertEqual(self.chat("update", "off", "--yes").returncode, 0)
+        self.assertIs(json.loads(markets.read_text())["longhaul"]["autoUpdate"], False)
+
+    def test_from_a_chat_uninstall_lists_then_removes_and_purges_the_scratch_home(self):
+        home, launcher = self.tmp / "home", self.tmp / ".local" / "bin" / "longhaul"
+        home.mkdir()
+        (home / "accounts.json").write_text("[]")
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(HERE / "longhaul.py")  # setup's link
+        out = self.chat("uninstall", "--dry-run", "--purge")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Longhaul would remove:", out.stdout)
+        self.assertIn("~/.local/bin/longhaul", out.stdout)
+        self.assertTrue(launcher.is_symlink() and (home / "accounts.json").exists(), "only listed")
+        out = self.chat("uninstall", "--yes", "--purge")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(os.path.lexists(launcher))
+        self.assertFalse(home.exists(), "--purge took ~/.longhaul's stand-in")
+        self.assertIn("What stays:", out.stdout)
 
     def test_the_shim_runs_allow(self):
         # The ask-first plan's decision 2 (the owner, 2026-10-29): a chat refused
@@ -11405,18 +11592,6 @@ class Shim(unittest.TestCase):
         self.assertFalse((self.tmp / "home" / "advisor").exists(), "nothing was written")
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
-
-    def test_the_shim_refuses_update_whose_on_and_off_edit_claude_codes_own_files(self):
-        # 2026-10-25: `longhaul update on|off` edits Claude Code's list of
-        # marketplaces; `update status` is read-only, but ADR-0001's decision 5
-        # lists what the shim admits, and each addition was the owner's, so it
-        # stays in a terminal until the owner adds it.
-        for args in (("update",), ("update", "status"), ("update", "on"), ("update", "on", "--yes"), ("update", "off")):
-            out = self.shim(*args)
-            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
-            self.assertIn("run it in a terminal", out.stderr, args)
-        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
-        self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
 
     def test_the_shim_runs_doctor_which_only_reads(self):
         # The owner, 2026-10-25 ("Doctor + first-chat line"): /longhaul:doctor
@@ -12281,6 +12456,94 @@ class CheckpointSkill(unittest.TestCase):
         self.assertTrue(all(state[key] for key in longhaul.CHECKPOINT_MORE), "the example shows each new list in use")
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/checkpoint/SKILL.md"], cwd=HERE).returncode, 1)
+
+
+class ManageSkill(unittest.TestCase):
+    """/longhaul:manage (C3 of the chat-commands plan; the owner,
+    2026-10-30, "every terminal action from the VS Code chat"): the one
+    place that lists the setup actions a chat may take, each with its exact
+    command, and the rule that Claude asks first, in the chat, for each one
+    that changes something."""
+
+    ROOT = "${CLAUDE_PLUGIN_ROOT}/bin/longhaul"
+    # The forms that only read: the only ones the skill's rule may approve by itself.
+    READS = ("status", "switch", "models", "update status", "uninstall --dry-run")
+
+    def skill(self):
+        text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        return text, head, body
+
+    def commands(self, body):
+        """Each command the body names by the shim's full path, its words after it."""
+        return [c[len(self.ROOT):].split() for c in re.findall(r"`([^`]+)`", body) if c.startswith(self.ROOT + " ")]
+
+    def through_the_shim(self, words):
+        """The shim given `words`, a stand-in python3 first on PATH that only
+        says what it was handed: whether the shim lets them through, and
+        nothing of Longhaul's runs."""
+        fake = Path(tempfile.mkdtemp())
+        (fake / "python3").write_text('#!/bin/sh\nshift\necho "ran $*"\n')
+        (fake / "python3").chmod(0o755)
+        return subprocess.run([str(HERE / "bin" / "longhaul"), *words], capture_output=True, text=True, timeout=30,
+                              env={"PATH": f"{fake}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(fake)})
+
+    def test_the_description_is_short_and_the_rule_approves_only_what_reads(self):
+        _, head, _ = self.skill()
+        self.assertIn("name: manage\n", head)
+        [description] = re.findall(r'(?m)^description: "(.+)"$', head)
+        # The description loads in every chat until the skill is used: a few dozen tokens.
+        self.assertLessEqual(len(description), 240, description)
+        self.assertLessEqual(len(re.findall(r"[.!?](?:\s|$)", description)), 2, "one or two sentences")
+        self.assertIn("yes", description, "it says the user decides")
+        [tools] = [line for line in head.splitlines() if line.startswith("allowed-tools:")]
+        rules = re.findall(r"Bash\(([^)]*)\)", tools)
+        self.assertEqual(tools, "allowed-tools: " + " ".join(f"Bash({r})" for r in rules), "Bash rules alone")
+        self.assertEqual(sorted(rules), sorted(f"{self.ROOT} {form}" for form in self.READS),
+                         "exact read-only forms only, so Claude Code's own prompt shows for every change too")
+        self.assertNotIn("*", tools)
+
+    def test_the_body_asks_first_names_what_purge_deletes_and_each_actions_exact_command(self):
+        _, _, body = self.skill()
+        flat = " ".join(body.split())
+        for rule in ("show the user the exact command", "say in plain words what it changes",
+                     "run it only after their yes in this chat", "not enough",
+                     "approves Bash by itself"):
+            self.assertIn(rule, flat)
+        self.assertIn("say first that it deletes ~/.longhaul: the checkpoints, the usage ledger and the accounts list",
+                      flat)
+        self.assertIn("Cmd+Shift+P, then Developer: Reload Window", flat, "after vscode on or off")
+        self.assertIn("the sign-in opens in the browser", flat)
+        self.assertIn("with that account's email", flat)
+        self.assertIn("Never ask for a password, a code or a token in the chat", flat)
+        for terminal_only in ("`longhaul trial ...`", "`longhaul advisor record-probe`", "`longhaul`, `-c`, `-r`"):
+            self.assertIn(terminal_only, flat)
+        named = {" ".join(words) for words in self.commands(body)}
+        for action in ("status", "add NAME EMAIL", "setup NAME --relogin", "setup NAME", "remove NAME", "switch",
+                       "switch MODE", "models", "models MODE", "models cap MODEL", "models TYPE MODEL", "vscode on --yes",
+                       "vscode off", "statusline install --yes", "statusline uninstall", "update status",
+                       "update on --yes", "update off --yes", "clear", "uninstall --dry-run", "uninstall --dry-run --purge",
+                       "uninstall --yes", "uninstall --yes --purge"):
+            self.assertIn(action, named)
+        self.assertNotIn("bin/longhaul trial", body)
+        self.assertNotIn("record-probe", " ".join(" ".join(w) for w in self.commands(body)))
+
+    def test_every_command_it_names_is_one_the_shim_lets_through_and_the_terminal_ones_are_not(self):
+        _, _, body = self.skill()
+        values = {"NAME": "Work", "EMAIL": "work@example.com", "MODEL": "sonnet", "TYPE": "implementer"}
+        for words in self.commands(body):
+            words = [values.get(w, w) for w in words]
+            words = [("auto" if words[0] == "switch" else "off") if w == "MODE" else w for w in words]
+            out = self.through_the_shim(words)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), words)
+            self.assertTrue(out.stdout.startswith(f"ran {' '.join(words)}"), (words, out.stdout))
+        for words in (("trial", "status"), ("advisor", "record-probe", "x.json"), (), ("-c",), ("-r", "x")):
+            out = self.through_the_shim(words)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), words)
+
+    def test_the_skill_ships(self):
+        requires_git(self)
+        self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/manage/SKILL.md"], cwd=HERE).returncode, 1)
 
 
 class Reminder(unittest.TestCase):
@@ -17390,7 +17653,7 @@ class Models(unittest.TestCase):
             self.config(models_cap=cap)
             self.assertIsNone(self.routed(self.call(model="fable")), cap)
 
-    def test_the_hook_as_registered_lowers_the_model_and_the_shim_refuses_the_command(self):
+    def test_the_hook_as_registered_lowers_the_model_and_the_shim_runs_the_command(self):
         self.config(subagents={"implementer": "sonnet"}, models="on")
         env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         env.update(LONGHAUL_HOME=str(self.home), HOME=str(self.tmp / "user"), LONGHAUL_NO_NOTIFY="1")
@@ -17398,10 +17661,12 @@ class Models(unittest.TestCase):
         out = subprocess.run(cmd, input=json.dumps(self.call()), capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout)["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
-        shim = subprocess.run([str(HERE / "bin" / "longhaul"), "models", "on"], capture_output=True, text=True,
-                              env={**env, "CLAUDECODE": "1"}, timeout=30)
-        self.assertNotEqual(shim.returncode, 0)
-        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "on", "unchanged")
+        # The owner, 2026-10-30 (the chat-commands plan): `models` in any of
+        # its forms runs from a chat too, after the user's yes there.
+        shim = subprocess.run([str(HERE / "bin" / "longhaul"), "models", "off"], capture_output=True, text=True,
+                              env={**env, "CLAUDECODE": "1"}, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(shim.returncode, 0, shim.stderr)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "off")
 
 
 class CodexModels(unittest.TestCase):
@@ -19334,6 +19599,45 @@ class Accounts(unittest.TestCase):
         self.assertIn(f'"claudeCode.claudeProcessWrapper": "{wrapper}"', out.stdout, "the line to add by hand")
         self.assertEqual(settings.read_text(), "[1, 2]")
 
+    def test_longhaul_vscode_on_without_a_terminal_changes_nothing_unless_given_yes(self):
+        # The chat-commands plan (the owner, 2026-10-30): a chat runs `vscode
+        # on` after the user's yes in the chat, with no terminal to ask in,
+        # so --yes stands for that yes, as for statusline, update and
+        # uninstall; with neither, it once died on input()'s end of file.
+        settings = self.tmp / "vscode" / "settings.json"
+        settings.parent.mkdir()
+        wrapper = str((HERE / "longhaul-vscode").resolve())
+        settings.write_text('{\n    "a": 1\n}\n')
+        out = self.longhaul("vscode", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("Not changed: `longhaul vscode on` asks first, in a terminal, before it adds one line to "
+                      "~/vscode/settings.json; run it in one, or add --yes to do it without asking.", out.stdout)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual(settings.read_text(), '{\n    "a": 1\n}\n')
+        self.assertEqual(list(settings.parent.glob("settings.json.before-longhaul-*")), [], "no copy either")
+        out = self.longhaul("vscode", "on", "--yes", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1, "claudeCode.claudeProcessWrapper": wrapper})
+        self.assertIn("Developer: Reload Window", out.stdout)
+        [backup] = settings.parent.glob("settings.json.before-longhaul-*")
+        self.assertEqual(backup.read_text(), '{\n    "a": 1\n}\n')
+        backup.unlink()
+        # Another program in the setting is named, and replaced only with --yes.
+        settings.write_text('{\n    "claudeCode.claudeProcessWrapper": "/other/wrapper",\n    "a": 1\n}\n')
+        out = self.longhaul("vscode", "on", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("Not changed: VS Code's Claude panel runs /other/wrapper now; `longhaul vscode on` asks first, in a "
+                      "terminal, before it replaces it; run it in one, or add --yes to do it without asking.", out.stdout)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text())["claudeCode.claudeProcessWrapper"], "/other/wrapper")
+        out = self.longhaul("vscode", "on", "--yes", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1, "claudeCode.claudeProcessWrapper": wrapper})
+        # Off asks nothing, so it needs no --yes.
+        out = self.longhaul("vscode", "off", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1})
+        self.assertIn("longhaul vscode [on|off] [--yes]", longhaul.__doc__, "the Usage block names it")
+
     def test_the_settings_editor_keeps_what_vs_code_allows_and_refuses_what_it_cannot_read_back(self):
         key, value = "claudeCode.claudeProcessWrapper", "/x/longhaul-vscode"
         for text in ('{\n    "a": 1\n}\n', '{\n    "a": [1, 2,],\n}\n', '{"a": 1}', "{}", "{\n}\n",
@@ -19562,6 +19866,95 @@ class Accounts(unittest.TestCase):
                          "add writes back the list it read, and the field only when given")
         self.assertEqual(self.longhaul("remove", "Max").returncode, 0)
         self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
+
+
+class Switch(unittest.TestCase):
+    """`longhaul switch [ask|auto|never]` (C1 of the chat-commands plan; the
+    owner, 2026-10-30, "every terminal action from the VS Code chat"): the
+    switching mode in force and where it comes from, or one saved in
+    config.json as the guided add saves it, which only the guided add or
+    --switch could set before. Every path is scratch, HOME too."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.config = self.home / "config.json"
+        self.where = "~/home/config.json"  # LONGHAUL_HOME, shown from the scratch HOME
+
+    def switch(self, *args, **extra):
+        # No LONGHAUL_SWITCH unless a test gives one: the suite may run in a shell that sets it.
+        env = {k: v for k, v in os.environ.items() if k != "LONGHAUL_SWITCH"}
+        env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1", **extra)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "switch", *args], env=env, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+
+    def test_with_no_mode_it_shows_the_one_in_force_and_where_it_comes_from_and_writes_nothing(self):
+        out = self.switch()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(out.stdout.startswith(f"Switching: ask (the default): {longhaul.SWITCH_MODES['ask']}"), out.stdout)
+        self.assertIn("`longhaul switch ask|auto|never`", out.stdout, "how to change it")
+        self.assertFalse(self.home.exists(), "nothing written, the log included")
+        self.home.mkdir()
+        self.config.write_text(json.dumps({"switch": "auto", "models": "on"}))
+        out = self.switch()
+        self.assertTrue(out.stdout.startswith(f"Switching: auto (saved in {self.where}): "
+                                              f"{longhaul.SWITCH_MODES['auto']}"), out.stdout)
+        # The environment wins, as for a launch, and the saved one is named beside it.
+        out = self.switch(LONGHAUL_SWITCH="never")
+        self.assertTrue(out.stdout.startswith(f"Switching: never (set by LONGHAUL_SWITCH, over auto saved in {self.where}): "
+                                              f"{longhaul.SWITCH_MODES['never']}"), out.stdout)
+        self.config.write_text(json.dumps({"switch": "sometimes"}))  # not a mode: the default, as for a launch
+        self.assertTrue(self.switch().stdout.startswith("Switching: ask (the default)"))
+        out = self.switch(LONGHAUL_SWITCH="sometimes")
+        self.assertEqual(out.returncode, 2, "as status says it")
+        self.assertIn("Switching: invalid. LONGHAUL_SWITCH is 'sometimes'", out.stdout)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["config.json"], "still nothing written")
+
+    def test_with_a_mode_it_saves_it_as_the_guided_add_does_keeping_the_other_keys(self):
+        out = self.switch("never")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(self.config.read_text()), {"switch": "never"})
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600, "written whole, private, as write_json writes")
+        self.assertIn(f"Saved: switching at a usage limit is never, for the terminal and the VS Code panel, in {self.where}: "
+                      f"{longhaul.SWITCH_MODES['never']}.", out.stdout)
+        self.assertIn("--switch or LONGHAUL_SWITCH override it.", out.stdout)
+        self.config.write_text(json.dumps({"models": "on", "models_cap": "sonnet", "switch": "never"}))
+        self.assertEqual(self.switch("auto").returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text()), {"models": "on", "models_cap": "sonnet", "switch": "auto"})
+        self.assertTrue(self.switch().stdout.startswith(f"Switching: auto (saved in {self.where})"))
+        # What the launch and the panel read is what it saved.
+        with mock.patch.object(longhaul, "CONFIG", self.config), mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}):
+            self.assertEqual((longhaul.config_switch(), longhaul.switch_mode()), ("auto", "auto"))
+        # Ask in the panel stays put: it cannot ask there.
+        out = self.switch("ask")
+        self.assertIn(f"{longhaul.SWITCH_MODES['ask']}; the VS Code panel cannot ask, so there it stays put.", out.stdout)
+        # LONGHAUL_SWITCH still wins where it is set, and the line says so.
+        out = self.switch("auto", LONGHAUL_SWITCH="never")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(self.config.read_text())["switch"], "auto")
+        self.assertIn("LONGHAUL_SWITCH (never) is set here and still wins over it", out.stdout)
+        # Anything else is argparse's refusal, and nothing is written.
+        before = self.config.read_text()
+        out = self.switch("sometimes")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("invalid choice", out.stderr)
+        self.assertEqual(self.config.read_text(), before)
+        self.assertEqual(self.switch("auto", "never").returncode, 2, "one mode at most")
+
+    def test_a_config_json_that_is_not_an_object_is_written_over_with_the_mode(self):
+        # As guided_switching() writes it: what is not an object holds no other key to keep.
+        self.home.mkdir()
+        self.config.write_text("[1, 2]")
+        self.assertEqual(self.switch("auto").returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text()), {"switch": "auto"})
+
+    def test_the_usage_block_and_its_help_name_it(self):
+        self.assertIn("longhaul switch [ask|auto|never]", longhaul.__doc__)
+        out = self.switch("-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul switch [-h] [{ask,auto,never}]", out.stdout)
+        self.assertIn("LONGHAUL_SWITCH", out.stdout)
 
 
 class AccountCheck(unittest.TestCase):
