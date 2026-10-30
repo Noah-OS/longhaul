@@ -19564,6 +19564,95 @@ class Accounts(unittest.TestCase):
         self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
 
 
+class Switch(unittest.TestCase):
+    """`longhaul switch [ask|auto|never]` (C1 of the chat-commands plan; the
+    owner, 2026-10-30, "every terminal action from the VS Code chat"): the
+    switching mode in force and where it comes from, or one saved in
+    config.json as the guided add saves it, which only the guided add or
+    --switch could set before. Every path is scratch, HOME too."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.config = self.home / "config.json"
+        self.where = "~/home/config.json"  # LONGHAUL_HOME, shown from the scratch HOME
+
+    def switch(self, *args, **extra):
+        # No LONGHAUL_SWITCH unless a test gives one: the suite may run in a shell that sets it.
+        env = {k: v for k, v in os.environ.items() if k != "LONGHAUL_SWITCH"}
+        env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1", **extra)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "switch", *args], env=env, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+
+    def test_with_no_mode_it_shows_the_one_in_force_and_where_it_comes_from_and_writes_nothing(self):
+        out = self.switch()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(out.stdout.startswith(f"Switching: ask (the default): {longhaul.SWITCH_MODES['ask']}"), out.stdout)
+        self.assertIn("`longhaul switch ask|auto|never`", out.stdout, "how to change it")
+        self.assertFalse(self.home.exists(), "nothing written, the log included")
+        self.home.mkdir()
+        self.config.write_text(json.dumps({"switch": "auto", "models": "on"}))
+        out = self.switch()
+        self.assertTrue(out.stdout.startswith(f"Switching: auto (saved in {self.where}): "
+                                              f"{longhaul.SWITCH_MODES['auto']}"), out.stdout)
+        # The environment wins, as for a launch, and the saved one is named beside it.
+        out = self.switch(LONGHAUL_SWITCH="never")
+        self.assertTrue(out.stdout.startswith(f"Switching: never (set by LONGHAUL_SWITCH, over auto saved in {self.where}): "
+                                              f"{longhaul.SWITCH_MODES['never']}"), out.stdout)
+        self.config.write_text(json.dumps({"switch": "sometimes"}))  # not a mode: the default, as for a launch
+        self.assertTrue(self.switch().stdout.startswith("Switching: ask (the default)"))
+        out = self.switch(LONGHAUL_SWITCH="sometimes")
+        self.assertEqual(out.returncode, 2, "as status says it")
+        self.assertIn("Switching: invalid. LONGHAUL_SWITCH is 'sometimes'", out.stdout)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["config.json"], "still nothing written")
+
+    def test_with_a_mode_it_saves_it_as_the_guided_add_does_keeping_the_other_keys(self):
+        out = self.switch("never")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(self.config.read_text()), {"switch": "never"})
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600, "written whole, private, as write_json writes")
+        self.assertIn(f"Saved: switching at a usage limit is never, for the terminal and the VS Code panel, in {self.where}: "
+                      f"{longhaul.SWITCH_MODES['never']}.", out.stdout)
+        self.assertIn("--switch or LONGHAUL_SWITCH override it.", out.stdout)
+        self.config.write_text(json.dumps({"models": "on", "models_cap": "sonnet", "switch": "never"}))
+        self.assertEqual(self.switch("auto").returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text()), {"models": "on", "models_cap": "sonnet", "switch": "auto"})
+        self.assertTrue(self.switch().stdout.startswith(f"Switching: auto (saved in {self.where})"))
+        # What the launch and the panel read is what it saved.
+        with mock.patch.object(longhaul, "CONFIG", self.config), mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}):
+            self.assertEqual((longhaul.config_switch(), longhaul.switch_mode()), ("auto", "auto"))
+        # Ask in the panel stays put: it cannot ask there.
+        out = self.switch("ask")
+        self.assertIn(f"{longhaul.SWITCH_MODES['ask']}; the VS Code panel cannot ask, so there it stays put.", out.stdout)
+        # LONGHAUL_SWITCH still wins where it is set, and the line says so.
+        out = self.switch("auto", LONGHAUL_SWITCH="never")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(self.config.read_text())["switch"], "auto")
+        self.assertIn("LONGHAUL_SWITCH (never) is set here and still wins over it", out.stdout)
+        # Anything else is argparse's refusal, and nothing is written.
+        before = self.config.read_text()
+        out = self.switch("sometimes")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("invalid choice", out.stderr)
+        self.assertEqual(self.config.read_text(), before)
+        self.assertEqual(self.switch("auto", "never").returncode, 2, "one mode at most")
+
+    def test_a_config_json_that_is_not_an_object_is_written_over_with_the_mode(self):
+        # As guided_switching() writes it: what is not an object holds no other key to keep.
+        self.home.mkdir()
+        self.config.write_text("[1, 2]")
+        self.assertEqual(self.switch("auto").returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text()), {"switch": "auto"})
+
+    def test_the_usage_block_and_its_help_name_it(self):
+        self.assertIn("longhaul switch [ask|auto|never]", longhaul.__doc__)
+        out = self.switch("-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul switch [-h] [{ask,auto,never}]", out.stdout)
+        self.assertIn("LONGHAUL_SWITCH", out.stdout)
+
+
 class AccountCheck(unittest.TestCase):
     """`longhaul account-check`, a UserPromptSubmit hook (the owner's
     decision of 2026-10-25, "Stop the prompt"): two VS Code chats in ~/zain,

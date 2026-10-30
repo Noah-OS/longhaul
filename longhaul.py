@@ -86,6 +86,13 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
+  longhaul switch [ask|auto|never]
+                          the switching mode at a usage limit (see --switch):
+                          with none, the one in force and where it comes from
+                          (LONGHAUL_SWITCH, else ~/.longhaul/config.json, else
+                          ask); with one, saved in config.json for the terminal
+                          and the VS Code panel, as the guided add saves it;
+                          LONGHAUL_SWITCH and --switch still win over it
   longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]
                           Auto Model, subagents' models: guide (the default)
                           gives the main conversation a short guide at each
@@ -13184,6 +13191,38 @@ def guided_switching() -> None:
         + f", for the terminal and the VS Code panel, in {home_path(str(CONFIG))}. --switch or LONGHAUL_SWITCH override it.")
 
 
+def switch_cmd(opts) -> int:
+    """`longhaul switch [ask|auto|never]` (the owner, 2026-10-30: every
+    terminal action from the VS Code chat): with no mode, the one in force
+    and where it comes from, as status names it, writing nothing; with one,
+    saved in config.json as guided_switching() saves it, the other keys
+    kept, for the terminal and the panel alike. --switch and
+    LONGHAUL_SWITCH still win over it."""
+    env, saved, where = os.environ.get("LONGHAUL_SWITCH"), config_switch(), home_path(str(CONFIG))
+    if opts.mode is None:
+        try:
+            mode = switch_mode()
+        except ValueError as e:  # as status says it
+            print(f"Switching: invalid. {e}")
+            return 2
+        source = ("set by LONGHAUL_SWITCH" + (f", over {saved} saved in {where}" if saved else "") if env
+                  else f"saved in {where}" if saved else "the default")
+        print(f"Switching: {mode} ({source}): {switch_said(mode)}. `longhaul switch ask|auto|never` saves another.")
+        return 0
+    found = read_json(CONFIG)
+    write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": opts.mode})
+    say(f"Saved: switching at a usage limit is {opts.mode}, for the terminal and the VS Code panel, in {where}: "
+        f"{switch_said(opts.mode)}." + (f" LONGHAUL_SWITCH ({env}) is set here and still wins over it; unset it to "
+                                        "use the saved mode." if env else " --switch or LONGHAUL_SWITCH override it."))
+    return 0
+
+
+def switch_said(mode: str) -> str:
+    """What `mode` does, as SWITCH_MODES says it; ask says the panel too,
+    which cannot ask and so stays put."""
+    return SWITCH_MODES[mode] + ("; the VS Code panel cannot ask, so there it stays put" if mode == "ask" else "")
+
+
 VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
     HOME / "Library" / "Application Support" / "Code" / "User" / "settings.json" if sys.platform == "darwin"
     else HOME / ".config" / "Code" / "User" / "settings.json"))
@@ -13416,8 +13455,8 @@ def status(_opts) -> int:
                  else "ask (the default)" if not key else f"never ({key!r} in vscode.json is not a mode)")
         tail = (f"The VS Code panel moves a chat at a limit only in auto; it is {shown}, "
                 "unless VS Code was started with LONGHAUL_SWITCH set.")
-    print(f"Switching: {mode} ({source}): {SWITCH_MODES[mode]}. Change it with --switch ask|auto|never "
-          f"or LONGHAUL_SWITCH. {tail} longhaul pipe moves a session only when its driver passes --swap and the mode "
+    print(f"Switching: {mode} ({source}): {SWITCH_MODES[mode]}. Change it with `longhaul switch ask|auto|never`, "
+          f"--switch or LONGHAUL_SWITCH. {tail} longhaul pipe moves a session only when its driver passes --swap and the mode "
           "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never.")
     if settings_note():
         print(settings_note())
@@ -15136,7 +15175,7 @@ def main(argv: list[str]) -> int:
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow"):
+                            "models-hook", "allow", "switch"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -15204,6 +15243,11 @@ def main(argv: list[str]) -> int:
                            help="nothing: the mode, the guide, the cap and the table; guide (the default), on, off "
                                 "or trial: the mode; cap MODEL or cap off: the cap where the guide is given; "
                                 "TYPE MODEL: an agent type's model in the table (haiku, sonnet, opus, fable or keep)")
+        if cmd == "switch":
+            p.add_argument("mode", nargs="?", choices=list(SWITCH_MODES),
+                           help="ask, auto or never: saved in config.json, for the terminal and the VS Code panel "
+                                "(default: show the mode in force and where it comes from: LONGHAUL_SWITCH, else "
+                                "config.json, else ask); LONGHAUL_SWITCH and --switch still win over it")
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
@@ -15242,7 +15286,8 @@ def main(argv: list[str]) -> int:
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
-                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd}[cmd](opts)
+                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
+                "switch": switch_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
