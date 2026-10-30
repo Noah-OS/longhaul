@@ -77,7 +77,9 @@ plan = json.loads(plan_file.read_text())
 step = plan.pop(0) if plan else "exit"
 save_plan()
 
-sid = args[args.index("--resume") + 1] if "--resume" in args else "sid-1"
+# A new conversation is sid-1, or the id --session-id gives it, as Claude Code's is.
+sid = (args[args.index("--resume") + 1] if "--resume" in args
+       else args[args.index("--session-id") + 1] if "--session-id" in args else "sid-1")
 sessions = cfg / "sessions"
 sessions.mkdir(parents=True, exist_ok=True)
 transcript = cfg / "projects" / "-tmp-proj" / f"{sid}.jsonl"

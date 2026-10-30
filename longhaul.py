@@ -19,7 +19,11 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   `--switch never` always waits. Before Sprint 1 longhaul always moved without
   asking: that is now `--switch auto` (or LONGHAUL_SWITCH=auto). `longhaul pipe` and
   the VS Code panel cannot ask, so there "ask" acts as "never": they move
-  only in auto (an unattended move is never made without an explicit yes);
+  only in auto (an unattended move is never made without an explicit yes).
+  In "ask" this terminal asks too before an early move (an account nearly
+  full while Claude is idle), and, in a folder kept for accounts that are
+  all at their limit, before running the conversation on another account,
+  which allows the chat there (`longhaul allow`); no answer never moves it;
 - Remote Control lost while Claude sits idle: longhaul reopens the conversation,
   which connects it again (Claude Code reconnects short drops itself; this
   is for the ones it gives up on, after a VPN change or a long outage). A
@@ -207,8 +211,14 @@ Usage:
                           refuses each prompt of a chat on any other account (by
                           its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
                           is sent on the wrong one; whatever it cannot read lets
-                          the prompt through
-  longhaul session-end          the plugin's SessionEnd hook: keeps why the session
+                          the prompt through, and a chat allowed there goes through
+  longhaul allow ID [--account NAME]
+                          lets one chat's prompts through on its account (or NAME)
+                          in the folder it last ran in, where other accounts keep
+                          it, for 30 days (LONGHAUL_HOME/allowed.json); ID is the
+                          chat's id or its first 8 characters, as the refusal names
+                          it. In a terminal of your own, never from inside a chat
+  longhaul session-end         the plugin's SessionEnd hook: keeps why the session
                           ended (clear, resume, logout, prompt_input_exit or
                           other) and when, nothing else, so that a non-zero exit
                           after you closed the chat or signed out is no crash
@@ -743,6 +753,10 @@ def load_state() -> dict:
 # while idle.
 NEAR_FULL = setting("LONGHAUL_NEAR_FULL", 95, float)
 IDLE_MOVE = setting("LONGHAUL_IDLE_MOVE_SECONDS", 120, float)
+# In "ask", how long the terminal's question before an early move waits for
+# an answer (Claude is closed meanwhile); with none, the conversation
+# reopens where it was.
+EARLY_ASK = setting("LONGHAUL_EARLY_ASK_SECONDS", 300, float)
 
 
 def windows(reading, now: float):
@@ -1360,7 +1374,8 @@ def countdown(seconds: int, text: str) -> bool:
 # switch_mid_session). The owner's decision record on switching without a
 # terminal says why (not shipped).
 SWITCH_MODES = {
-    "ask": "at a limit longhaul asks in its terminal before it moves a conversation to another account",
+    "ask": "at a limit, and before an early move, longhaul asks in its terminal before it moves a conversation to "
+           "another account",
     "auto": "longhaul moves a conversation to another account at a limit, and early when one is nearly full",
     "never": "longhaul waits for the reset and never moves a conversation to another account",
 }
@@ -1402,35 +1417,84 @@ def switch_mode(flag: str | None = None) -> str:
     return mode
 
 
+def terminal_fd():
+    """This terminal's stdin, to ask in, or None: no terminal, or a closed stdin."""
+    try:
+        return sys.stdin.fileno() if sys.stdin is not None and sys.stdin.isatty() else None
+    except ValueError:  # a closed stdin
+        return None
+
+
 def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
-    """At a limit in "ask" mode: "yes" only for a y typed in this terminal
-    once longhaul has asked; "stop" for q or Ctrl+C; "no" for n or Enter, no
-    answer by the reset, no terminal, or a reset already past. Other keys
-    are ignored: an arrow key, or a terminal's focus report, starts with
-    ESC, and once stopped longhaul (review, Sprint 1). Keys typed while Claude
-    ran are thrown away first, so a stray y never moves the conversation."""
+    """At a limit in "ask" mode: ask_here()'s answer to moving this
+    conversation to `there`, asked until the reset; "no", unasked, for a
+    reset already past: no one could answer in time."""
     if resets_at <= time.time():  # no one could answer in time, so nothing is asked
         return "no"
-    question = (f"{here} hit its {kind} limit (resets {clock(resets_at)}). "
-                f"Move this conversation to {there} now?")
-    then = f"longhaul waits and carries on with {here} at {clock(resets_at)}"
-    try:
-        fd = sys.stdin.fileno() if sys.stdin is not None and sys.stdin.isatty() else None
-    except ValueError:  # a closed stdin
-        fd = None
+    return ask_here(f"{here} hit its {kind} limit (resets {clock(resets_at)}). Move this conversation to {there} now?",
+                    f"y: move to {there}, n: wait for {here}, q: stop",
+                    f"longhaul waits and carries on with {here} at {clock(resets_at)}", resets_at,
+                    f"move to {there}", f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}?",
+                    f"No answer by the reset, so longhaul carries on with {here}.")
+
+
+def ask_early_move(here: str, used: float, there: str, until: float) -> str:
+    """In "ask", before an early move (Watch.should_move(): `here` nearly
+    full, at `used`%, and Claude idle, so closed to ask; the ask-first plan
+    of 2026-10-29, A4): ask_here()'s answer to moving this conversation to
+    `there`, asked until `until`; with none it reopens on `here`."""
+    return ask_here(f"{here} is at {used:g}% of its allowance, and this conversation is idle. Move it to {there} now?",
+                    f"y: move to {there}, n: stay on {here}, q: stop",
+                    f"longhaul reopens it on {here} at {clock(until)}", until, f"move early to {there}",
+                    f"{here} is at {used:g}% of its allowance. Answer in longhaul's terminal: move this conversation "
+                    f"to {there}?", f"No answer, so longhaul reopens this conversation on {here}.")
+
+
+def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, there: str) -> str:
+    """In "ask", before waiting for `first` to reset at `resets_at` in a
+    folder, `where`, that `kept` keep, all at their limit (the ask-first
+    plan, A4): ask_here()'s answer to running this conversation on
+    `there`, an account allowed anywhere. "auto" never runs it there, so
+    nothing says to use it."""
+    one = len(kept) == 1
+    names = " and ".join(kept)
+    question = (f"The account{'' if one else 's'} kept for {where} ({names}) {'is' if one else 'are'} at "
+                f"{'its limit' if one else 'their limits'}. Run this conversation on {there} here?")
+    return ask_here(question, f"y: run on {there}, n: wait for {first}, q: stop",
+                    f"longhaul waits and carries on with {first} at {clock(resets_at)}", resets_at,
+                    f"run on {there} in {where}",
+                    f"{where} is kept for {names}, at {'its limit' if one else 'their limits'}. Answer in longhaul's "
+                    f"terminal: run this conversation on {there}?",
+                    f"No answer by the reset, so longhaul carries on with {first}.", auto=False)
+
+
+def ask_here(question: str, keys: str, then: str, until: float, about: str, notice: str, late: str,
+             auto: bool = True) -> str:
+    """Ask `question` in this terminal, `keys` naming the answers: "yes"
+    only for a y typed in this terminal once longhaul has asked; "stop" for
+    q or Ctrl+C; "no" for n or Enter, no answer by `until` (`late` is said
+    then), or no terminal (the question is said, and `then`: what longhaul
+    does instead). No answer never moves anything. Other keys are ignored:
+    an arrow key, or a terminal's focus report, starts with ESC, and once
+    stopped longhaul (review, Sprint 1). Keys typed while Claude ran are
+    thrown away first, so a stray y never moves the conversation. `about`
+    names the question in the log ("asked to <about>: yes"), `notice`
+    begins the notification; `auto`: whether --switch auto would do it
+    without asking, which a question no one can answer says."""
+    hint = " To move without asking, use --switch auto or LONGHAUL_SWITCH=auto." if auto else ""
+    fd = terminal_fd()
     if fd is None:
-        say(f"{question} There is no terminal to answer in, so {then}. "
-            "To move without asking, use --switch auto or LONGHAUL_SWITCH=auto.")
+        say(f"{question} There is no terminal to answer in, so {then}.{hint}")
         return "no"
     try:
-        notify(f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}? "
-               f"With no answer {then}. To move without asking, run longhaul --switch auto.")
+        notify(f"{notice} With no answer {then}." + (" To move without asking, run longhaul --switch auto." if auto
+                                                     else ""))
         old = termios.tcgetattr(fd)
     except KeyboardInterrupt:
         print()
         return "stop"
     except termios.error as e:
-        log(f"asked to move to {there}: the terminal cannot be read ({e!r})")
+        log(f"asked to {about}: the terminal cannot be read ({e!r})")
         say(f"{question} The terminal cannot be read, so {then}.")
         return "no"
     try:
@@ -1439,11 +1503,10 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
         # that wait never ended, and longhaul hung at the limit (Sprint 1).
         termios.tcflush(fd, termios.TCIFLUSH)
         tty.setcbreak(fd, termios.TCSANOW)
-        sys.stdout.write(f"\033[36mlonghaul\033[0m {question} (y: move to {there}, n: wait for {here}, q: stop). "
-                         f"With no answer {then}. ")
+        sys.stdout.write(f"\033[36mlonghaul\033[0m {question} ({keys}). With no answer {then}. ")
         sys.stdout.flush()
-        while time.time() < resets_at:
-            ready, _, _ = select.select([fd], [], [], min(1.0, max(0.0, resets_at - time.time())))
+        while time.time() < until:
+            ready, _, _ = select.select([fd], [], [], min(1.0, max(0.0, until - time.time())))
             if not ready:
                 continue
             try:
@@ -1454,31 +1517,31 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                 why = "end of input"
             if not key:  # the terminal went away: a closed one reads as empty for ever
                 print()
-                log(f"asked to move to {there}: no answer, the terminal is gone ({why})")
+                log(f"asked to {about}: no answer, the terminal is gone ({why})")
                 return "no"
             if key in (b"y", b"Y"):
                 print("y")
-                log(f"asked to move to {there}: yes")
+                log(f"asked to {about}: yes")
                 return "yes"
             if key in (b"q", b"Q", b"\x03"):
                 print()
-                log(f"asked to move to {there}: stop")
+                log(f"asked to {about}: stop")
                 return "stop"
             if key in (b"n", b"N", b"\r", b"\n"):
                 print("n")
-                log(f"asked to move to {there}: no")
+                log(f"asked to {about}: no")
                 return "no"
         print()
-        say(f"No answer by the reset, so longhaul carries on with {here}.")
-        notify(f"No answer by the reset, so longhaul carries on with {here}.")
+        say(late)
+        notify(late)
         return "no"
     except KeyboardInterrupt:
         print()
-        log(f"asked to move to {there}: stop (Ctrl+C)")
+        log(f"asked to {about}: stop (Ctrl+C)")
         return "stop"
     except termios.error as e:  # the terminal went away while longhaul set it up
         print()
-        log(f"asked to move to {there}: no answer, the terminal is gone ({e!r})")
+        log(f"asked to {about}: no answer, the terminal is gone ({e!r})")
         return "no"
     finally:
         with contextlib.suppress(termios.error):  # a terminal that went away cannot be set back
@@ -1767,6 +1830,17 @@ def first_message(path: str) -> str | None:
     return text
 
 
+def session_id_arg(args: list[str]):
+    """The id a --session-id among claude's arguments gives a new
+    conversation, or None."""
+    for i, a in enumerate(args):
+        if a.startswith("--session-id="):
+            return a.split("=", 1)[1]
+        if a == "--session-id" and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
 def run(opts) -> int:
     try:
         mode = switch_mode(getattr(opts, "switch", None))
@@ -1880,6 +1954,76 @@ def run(opts) -> int:
         return False
 
     forced = opts.account  # `--account` decides the first launch only
+    # The ask-first plan of 2026-10-29 (A4). In a folder some accounts keep
+    # (kept_here), "ask" asks before it waits for them all at their limit
+    # whether to run the conversation on an account allowed anywhere; a yes
+    # allows the chat there (allow_chat(), read by the account check), by
+    # its id before the launch, or as Claude names it (claim()) for -c, the
+    # picker and a /clear: `allowing` holds the accounts a yes was for,
+    # `allowed_ids` the ids recorded. `carry` is the limit waited out last
+    # (account, kind), for the carry-on after such a yes. And "ask" asks
+    # before an early move; a no is not asked again of that account until
+    # its full windows reset (`declined`).
+    kept_here = [a["name"] for a in accounts if covers(a, top)]
+    allowing: set[str] = set()
+    allowed_ids: set[str] = set()
+    declined: dict[str, float] = {}
+    carry, new_id = None, None
+
+    def stopped() -> int:
+        again = f" `longhaul -r {resume}` opens it again." if resume else ""
+        say(f"Stopped at your request. The conversation is saved.{again}")
+        return 0
+
+    def kept_offer(state: dict, seen: dict):
+        """In "ask", in a folder its accounts keep when every one of them is
+        at its limit: the index of an account allowed anywhere (never one
+        kept for other repositories), not at its limit and signed in as
+        expected, to offer; else None."""
+        now = time.time()
+        if mode != "ask" or not kept_here or any(state["limited_until"].get(n, 0) <= now for n in kept_here):
+            return None
+        skip = {a["name"] for a in accounts if a["name"] in kept_here or not account_allowed(a, top)}
+        while True:
+            i, until = pick(accounts, state, 0, skip=skip, seen=seen)
+            if i is None or until:
+                return None
+            if signed_in_as_expected(accounts[i]):
+                return i
+            skip.add(accounts[i]["name"])
+
+    def run_elsewhere(state: dict, seen: dict, first: str, resets_at: float):
+        """Before waiting for `first` to reset at `resets_at`: when
+        kept_offer() has an account, ask_kept_full()'s question, and on a
+        yes the chat allowed there and the index to launch on; "stop" for
+        q; None to wait as before (no, no answer, nothing to offer)."""
+        nonlocal new_id, prompt
+        i = kept_offer(state, seen)
+        if i is None:
+            return None
+        there, where = names[i], home_path(top)
+        answer = ask_kept_full(where, kept_here, first, resets_at, there)
+        if answer != "yes":
+            return "stop" if answer == "stop" else None
+        sid = resume or None
+        if resume is None and not cont and without_resume(opts.extra) == opts.extra:
+            sid = new_id = str(uuid.uuid4())  # a new conversation's id, chosen now: its first prompt is checked at once
+        elif not sid:
+            sid = session_id_arg(opts.extra)  # else claim() allows it once Claude names it
+        try:
+            if sid:
+                allow_chat(sid, there, top)
+                allowed_ids.add(sid)
+        except OSError as e:
+            say(f"could not allow this chat on {there} in {where} ({e.strerror or e}), so longhaul waits for {first}")
+            return None
+        allowing.add(there)
+        say(f"Running this conversation on {there}; this chat is allowed on it in {where} for {ALLOWED_DAYS} days, "
+            "so its prompts go through.")
+        if carry:
+            prompt = CARRY_ON.format(old=carry[0], kind=carry[1], new=there)
+        return i
+
     # In "ask" and "never" the conversation reopens on the account it was on,
     # whatever pick() would prefer: only a yes at a limit moves it. Before,
     # a reopen after a crash could land on another account unasked. A
@@ -1916,17 +2060,23 @@ def run(opts) -> int:
             # Within the margin too: a question unanswered until the reset
             # second otherwise reopened before the limit had lifted (review).
             resets = state["limited_until"].get(stay, 0)
-            if resets + RESET_MARGIN > time.time():
+            elsewhere = run_elsewhere(state, seen, stay, resets) if resets + RESET_MARGIN > time.time() else None
+            if elsewhere == "stop":
+                return stopped()
+            if elsewhere is not None:
+                idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
+            elif resets + RESET_MARGIN > time.time():
                 if not wait_until(resets + RESET_MARGIN,
                                   f"{stay} is at its limit, and with switching set to {mode} "
                                   "the conversation stays on it (or start it with --account NAME)"):
                     return 0
                 continue
-            if not signed_in_as_expected(accounts[names.index(stay)]):
+            elif not signed_in_as_expected(accounts[names.index(stay)]):
                 say(f"{stay} is not signed in as expected, and with switching set to {mode} longhaul does not move "
                     "the conversation by itself. Run `longhaul status`, then `longhaul setup`.")
                 return 1
-            idx, until, chosen = names.index(stay), None, True
+            else:
+                idx, until, chosen = names.index(stay), None, True
         elif forced:
             i, forced = names.index(forced), None
             resets = state["limited_until"].get(names[i], 0)
@@ -1949,10 +2099,15 @@ def run(opts) -> int:
             say(f"{which} is signed in as expected. Run `longhaul status`, then `longhaul setup`.")
             return 1
         if until:
-            which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
-            if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
-                return 0
-            continue
+            elsewhere = run_elsewhere(state, seen, names[idx], until)
+            if elsewhere == "stop":
+                return stopped()
+            if elsewhere is None:
+                which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
+                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
+                    return 0
+                continue
+            idx, forced, stay = elsewhere, None, (names[elsewhere] if mode != "auto" else None)
         acct = accounts[idx]
         prepare(acct)
 
@@ -1963,6 +2118,8 @@ def run(opts) -> int:
             cmd += ["--resume"]
         elif cont:
             cmd += ["--continue"]
+        elif new_id:
+            cmd += ["--session-id", new_id]
         if opts.rc:
             # On the phone two sessions from one folder would both read
             # "myproject · Max"; --name tells them apart.
@@ -1990,10 +2147,29 @@ def run(opts) -> int:
                        and st["limited_until"].get(a["name"], 0) <= now
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
+        def early(here=acct["name"]) -> bool:
+            return declined.get(here, 0) <= time.time() and other_has_room()
+
+        def claim(sid: str, here=acct["name"]) -> bool:
+            """guard()'s lock on the conversation Claude names; on an account
+            a yes allowed this conversation on in this kept folder, that id
+            allowed too, once (-c, the picker, a /clear's new id)."""
+            if here in allowing and sid not in allowed_ids:
+                allowed_ids.add(sid)
+                try:
+                    allow_chat(sid, here, top)
+                except OSError as e:
+                    later(f"could not allow {sid[:8]} on {here} in {home_path(top)}: {e!r}")
+            return guard(sid, later)
+
         try:
-            # The early move to an account with room happens in "auto" only.
-            why = supervise(proc, w, other_has_room if mode == "auto" else (lambda: False), may_reconnect,
-                            claim=lambda sid: guard(sid, later))
+            # The early move to an account with room: in "auto" at once; in
+            # "ask" after a yes in this terminal (A4), so only with one to
+            # answer in: Claude is closed to ask, and without a terminal it
+            # would be closed and reopened for nothing.
+            room = (other_has_room if mode == "auto" else early if mode == "ask" and terminal_fd() is not None
+                    else (lambda: False))
+            why = supervise(proc, w, room, may_reconnect, claim=claim)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -2036,6 +2212,7 @@ def run(opts) -> int:
             return exit_code(proc.returncode, 0)
         if mode != "auto":
             stay = acct["name"]
+        carry = None
 
         if why == "limit":
             def mark(state, name=acct["name"], limit=w.limit):
@@ -2059,9 +2236,7 @@ def run(opts) -> int:
             else:
                 answer = "yes" if verdict == "move" else "no"
             if answer == "stop":
-                again = f" `longhaul -r {resume}` opens it again." if resume else ""
-                say(f"Stopped at your request. The conversation is saved.{again}")
-                return 0
+                return stopped()
             if answer == "yes":  # always, in "auto"
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
                     old=acct["name"], kind=w.limit["kind"], new=new, every=every)
@@ -2075,19 +2250,41 @@ def run(opts) -> int:
             else:  # "ask" without a yes, or "never": the reset, on this account
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
                     old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
+                carry = (acct["name"], w.limit["kind"])
                 log(msg)  # the wait at the top of the loop says it, with the time
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
             # carry on, and your next message goes to the new account.
             prompt = None
-            used = max((u for u, _ in windows(readings(accounts).get(acct["name"]), time.time())), default=0)
-            nxt, _ = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
-                          seen=readings(accounts))
-            msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
-                   f"longhaul moved it to {accounts[nxt]['name']}.")
-            say(msg)
-            notify(msg)
-            idx = nxt
+            reading = readings(accounts).get(acct["name"])
+            used = max((u for u, _ in windows(reading, time.time())), default=0)
+            nxt, wait = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
+                             seen=readings(accounts))
+            there = accounts[nxt]["name"]
+            # In "ask" the question first; an account signed in as someone
+            # else, or no account with room by now, is never offered.
+            answer = "yes" if mode == "auto" else "no"
+            if mode == "ask" and nxt != idx and not wait and signed_in_as_expected(accounts[nxt]):
+                answer = ask_early_move(acct["name"], used, there, time.time() + EARLY_ASK)
+            if answer == "stop":
+                return stopped()
+            if mode == "auto":
+                msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
+                       f"longhaul moved it to {there}.")
+                say(msg)
+                notify(msg)
+                idx = nxt
+            elif answer == "yes":
+                msg = f"Moving to {there}: reopening this conversation there."
+                idx, stay = nxt, there
+                say(msg)
+                notify(msg)
+            else:
+                # Not asked again of this account until the windows that
+                # make it nearly full reset; its limit asks as ever.
+                declined[acct["name"]] = max((r for u, r in windows(reading, time.time()) if u >= NEAR_FULL),
+                                             default=time.time() + EARLY_ASK)
+                say(f"Staying on {acct['name']}: reopening this conversation there; longhaul asks again at its limit.")
         elif why == "reconnect":
             prompt = None
             reconnects.append(time.time())
@@ -2192,13 +2389,19 @@ UNREADABLE_SAID: set = set()
 # prompt refused (ACCOUNT_REFUSED, which the user reads and the model never
 # does) and logged (ACCOUNT_LOGGED, which the display module's pop-up
 # reads), so no tokens are spent on the wrong account. Of the input only
-# session_id and cwd are used: the prompt's text is never used, logged,
-# kept or said. It fails open: no accounts.json, one it cannot read, input
-# it cannot read or any error lets the prompt through, and a folder no
-# account keeps is never refused.
+# session_id, cwd and whether transcript_path is a file are used: the
+# prompt's text is never used, logged, kept or said. It fails open: no
+# accounts.json, one it cannot read, input it cannot read or any error
+# lets the prompt through, and a folder no account keeps is never refused.
+# A chat allowed there (allowed.json, below) goes through on the account
+# it was allowed on.
 
 ACCOUNT_REFUSED = ("Longhaul: {where} is kept for {names}, and this chat runs on {label}. Nothing was sent. Close "
-                   "this chat and open it again (in a terminal: longhaul -r {short}), so it starts on {first}.")
+                   "this chat and open it again (in a terminal: longhaul -r {short}), so it starts on {first}{allow}.")
+# The refusal's second way (the ask-first plan of 2026-10-29): a plain
+# `claude` cannot be asked, so the refusal names the one command that
+# allows the chat, run in a terminal.
+ACCOUNT_ALLOW = ", or allow this chat on {label} here: longhaul allow {short} (in a terminal)"
 ACCOUNT_LOGGED = "account: refused a prompt in {sid}: {where} is kept for {names}; the chat runs on {label}"
 # The hook's input holds the prompt, and the bigger the prompt the more a
 # wrong account costs: a prompt that fits a 1M-token context is well under
@@ -2235,14 +2438,82 @@ def chat_label(on: list[dict], folder: str) -> str:
     return f"an account Longhaul doesn't know ({home_path(folder)})"
 
 
+# A chat allowed on an account in a folder other accounts keep (the
+# ask-first plan of 2026-10-29, A3 and A4): `longhaul allow`, or a yes to
+# the terminal's question before a launch (run()), records it in
+# LONGHAUL_HOME/allowed.json as {chat id: {"account", "folder" (the
+# repository's top), "at"}}, and the account check lets that chat's
+# prompts through there on that account. Per chat, never per folder: that
+# stays the accounts file's job. An entry older than ALLOWED_DAYS is read
+# as none and dropped at the next write, which keeps the newest
+# ALLOWED_KEEP.
+ALLOWED = "allowed.json"
+ALLOWED_DAYS = 30
+ALLOWED_KEEP = 200
+
+
+def allowance_fresh(entry, now: float) -> bool:
+    """Whether `entry` of allowed.json is an allowance still in force: an
+    account's name, an absolute folder, and a time (a number) less than
+    ALLOWED_DAYS ago. Anything else a hand or a crash left is none."""
+    if not isinstance(entry, dict):
+        return False
+    account, folder, at = entry.get("account"), entry.get("folder"), entry.get("at")
+    return (isinstance(account, str) and bool(account) and isinstance(folder, str) and os.path.isabs(folder)
+            and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < ALLOWED_DAYS * 86400)
+
+
+def allowances(now: float | None = None) -> dict:
+    """allowed.json's allowances in force, by chat id (a plain one,
+    GUARD_ID, alone); {} for no file or one that cannot be read."""
+    now = time.time() if now is None else now
+    found = read_json(LONGHAUL_HOME / ALLOWED)
+    if not isinstance(found, dict):
+        return {}
+    return {sid: entry for sid, entry in found.items()
+            if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and allowance_fresh(entry, now)}
+
+
+def allow_chat(sid: str, account: str, folder: str, now: float | None = None) -> None:
+    """Record that chat `sid` may run on `account` in the repository
+    `folder`, in place of any allowance it had. Under the "allowed" lock,
+    written whole and private (write_json(): 0600), the stale and the
+    junk dropped and the newest ALLOWED_KEEP kept, the newest last.
+    OSError when it cannot be written: each caller says so."""
+    now = time.time() if now is None else now
+    with locked("allowed"):
+        kept = allowances(now)
+        kept.pop(sid, None)
+        kept[sid] = {"account": account, "folder": folder, "at": round(now, 1)}
+        newest = sorted(kept.items(), key=lambda item: item[1]["at"])[-ALLOWED_KEEP:]
+        write_json(LONGHAUL_HOME / ALLOWED, dict(newest))
+
+
+def chat_allowed(sid: str, on: list[dict], top: str) -> bool:
+    """Whether chat `sid` has an allowance for an account in `on` (the
+    accounts its config folder is) in the repository `top`, by real path
+    on both sides, and that account may be used there at all: one since
+    restricted to other repositories is not, allowed or not."""
+    entry = allowances().get(sid)
+    acct = next((a for a in on if entry and a["name"] == entry["account"]), None)
+    return (acct is not None and account_allowed(acct, top)
+            and os.path.realpath(entry["folder"]) == os.path.realpath(top))
+
+
 def account_refusal(data: dict):
     """The hook's answer refusing the prompt in `data` (a UserPromptSubmit
     input), logged, or None to let it through: None unless the session
     has an id, its cwd is an absolute path whose repository
-    (repository_of()) some accounts keep, and the chat's config folder is
-    none of theirs. The reason names the folder, the accounts that keep it
-    in the file's order, the chat's account, and how to open the chat
-    again on the first of them."""
+    (repository_of()) some accounts keep, the chat's config folder is
+    none of theirs, and the chat has no allowance there for its account
+    (chat_allowed()). The reason names the folder, the accounts that keep
+    it in the file's order, the chat's account, and how to open the chat
+    again on the first of them; and, for a chat on an account Longhaul
+    knows that may be used there, whose transcript is there to name its
+    folder, the command that allows it (ACCOUNT_ALLOW). A refusal notes
+    that account in the chat's record (note_session_account()), for
+    `longhaul allow` to find: a chat whose claude has no status line of
+    Longhaul's has none otherwise."""
     sid, cwd = data.get("session_id"), data.get("cwd")
     if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) and isinstance(cwd, str) and os.path.isabs(cwd)):
         return None
@@ -2255,12 +2526,17 @@ def account_refusal(data: dict):
         return None
     folder = chat_config_dir()
     on = accounts_on(accounts, folder)
-    if any(a["name"] in kept for a in on):
+    if any(a["name"] in kept for a in on) or chat_allowed(sid, on, top):
         return None
     label, where = chat_label(on, folder), home_path(top)
     log(ACCOUNT_LOGGED.format(sid=sid, where=where, names=", ".join(kept), label=label))
+    allow, path = "", data.get("transcript_path")
+    if on:
+        note_session_account(sid, on[0]["name"])
+        if account_allowed(on[0], top) and isinstance(path, str) and os.path.isfile(path):
+            allow = ACCOUNT_ALLOW.format(label=label, short=sid[:8])
     return {"decision": "block", "reason": ACCOUNT_REFUSED.format(
-        where=where, names=" or ".join(kept), label=label, short=sid[:8], first=kept[0])}
+        where=where, names=" or ".join(kept), label=label, short=sid[:8], first=kept[0], allow=allow)}
 
 
 def account_check(_opts) -> int:
@@ -2278,6 +2554,102 @@ def account_check(_opts) -> int:
             print(json.dumps(answer))
     except Exception as e:
         log(f"account-check hook: no check ({type(e).__name__})")
+    return 0
+
+
+def last_cwd(path: Path):
+    """The folder a transcript last ran in: the top-level cwd, an absolute
+    path, of its newest line that has one; None for none, or a file that
+    cannot be read. Read back from its end a block at a time, so a long
+    transcript is never read or parsed whole."""
+    try:
+        with path.open("rb") as f:
+            pos, cut = f.seek(0, os.SEEK_END), b""
+            while pos > 0:
+                step = min(1 << 20, pos)
+                pos -= step
+                f.seek(pos)
+                lines = (f.read(step) + cut).split(b"\n")
+                cut = lines.pop(0) if pos > 0 else b""  # the block's first line may begin in the one before
+                for raw in reversed(lines):
+                    if b'"cwd"' not in raw:
+                        continue
+                    try:
+                        line = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    cwd = line.get("cwd") if isinstance(line, dict) else None
+                    if isinstance(cwd, str) and os.path.isabs(cwd):
+                        return cwd
+    except OSError:
+        return None
+    return None
+
+
+def allow_cmd(opts) -> int:
+    """`longhaul allow ID [--account NAME]` (the ask-first plan of
+    2026-10-29, A3): the terminal's way to let a chat's prompts through in
+    a folder other accounts keep, which the account check's refusal names
+    for a plain `claude` that cannot be asked. ID is the chat's id, or its
+    first 8 characters or more when only one chat's transcript or record
+    starts with them. The folder is the one it last ran in (its newest
+    transcript's last cwd, by repository: repository_of()); the account is
+    NAME, else the one its record names (last_account(): the status
+    line's, the relay's, the supervisor's or the refusal's note). Refused,
+    with nothing written, from inside a Claude Code session (any
+    SESSION_ENV variable set): whether a chat may allow itself is the
+    owner's decision 2 of that plan, not taken; and for an unknown chat or
+    account, or one that may not be used there. A folder no account keeps,
+    or one the account keeps itself, needs nothing: said, exit 0."""
+    def refuse(why: str) -> int:
+        print(f"longhaul allow: {why}", file=sys.stderr)
+        return 2
+    inside = [name for name in SESSION_ENV if name in os.environ]
+    if inside:
+        return refuse(f"not allowed: it runs inside a Claude Code session ({', '.join(inside)} set); "
+                      "run it in a terminal of your own")
+    accounts, problem = read_accounts_file()
+    if problem:
+        return refuse(unreadable_text(problem))
+    target, names = opts.chat, [a["name"] for a in accounts]
+    if not re.fullmatch(GUARD_ID, target) or len(target) < 8:
+        return refuse("give the chat's id, or its first 8 characters or more, as the refusal names it")
+    known = ({p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{target}*.jsonl"))}
+             | {p.stem for p in files_of((USAGE_DIR / "sessions").glob(f"{target}*.json"))})
+    if target not in known and len(known) > 1:
+        return refuse(f"{len(known)} chats start with {target}; give more of its id")
+    if not known:
+        return refuse(f"no chat {target} is known: no transcript or record of one starts with it")
+    sid = target if target in known else known.pop()
+    short = sid[:8]
+    if opts.account is not None and opts.account not in names:
+        return refuse(f"no account called {opts.account}; the accounts are {', '.join(names) or 'none'}")
+    name = opts.account or last_account(sid, accounts)
+    if not name:
+        return refuse(f"no record of which account {short} runs on; name it: longhaul allow {short} --account NAME")
+    hits = transcript_hits(sid)
+    cwd = last_cwd(max(hits, key=lambda p: p.stat().st_mtime)) if hits else None
+    if cwd is None:
+        return refuse(f"no transcript of {short} names the folder it ran in; a chat that has sent nothing has none: "
+                      "open a new one on the account that keeps the folder")
+    top = repository_of(cwd)
+    where, kept = home_path(top), [a["name"] for a in accounts if covers(a, top)]
+    if not kept:
+        print(f"No account keeps {where}, so every chat's prompts go through there; nothing to allow.")
+        return 0
+    if name in kept:
+        print(f"{name} keeps {where}, so its chats go through there already; nothing to allow.")
+        return 0
+    acct = accounts[names.index(name)]
+    if not account_allowed(acct, top):
+        return refuse(f"{may_not_text(acct, top)}; not allowed")
+    try:
+        allow_chat(sid, name, top)
+    except OSError as e:
+        return refuse(f"could not write {home_path(str(LONGHAUL_HOME / ALLOWED))}: {e.strerror or e}")
+    log(f"allow: {sid} may run on {name} in {where}")
+    print(f"Allowed chat {short} on {name} in {where}: its prompts go through there for {ALLOWED_DAYS} days "
+          f"(this chat only; {where} stays kept for {' and '.join(kept)}).")
     return 0
 
 
@@ -14809,7 +15181,7 @@ def main(argv: list[str]) -> int:
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook"):
+                            "models-hook", "allow"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -14866,6 +15238,12 @@ def main(argv: list[str]) -> int:
                                 "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "allow":
+            p.add_argument("chat", metavar="ID",
+                           help="the chat: its id, or its first 8 characters or more (the account check's refusal "
+                                "names them)")
+            p.add_argument("--account", metavar="NAME",
+                           help="the account to allow it on (default: the one its record says it runs on)")
         if cmd == "models":
             p.add_argument("args", nargs="*", metavar="guide|on|off|trial | cap MODEL|off | TYPE MODEL",
                            help="nothing: the mode, the guide, the cap and the table; guide (the default), on, off "
@@ -14909,7 +15287,7 @@ def main(argv: list[str]) -> int:
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
-                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall}[cmd](opts)
+                "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
