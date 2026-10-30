@@ -8,33 +8,63 @@
 # Sprint 11 (I4), has no bin/ of its own: its rule and its step name the
 # bare `longhaul advisor status`, which is this file while Longhaul is
 # enabled, and a step that fails stops that skill. It runs the longhaul.py
-# beside it, so an installed plugin runs its own version. Only the
-# read-only commands are allowed (`advisor status` among them since
-# Sprint 8: the advise skill's first step; `doctor`, with nothing after it, since 2026-10-25: the
-# /longhaul:doctor skill's checklist, which writes nothing), and
-# `checkpoint save`, which writes one file under LONGHAUL_HOME/
-# checkpoints/ and nothing else, and `allow` (the owner, 2026-10-29, the
-# ask-first plan's decision 2), which lets one chat's prompts through in
-# a folder other accounts keep and writes LONGHAUL_HOME/allowed.json alone:
-# a chat refused there cannot ask its own Claude, so another chat runs it
-# on the user's word. The supervisor starts and watches a
-# claude of its own, and the others change the accounts or the state, so
-# they belong in a terminal (the rule since the plugin layout was decided,
-# amended by the owner on 2026-10-20 to let the checkpoint through). The
-# model reads the refusal through the Bash tool, so it says what to ask
-# the user.
+# beside it, so an installed plugin runs its own version. The read-only
+# commands are allowed (`advisor status` among them since Sprint 8: the
+# advise skill's first step; `doctor`, with nothing after it, since
+# 2026-10-25: the /longhaul:doctor skill's checklist, which writes
+# nothing), and `checkpoint save`, which writes one file under
+# LONGHAUL_HOME/checkpoints/ and nothing else, and `allow` (the owner,
+# 2026-10-29, the ask-first plan's decision 2), which lets one chat's
+# prompts through in a folder other accounts keep and writes
+# LONGHAUL_HOME/allowed.json alone: a chat refused there cannot ask its
+# own Claude, so another chat runs it on the user's word. Since the
+# owner's decision of 2026-10-30 ("every terminal action from the VS Code
+# chat") the commands that set Longhaul up run from here too: add, setup,
+# remove, models, switch, vscode, statusline install and uninstall,
+# update, clear and uninstall, each in the forms its case below allows
+# and no other. A user of the VS Code panel may have no terminal open, and
+# the /longhaul:manage skill shows each command and what it changes and
+# runs it only after the user's yes in the chat (the panel can approve
+# Bash by itself, so Claude Code's own prompt is not enough); where a
+# command asks in a terminal, its --yes stands for that yes, and a form
+# that would wait for typed answers is refused. No sign-in passes through
+# the chat: add and setup open the browser, as from a terminal. What still
+# belongs in a terminal: the supervisor, `pipe` and `wrap`, which start a
+# claude of their own (in VS Code the panel already runs the chat on the
+# right account); the hooks, which the engine runs; the trials, whose arm
+# a session must not know or set; and `advisor record-probe`, half of the
+# Advisor's gate (the rule since the plugin layout was decided, amended by
+# the owner on 2026-10-20 to let the checkpoint through, on 2026-10-29 for
+# allow and on 2026-10-30 for the setup commands). The model reads the
+# refusal through the Bash tool, so it says what to ask the user.
 # CDPATH is emptied: set, it would make cd print and could send it elsewhere.
 command -v python3 >/dev/null 2>&1 || {
   printf '%s\n' "longhaul: python3 was not found on PATH; Longhaul needs Python 3. Ask the user to install it (on a Mac: xcode-select --install, or brew install python)." >&2
   exit 2
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, models, switch, vscode on|off, statusline install|uninstall, update, clear, uninstall --dry-run|--yes and -h"
+# A setup command, $1, in a form its case does not allow: the forms that
+# do run, $2, and why the rest does not, $3, when that needs saying.
+only() {
+  printf '%s\n' "longhaul: from here \`$1\` runs only as $2${3:+: $3}. Ask the user to run it in a terminal." >&2
+  exit 2
+}
+# A word that is a value, not empty and not a flag.
+plain() { case "$1" in ""|-*) return 1 ;; esac; }
+# add's arguments after NAME EMAIL: --dir and --repo, each with its value.
+add_rest() {
+  shift 3
+  while [ $# -gt 0 ]; do
+    case "$1" in --dir|--repo) [ $# -ge 2 ] || return 1; shift 2 ;; *) return 1 ;; esac
+  done
+}
 if [ $# -eq 0 ]; then
-  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, doctor, advisor status, checkpoint save, allow and -h run; for the rest, ask the user to run it in a terminal." >&2
+  printf '%s\n' "longhaul: nothing to run. From here only $runs run; for the rest, ask the user to run it in a terminal." >&2
   exit 2
 fi
 case "$1" in
-  inspect|usage|status|allow|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
+  inspect|usage|status|allow|models|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
   doctor)
     # The checklist only reads (ps and lsof of the user's own chats among
     # it); the skill's rule names it alone, so nothing may follow it.
@@ -53,6 +83,40 @@ case "$1" in
     [ "$2" = save ] && exec python3 "$here/longhaul.py" "$@"
     printf '%s\n' "longhaul: from here only \`checkpoint save\` runs; \`longhaul checkpoint\` with no action is the SessionStart hook, which the engine runs by itself." >&2
     exit 2 ;;
+  add)
+    # With no NAME and EMAIL, add is the guided form, which waits for answers typed in a terminal.
+    plain "$2" && plain "$3" && add_rest "$@" && exec python3 "$here/longhaul.py" "$@"
+    only add "\`add NAME EMAIL [--dir DIR] [--repo PATH]...\`" "bare \`add\` is the guided form, which waits for typed answers" ;;
+  setup)
+    # One account, by its NAME: with none, setup signs in every account not signed in.
+    if plain "$2" && { [ $# -eq 2 ] || [ "$#:$3" = "3:--relogin" ]; }; then exec python3 "$here/longhaul.py" "$@"; fi
+    only setup "\`setup NAME [--relogin]\`" "with no NAME it signs in every account at once" ;;
+  remove)
+    plain "$2" && [ $# -eq 2 ] && exec python3 "$here/longhaul.py" "$@"
+    only remove "\`remove NAME\`" ;;
+  switch)
+    case "$#:$2" in 1:|2:ask|2:auto|2:never) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only switch "\`switch [ask|auto|never]\`" ;;
+  vscode)
+    # On asks before it edits VS Code's settings, in a terminal; off asks nothing.
+    case "$#:$2:$3" in 3:on:--yes|2:off:) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only vscode "\`vscode on --yes\` or \`vscode off\`" "on asks first in a terminal, and from here the user's yes in the chat is its --yes" ;;
+  statusline)
+    # Bare, statusline is the status line Claude Code runs itself; install
+    # asks in a terminal before it replaces a line of the user's own.
+    case "$#:$2:$3" in 3:install:--yes|2:uninstall:|3:uninstall:--yes) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only statusline "\`statusline install --yes\` or \`statusline uninstall\`" "bare \`statusline\` is the status line Claude Code runs itself, and install asks first in a terminal" ;;
+  update)
+    # On and off ask before they edit Claude Code's list of marketplaces, in a terminal.
+    case "$#:$2:$3" in 1::|2:status:|3:on:--yes|3:off:--yes) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only update "\`update [status]\`, \`update on --yes\` or \`update off --yes\`" "on and off ask first in a terminal, and from here the user's yes in the chat is their --yes" ;;
+  clear)
+    [ $# -eq 1 ] && exec python3 "$here/longhaul.py" clear
+    only clear "\`clear\` with nothing after it" ;;
+  uninstall)
+    # Bare, uninstall asks in a terminal before it removes anything.
+    case "$#:$2:$3" in 2:--dry-run:|3:--dry-run:--purge|2:--yes:|3:--yes:--purge) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only uninstall "\`uninstall --dry-run [--purge]\` or \`uninstall --yes [--purge]\`" "bare \`uninstall\` asks first in a terminal" ;;
   trial)
     # The checkpoint A/B (2026-10-23): its start, stop, ratings and report
     # are the user's, and its status counts the arms, which a session is
@@ -60,6 +124,6 @@ case "$1" in
     printf '%s\n' "longhaul: \`trial\` does not run from inside a session: the checkpoint trial (its start, stop, status, ratings and report) is the user's, and a session is not told its arm. Ask the user to run it in a terminal." >&2
     exit 2 ;;
   *)
-    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, doctor, advisor status, checkpoint save, allow and -h run. Ask the user to run it in a terminal." >&2
+    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own, or it is a hook the engine runs. From here only $runs run. Ask the user to run it in a terminal." >&2
     exit 2 ;;
 esac

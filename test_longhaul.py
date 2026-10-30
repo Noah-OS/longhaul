@@ -11345,13 +11345,25 @@ class Shim(unittest.TestCase):
         # A terminal's environment (the suite runs from inside a session too).
         self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         # Every data path in scratch: `usage` and `inspect` read the config
-        # folder, which must never be the real one (review, Sprint 3).
+        # folder, which must never be the real one (review, Sprint 3). Since
+        # the setup commands run from here (the owner, 2026-10-30) HOME and
+        # VS Code's settings are scratch too: the filter above drops the
+        # suite's own LONGHAUL_VSCODE_SETTINGS with the other LONGHAUL_ ones.
         self.env.update(LONGHAUL_HOME=str(self.tmp / "home"), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
-                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        HOME=str(self.tmp), LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode" / "settings.json"))
 
     def shim(self, *args, input=None, **env):
         return subprocess.run([str(HERE / "bin" / "longhaul"), *args], input=input, capture_output=True, text=True,
                               env={**self.env, **env}, timeout=30)
+
+    def chat(self, *args, **env):
+        """The shim as a chat's Bash tool runs it: inside a Claude Code
+        session (its variables set, its account's folder the scratch one),
+        no terminal, an empty stdin, the stand-in claude for any sign-in."""
+        return self.shim(*args, input="", CLAUDECODE="1", CLAUDE_CODE_ENTRYPOINT="claude-vscode",
+                         CLAUDE_CODE_SESSION_ID="s1", CLAUDE_CONFIG_DIR=str(self.tmp / "claude"),
+                         LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), **env)
 
     def test_the_shim_runs_the_read_only_commands_of_the_checkout_it_sits_in(self):
         out = self.shim("-h")
@@ -11365,17 +11377,188 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("Allowance", out.stdout)
 
-    def test_the_shim_refuses_the_supervisor_and_anything_that_changes_state(self):
+    def test_the_shim_refuses_the_supervisor_and_the_hooks(self):
         # From the Bash tool a plain `longhaul` would start a second claude
-        # under a session, with Remote Control and caffeinate.
-        for args in ((), ("-c",), ("-r", "x"), ("setup",), ("add", "A", "a@b"), ("remove", "A"), ("clear",),
-                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto")):
-            out = self.shim(*args)
+        # under a session, with Remote Control and caffeinate; pipe and wrap
+        # start one too, and the hooks are the engine's. Bare `statusline`
+        # is the status line Claude Code runs itself.
+        for args in ((), ("-c",), ("-r", "x"), ("--account", "Max"), ("--name", "x"), ("--no-rc",), ("--first", "f"),
+                     ("--switch", "auto"), ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",),
+                     ("account-check",), ("session-end",), ("filter",), ("models-hook",), ("trial", "status")):
+            out = self.chat(*args)
             self.assertEqual(out.returncode, 2, args)
             self.assertIn("run it in a terminal", out.stderr, args)
             self.assertEqual(out.stdout, "", args)
         self.assertIn("nothing to run", self.shim().stderr)
+        self.assertIn("starts a Claude of its own, or it is a hook", self.shim("wrap").stderr)
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
+    def test_the_shim_lets_each_setup_command_through_in_its_own_forms_alone(self):
+        # The owner, 2026-10-30 (the chat-commands plan, C2): each with the
+        # arguments it needs and no more. A bare `add` is the guided form,
+        # which waits for typed answers; `setup` without a NAME signs in
+        # every account at once; where a command asks in a terminal, the
+        # chat's --yes stands for the user's yes in the chat.
+        refused = {
+            ("add", "`add NAME EMAIL [--dir DIR] [--repo PATH]...`"): (
+                ("add",), ("add", "A"), ("add", "-h", "a@example.com"), ("add", "A", "--repo"), ("add", "A", "a@b", "x"),
+                ("add", "A", "a@b", "--repo"), ("add", "A", "a@b", "--force", "x"), ("add", "--repo", "/x", "A", "a@b"),
+                ("add", "A", "a@b", "--dir=x")),
+            ("setup", "`setup NAME [--relogin]`"): (("setup",), ("setup", "--relogin"), ("setup", "Max", "-h"),
+                                         ("setup", "Max", "Pro"), ("setup", "Max", "--relogin", "x")),
+            ("remove", "`remove NAME`"): (("remove",), ("remove", "-h"), ("remove", "A", "B")),
+            ("switch", "`switch [ask|auto|never]`"): (("switch", "sometimes"), ("switch", "-h"), ("switch", "auto", "never")),
+            ("vscode", "`vscode on --yes` or `vscode off`"): (("vscode",), ("vscode", "on"), ("vscode", "--yes", "on"),
+                                                   ("vscode", "off", "x"), ("vscode", "--yes")),
+            ("statusline", "`statusline install --yes` or `statusline uninstall`"): (
+                ("statusline", "install"), ("statusline", "install", "--yes", "x"), ("statusline", "--yes", "install"),
+                ("statusline", "uninstall", "x")),
+            ("update", "`update [status]`, `update on --yes` or `update off --yes`"): (
+                ("update", "on"), ("update", "off"), ("update", "--yes"), ("update", "status", "--yes"),
+                ("update", "on", "--yes", "x"), ("update", "-h")),
+            ("clear", "`clear` with nothing after it"): (("clear", "x"), ("clear", "-h")),
+            ("uninstall", "`uninstall --dry-run [--purge]` or `uninstall --yes [--purge]`"): (
+                ("uninstall",), ("uninstall", "--purge"), ("uninstall", "--purge", "--yes"),
+                ("uninstall", "--dry-run", "--yes"), ("uninstall", "--yes", "--purge", "x"), ("uninstall", "-h")),
+        }
+        for (command, forms), cases in refused.items():
+            for args in cases:
+                out = self.chat(*args)
+                self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+                self.assertIn(f"longhaul: from here `{command}` runs only as {forms}", out.stderr, args)
+                self.assertIn("run it in a terminal", out.stderr, args)
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+        self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
+        self.assertFalse((self.tmp / "vscode").exists(), "nor of VS Code's")
+        # Each form that runs reaches longhaul itself: its own answer, never the shim's.
+        for args, said in ((("add", "bad name!", "a@example.com"), "a name is letters and digits"),
+                           (("add", "A", "not-an-email", "--dir", "/x", "--repo", "/y", "--repo", "/z"),
+                            "does not look like an email"),
+                           (("setup", "Max"), "no account called Max"), (("setup", "Max", "--relogin"), "no account called Max"),
+                           (("remove", "Max"), "no account called Max"), (("switch",), "Switching: ask (the default)"),
+                           (("models",), "Where it applies:"), (("update",), "Running here:"),
+                           (("update", "status"), "Running here:"),
+                           (("vscode", "on", "--yes"), "VS Code's user settings are not at ~/vscode/settings.json"),
+                           (("vscode", "off"), "VS Code's settings are not on this machine; nothing to change."),
+                           (("statusline", "install", "--yes"), "Not changed: the status line runs ~/.local/bin/longhaul"),
+                           (("statusline", "uninstall"), "Nothing to undo"),
+                           (("statusline", "uninstall", "--yes"), "Nothing to undo"),
+                           (("update", "on", "--yes"), "list of marketplaces is not at"),
+                           (("update", "off", "--yes"), "list of marketplaces is not at"),
+                           (("uninstall", "--dry-run"), "What stays:"), (("uninstall", "--dry-run", "--purge"), "What stays:")):
+            out = self.chat(*args)
+            self.assertNotIn("runs only as", out.stderr, args)
+            self.assertNotIn("does not run from inside a session", out.stderr, args)
+            self.assertNotIn("Traceback", out.stderr, args)
+            self.assertIn(said, out.stdout + out.stderr, args)
+        for runs in ("add NAME EMAIL", "setup NAME", "remove", "models", "switch", "vscode", "statusline install",
+                     "update", "clear", "uninstall"):
+            self.assertIn(runs, self.shim().stderr, "the refusal names what does run")
+            self.assertIn(runs, self.shim("nope").stderr)
+
+    def test_from_a_chat_the_account_commands_sign_in_through_the_browser_and_write_the_list(self):
+        # add NAME EMAIL and setup NAME --relogin run the browser sign-in
+        # (here the stand-in claude records it) with the session's variables
+        # dropped, as from a terminal; remove takes an account off the list.
+        team, pro = self.tmp / "team", self.tmp / "pro"
+        emails = json.dumps({str(team): "team@example.com", str(pro): "pro@example.com"})
+        out = self.chat("add", "Team", "team@example.com", "--dir", str(team), "--repo", str(self.tmp / "work"),
+                        FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        home = self.tmp / "home"
+        accounts = json.loads((home / "accounts.json").read_text())
+        self.assertEqual(accounts, [{"name": "Team", "config_dir": str(team), "email": "team@example.com",
+                                     "repositories": [str(self.tmp / "work")]}])
+        logins = [json.loads(l) for l in (home / "logins.jsonl").read_text().splitlines()]
+        self.assertEqual([(l["config"], l["args"]) for l in logins],
+                         [(str(team), ["auth", "login", "--email", "team@example.com"])], "the browser, the email filled in")
+        self.assertIn("Team: team@example.com (max)", out.stdout)
+        self.assertTrue((self.tmp / ".local" / "bin" / "longhaul").is_symlink(), "setup's command, in the scratch HOME")
+        out = self.chat("setup", "Team", "--relogin", FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(len((home / "logins.jsonl").read_text().splitlines()), 2, "signed in again")
+        out = self.chat("add", "Pro", "pro@example.com", "--dir", str(pro), FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        out = self.chat("remove", "Pro")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual([a["name"] for a in json.loads((home / "accounts.json").read_text())], ["Team"])
+        self.assertTrue(pro.is_dir(), "its folder kept")
+
+    def test_from_a_chat_switch_models_and_clear_write_longhauls_own_config(self):
+        home = self.tmp / "home"
+        out = self.chat("switch", "auto")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Switching: auto (saved in ~/home/config.json)", self.chat("switch").stdout)
+        out = self.chat("models", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.chat("models", "cap", "sonnet").returncode, 0)
+        self.assertEqual(self.chat("models", "implementer", "sonnet").returncode, 0)
+        self.assertEqual(json.loads((home / "config.json").read_text()),
+                         {"switch": "auto", "models": "off", "models_cap": "sonnet", "subagents": {"implementer": "sonnet"}})
+        self.assertEqual(self.chat("models", "bogus", "x").returncode, 2, "longhaul's own refusal")
+        (home / "state.json").write_text(json.dumps({"limited_until": {"Max": time.time() + 3600}}))
+        out = self.chat("clear")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("forgot the recorded limits", out.stdout)
+        self.assertEqual(json.loads((home / "state.json").read_text())["limited_until"], {})
+
+    def test_from_a_chat_vscode_statusline_and_update_edit_the_scratch_settings_a_copy_kept(self):
+        settings = self.tmp / "vscode" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{\n    "a": 1\n}\n')
+        out = self.chat("vscode", "on", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text())["claudeCode.claudeProcessWrapper"],
+                         str((HERE / "longhaul-vscode").resolve()))
+        self.assertIn("Developer: Reload Window", out.stdout)
+        out = self.chat("vscode", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1})
+        # The status line: the terminal command a fake at the scratch
+        # ~/.local/bin/longhaul, the chat's settings.json the scratch one.
+        launcher = self.tmp / ".local" / "bin" / "longhaul"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('#!/bin/sh\n[ "$1" = statusline ] || exit 9\ncat >/dev/null\necho main\n')
+        launcher.chmod(0o755)
+        claude = self.tmp / "claude"
+        claude.mkdir()
+        mine = {"type": "command", "command": "~/bin/my-status"}
+        (claude / "settings.json").write_text(json.dumps({"theme": "dark", "statusLine": mine}))
+        out = self.chat("statusline", "install", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads((claude / "settings.json").read_text())["statusLine"]["command"],
+                         "~/.local/bin/longhaul statusline")
+        out = self.chat("statusline", "uninstall")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads((claude / "settings.json").read_text()), {"theme": "dark", "statusLine": mine})
+        # Claude Code's auto-update for Longhaul's marketplace.
+        (claude / "plugins").mkdir()
+        markets = claude / "plugins" / "known_marketplaces.json"
+        markets.write_text(json.dumps({"longhaul": {"source": {"source": "github", "repo": "example/longhaul"},
+                                                    "autoUpdate": False}}))
+        out = self.chat("update", "on", "--yes")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIs(json.loads(markets.read_text())["longhaul"]["autoUpdate"], True)
+        self.assertIn("Auto-update: on for Longhaul's marketplace", self.chat("update", "status").stdout)
+        self.assertEqual(self.chat("update", "off", "--yes").returncode, 0)
+        self.assertIs(json.loads(markets.read_text())["longhaul"]["autoUpdate"], False)
+
+    def test_from_a_chat_uninstall_lists_then_removes_and_purges_the_scratch_home(self):
+        home, launcher = self.tmp / "home", self.tmp / ".local" / "bin" / "longhaul"
+        home.mkdir()
+        (home / "accounts.json").write_text("[]")
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(HERE / "longhaul.py")  # setup's link
+        out = self.chat("uninstall", "--dry-run", "--purge")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Longhaul would remove:", out.stdout)
+        self.assertIn("~/.local/bin/longhaul", out.stdout)
+        self.assertTrue(launcher.is_symlink() and (home / "accounts.json").exists(), "only listed")
+        out = self.chat("uninstall", "--yes", "--purge")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(os.path.lexists(launcher))
+        self.assertFalse(home.exists(), "--purge took ~/.longhaul's stand-in")
+        self.assertIn("What stays:", out.stdout)
 
     def test_the_shim_runs_allow(self):
         # The ask-first plan's decision 2 (the owner, 2026-10-29): a chat refused
@@ -11405,18 +11588,6 @@ class Shim(unittest.TestCase):
         self.assertFalse((self.tmp / "home" / "advisor").exists(), "nothing was written")
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
-
-    def test_the_shim_refuses_update_whose_on_and_off_edit_claude_codes_own_files(self):
-        # 2026-10-25: `longhaul update on|off` edits Claude Code's list of
-        # marketplaces; `update status` is read-only, but ADR-0001's decision 5
-        # lists what the shim admits, and each addition was the owner's, so it
-        # stays in a terminal until the owner adds it.
-        for args in (("update",), ("update", "status"), ("update", "on"), ("update", "on", "--yes"), ("update", "off")):
-            out = self.shim(*args)
-            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
-            self.assertIn("run it in a terminal", out.stderr, args)
-        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
-        self.assertFalse((self.tmp / "claude").exists(), "nothing of Claude Code's was touched")
 
     def test_the_shim_runs_doctor_which_only_reads(self):
         # The owner, 2026-10-25 ("Doctor + first-chat line"): /longhaul:doctor
@@ -17390,7 +17561,7 @@ class Models(unittest.TestCase):
             self.config(models_cap=cap)
             self.assertIsNone(self.routed(self.call(model="fable")), cap)
 
-    def test_the_hook_as_registered_lowers_the_model_and_the_shim_refuses_the_command(self):
+    def test_the_hook_as_registered_lowers_the_model_and_the_shim_runs_the_command(self):
         self.config(subagents={"implementer": "sonnet"}, models="on")
         env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         env.update(LONGHAUL_HOME=str(self.home), HOME=str(self.tmp / "user"), LONGHAUL_NO_NOTIFY="1")
@@ -17398,10 +17569,12 @@ class Models(unittest.TestCase):
         out = subprocess.run(cmd, input=json.dumps(self.call()), capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout)["hookSpecificOutput"]["updatedInput"]["model"], "sonnet")
-        shim = subprocess.run([str(HERE / "bin" / "longhaul"), "models", "on"], capture_output=True, text=True,
-                              env={**env, "CLAUDECODE": "1"}, timeout=30)
-        self.assertNotEqual(shim.returncode, 0)
-        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "on", "unchanged")
+        # The owner, 2026-10-30 (the chat-commands plan): `models` in any of
+        # its forms runs from a chat too, after the user's yes there.
+        shim = subprocess.run([str(HERE / "bin" / "longhaul"), "models", "off"], capture_output=True, text=True,
+                              env={**env, "CLAUDECODE": "1"}, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(shim.returncode, 0, shim.stderr)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["models"], "off")
 
 
 class CodexModels(unittest.TestCase):
