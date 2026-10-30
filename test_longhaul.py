@@ -19334,6 +19334,45 @@ class Accounts(unittest.TestCase):
         self.assertIn(f'"claudeCode.claudeProcessWrapper": "{wrapper}"', out.stdout, "the line to add by hand")
         self.assertEqual(settings.read_text(), "[1, 2]")
 
+    def test_longhaul_vscode_on_without_a_terminal_changes_nothing_unless_given_yes(self):
+        # The chat-commands plan (the owner, 2026-10-30): a chat runs `vscode
+        # on` after the user's yes in the chat, with no terminal to ask in,
+        # so --yes stands for that yes, as for statusline, update and
+        # uninstall; with neither, it once died on input()'s end of file.
+        settings = self.tmp / "vscode" / "settings.json"
+        settings.parent.mkdir()
+        wrapper = str((HERE / "longhaul-vscode").resolve())
+        settings.write_text('{\n    "a": 1\n}\n')
+        out = self.longhaul("vscode", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("Not changed: `longhaul vscode on` asks first, in a terminal, before it adds one line to "
+                      "~/vscode/settings.json; run it in one, or add --yes to do it without asking.", out.stdout)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual(settings.read_text(), '{\n    "a": 1\n}\n')
+        self.assertEqual(list(settings.parent.glob("settings.json.before-longhaul-*")), [], "no copy either")
+        out = self.longhaul("vscode", "on", "--yes", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1, "claudeCode.claudeProcessWrapper": wrapper})
+        self.assertIn("Developer: Reload Window", out.stdout)
+        [backup] = settings.parent.glob("settings.json.before-longhaul-*")
+        self.assertEqual(backup.read_text(), '{\n    "a": 1\n}\n')
+        backup.unlink()
+        # Another program in the setting is named, and replaced only with --yes.
+        settings.write_text('{\n    "claudeCode.claudeProcessWrapper": "/other/wrapper",\n    "a": 1\n}\n')
+        out = self.longhaul("vscode", "on", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("Not changed: VS Code's Claude panel runs /other/wrapper now; `longhaul vscode on` asks first, in a "
+                      "terminal, before it replaces it; run it in one, or add --yes to do it without asking.", out.stdout)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text())["claudeCode.claudeProcessWrapper"], "/other/wrapper")
+        out = self.longhaul("vscode", "on", "--yes", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1, "claudeCode.claudeProcessWrapper": wrapper})
+        # Off asks nothing, so it needs no --yes.
+        out = self.longhaul("vscode", "off", LONGHAUL_VSCODE_SETTINGS=str(settings))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(longhaul.jsonc_load(settings.read_text()), {"a": 1})
+        self.assertIn("longhaul vscode [on|off] [--yes]", longhaul.__doc__, "the Usage block names it")
+
     def test_the_settings_editor_keeps_what_vs_code_allows_and_refuses_what_it_cannot_read_back(self):
         key, value = "claudeCode.claudeProcessWrapper", "/x/longhaul-vscode"
         for text in ('{\n    "a": 1\n}\n', '{\n    "a": [1, 2,],\n}\n', '{"a": 1}', "{}", "{\n}\n",

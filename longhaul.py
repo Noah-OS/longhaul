@@ -102,9 +102,11 @@ Usage:
                           applies the table of agent type -> model instead
                           (TYPE MODEL sets a row; lowered only), trial applies
                           it in a models trial's routed half; off: nothing
-  longhaul vscode [on|off]      VS Code's Claude panel uses your Longhaul accounts
+  longhaul vscode [on|off] [--yes]
+                          VS Code's Claude panel uses your Longhaul accounts
                           (on), or its own sign-in again (off); it edits VS
-                          Code's settings for you, a copy kept
+                          Code's settings for you, a copy kept, on after a yes
+                          in a terminal (--yes: without asking)
   longhaul setup [NAME]         sign each account in to its own folder (a browser
                           sign-in); only the emails in accounts.json count. It
                           sets up the `longhaul` command too: run from the
@@ -13315,12 +13317,14 @@ def vscode_write(text: str) -> str:
     return home_path(str(backup))
 
 
-def vscode_on(asked: bool = False) -> int:
+def vscode_on(asked: bool = False, assume_yes: bool = False) -> int:
     """Points VS Code's Claude panel at longhaul-vscode, so that its chats use
     Longhaul's accounts (the owner, 2026-10-23: Longhaul does it for the
     user). It edits VS Code's user settings as they are written, comments
     and trailing commas kept, a copy saved first, and only after a yes;
-    when it cannot do so safely it says why and shows the line."""
+    when it cannot do so safely it says why and shows the line. Without a
+    terminal only with `assume_yes` (--yes), exit 2 otherwise: a chat runs
+    it after the user's yes in the chat (the owner, 2026-10-30)."""
     wrapper = Path(__file__).resolve().parent / "longhaul-vscode"
     if not VSCODE_SETTINGS.is_file():
         if not asked:
@@ -13337,7 +13341,13 @@ def vscode_on(asked: bool = False) -> int:
                 "(a copy of them is kept).")
     if current:
         question = f"VS Code's Claude panel runs {shown(current)} now. Replace it with Longhaul's?"
-    if not yes(question, default=not current):
+    if not assume_yes and not terminal():
+        what = (f"VS Code's Claude panel runs {shown(current)} now; `longhaul vscode on` asks first, in a terminal, "
+                "before it replaces it" if current else "`longhaul vscode on` asks first, in a terminal, before it "
+                f"adds one line to {home_path(str(VSCODE_SETTINGS))}")
+        say(f"Not changed: {what}; run it in one, or add --yes to do it without asking.")
+        return 2
+    if not assume_yes and not yes(question, default=not current):
         say(f"Not changed. Run `longhaul vscode` to do it later.")
         return 1
     joined = jsonc_add(jsonc_drop(text, VSCODE_WRAPPER_KEY) or text if current else text, VSCODE_WRAPPER_KEY, str(wrapper))
@@ -13370,8 +13380,8 @@ def vscode_off() -> int:
 
 
 def vscode(opts) -> int:
-    """`longhaul vscode [on|off]`."""
-    return vscode_off() if opts.action == "off" else vscode_on()
+    """`longhaul vscode [on|off] [--yes]`."""
+    return vscode_off() if opts.action == "off" else vscode_on(assume_yes=opts.yes)
 
 
 def guided_vscode() -> None:
@@ -15251,6 +15261,9 @@ def main(argv: list[str]) -> int:
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
+            p.add_argument("--yes", action="store_true",
+                           help="on: change VS Code's settings without asking, a program of your own in the setting "
+                                "replaced too (needed without a terminal)")
         if cmd == "uninstall":
             p.add_argument("--dry-run", action="store_true", help="list what it would remove, and remove nothing")
             p.add_argument("--purge", action="store_true",
