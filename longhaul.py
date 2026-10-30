@@ -2359,7 +2359,8 @@ ACCOUNT_REFUSED = ("Longhaul: {where} is kept for {names}, and this chat runs on
 # The refusal's second way (the ask-first plan of 2026-10-29): a plain
 # `claude` cannot be asked, so the refusal names the one command that
 # allows the chat, run in a terminal.
-ACCOUNT_ALLOW = ", or allow this chat on {label} here: longhaul allow {short} (in a terminal)"
+ACCOUNT_ALLOW = (", or allow this chat on {label} here: longhaul allow {short} (in a terminal, or ask "
+                 "Claude in another chat to run it)")
 ACCOUNT_LOGGED = "account: refused a prompt in {sid}: {where} is kept for {names}; the chat runs on {label}"
 # The hook's input holds the prompt, and the bigger the prompt the more a
 # wrong account costs: a prompt that fits a 1M-token context is well under
@@ -2553,19 +2554,15 @@ def allow_cmd(opts) -> int:
     starts with them. The folder is the one it last ran in (its newest
     transcript's last cwd, by repository: repository_of()); the account is
     NAME, else the one its record names (last_account(): the status
-    line's, the relay's, the supervisor's or the refusal's note). Refused,
-    with nothing written, from inside a Claude Code session (any
-    SESSION_ENV variable set): whether a chat may allow itself is the
-    owner's decision 2 of that plan, not taken; and for an unknown chat or
-    account, or one that may not be used there. A folder no account keeps,
+    line's, the relay's, the supervisor's or the refusal's note). It runs
+    from a chat too, through the shim (the owner, 2026-10-29, decision 2):
+    a chat refused in a kept folder cannot ask its own Claude, so another
+    chat allows it on the user's word. Refused, with nothing written, for
+    an unknown chat or account, or one that may not be used there. A folder no account keeps,
     or one the account keeps itself, needs nothing: said, exit 0."""
     def refuse(why: str) -> int:
         print(f"longhaul allow: {why}", file=sys.stderr)
         return 2
-    inside = [name for name in SESSION_ENV if name in os.environ]
-    if inside:
-        return refuse(f"not allowed: it runs inside a Claude Code session ({', '.join(inside)} set); "
-                      "run it in a terminal of your own")
     accounts, problem = read_accounts_file()
     if problem:
         return refuse(unreadable_text(problem))

@@ -11368,17 +11368,21 @@ class Shim(unittest.TestCase):
     def test_the_shim_refuses_the_supervisor_and_anything_that_changes_state(self):
         # From the Bash tool a plain `longhaul` would start a second claude
         # under a session, with Remote Control and caffeinate.
-        # `allow` too (the ask-first plan, 2026-10-29): whether a chat may
-        # allow itself is the owner's decision 2, not taken.
         for args in ((), ("-c",), ("-r", "x"), ("setup",), ("add", "A", "a@b"), ("remove", "A"), ("clear",),
-                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto"),
-                     ("allow", "1b2c3d4e"), ("allow", "1b2c3d4e", "--account", "A")):
+                     ("pipe", "--", "x"), ("wrap",), ("statusline",), ("guard",), ("reminder",), ("--switch", "auto")):
             out = self.shim(*args)
             self.assertEqual(out.returncode, 2, args)
             self.assertIn("run it in a terminal", out.stderr, args)
             self.assertEqual(out.stdout, "", args)
         self.assertIn("nothing to run", self.shim().stderr)
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
+    def test_the_shim_runs_allow(self):
+        # The ask-first plan's decision 2 (the owner, 2026-10-29): a chat refused
+        # in a kept folder cannot ask its own Claude, so another chat may allow it.
+        out = self.shim("allow", "1b2c3d4e")
+        self.assertNotIn("does not run from inside a session", out.stderr)
+        self.assertIn("longhaul allow: no chat 1b2c3d4e is known", out.stderr, "longhaul's own answer")
 
     def test_the_shim_runs_advisor_status_and_nothing_else_of_the_advisor(self):
         # Sprint 8: `advisor status` is the advise skill's first step. A probe
@@ -19629,7 +19633,8 @@ class AccountCheck(unittest.TestCase):
     def refused(self, label, where="~/zain", kept="zain-work", first="zain-work", allow=None):
         """What the hook prints to refuse a prompt, exactly: one JSON object;
         with `allow`, naming the command that allows the chat on that account."""
-        other = f", or allow this chat on {allow} here: longhaul allow 1b2c3d4e (in a terminal)" if allow else ""
+        other = (f", or allow this chat on {allow} here: longhaul allow 1b2c3d4e (in a terminal, or ask Claude in "
+                 "another chat to run it)") if allow else ""
         return json.dumps({"decision": "block", "reason": (
             f"Longhaul: {where} is kept for {kept}, and this chat runs on {label}. Nothing was sent. Close this chat "
             f"and open it again (in a terminal: longhaul -r 1b2c3d4e), so it starts on {first}{other}.")}) + "\n"
@@ -19827,7 +19832,8 @@ class AccountCheck(unittest.TestCase):
         self.assertEqual(json.loads(self.check(config=str(self.personal)))["reason"],
                          "Longhaul: ~/zain is kept for zain-work, and this chat runs on personal. Nothing was sent. "
                          "Close this chat and open it again (in a terminal: longhaul -r 1b2c3d4e), so it starts on "
-                         "zain-work, or allow this chat on personal here: longhaul allow 1b2c3d4e (in a terminal).")
+                         "zain-work, or allow this chat on personal here: longhaul allow 1b2c3d4e (in a terminal, or ask "
+                         "Claude in another chat to run it).")
         for config, label in ((None, "the default sign-in (~/.claude)"),
                               (str(self.tmp / ".claude-old"), "an account Longhaul doesn't know (~/.claude-old)")):
             with self.subTest(label):
@@ -20009,17 +20015,16 @@ class AccountCheck(unittest.TestCase):
                                           "nothing to allow.\n"))
         self.assertEqual(self.allowed(), {}, "nothing written")
 
-    def test_longhaul_allow_runs_in_a_terminal_of_your_own_only(self):
-        # Decision 2 of the ask-first plan (may the shim run it from inside a
-        # chat) is the owner's, not taken: from inside a session it refuses,
-        # whatever runs it.
+    def test_longhaul_allow_runs_from_inside_a_chat_too_and_refuses_an_unreadable_accounts_file(self):
+        # Decision 2 of the ask-first plan (the owner, 2026-10-29): a chat
+        # refused in a kept folder cannot ask its own Claude, so another chat
+        # may allow it, through the shim, on the user's word.
         self.chat()
-        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
-            with self.subTest(name):
-                code, out, err = self.allow_cmd("1b2c3d4e", **{name: "1"})
-                self.assertEqual((code, out), (2, ""))
-                self.assertEqual(err, f"longhaul allow: not allowed: it runs inside a Claude Code session ({name} set); "
-                                      "run it in a terminal of your own\n")
+        code, out, err = self.allow_cmd("1b2c3d4e", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="9" * 8)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("Allowed chat 1b2c3d4e", out)
+        self.assertEqual(len(self.allowed()), 1)
+        (self.home / "allowed.json").unlink()
         path = self.home / "accounts.json"
         for case, text in unreadable_accounts({"name": "personal", "config_dir": "~/.claude-personal"}).items():
             with self.subTest(case):

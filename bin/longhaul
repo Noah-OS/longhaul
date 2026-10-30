@@ -13,7 +13,11 @@
 # Sprint 8: the advise skill's first step; `doctor`, with nothing after it, since 2026-10-25: the
 # /longhaul:doctor skill's checklist, which writes nothing), and
 # `checkpoint save`, which writes one file under LONGHAUL_HOME/
-# checkpoints/ and nothing else: the supervisor starts and watches a
+# checkpoints/ and nothing else, and `allow` (the owner, 2026-10-29, the
+# ask-first plan's decision 2), which lets one chat's prompts through in
+# a folder other accounts keep and writes LONGHAUL_HOME/allowed.json alone:
+# a chat refused there cannot ask its own Claude, so another chat runs it
+# on the user's word. The supervisor starts and watches a
 # claude of its own, and the others change the accounts or the state, so
 # they belong in a terminal (the rule since the plugin layout was decided,
 # amended by the owner on 2026-10-20 to let the checkpoint through). The
@@ -26,11 +30,11 @@ command -v python3 >/dev/null 2>&1 || {
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 if [ $# -eq 0 ]; then
-  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, doctor, advisor status, checkpoint save and -h run; for the rest, ask the user to run it in a terminal." >&2
+  printf '%s\n' "longhaul: nothing to run. From here only inspect, usage, status, doctor, advisor status, checkpoint save, allow and -h run; for the rest, ask the user to run it in a terminal." >&2
   exit 2
 fi
 case "$1" in
-  inspect|usage|status|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
+  inspect|usage|status|allow|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
   doctor)
     # The checklist only reads (ps and lsof of the user's own chats among
     # it); the skill's rule names it alone, so nothing may follow it.
@@ -56,6 +60,6 @@ case "$1" in
     printf '%s\n' "longhaul: \`trial\` does not run from inside a session: the checkpoint trial (its start, stop, status, ratings and report) is the user's, and a session is not told its arm. Ask the user to run it in a terminal." >&2
     exit 2 ;;
   *)
-    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, doctor, advisor status, checkpoint save and -h run. Ask the user to run it in a terminal." >&2
+    printf '%s\n' "longhaul: '$1' does not run from inside a session: it starts a Claude of its own or changes accounts. From here only inspect, usage, status, doctor, advisor status, checkpoint save, allow and -h run. Ask the user to run it in a terminal." >&2
     exit 2 ;;
 esac
