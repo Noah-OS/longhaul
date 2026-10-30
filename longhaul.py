@@ -19,7 +19,11 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   `--switch never` always waits. Before Sprint 1 longhaul always moved without
   asking: that is now `--switch auto` (or LONGHAUL_SWITCH=auto). `longhaul pipe` and
   the VS Code panel cannot ask, so there "ask" acts as "never": they move
-  only in auto (an unattended move is never made without an explicit yes);
+  only in auto (an unattended move is never made without an explicit yes).
+  In "ask" this terminal asks too before an early move (an account nearly
+  full while Claude is idle), and, in a folder kept for accounts that are
+  all at their limit, before running the conversation on another account,
+  which allows the chat there (`longhaul allow`); no answer never moves it;
 - Remote Control lost while Claude sits idle: longhaul reopens the conversation,
   which connects it again (Claude Code reconnects short drops itself; this
   is for the ones it gives up on, after a VPN change or a long outage). A

@@ -19971,6 +19971,7 @@ class AccountCheck(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("Allowed chat 1b2c3d4e on spare in ~/zain"), out)
         self.assertEqual(self.allowed()[self.SID]["account"], "spare", "in place of the one before")
+        self.assertIn("longhaul allow ID [--account NAME]", longhaul.__doc__, "the Usage block names it")
 
     def test_longhaul_allow_takes_the_folder_the_chat_last_ran_in(self):
         tools = self.zain / "tools"
