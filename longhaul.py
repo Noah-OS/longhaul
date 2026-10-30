@@ -749,6 +749,10 @@ def load_state() -> dict:
 # while idle.
 NEAR_FULL = setting("LONGHAUL_NEAR_FULL", 95, float)
 IDLE_MOVE = setting("LONGHAUL_IDLE_MOVE_SECONDS", 120, float)
+# In "ask", how long the terminal's question before an early move waits for
+# an answer (Claude is closed meanwhile); with none, the conversation
+# reopens where it was.
+EARLY_ASK = setting("LONGHAUL_EARLY_ASK_SECONDS", 300, float)
 
 
 def windows(reading, now: float):
@@ -1366,7 +1370,8 @@ def countdown(seconds: int, text: str) -> bool:
 # switch_mid_session). The owner's decision record on switching without a
 # terminal says why (not shipped).
 SWITCH_MODES = {
-    "ask": "at a limit longhaul asks in its terminal before it moves a conversation to another account",
+    "ask": "at a limit, and before an early move, longhaul asks in its terminal before it moves a conversation to "
+           "another account",
     "auto": "longhaul moves a conversation to another account at a limit, and early when one is nearly full",
     "never": "longhaul waits for the reset and never moves a conversation to another account",
 }
@@ -1408,35 +1413,84 @@ def switch_mode(flag: str | None = None) -> str:
     return mode
 
 
+def terminal_fd():
+    """This terminal's stdin, to ask in, or None: no terminal, or a closed stdin."""
+    try:
+        return sys.stdin.fileno() if sys.stdin is not None and sys.stdin.isatty() else None
+    except ValueError:  # a closed stdin
+        return None
+
+
 def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
-    """At a limit in "ask" mode: "yes" only for a y typed in this terminal
-    once longhaul has asked; "stop" for q or Ctrl+C; "no" for n or Enter, no
-    answer by the reset, no terminal, or a reset already past. Other keys
-    are ignored: an arrow key, or a terminal's focus report, starts with
-    ESC, and once stopped longhaul (review, Sprint 1). Keys typed while Claude
-    ran are thrown away first, so a stray y never moves the conversation."""
+    """At a limit in "ask" mode: ask_here()'s answer to moving this
+    conversation to `there`, asked until the reset; "no", unasked, for a
+    reset already past: no one could answer in time."""
     if resets_at <= time.time():  # no one could answer in time, so nothing is asked
         return "no"
-    question = (f"{here} hit its {kind} limit (resets {clock(resets_at)}). "
-                f"Move this conversation to {there} now?")
-    then = f"longhaul waits and carries on with {here} at {clock(resets_at)}"
-    try:
-        fd = sys.stdin.fileno() if sys.stdin is not None and sys.stdin.isatty() else None
-    except ValueError:  # a closed stdin
-        fd = None
+    return ask_here(f"{here} hit its {kind} limit (resets {clock(resets_at)}). Move this conversation to {there} now?",
+                    f"y: move to {there}, n: wait for {here}, q: stop",
+                    f"longhaul waits and carries on with {here} at {clock(resets_at)}", resets_at,
+                    f"move to {there}", f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}?",
+                    f"No answer by the reset, so longhaul carries on with {here}.")
+
+
+def ask_early_move(here: str, used: float, there: str, until: float) -> str:
+    """In "ask", before an early move (Watch.should_move(): `here` nearly
+    full, at `used`%, and Claude idle, so closed to ask; the ask-first plan
+    of 2026-10-29, A4): ask_here()'s answer to moving this conversation to
+    `there`, asked until `until`; with none it reopens on `here`."""
+    return ask_here(f"{here} is at {used:g}% of its allowance, and this conversation is idle. Move it to {there} now?",
+                    f"y: move to {there}, n: stay on {here}, q: stop",
+                    f"longhaul reopens it on {here} at {clock(until)}", until, f"move early to {there}",
+                    f"{here} is at {used:g}% of its allowance. Answer in longhaul's terminal: move this conversation "
+                    f"to {there}?", f"No answer, so longhaul reopens this conversation on {here}.")
+
+
+def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, there: str) -> str:
+    """In "ask", before waiting for `first` to reset at `resets_at` in a
+    folder, `where`, that `kept` keep, all at their limit (the ask-first
+    plan, A4): ask_here()'s answer to running this conversation on
+    `there`, an account allowed anywhere. "auto" never runs it there, so
+    nothing says to use it."""
+    one = len(kept) == 1
+    names = " and ".join(kept)
+    question = (f"The account{'' if one else 's'} kept for {where} ({names}) {'is' if one else 'are'} at "
+                f"{'its limit' if one else 'their limits'}. Run this conversation on {there} here?")
+    return ask_here(question, f"y: run on {there}, n: wait for {first}, q: stop",
+                    f"longhaul waits and carries on with {first} at {clock(resets_at)}", resets_at,
+                    f"run on {there} in {where}",
+                    f"{where} is kept for {names}, at {'its limit' if one else 'their limits'}. Answer in longhaul's "
+                    f"terminal: run this conversation on {there}?",
+                    f"No answer by the reset, so longhaul carries on with {first}.", auto=False)
+
+
+def ask_here(question: str, keys: str, then: str, until: float, about: str, notice: str, late: str,
+             auto: bool = True) -> str:
+    """Ask `question` in this terminal, `keys` naming the answers: "yes"
+    only for a y typed in this terminal once longhaul has asked; "stop" for
+    q or Ctrl+C; "no" for n or Enter, no answer by `until` (`late` is said
+    then), or no terminal (the question is said, and `then`: what longhaul
+    does instead). No answer never moves anything. Other keys are ignored:
+    an arrow key, or a terminal's focus report, starts with ESC, and once
+    stopped longhaul (review, Sprint 1). Keys typed while Claude ran are
+    thrown away first, so a stray y never moves the conversation. `about`
+    names the question in the log ("asked to <about>: yes"), `notice`
+    begins the notification; `auto`: whether --switch auto would do it
+    without asking, which a question no one can answer says."""
+    hint = " To move without asking, use --switch auto or LONGHAUL_SWITCH=auto." if auto else ""
+    fd = terminal_fd()
     if fd is None:
-        say(f"{question} There is no terminal to answer in, so {then}. "
-            "To move without asking, use --switch auto or LONGHAUL_SWITCH=auto.")
+        say(f"{question} There is no terminal to answer in, so {then}.{hint}")
         return "no"
     try:
-        notify(f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}? "
-               f"With no answer {then}. To move without asking, run longhaul --switch auto.")
+        notify(f"{notice} With no answer {then}." + (" To move without asking, run longhaul --switch auto." if auto
+                                                     else ""))
         old = termios.tcgetattr(fd)
     except KeyboardInterrupt:
         print()
         return "stop"
     except termios.error as e:
-        log(f"asked to move to {there}: the terminal cannot be read ({e!r})")
+        log(f"asked to {about}: the terminal cannot be read ({e!r})")
         say(f"{question} The terminal cannot be read, so {then}.")
         return "no"
     try:
@@ -1445,11 +1499,10 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
         # that wait never ended, and longhaul hung at the limit (Sprint 1).
         termios.tcflush(fd, termios.TCIFLUSH)
         tty.setcbreak(fd, termios.TCSANOW)
-        sys.stdout.write(f"\033[36mlonghaul\033[0m {question} (y: move to {there}, n: wait for {here}, q: stop). "
-                         f"With no answer {then}. ")
+        sys.stdout.write(f"\033[36mlonghaul\033[0m {question} ({keys}). With no answer {then}. ")
         sys.stdout.flush()
-        while time.time() < resets_at:
-            ready, _, _ = select.select([fd], [], [], min(1.0, max(0.0, resets_at - time.time())))
+        while time.time() < until:
+            ready, _, _ = select.select([fd], [], [], min(1.0, max(0.0, until - time.time())))
             if not ready:
                 continue
             try:
@@ -1460,31 +1513,31 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                 why = "end of input"
             if not key:  # the terminal went away: a closed one reads as empty for ever
                 print()
-                log(f"asked to move to {there}: no answer, the terminal is gone ({why})")
+                log(f"asked to {about}: no answer, the terminal is gone ({why})")
                 return "no"
             if key in (b"y", b"Y"):
                 print("y")
-                log(f"asked to move to {there}: yes")
+                log(f"asked to {about}: yes")
                 return "yes"
             if key in (b"q", b"Q", b"\x03"):
                 print()
-                log(f"asked to move to {there}: stop")
+                log(f"asked to {about}: stop")
                 return "stop"
             if key in (b"n", b"N", b"\r", b"\n"):
                 print("n")
-                log(f"asked to move to {there}: no")
+                log(f"asked to {about}: no")
                 return "no"
         print()
-        say(f"No answer by the reset, so longhaul carries on with {here}.")
-        notify(f"No answer by the reset, so longhaul carries on with {here}.")
+        say(late)
+        notify(late)
         return "no"
     except KeyboardInterrupt:
         print()
-        log(f"asked to move to {there}: stop (Ctrl+C)")
+        log(f"asked to {about}: stop (Ctrl+C)")
         return "stop"
     except termios.error as e:  # the terminal went away while longhaul set it up
         print()
-        log(f"asked to move to {there}: no answer, the terminal is gone ({e!r})")
+        log(f"asked to {about}: no answer, the terminal is gone ({e!r})")
         return "no"
     finally:
         with contextlib.suppress(termios.error):  # a terminal that went away cannot be set back
@@ -1773,6 +1826,17 @@ def first_message(path: str) -> str | None:
     return text
 
 
+def session_id_arg(args: list[str]):
+    """The id a --session-id among claude's arguments gives a new
+    conversation, or None."""
+    for i, a in enumerate(args):
+        if a.startswith("--session-id="):
+            return a.split("=", 1)[1]
+        if a == "--session-id" and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
 def run(opts) -> int:
     try:
         mode = switch_mode(getattr(opts, "switch", None))
@@ -1886,6 +1950,76 @@ def run(opts) -> int:
         return False
 
     forced = opts.account  # `--account` decides the first launch only
+    # The ask-first plan of 2026-10-29 (A4). In a folder some accounts keep
+    # (kept_here), "ask" asks before it waits for them all at their limit
+    # whether to run the conversation on an account allowed anywhere; a yes
+    # allows the chat there (allow_chat(), read by the account check), by
+    # its id before the launch, or as Claude names it (claim()) for -c, the
+    # picker and a /clear: `allowing` holds the accounts a yes was for,
+    # `allowed_ids` the ids recorded. `carry` is the limit waited out last
+    # (account, kind), for the carry-on after such a yes. And "ask" asks
+    # before an early move; a no is not asked again of that account until
+    # its full windows reset (`declined`).
+    kept_here = [a["name"] for a in accounts if covers(a, top)]
+    allowing: set[str] = set()
+    allowed_ids: set[str] = set()
+    declined: dict[str, float] = {}
+    carry, new_id = None, None
+
+    def stopped() -> int:
+        again = f" `longhaul -r {resume}` opens it again." if resume else ""
+        say(f"Stopped at your request. The conversation is saved.{again}")
+        return 0
+
+    def kept_offer(state: dict, seen: dict):
+        """In "ask", in a folder its accounts keep when every one of them is
+        at its limit: the index of an account allowed anywhere (never one
+        kept for other repositories), not at its limit and signed in as
+        expected, to offer; else None."""
+        now = time.time()
+        if mode != "ask" or not kept_here or any(state["limited_until"].get(n, 0) <= now for n in kept_here):
+            return None
+        skip = {a["name"] for a in accounts if a["name"] in kept_here or not account_allowed(a, top)}
+        while True:
+            i, until = pick(accounts, state, 0, skip=skip, seen=seen)
+            if i is None or until:
+                return None
+            if signed_in_as_expected(accounts[i]):
+                return i
+            skip.add(accounts[i]["name"])
+
+    def run_elsewhere(state: dict, seen: dict, first: str, resets_at: float):
+        """Before waiting for `first` to reset at `resets_at`: when
+        kept_offer() has an account, ask_kept_full()'s question, and on a
+        yes the chat allowed there and the index to launch on; "stop" for
+        q; None to wait as before (no, no answer, nothing to offer)."""
+        nonlocal new_id, prompt
+        i = kept_offer(state, seen)
+        if i is None:
+            return None
+        there, where = names[i], home_path(top)
+        answer = ask_kept_full(where, kept_here, first, resets_at, there)
+        if answer != "yes":
+            return "stop" if answer == "stop" else None
+        sid = resume or None
+        if resume is None and not cont and without_resume(opts.extra) == opts.extra:
+            sid = new_id = str(uuid.uuid4())  # a new conversation's id, chosen now: its first prompt is checked at once
+        elif not sid:
+            sid = session_id_arg(opts.extra)  # else claim() allows it once Claude names it
+        try:
+            if sid:
+                allow_chat(sid, there, top)
+                allowed_ids.add(sid)
+        except OSError as e:
+            say(f"could not allow this chat on {there} in {where} ({e.strerror or e}), so longhaul waits for {first}")
+            return None
+        allowing.add(there)
+        say(f"Running this conversation on {there}; this chat is allowed on it in {where} for {ALLOWED_DAYS} days, "
+            "so its prompts go through.")
+        if carry:
+            prompt = CARRY_ON.format(old=carry[0], kind=carry[1], new=there)
+        return i
+
     # In "ask" and "never" the conversation reopens on the account it was on,
     # whatever pick() would prefer: only a yes at a limit moves it. Before,
     # a reopen after a crash could land on another account unasked. A
@@ -1922,17 +2056,23 @@ def run(opts) -> int:
             # Within the margin too: a question unanswered until the reset
             # second otherwise reopened before the limit had lifted (review).
             resets = state["limited_until"].get(stay, 0)
-            if resets + RESET_MARGIN > time.time():
+            elsewhere = run_elsewhere(state, seen, stay, resets) if resets + RESET_MARGIN > time.time() else None
+            if elsewhere == "stop":
+                return stopped()
+            if elsewhere is not None:
+                idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
+            elif resets + RESET_MARGIN > time.time():
                 if not wait_until(resets + RESET_MARGIN,
                                   f"{stay} is at its limit, and with switching set to {mode} "
                                   "the conversation stays on it (or start it with --account NAME)"):
                     return 0
                 continue
-            if not signed_in_as_expected(accounts[names.index(stay)]):
+            elif not signed_in_as_expected(accounts[names.index(stay)]):
                 say(f"{stay} is not signed in as expected, and with switching set to {mode} longhaul does not move "
                     "the conversation by itself. Run `longhaul status`, then `longhaul setup`.")
                 return 1
-            idx, until, chosen = names.index(stay), None, True
+            else:
+                idx, until, chosen = names.index(stay), None, True
         elif forced:
             i, forced = names.index(forced), None
             resets = state["limited_until"].get(names[i], 0)
@@ -1955,10 +2095,15 @@ def run(opts) -> int:
             say(f"{which} is signed in as expected. Run `longhaul status`, then `longhaul setup`.")
             return 1
         if until:
-            which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
-            if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
-                return 0
-            continue
+            elsewhere = run_elsewhere(state, seen, names[idx], until)
+            if elsewhere == "stop":
+                return stopped()
+            if elsewhere is None:
+                which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
+                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
+                    return 0
+                continue
+            idx, forced, stay = elsewhere, None, (names[elsewhere] if mode != "auto" else None)
         acct = accounts[idx]
         prepare(acct)
 
@@ -1969,6 +2114,8 @@ def run(opts) -> int:
             cmd += ["--resume"]
         elif cont:
             cmd += ["--continue"]
+        elif new_id:
+            cmd += ["--session-id", new_id]
         if opts.rc:
             # On the phone two sessions from one folder would both read
             # "myproject · Max"; --name tells them apart.
@@ -1996,10 +2143,29 @@ def run(opts) -> int:
                        and st["limited_until"].get(a["name"], 0) <= now
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
+        def early(here=acct["name"]) -> bool:
+            return declined.get(here, 0) <= time.time() and other_has_room()
+
+        def claim(sid: str, here=acct["name"]) -> bool:
+            """guard()'s lock on the conversation Claude names; on an account
+            a yes allowed this conversation on in this kept folder, that id
+            allowed too, once (-c, the picker, a /clear's new id)."""
+            if here in allowing and sid not in allowed_ids:
+                allowed_ids.add(sid)
+                try:
+                    allow_chat(sid, here, top)
+                except OSError as e:
+                    later(f"could not allow {sid[:8]} on {here} in {home_path(top)}: {e!r}")
+            return guard(sid, later)
+
         try:
-            # The early move to an account with room happens in "auto" only.
-            why = supervise(proc, w, other_has_room if mode == "auto" else (lambda: False), may_reconnect,
-                            claim=lambda sid: guard(sid, later))
+            # The early move to an account with room: in "auto" at once; in
+            # "ask" after a yes in this terminal (A4), so only with one to
+            # answer in: Claude is closed to ask, and without a terminal it
+            # would be closed and reopened for nothing.
+            room = (other_has_room if mode == "auto" else early if mode == "ask" and terminal_fd() is not None
+                    else (lambda: False))
+            why = supervise(proc, w, room, may_reconnect, claim=claim)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -2042,6 +2208,7 @@ def run(opts) -> int:
             return exit_code(proc.returncode, 0)
         if mode != "auto":
             stay = acct["name"]
+        carry = None
 
         if why == "limit":
             def mark(state, name=acct["name"], limit=w.limit):
@@ -2065,9 +2232,7 @@ def run(opts) -> int:
             else:
                 answer = "yes" if verdict == "move" else "no"
             if answer == "stop":
-                again = f" `longhaul -r {resume}` opens it again." if resume else ""
-                say(f"Stopped at your request. The conversation is saved.{again}")
-                return 0
+                return stopped()
             if answer == "yes":  # always, in "auto"
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
                     old=acct["name"], kind=w.limit["kind"], new=new, every=every)
@@ -2081,19 +2246,41 @@ def run(opts) -> int:
             else:  # "ask" without a yes, or "never": the reset, on this account
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
                     old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
+                carry = (acct["name"], w.limit["kind"])
                 log(msg)  # the wait at the top of the loop says it, with the time
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
             # carry on, and your next message goes to the new account.
             prompt = None
-            used = max((u for u, _ in windows(readings(accounts).get(acct["name"]), time.time())), default=0)
-            nxt, _ = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
-                          seen=readings(accounts))
-            msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
-                   f"longhaul moved it to {accounts[nxt]['name']}.")
-            say(msg)
-            notify(msg)
-            idx = nxt
+            reading = readings(accounts).get(acct["name"])
+            used = max((u for u, _ in windows(reading, time.time())), default=0)
+            nxt, wait = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
+                             seen=readings(accounts))
+            there = accounts[nxt]["name"]
+            # In "ask" the question first; an account signed in as someone
+            # else, or no account with room by now, is never offered.
+            answer = "yes" if mode == "auto" else "no"
+            if mode == "ask" and nxt != idx and not wait and signed_in_as_expected(accounts[nxt]):
+                answer = ask_early_move(acct["name"], used, there, time.time() + EARLY_ASK)
+            if answer == "stop":
+                return stopped()
+            if mode == "auto":
+                msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
+                       f"longhaul moved it to {there}.")
+                say(msg)
+                notify(msg)
+                idx = nxt
+            elif answer == "yes":
+                msg = f"Moving to {there}: reopening this conversation there."
+                idx, stay = nxt, there
+                say(msg)
+                notify(msg)
+            else:
+                # Not asked again of this account until the windows that
+                # make it nearly full reset; its limit asks as ever.
+                declined[acct["name"]] = max((r for u, r in windows(reading, time.time()) if u >= NEAR_FULL),
+                                             default=time.time() + EARLY_ASK)
+                say(f"Staying on {acct['name']}: reopening this conversation there; longhaul asks again at its limit.")
         elif why == "reconnect":
             prompt = None
             reconnects.append(time.time())
