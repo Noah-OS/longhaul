@@ -226,7 +226,8 @@ Usage:
                           in the folder it last ran in, where other accounts keep
                           it, for 30 days (LONGHAUL_HOME/allowed.json); ID is the
                           chat's id or its first 8 characters, as the refusal names
-                          it. In a terminal of your own, never from inside a chat
+                          it. In a terminal, or from another chat (the refused
+                          chat cannot ask its own Claude)
   longhaul session-end         the plugin's SessionEnd hook: keeps why the session
                           ended (clear, resume, logout, prompt_input_exit or
                           other) and when, nothing else, so that a non-zero exit
