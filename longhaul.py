@@ -11879,6 +11879,14 @@ def chat_file(folder: str, sid, suffix: str = "") -> Path | None:
     return LONGHAUL_HOME / folder / f"{sid}{suffix}.json"
 
 
+def carry_time(reset: float) -> int:
+    """When a carry-on for a reset at `reset` goes: RESET_MARGIN later (a
+    reset is approximate), in whole seconds rounded up. One rule for the
+    wait's "until" and the question's "carries_on_at", so what the pane's
+    button and the status entry say is the same minute."""
+    return math.ceil(reset + RESET_MARGIN)
+
+
 def write_private(path: Path, data) -> None:
     """write_json (whole, 0600) in a folder only you can open: a question
     names your accounts and a chat's id."""
@@ -12897,11 +12905,15 @@ class Relay:
         there = self.accounts[nxt]["name"]
         resets = max(limit["resets_at"], state["limited_until"].get(here["name"], 0))
         # Whole seconds rounded up: a carry-on scheduled from them never comes
-        # before the reset itself.
+        # before the reset itself. carries_on_at is when the answer that
+        # waits (yes, or wait) carries on, worked out as schedule() will from
+        # the same reset, so the pane's "Yes, carry on at 14:01" is the wait
+        # file's until, the status entry's minute, and not the reset's 14:00.
+        at = math.ceil(until) if until else math.ceil(resets)
         q = {"id": f"q-{uuid.uuid4().hex[:12]}", "chat": sid, "relay_pid": os.getpid(), "asked_at": int(time.time()),
              "kind": "first_reset" if until else "move", "from": here["name"], "limit": limit["kind"],
              "resets_at": math.ceil(resets), "to": there, "to_resets_at": math.ceil(until) if until else None,
-             "choices": ["yes", "no"] if until else ["move", "wait"]}
+             "carries_on_at": carry_time(at), "choices": ["yes", "no"] if until else ["move", "wait"]}
         try:
             write_private(path, q)
         except OSError as e:
@@ -12979,7 +12991,7 @@ class Relay:
             log("wait: none for a chat with no id yet; the chat stays as it is")
             return
         name = self.accounts[to]["name"]
-        self.carry = {"chat": sid, "until": math.ceil(at + RESET_MARGIN), "account": name, "why": why}
+        self.carry = {"chat": sid, "until": carry_time(at), "account": name, "why": why}
         self.carry_for = {"to": to, "limit": limit, "since": since}
         try:
             write_private(path, self.carry)

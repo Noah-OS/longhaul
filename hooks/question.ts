@@ -65,7 +65,7 @@ export function cleanQuestion(v: any, chat: string): LonghaulQuestion | null {
   if (from === null || to === null || limit === null || resets === null || (kind === 'first_reset' && toResets === null))
     return null
   return { id: v.id, chat, relay_pid: pid, asked_at: num(v.asked_at) ?? 0, kind, from, limit, resets_at: resets, to,
-    to_resets_at: toResets, choices: [...choices] }
+    to_resets_at: toResets, carries_on_at: num(v.carries_on_at), choices: [...choices] }
 }
 
 export function cleanWait(v: any, chat: string, now: number): LonghaulWait | null {
@@ -128,14 +128,19 @@ export function clock(seconds: number, nowMs: number): string {
 }
 
 // What the question says, and each choice's button, in the relay's words.
+// The question names the reset; Yes names when the carry-on goes, a
+// minute later (the relay's carries_on_at), which is the minute the status
+// entry and the pane show once it waits. A relay older than that field:
+// the reset, as before.
 export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels: Record<string, string> } {
   if (q.kind === 'move')
     return { says: `${q.from} hit its ${q.limit} limit (resets ${clock(q.resets_at, nowMs)}). `
       + `Move this chat to ${q.to} and carry on?`, labels: { move: 'Move and carry on', wait: 'Wait for the reset' } }
-  const at = clock(q.to_resets_at ?? q.resets_at, nowMs)
+  const reset = q.to_resets_at ?? q.resets_at
+  const at = clock(reset, nowMs)
   return { says: q.to === q.from ? `${q.from} resets at ${at}. Carry on then?`
     : `Every account is at its limit. ${q.to} resets first, at ${at}. Carry on there then?`,
-  labels: { yes: `Yes, carry on at ${at}`, no: "No, I'll come back" } }
+  labels: { yes: `Yes, carry on at ${clock(q.carries_on_at ?? reset, nowMs)}`, no: "No, I'll come back" } }
 }
 
 // The pop-up that says a question waits, for a pane that may not have opened.

@@ -38,7 +38,7 @@ const RELAY = 4242
 const QUESTION = { id: 'q-0123456789ab', chat: SID, relay_pid: RELAY, asked_at: AT, kind: 'move', from: 'personal-1',
   limit: 'weekly', resets_at: AT + 38 * HOUR, to: 'work-2', to_resets_at: null, choices: ['move', 'wait'] }
 const FIRST = { ...QUESTION, id: 'q-ba9876543210', kind: 'first_reset', to: 'work-2', to_resets_at: AT + 2 * HOUR,
-  choices: ['yes', 'no'] }
+  carries_on_at: AT + 2 * HOUR + 60, choices: ['yes', 'no'] }
 const WAIT = { chat: SID, until: AT + 2 * HOUR, account: 'personal-1', why: 'answered' }
 const QUESTION_FILE = `${HOME}/questions/${SID}.json`
 const WAIT_FILE = `${HOME}/waits/${SID}.json`
@@ -634,7 +634,11 @@ both('every account at its limit: the first reset, and the same account worded a
   const { ui } = await opened($, w, surface)
   const at = clock(AT + 2 * HOUR)
   expect((await texts(ui))[0]).toBe(`Every account is at its limit. work-2 resets first, at ${at}. Carry on there then?`)
-  expect((await ui.find({ key: 'answer-yes' }))?.text).toBe(`Yes, carry on at ${at}`)
+  // Yes names the carry-on's own minute, the relay's carries_on_at: the
+  // reset plus its margin, as the wait's until will be.
+  const later = clock(AT + 2 * HOUR + 60)
+  expect(later).not.toBe(at)
+  expect((await ui.find({ key: 'answer-yes' }))?.text).toBe(`Yes, carry on at ${later}`)
   expect((await ui.find({ key: 'answer-no' }))?.text).toBe("No, I'll come back")
   await ui.press({ key: 'answer-no' })
   expect(after(w)).toEqual([['answer', SID, 'q-ba9876543210', 'no']])
@@ -644,6 +648,27 @@ both('every account at its limit: the first reset, and the same account worded a
   expect((await texts(ui))[0]).toBe(`personal-1 resets at ${at}. Carry on then?`)
   await ui.press({ key: 'answer-yes' })
   expect(after(w).slice(-1)).toEqual([['answer', SID, 'q-aaaaaaaaaaaa', 'yes']])
+  await ui.unmount()
+})
+
+both("the yes names the minute the carry-on then shows; an older relay's question names the reset", async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, FIRST)
+  const { ui } = await opened($, w, surface)
+  const yes = (await ui.find({ key: 'answer-yes' }))?.text
+  await ui.press({ key: 'answer-yes' })
+  // The relay acts on the yes: the question goes, and its wait's until is the question's carries_on_at.
+  write(w, QUESTION_FILE, null)
+  write(w, WAIT_FILE, { ...WAIT, until: FIRST.carries_on_at, account: 'work-2' })
+  await w.clock.advance(3000)
+  expect(yes).toBe(`Yes, carry on at ${clock(FIRST.carries_on_at)}`)
+  expect(await texts(ui)).toContain(`This chat carries on at ${clock(FIRST.carries_on_at)} on work-2.`)
+  // A relay older than carries_on_at: the reset, as before.
+  const { carries_on_at: _, ...older } = FIRST
+  write(w, WAIT_FILE, null)
+  write(w, QUESTION_FILE, { ...older, id: 'q-cccccccccccc' })
+  await w.clock.advance(3000)
+  expect((await ui.find({ key: 'answer-yes' }))?.text).toBe(`Yes, carry on at ${clock(AT + 2 * HOUR)}`)
   await ui.unmount()
 })
 

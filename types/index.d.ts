@@ -75,6 +75,9 @@ export type LonghaulQuestion = {
   resets_at: number
   to: string // move: the account offered; first_reset: the one that resets first
   to_resets_at: number | null
+  // When the answer that waits (yes, or wait) carries on: the reset plus a
+  // margin, as the wait's until will be. Optional: an older relay does not write it.
+  carries_on_at?: number | null
   choices: string[] // move: move, wait; first_reset: yes, no
 }
 

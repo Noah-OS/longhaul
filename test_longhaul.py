@@ -17043,10 +17043,11 @@ class PanelKeepWorking(StreamHarness):
     def test_the_question_is_written_and_move_carries_on_on_the_other_account(self):
         p, q = self.limit_and_question()
         self.assertRegex(q["id"], r"^q-[0-9a-f]{12}$")
-        self.assertEqual({k: v for k, v in q.items() if k not in ("id", "asked_at", "resets_at")},
+        self.assertEqual({k: v for k, v in q.items() if k not in ("id", "asked_at", "resets_at", "carries_on_at")},
                          {"chat": "sid-1", "relay_pid": p.pid, "kind": "move", "from": "Max", "limit": "session",
                           "to": "Pro", "to_resets_at": None, "choices": ["move", "wait"]})
         self.assertAlmostEqual(q["resets_at"], time.time() + 3600, delta=30)
+        self.assertEqual(q["carries_on_at"], q["resets_at"] + 60, "a wait carries on RESET_MARGIN after the reset")
         self.assertEqual((self.relay / "questions" / "sid-1.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.relay / "questions").stat().st_mode & 0o777, 0o700)
         self.assertEqual(len(self.calls()), 1, "nothing moves before the answer")
@@ -17070,6 +17071,7 @@ class PanelKeepWorking(StreamHarness):
         (self.relay / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3}}))
         p, q = self.limit_and_question(LONGHAUL_RESET_MARGIN="0")
         self.assertEqual((q["kind"], q["to"], q["choices"]), ("first_reset", "Pro", ["yes", "no"]))
+        self.assertEqual(q["carries_on_at"], q["to_resets_at"], "LONGHAUL_RESET_MARGIN=0: at Pro's reset itself")
         self.answer(q, "yes")
         self.carry_on("The Max account hit its session limit while every account was at its limit, so longhaul "
                       "waited for the Pro account to reset")
@@ -17092,8 +17094,8 @@ class KeepWorking(unittest.TestCase):
     test's own, so a reset an hour away comes at once. The swap is stood in
     for (moves records it); PanelKeepWorking runs the real one."""
 
-    QUESTION_KEYS = ["asked_at", "chat", "choices", "from", "id", "kind", "limit", "relay_pid", "resets_at", "to",
-                     "to_resets_at"]
+    QUESTION_KEYS = ["asked_at", "carries_on_at", "chat", "choices", "from", "id", "kind", "limit", "relay_pid",
+                     "resets_at", "to", "to_resets_at"]
 
     class Clock:
         """longhaul's time module with time() the test's own."""
@@ -17191,7 +17193,8 @@ class KeepWorking(unittest.TestCase):
         self.assertRegex(q.pop("id"), r"^q-[0-9a-f]{12}$")
         self.assertEqual(q, {"chat": "sid-k", "relay_pid": os.getpid(), "asked_at": int(self.clock.at), "kind": "move",
                              "from": "Max", "limit": "session", "resets_at": int(self.clock.at + 3600), "to": "Pro",
-                             "to_resets_at": None, "choices": ["move", "wait"]})
+                             "to_resets_at": None, "carries_on_at": int(self.clock.at + 3600) + 60,
+                             "choices": ["move", "wait"]})
         self.assertEqual((r.moves, list(r.queue), r.paused), ([], [], False), "nothing moves; the lines go on")
         self.assertIsNone(self.waiting())
         self.assertEqual(self.state()["limited_until"]["Max"], self.clock.at + 3600)
@@ -17278,9 +17281,10 @@ class KeepWorking(unittest.TestCase):
         r = self.relay()
         self.stop(r)
         q = self.question()
-        self.assertEqual({k: q[k] for k in ("kind", "from", "to", "to_resets_at", "resets_at", "choices")},
+        self.assertEqual({k: q[k] for k in ("kind", "from", "to", "to_resets_at", "resets_at", "carries_on_at", "choices")},
                          {"kind": "first_reset", "from": "Max", "to": "Pro", "to_resets_at": int(self.clock.at + 600),
-                          "resets_at": int(self.clock.at + 3600), "choices": ["yes", "no"]})
+                          "resets_at": int(self.clock.at + 3600), "carries_on_at": int(self.clock.at + 600) + 60,
+                          "choices": ["yes", "no"]}, "a yes carries on a minute after Pro's reset")
         self.assertIn("Every account is at its limit. Pro resets first, at ", self.notes[0])
         self.assertIn("Carry on there then?", self.notes[0])
 
@@ -17288,9 +17292,12 @@ class KeepWorking(unittest.TestCase):
         self.limited(Pro=self.clock.at + 600)
         r = self.relay()
         self.stop(r)
-        self.answer("sid-k", self.question()["id"], "yes")
+        q = self.question()
+        self.answer("sid-k", q["id"], "yes")
         r.tend()
         self.assertEqual(self.waiting()["account"], "Pro")
+        # The pane's "Yes, carry on at" and the status entry's "carries on at" read these two: one minute.
+        self.assertEqual(self.waiting()["until"], q["carries_on_at"])
         self.later(600 + 60)
         r.tend()
         self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON_AFTER_WAIT.format(
