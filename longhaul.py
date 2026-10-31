@@ -30,7 +30,10 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   at the first reset, without asking, and "never" carries on at this
   account's reset. A carry-on waiting for a reset (LONGHAUL_HOME/waits/
   <chat>.json) goes only to a chat idle since its limit: when Claude
-  Code's own wait or you carried on first, nothing is sent. `longhaul
+  Code's own wait or you carried on first, nothing is sent. The relay
+  stays in each panel chat for this, in every mode; "switch_mid_session":
+  false in LONGHAUL_HOME/vscode.json turns it off, and the panel then
+  runs Claude alone: no question, no carry-on, no move. `longhaul
   pipe` cannot ask, so there "ask" acts as "never": it moves only in auto
   (an unattended move is never made without an explicit yes).
   In "ask" this terminal never moves early (to ask it would close Claude),
@@ -120,7 +123,10 @@ Usage:
                           VS Code's Claude panel uses your Longhaul accounts
                           (on), or its own sign-in again (off); it edits VS
                           Code's settings for you, a copy kept, on after a yes
-                          in a terminal (--yes: without asking)
+                          in a terminal (--yes: without asking). On, Longhaul
+                          stays in each panel chat to ask and carry on at a
+                          limit; "switch_mid_session": false in
+                          ~/.longhaul/vscode.json runs Claude alone there
   longhaul setup [NAME] [--relogin]
                           sign each account in to its own folder (a browser
                           sign-in; --relogin: again, even if signed in); only
@@ -1419,8 +1425,8 @@ def decide_move(mode: str, consent: bool, can_ask: bool) -> str:
     """The one rule for every front end (decision 1 of the owner's record on
     switching without a terminal, not shipped): a conversation moves to another account
     only when the user's mode allows it and the front end consented (the
-    person at the terminal; --swap from a driver; switch_mid_session for
-    the panel). "move": go. "ask": ask the person first. "stay": wait for
+    person at the terminal; --swap from a driver; for the panel, its relay
+    in the chat, there unless switch_mid_session is false). "move": go. "ask": ask the person first. "stay": wait for
     the reset where it is. Written once, so run() and the relay cannot
     drift apart, as they did in Sprint 2's review."""
     if not consent or mode == "never":
@@ -11911,25 +11917,68 @@ def trace(direction: str, pid, line: bytes, note: str = "") -> None:
 
 
 def vscode_config() -> dict:
-    """{"switch_mid_session": bool, "switch": "ask"|"auto"|"never"}.
-    switch_mid_session off (the default): a panel chat only starts on the
-    account longhaul picks. On, and only when it is the JSON value true: longhaul also
-    stays in between, and moves the chat at a limit when the mode is auto
-    (LONGHAUL_SWITCH in the wrapper's environment, then "switch" here, then
-    "ask"; see panel_switch_mode)."""
+    """{"switch_mid_session": bool, "switch": "ask"|"auto"|"never"}, the
+    user's own file (longhaul only reads it); {} when it is not there or
+    not an object. switch_mid_session: see panel_mid_session(). switch:
+    the panel's switching, after LONGHAUL_SWITCH in the wrapper's
+    environment and before config.json's (panel_switch_mode())."""
     found = read_json(VSCODE_CONFIG)
-    return {"switch_mid_session": False, **(found if isinstance(found, dict) else {})}
+    return found if isinstance(found, dict) else {}
 
 
 def panel_mid_session() -> bool:
-    """Whether the wrapper stays in a panel chat to move it at a limit:
-    vscode.json's switch_mid_session when it says, only the JSON true being
-    on; else on when config.json's switching is auto, the one answer the
-    guided `longhaul add` gives for both front ends."""
-    found = read_json(VSCODE_CONFIG)
-    if isinstance(found, dict) and "switch_mid_session" in found:
-        return found["switch_mid_session"] is True
-    return config_switch() == "auto"
+    """Whether the wrapper stays in a panel chat (the relay): to ask at a
+    limit in ask, to carry on at a reset, to move in auto. On in every
+    mode by default (the owner's decision 3, 2026-10-31: "Yes, in every
+    mode"): it was on only with this key true or auto saved, so in ask,
+    the default, the panel's question was never asked and in never no
+    carry-on was scheduled. Only "switch_mid_session": false in
+    vscode.json, the JSON false itself, turns it off; the chat then runs
+    on Claude alone, with no question, no carry-on and no move.
+
+    Any other value, the word "false" among them, is the default, on.
+    Off is the one setting that loses the question and the carry-on, so
+    it takes the plain false, as on once took the plain true (review,
+    Sprint 2); and a value longhaul cannot read gets what no file gets.
+    status, `longhaul switch` and the doctor name a value that is neither
+    (panel_mid_session_odd())."""
+    return vscode_config().get("switch_mid_session") is not False
+
+
+# What status, `longhaul switch` and the doctor say of a panel with the relay off.
+PANEL_ALONE = ('The VS Code panel runs Claude alone ("switch_mid_session": false in {file}): at a limit there is '
+               "no question, no carry-on and no move.")
+
+
+def panel_mid_session_odd() -> str:
+    """A switch_mid_session in vscode.json that is neither true nor false,
+    which panel_mid_session() takes for on, named for status, `longhaul
+    switch` and the doctor; "" for none."""
+    found = vscode_config()
+    if "switch_mid_session" not in found or isinstance(found["switch_mid_session"], bool):
+        return ""
+    return (f"{json.dumps(found['switch_mid_session'])} for switch_mid_session in {home_path(str(VSCODE_CONFIG))} "
+            "is not true or false, so it is on, the default")
+
+
+def panel_switch_source() -> tuple:
+    """(the panel's switching as written, where it is written): "env"
+    for LONGHAUL_SWITCH in this process's environment, then "vscode" for
+    "switch" in vscode.json, then "config" for config.json's, then
+    "default" for ask. It reads only, and logs nothing: status --json and
+    the relay's notifications ask it too."""
+    if os.environ.get("LONGHAUL_SWITCH"):
+        return os.environ["LONGHAUL_SWITCH"], "env"
+    key = vscode_config().get("switch")
+    if key:
+        return key, "vscode"
+    return (config_switch(), "config") if config_switch() else ("ask", "default")
+
+
+def panel_switch_in_force() -> str:
+    """The panel's mode, as panel_switch_mode() decides it, with no log line."""
+    value, _ = panel_switch_source()
+    return value if isinstance(value, str) and value in SWITCH_MODES else "never"
 
 
 def panel_switch_mode() -> str:
@@ -11937,13 +11986,26 @@ def panel_switch_mode() -> str:
     "switch" in vscode.json, then config.json's, then "ask". An unknown
     value never stops a chat: it runs and never moves, and the log says why
     (ADR-0002)."""
-    value = os.environ.get("LONGHAUL_SWITCH") or vscode_config().get("switch") or config_switch() or "ask"
+    value, where = panel_switch_source()
     if isinstance(value, str) and value in SWITCH_MODES:
         return value
-    where = "LONGHAUL_SWITCH" if os.environ.get("LONGHAUL_SWITCH") else f'"switch" in {VSCODE_CONFIG}'
+    where = "LONGHAUL_SWITCH" if where == "env" else f'"switch" in {VSCODE_CONFIG}'
     log(f"panel: switching {value!r} (from {where}) is not ask, auto or never, so the chat runs and "
         "never moves. Set it to one of the three, or remove it.")
     return "never"
+
+
+def panel_switch_fix(mode: str = "auto") -> str:
+    """How to set the panel's switching to `mode`, where it is set now:
+    `longhaul switch` saves config.json, which a "switch" in vscode.json
+    or LONGHAUL_SWITCH in VS Code's environment wins over, so it names
+    that one instead. Plain words, no quotes: notify() turns " into '."""
+    where = panel_switch_source()[1]
+    if where == "vscode":
+        return f"set the key switch to {mode} in {VSCODE_CONFIG}"
+    if where == "env":
+        return f"start VS Code with LONGHAUL_SWITCH={mode}"
+    return f"run longhaul switch {mode}"
 
 
 def is_chat(args: list[str]) -> bool:
@@ -12164,14 +12226,14 @@ def wrap(argv: list[str]) -> int:
         log(f"panel {'chat' if chat else 'job'} on {acct['name']}{where}: {shown[:240]}")
         if resumed:
             # The record the next reopen reads (D3d). With switch_mid_session
-            # off claude runs in this process's place and nothing of longhaul
+            # false claude runs in this process's place and nothing of longhaul
             # sees the chat, and the relay's note_cost() writes the record
             # only once a turn has cost something: a chat reopened by id with
             # no record was picked, and could be picked again, elsewhere, at
             # the next reopen (review, Sprint 5). A new chat's id is not known
             # before the exec: the status line or the relay records it.
             note_session_account(resumed, acct["name"])
-        if not chat or not panel_mid_session():  # "false" in vscode.json is not on
+        if not chat or not panel_mid_session():  # only the JSON false turns the relay off
             os.execve(binary, [binary] + args, wrapper_env(acct))
         relay = Relay(binary, args, accounts, idx, mode=mode)
         relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
@@ -13791,7 +13853,8 @@ def guided_switching() -> None:
                default=True)
     found = read_json(CONFIG)
     write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": "auto" if auto else "ask"})
-    say(("Saved: it moves by itself (auto)" if auto else "Saved: it asks first in the terminal, and stays put in the panel (ask)")
+    # The panel asks too since keep working (K1): "stays put in the panel" was true only with its relay off.
+    say(("Saved: it moves by itself (auto)" if auto else "Saved: it asks first (ask)")
         + f", for the terminal and the VS Code panel, in {home_path(str(CONFIG))}. --switch or LONGHAUL_SWITCH override it.")
 
 
@@ -13811,21 +13874,43 @@ def switch_cmd(opts) -> int:
             return 2
         source = ("set by LONGHAUL_SWITCH" + (f", over {saved} saved in {where}" if saved else "") if env
                   else f"saved in {where}" if saved else "the default")
-        print(f"Switching: {mode} ({source}): {switch_said(mode)}. `longhaul switch ask|auto|never` saves another.")
+        print(f"Switching: {mode} ({source}): {switch_said(mode)}. `longhaul switch ask|auto|never` saves another."
+              + switch_panel_note())
         return 0
     found = read_json(CONFIG)
     write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": opts.mode})
     say(f"Saved: switching at a usage limit is {opts.mode}, for the terminal and the VS Code panel, in {where}: "
         f"{switch_said(opts.mode)}." + (f" LONGHAUL_SWITCH ({env}) is set here and still wins over it; unset it to "
-                                        "use the saved mode." if env else " --switch or LONGHAUL_SWITCH override it."))
+                                        "use the saved mode." if env else " --switch or LONGHAUL_SWITCH override it.")
+        + switch_panel_note())
     return 0
 
 
 def switch_said(mode: str) -> str:
     """What `mode` does, as SWITCH_MODES says it; ask says the panel too,
-    which asks in Longhaul's pane (keep working, K1 and K2)."""
+    which asks in Longhaul's pane (keep working, K1 and K2) while its
+    relay stays in the chat (panel_mid_session())."""
     return SWITCH_MODES[mode] + ("; the VS Code panel asks too, in Longhaul's pane, and with every account at its "
-                                 "limit asks once whether to carry on at the first reset" if mode == "ask" else "")
+                                 "limit asks once whether to carry on at the first reset"
+                                 if mode == "ask" and panel_mid_session() else "")
+
+
+def switch_panel_note() -> str:
+    """For `longhaul switch`: where the VS Code panel does not take
+    config.json's mode, from the files alone (this terminal's
+    LONGHAUL_SWITCH need not be VS Code's): its relay off, or a "switch"
+    in vscode.json, which wins there; and a switch_mid_session that is
+    neither true nor false. "" when the panel takes it as it is."""
+    file = home_path(str(VSCODE_CONFIG))
+    if not panel_mid_session():
+        return " " + PANEL_ALONE.format(file=file)
+    odd = panel_mid_session_odd()
+    note = f" The VS Code panel stays in each chat ({odd})." if odd else ""
+    key = vscode_config().get("switch")
+    if key:
+        used = key if isinstance(key, str) and key in SWITCH_MODES else "never"
+        note += f" The VS Code panel uses {used}, from the key switch in {file}, which wins there."
+    return note
 
 
 VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
@@ -14065,15 +14150,18 @@ def status(opts) -> int:
     source = ("set by LONGHAUL_SWITCH" if os.environ.get("LONGHAUL_SWITCH")
               else f"saved in {home_path(str(CONFIG))}" if config_switch() else "the default")
     if not panel_mid_session():
-        tail = "The VS Code panel never moves a chat (switching mid-chat is off)."
+        tail = PANEL_ALONE.format(file=home_path(str(VSCODE_CONFIG)))
     else:
         # From the files only: this terminal's LONGHAUL_SWITCH may not be the panel's.
         key = vscode_config().get("switch")
         shown = (f"{key} (from vscode.json)" if isinstance(key, str) and key in SWITCH_MODES
                  else f"{config_switch()} (saved in {home_path(str(CONFIG))})" if not key and config_switch()
                  else "ask (the default)" if not key else f"never ({key!r} in vscode.json is not a mode)")
-        tail = (f"The VS Code panel moves a chat at a limit only in auto; it is {shown}, "
-                "unless VS Code was started with LONGHAUL_SWITCH set.")
+        odd = panel_mid_session_odd()
+        tail = (f"The VS Code panel stays in each chat{f' ({odd})' if odd else ''}: at a limit it asks in ask, moves "
+                f"by itself in auto, and carries on after the reset in never; it is {shown}, unless VS Code was "
+                f'started with LONGHAUL_SWITCH set. "switch_mid_session": false in {home_path(str(VSCODE_CONFIG))} '
+                "turns that off.")
     print(f"Switching: {mode} ({source}): {SWITCH_MODES[mode]}. Change it with `longhaul switch ask|auto|never`, "
           f"--switch or LONGHAUL_SWITCH. {tail} longhaul pipe moves a session only when its driver passes --swap and the mode "
           "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never.")
@@ -14728,8 +14816,9 @@ def doctor_statusline() -> dict:
 
 def doctor_vscode() -> dict:
     """6. The VS Code panel: whether VS Code's settings point its Claude
-    at a longhaul-vscode that is there (`longhaul vscode on`). Nothing to
-    set with one subscription, or without VS Code."""
+    at a longhaul-vscode that is there (`longhaul vscode on`), and whether
+    its relay stays in the chats (panel_mid_session()). Nothing to set with
+    one subscription, or without VS Code."""
     accounts, problem = read_accounts_file()
     if not accounts and not problem:
         return doctor_result("nothing to set with one subscription (the panel signs in on its own)")
@@ -14756,7 +14845,15 @@ def doctor_vscode() -> dict:
     if doctor_in_plugins(path):
         return doctor_result(f"points into the plugin's own copy ({home_path(path)}), which moves at every update",
                              mark="warn", step="`longhaul vscode on` from the terminal command")
-    return doctor_result(f"through Longhaul ({home_path(path)})")
+    said, file = f"through Longhaul ({home_path(path)})", home_path(str(VSCODE_CONFIG))
+    if not panel_mid_session():  # the user's own choice: said, not judged
+        return doctor_result(f"{said}; Claude runs alone in its chats (switch_mid_session is false in {file}): at "
+                             "a limit there is no question, no carry-on and no move")
+    odd = panel_mid_session_odd()
+    if odd:
+        return doctor_result(f"{said}, which stays in each chat to ask and carry on at a limit ({odd})", mark="warn",
+                             step=f"set switch_mid_session to true or false in {file}, or remove it")
+    return doctor_result(f"{said}, which stays in each chat to ask and carry on at a limit")
 
 
 def doctor_default_email():

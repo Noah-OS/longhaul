@@ -649,13 +649,27 @@ class Loop(unittest.TestCase):
         last = out.stdout.splitlines()[-1]
         self.assertEqual(last.split()[:2], ["Switching:", "ask"])
         self.assertIn("longhaul pipe moves a session only when its driver passes --swap and the mode there is auto", last)
-        self.assertIn("The VS Code panel never moves a chat (switching mid-chat is off)", last)
+        # The owner's decision 3, 2026-10-31: the panel's relay is in every chat by default.
+        self.assertIn("The VS Code panel stays in each chat: at a limit it asks in ask, moves by itself in auto, and "
+                      "carries on after the reset in never; it is ask (the default), unless VS Code was started with "
+                      'LONGHAUL_SWITCH set. "switch_mid_session": false in ', last)
+        self.assertNotIn("never moves a chat", last)
         # Sprint 5, D3d: a resume by id is a move too.
         self.assertIn("A conversation resumed by id starts on the account it last ran on in ask and never", last)
         (self.home / "vscode.json").write_text(json.dumps({"switch_mid_session": True, "switch": "never"}))
         out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
-        self.assertIn("The VS Code panel moves a chat at a limit only in auto; it is never (from vscode.json)",
-                      out.stdout.splitlines()[-1])
+        self.assertIn("it is never (from vscode.json)", out.stdout.splitlines()[-1])
+        # Off only with the JSON false: then Claude runs alone in the panel.
+        (self.home / "vscode.json").write_text(json.dumps({"switch_mid_session": False}))
+        out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
+        last = out.stdout.splitlines()[-1]
+        self.assertIn('The VS Code panel runs Claude alone ("switch_mid_session": false in ', last)
+        self.assertIn("vscode.json): at a limit there is no question, no carry-on and no move.", last)
+        # A value neither true nor false is on, the default, and named.
+        (self.home / "vscode.json").write_text(json.dumps({"switch_mid_session": "false"}))
+        out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
+        self.assertIn('The VS Code panel stays in each chat ("false" for switch_mid_session in ', out.stdout)
+        self.assertIn("vscode.json is not true or false, so it is on, the default): at a limit", out.stdout)
         # The guided add's saved answer (the owner, 2026-10-23): named as such,
         # not as the default, and the panel's too when vscode.json says nothing.
         (self.home / "vscode.json").unlink()
@@ -16054,7 +16068,9 @@ class StreamHarness(unittest.TestCase):
         self.accounts([{"name": "Max", "config_dir": str(self.max), "email": "first@example.com"},
                        {"name": "Pro", "config_dir": str(self.pro), "email": "second@example.com"}])
         self.emails = {str(self.max): "first@example.com", str(self.pro): "second@example.com"}
-        self.switch_mid_session(True)
+        # No vscode.json: the relay stays in every panel chat by default (the
+        # owner's decision 3, 2026-10-31), so every test runs it unless it
+        # writes "switch_mid_session": false itself.
         self.procs, self.readers = [], []
 
     def tearDown(self):
@@ -16224,19 +16240,61 @@ class Panel(StreamHarness):
         self.assertEqual(p.wait(10), 0)
         self.assertEqual(self.calls()[0]["config"], str(self.pro), "Max is nearly full")
 
-    def test_without_the_switch_the_panel_talks_to_claude_itself(self):
-        self.switch_mid_session(False)
-        self.plan(["reply"])
-        p = self.start()
+    def chat_said_hello(self, **env):
+        """A panel chat that says hello and ends: (its process, claude's launch)."""
+        p = self.start(**env)
         self.initialize(p)
         self.wait_for(lambda m: m.get("type") == "control_response")
         u = self.user(p, "hello")
         self.assertEqual(self.wait_for(self.result_for(u))["result"], "reply to: hello")
-        call = self.calls()[0]
-        self.assertEqual(call["pid"], p.pid, "longhaul handed over: the process is claude itself")
-        self.assertEqual(call["config"], str(self.max))
-        self.assertEqual(call["entrypoint"], "claude-vscode", "the extension's environment is kept")
-        self.assertIsNone(call["api_key"])
+        p.stdin.close()
+        p.wait(10)
+        return p, self.calls()[-1]
+
+    def test_with_switch_mid_session_false_the_panel_talks_to_claude_itself_in_every_mode(self):
+        # The one way to turn the relay off (the owner's decision 3,
+        # 2026-10-31), whatever the mode: from the environment or the files.
+        self.switch_mid_session(False)
+        self.plan(["reply"] * 5)
+        for env in ({"LONGHAUL_SWITCH": "ask"}, {"LONGHAUL_SWITCH": "auto"}, {"LONGHAUL_SWITCH": "never"},
+                    {"LONGHAUL_SWITCH": ""}):
+            with self.subTest(**env):
+                p, call = self.chat_said_hello(**env)
+                self.assertEqual(call["pid"], p.pid, "longhaul handed over: the process is claude itself")
+                self.assertEqual(call["config"], str(self.max))
+                self.assertEqual(call["entrypoint"], "claude-vscode", "the extension's environment is kept")
+                self.assertIsNone(call["api_key"])
+        (self.relay / "config.json").write_text(json.dumps({"switch": "auto"}))  # auto once kept it in: no longer
+        p, call = self.chat_said_hello(LONGHAUL_SWITCH="")
+        self.assertEqual(call["pid"], p.pid, "false wins over the saved auto")
+
+    def test_in_ask_with_no_vscode_json_the_relay_stays_in_the_chat(self):
+        # The owner's decision 3, 2026-10-31: the relay stays in every panel
+        # chat by default; before, ask (the default) handed the chat to
+        # claude, so its question was never asked.
+        self.assertFalse((self.relay / "vscode.json").exists())
+        self.plan(["reply"] * 4)
+        for env in ({"LONGHAUL_SWITCH": ""}, {"LONGHAUL_SWITCH": "ask"}, {"LONGHAUL_SWITCH": "never"}):
+            with self.subTest(**env):
+                p, call = self.chat_said_hello(**env)
+                self.assertNotEqual(call["pid"], p.pid, "longhaul stays in between")
+                self.assertEqual(call["config"], str(self.max))
+        (self.relay / "vscode.json").write_text(json.dumps({"switch": "never"}))  # a file without the key: the same
+        p, call = self.chat_said_hello(LONGHAUL_SWITCH="")
+        self.assertNotEqual(call["pid"], p.pid)
+
+    def test_a_switch_mid_session_neither_true_nor_false_is_the_default_on(self):
+        # Chosen (see panel_mid_session()): only the JSON false turns the
+        # relay off, the one setting that loses the question and the
+        # carry-on; a value longhaul cannot read gets what no file gets.
+        # Sprint 2's review saw the word "false" put longhaul in between when
+        # off was the default; the rule is now the other way round.
+        self.plan(["reply"] * 5)
+        for junk in ("false", 0, None, [], {"on": False}):
+            with self.subTest(junk=junk):
+                self.switch_mid_session(junk)
+                p, call = self.chat_said_hello(LONGHAUL_SWITCH="ask")
+                self.assertNotEqual(call["pid"], p.pid, "longhaul stays in between")
 
     def test_the_relay_passes_a_chat_through_unchanged(self):
         self.plan(["reply"])
@@ -16638,8 +16696,9 @@ class Panel(StreamHarness):
         self.assertIn("panel: sid-c last ran on Pro, which is not signed in as expected; picking an account", log())
 
     def test_with_the_switch_off_a_chat_reopened_by_id_is_recorded_where_it_ran(self):
-        # Review, Sprint 5 (B1). With switch_mid_session off (the default)
-        # the wrapper execs claude and nothing of longhaul sees the chat;
+        # Review, Sprint 5 (B1). With switch_mid_session off (the default
+        # then; since the owner's decision 3, 2026-10-31, only false in
+        # vscode.json) the wrapper execs claude and nothing of longhaul sees the chat;
         # only the relay's note_cost() wrote the record, so a chat reopened
         # by id with no record was picked, ran, and could be picked again at
         # the next reopen, moved without a word in never. The wrapper now
@@ -16829,8 +16888,10 @@ class Panel(StreamHarness):
 
 
 class PanelSwitching(StreamHarness):
-    """Sprint 2, D3c: with switch_mid_session on, the panel moves a chat only
-    in "auto" (docs/adr/0002-switching-without-a-terminal.md)."""
+    """Sprint 2, D3c: the panel moves a chat by itself only in "auto"
+    (docs/adr/0002-switching-without-a-terminal.md); in "ask" it asks first
+    (keep working, K1). Its relay is in every chat unless switch_mid_session
+    is false (the owner's decision 3, 2026-10-31)."""
 
     def limit_in_chat(self, **env):
         """A chat that meets a limit: the result, after checking that no
@@ -16921,16 +16982,6 @@ class PanelSwitching(StreamHarness):
         lines = [l for l in (self.relay / "longhaul.log").read_text().splitlines() if "is not ask, auto or never" in l]
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("vscode.json", lines[0], "the log says where the value came from")
-
-    def test_switch_mid_session_must_be_true_itself_not_a_truthy_word(self):
-        # Review, Sprint 2: "false" in vscode.json put longhaul in between.
-        (self.relay / "vscode.json").write_text(json.dumps({"switch_mid_session": "false"}))
-        self.plan(["reply"])
-        p = self.start()
-        self.initialize(p)
-        self.wait_for(lambda m: m.get("type") == "control_response")
-        self.assertEqual(self.wait_for(self.result_for(self.user(p, "hello")))["result"], "reply to: hello")
-        self.assertEqual(self.calls()[0]["pid"], p.pid, "longhaul handed over: the process is claude itself")
 
 
 class PanelKeepWorking(StreamHarness):
@@ -20390,8 +20441,9 @@ class Accounts(unittest.TestCase):
         with mock.patch.object(longhaul, "CONFIG", config), mock.patch.object(longhaul, "VSCODE_CONFIG", vscode), \
                 mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LONGHAUL_SWITCH", None)
+            # The relay is in the panel's chats in every mode (the owner's decision 3, 2026-10-31).
             self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode(), longhaul.panel_mid_session()),
-                             ("ask", "ask", False))
+                             ("ask", "ask", True))
             config.write_text('{"switch": "auto"}')
             self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode(), longhaul.panel_mid_session()),
                              ("auto", "auto", True))
@@ -20401,9 +20453,15 @@ class Accounts(unittest.TestCase):
             vscode.write_text('{"switch": "never", "switch_mid_session": false}')
             self.assertEqual((longhaul.panel_switch_mode(), longhaul.panel_mid_session()), ("never", False),
                              "vscode.json, when it says, before the shared answer")
+            config.write_text('{"switch": "never"}')
+            vscode.write_text('{"switch_mid_session": true}')
+            self.assertEqual((longhaul.panel_switch_mode(), longhaul.panel_mid_session()), ("never", True))
             config.write_text('{"switch": "sometimes"}')
             vscode.unlink()
-            self.assertEqual((longhaul.switch_mode(), longhaul.panel_mid_session()), ("ask", False), "junk is no answer")
+            self.assertEqual((longhaul.switch_mode(), longhaul.panel_mid_session()), ("ask", True), "junk is no answer")
+            for junk in ('{"switch_mid_session": "false"}', '{"switch_mid_session": 0}', "[false]", "not json"):
+                vscode.write_text(junk)
+                self.assertIs(longhaul.panel_mid_session(), True, f"{junk}: the default, on")
 
     def test_status_says_where_each_account_may_be_used_and_which_this_folder_can_use(self):
         # The owner, 2026-10-23: "how can I see how many accounts are connected on which repo".
@@ -21042,6 +21100,28 @@ class Switch(unittest.TestCase):
         self.assertIn("invalid choice", out.stderr)
         self.assertEqual(self.config.read_text(), before)
         self.assertEqual(self.switch("auto", "never").returncode, 2, "one mode at most")
+
+    def test_it_says_where_the_vs_code_panel_does_not_take_the_saved_mode(self):
+        # The panel's relay is in every chat unless switch_mid_session is
+        # false (the owner's decision 3, 2026-10-31), and a "switch" in
+        # vscode.json wins there over config.json.
+        out = self.switch("ask")
+        self.assertIn("the VS Code panel asks too", out.stdout)
+        self.assertNotIn("The VS Code panel", out.stdout)
+        vscode = self.home / "vscode.json"
+        vscode.write_text(json.dumps({"switch": "never"}))
+        for out in (self.switch(), self.switch("auto")):
+            self.assertIn("The VS Code panel uses never, from the key switch in ~/home/vscode.json, which wins there.",
+                          out.stdout)
+        vscode.write_text(json.dumps({"switch_mid_session": "off"}))
+        self.assertIn('The VS Code panel stays in each chat ("off" for switch_mid_session in ~/home/vscode.json is '
+                      "not true or false, so it is on, the default).", self.switch().stdout)
+        vscode.write_text(json.dumps({"switch_mid_session": False, "switch": "auto"}))
+        out = self.switch("ask")
+        self.assertNotIn("the VS Code panel asks too", out.stdout, "it does not, with its relay off")
+        self.assertIn('The VS Code panel runs Claude alone ("switch_mid_session": false in ~/home/vscode.json): at a '
+                      "limit there is no question, no carry-on and no move.", out.stdout)
+        self.assertNotIn("The VS Code panel uses", out.stdout)
 
     def test_a_config_json_that_is_not_an_object_is_written_over_with_the_mode(self):
         # As guided_switching() writes it: what is not an object holds no other key to keep.
@@ -22209,7 +22289,8 @@ class Doctor(unittest.TestCase):
             folder.mkdir(parents=True)
         for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude,
                             "DEFAULT_GLOBAL_JSON": self.user / ".claude.json", "VSCODE_SETTINGS": self.vscode,
-                            "CONFIG": self.home / "config.json", "CLAUDE": str(HERE / "fake_stream.py")}.items():
+                            "CONFIG": self.home / "config.json", "VSCODE_CONFIG": self.home / "vscode.json",
+                            "CLAUDE": str(HERE / "fake_stream.py")}.items():
             patcher = mock.patch.object(longhaul, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -22495,7 +22576,23 @@ class Doctor(unittest.TestCase):
         self.assertIn("`longhaul vscode on`", c["step"])
         wrapper = self.program("longhaul-vscode", folder=self.tmp / "checkout")
         self.write(self.vscode, json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(wrapper)}))
-        self.assertEqual(longhaul.doctor_vscode()["mark"], "ok")
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "ok")
+        self.assertTrue(c["said"].endswith(", which stays in each chat to ask and carry on at a limit"), c["said"])
+        # The owner's decision 3, 2026-10-31: on unless the JSON false. Off
+        # is the user's own choice: said, not judged; a value neither true
+        # nor false is on, and named.
+        self.write(self.home / "vscode.json", '{"switch_mid_session": false}')
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "ok")
+        self.assertIn("Claude runs alone in its chats (switch_mid_session is false in ", c["said"])
+        self.assertIn("at a limit there is no question, no carry-on and no move", c["said"])
+        self.write(self.home / "vscode.json", '{"switch_mid_session": "no"}')
+        c = longhaul.doctor_vscode()
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn('("no" for switch_mid_session in ', c["said"])
+        self.assertIn("set switch_mid_session to true or false in ", c["step"])
+        (self.home / "vscode.json").unlink()
         self.write(self.vscode, json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(self.tmp / "gone" / "longhaul-vscode")}))
         c = longhaul.doctor_vscode()
         self.assertEqual(c["mark"], "bad")
