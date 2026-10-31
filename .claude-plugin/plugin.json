@@ -9,5 +9,6 @@
   "license": "MIT",
   "homepage": "https://github.com/Noah-OS/longhaul",
   "repository": "https://github.com/Noah-OS/longhaul",
-  "keywords": ["sessions", "usage", "supervisor"]
+  "keywords": ["sessions", "usage", "supervisor"],
+  "types": "./types/index.d.ts"
 }

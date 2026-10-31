@@ -23,6 +23,10 @@
 !hooks/autocompact.ts
 !hooks/autocompact.test.ts
 !hooks/display.test.ts
+!hooks/accounts.tsx
+!hooks/accounts.test.tsx
+!types/
+!types/index.d.ts
 !hooks/codex_hook.py
 !hooks/codex-hooks.json
 !.codex-plugin/
