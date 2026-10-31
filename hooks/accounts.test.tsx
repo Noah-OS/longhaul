@@ -308,6 +308,38 @@ both('a name the check refuses gets no button, and nothing runs with it', async 
   await ui.unmount()
 })
 
+both('an account with no folder and times in decimals, and an odd record, are drawn as far as they go', async ($, on, surface) => {
+  const w = world(on)
+  // S1's record: `folder` is "" when config_dir is not text, and times may be decimals.
+  const noFolder = { ...ACCOUNTS[0], name: 'odd-5', folder: '', signed_in: null, as_expected: null, this_chat: false,
+    check_failed: "its config_dir is not a folder's path", limited_until: AT + 3600.5,
+    five_hour: { used: 99.6, resets_at: AT + 3600.5 } }
+  const odd = { name: 'odd-6', only_in: 'everywhere', five_hour: 'full', signed_in: 'yes' }
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [noFolder, odd, 7], here: 'x', switch: 'sometimes' }))
+  const { ui } = await opened($, w, surface)
+  const all = (await texts(ui)).join('\n')
+  expect(all).toContain("could not check: its config_dir is not a folder's path")
+  expect(all).toMatch(/5-hour 100%, resets \w{3} \d\d:\d\d/)
+  expect(all).toMatch(/at its limit until \w{3} \d\d:\d\d/)
+  expect(all).toMatch(/odd-6\n/)
+  expect(all).toMatch(/may be used nowhere/)
+  expect(all).not.toMatch(/NaN|undefined/)
+  expect(await ui.find({ key: 'signin-odd-5' })).toBeDefined()
+  await ui.unmount()
+})
+
+both('a pane drawn before /accounts has read the rows reads them once', async ($, on, surface) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  const ui = await $.ui.mount(pane(surface))
+  expect((await texts(ui)).join('\n')).toMatch(/Reading Longhaul's accounts/)
+  await $.command.run(TYPED)
+  await w.clock.settle()
+  expect(w.runs).toEqual([['status', '--json']])
+  expect(await ui.find({ key: 'signin-personal-1' })).toBeDefined()
+  await ui.unmount()
+})
+
 test('on the phone: the rows, nothing to type or pick, and to manage accounts from the computer', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/scratch/code/x', surface: 'mobile', isInteractive: true })

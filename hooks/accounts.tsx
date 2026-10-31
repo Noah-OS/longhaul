@@ -48,7 +48,8 @@ const form = atom({ plugin: 'longhaul', key: 'accountsForm' } as const, EMPTY, {
 // a new mark, so an action marked by another one was cut off by the reload.
 const SELF = `m${Math.random().toString(36).slice(2)}`
 let busy = false // an action of this module runs: one at a time
-let kicked = false // this module asked for its first read from a drawing
+let kicked = false // this module looked at what it found once, from a drawing
+let asked = false // this module has read the rows, or is reading them
 let reads: Promise<void> = Promise.resolve() // the reads, one after another
 
 // Every email in a text masked: its local part's first character, then
@@ -113,11 +114,34 @@ async function readStatus($: any): Promise<LonghaulAccountsRead> {
   }
   if (!status || typeof status !== 'object' || !Array.isArray(status.accounts))
     return { status: null, problem: 'Its answer has no list of accounts.', update: false }
-  return { status: status as LonghaulStatus, problem: null, update: false }
+  return { status: clean(status), problem: null, update: false }
+}
+
+// The record as the pane draws it: each field of its type, or "not known",
+// so an odd record never makes a drawing throw. A name stays as given: a
+// row whose name fails the check gets no button.
+function clean(s: any): LonghaulStatus {
+  const str = (v: any) => (typeof v === 'string' ? v : null)
+  const flag = (v: any) => (typeof v === 'boolean' ? v : null)
+  const num = (v: any) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  const strs = (v: any) => (Array.isArray(v) ? v.filter((p: any) => typeof p === 'string') : null)
+  const win = (w: any) => (w && typeof w === 'object' && num(w.used) !== null
+    ? { used: w.used as number, resets_at: num(w.resets_at) ?? 0 } : null)
+  const accounts = (s.accounts as any[]).filter(a => a && typeof a === 'object' && typeof a.name === 'string')
+    .map(a => ({ name: a.name as string, email: str(a.email), signed_in: flag(a.signed_in), as_expected: flag(a.as_expected),
+      check_failed: str(a.check_failed), plan: str(a.plan), limited_until: num(a.limited_until),
+      five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in), folder: str(a.folder) ?? '',
+      this_chat: a.this_chat === true }))
+  const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
+    ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
+  return { accounts, listed: s.listed === true, here,
+    switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
+    vscode: flag(s.vscode), problem: str(s.problem) }
 }
 
 // Reads the rows again, after any read already under way.
 function refresh($: any): Promise<void> {
+  asked = true
   reads = reads.then(async () => {
     const got = await readStatus($)
     await update($, lastRead, () => got)
@@ -153,19 +177,20 @@ async function act($: any, a: Action): Promise<void> {
     if (end.ok && a.done) await a.done()
     await update($, result, () => end)
     await refresh($)
-  } finally {
-    busy = false
+  } finally { // the mark goes before the next action may start, so it never clears that one's
     await update($, running, r => (r && r.by === SELF ? null : r)).catch(() => {})
+    busy = false
   }
 }
 
 // The first drawing of this module: an action another module (the one
 // before a reload) marked running is not known to have ended, so it is
-// said so; then, and when nothing was read yet, the rows are read. A
-// drawing writes nothing itself, so this runs on the clock, just after.
+// said so; then the rows are read, unless this module has read them (the
+// pane /accounts opened: the command reads them). A drawing writes nothing
+// itself, so this runs on the clock, just after.
 function firstLook($: any, before: LonghaulAccountsRunning | null, have: LonghaulAccountsRead | null): void {
   const stale = before !== null && before.by !== SELF
-  if (kicked || (!stale && have !== null)) return
+  if (kicked || !(stale || (have === null && !asked))) return
   kicked = true
   try {
     $.clock.after(0, () => {
@@ -175,7 +200,7 @@ function firstLook($: any, before: LonghaulAccountsRunning | null, have: Longhau
           await update($, result, () => ({ ok: null, label: before.label, after: null,
             lines: ['Longhaul was reloaded while this ran, so how it ended is not known. The rows were read again.'] }))
         }
-        await refresh($)
+        if (!asked) await refresh($)
       })().catch(() => {})
     })
   } catch {}
@@ -295,12 +320,12 @@ function signedIn(a: LonghaulAccount): string {
 
 function use(label: string, w: LonghaulAccount['week']): string | null {
   if (!w || typeof w.used !== 'number') return null
-  return `${label} ${Math.round(w.used)}%${typeof w.resets_at === 'number' ? `, resets ${when(w.resets_at)}` : ''}`
+  return `${label} ${Math.round(w.used)}%${w.resets_at > 0 ? `, resets ${when(w.resets_at)}` : ''}`
 }
 
 function where(a: LonghaulAccount): string {
   if (a.only_in === null) return 'may be used nowhere'
-  return a.only_in.length ? `may be used only in ${a.only_in.join(', ')}` : 'may be used anywhere'
+  return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
 }
 
 // One account: its name, what is known of it, and its buttons.
@@ -312,7 +337,7 @@ function row($: any, c: Ctx, a: LonghaulAccount): any {
   return (
     <Box flexDirection="column">
       <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
-      <Text>{[a.plan, signedIn(a)].filter(Boolean).join(' · ')}</Text>
+      <Text>{[a.plan && mask(a.plan), signedIn(a)].filter(Boolean).join(' · ')}</Text>
       {usage && <Text>{usage}</Text>}
       {typeof a.limited_until === 'number' && <Text color="warning">{`at its limit until ${when(a.limited_until)}`}</Text>}
       <Text dimColor>{where(a)}</Text>
@@ -351,7 +376,7 @@ function herePart($: any, c: Ctx): any {
   const here = c.status?.here
   if (!here) return null
   const may = here.may_use.length ? here.may_use.join(', ') : 'no account'
-  return <Text>{`Here, in ${here.folder}: ${may} may be used.`}</Text>
+  return <Text>{mask(`Here, in ${here.folder}: ${may} may be used.`)}</Text>
 }
 
 // The phone draws no field: it shows the rows, and says where to manage them.
@@ -435,7 +460,7 @@ function clearPart($: any, c: Ctx): any {
 // The last action's end: ✔ or ✘ (? when not known), its output's last lines, what next.
 function resultPart($: any, c: Ctx): any {
   const { Box, Text } = c.E
-  if (!c.last || !c.canType) return null
+  if (!c.last || !c.canType || !c.idle) return null
   const { ok, label, lines, after } = c.last
   return (
     <Box flexDirection="column">
@@ -462,13 +487,15 @@ export const register: Register = on => {
 
   // Opens the pane and reads the rows; where it cannot be drawn, says why.
   on('command.run', { command: 'accounts' }, async $ => {
+    // The read starts first, so the pane's first drawing finds it under way and asks for no other.
+    const reading = refresh($)
     let opened: { isPlaced: boolean; reason?: string }
     try {
       opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true })
     } catch (err: any) {
       opened = { isPlaced: false, reason: String(err?.message || err) }
     }
-    await refresh($)
+    await reading
     if (!opened.isPlaced)
       return { text: `Longhaul: the accounts pane cannot be shown here (${opened.reason}). /longhaul:manage does the same in words.` }
     return { text: 'Longhaul: the accounts pane is open. Escape closes it.' }
