@@ -1714,6 +1714,127 @@ class Usage(unittest.TestCase):
         self.assertNotIn(sid, out.stdout, "the short id, as everywhere else")
 
 
+class StatuslineUpdate(unittest.TestCase):
+    """The status line's word that a newer Longhaul is out (the keep-working
+    plan's K3, 2026-10-31): " · update 0.3.3" at the end of the line when
+    the release check is on and release.json's latest is newer than this
+    copy runs. The line runs at every update, so it reads the record and
+    the manifest and nothing else: GitHub is never asked from here, and a
+    record or manifest it cannot use shows nothing extra."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home, self.plugin = self.tmp / "home", self.tmp / "plugin"
+        self.home.mkdir()
+        (self.plugin / ".claude-plugin").mkdir(parents=True)
+        self.manifest("0.3.2")
+        self.record({"checked_at": time.time(), "latest": "0.3.3"})
+        for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                        mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"),
+                        mock.patch.object(longhaul, "LEDGER", self.home / "ledger.jsonl"),
+                        mock.patch.object(longhaul, "LABELS", self.home / "labels.json"),
+                        mock.patch.object(longhaul, "__file__", str(self.plugin / "longhaul.py")),
+                        mock.patch.dict(os.environ, {"LONGHAUL_UPDATE_CHECK": "on"}),
+                        mock.patch("urllib.request.urlopen", self.unexpected),
+                        mock.patch.object(longhaul, "release_spawn", self.unexpected)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", None)  # put back by the patch of the environment
+
+    def unexpected(self, *args, **kwargs):
+        raise AssertionError("the status line asked GitHub, or started the check")
+
+    def manifest(self, version):
+        (self.plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "longhaul", "version": version}))
+
+    def record(self, data):
+        (self.home / "release.json").write_text(json.dumps(data))
+
+    def line(self):
+        resets = time.time() + 3600
+        return longhaul.record_usage({"session_id": "s1", "cost": {"total_cost_usd": 0.03},
+                                      "rate_limits": {"five_hour": {"used_percentage": 23, "resets_at": resets},
+                                                      "seven_day": {"used_percentage": 51, "resets_at": resets + 86400}}},
+                                     None)
+
+    def test_a_newer_release_ends_the_line_with_its_version(self):
+        line = self.line()
+        self.assertTrue(line.endswith(" · update 0.3.3"), line)
+        self.assertTrue(line.startswith("\033[1mmain\033[0m · 5h"), "the account and the allowance come first")
+        self.assertEqual(line.count("update"), 1)
+
+    def test_versions_are_compared_as_numbers(self):
+        self.manifest("0.3.9")
+        self.record({"latest": "0.3.10"})
+        self.assertTrue(self.line().endswith(" · update 0.3.10"))
+        self.manifest("0.3.10")
+        self.record({"latest": "0.3.9"})
+        self.assertNotIn("update", self.line())
+
+    def test_the_same_or_an_older_release_shows_nothing(self):
+        for latest in ("0.3.2", "0.3.1", "0.2.9"):
+            with self.subTest(latest=latest):
+                self.record({"latest": latest})
+                self.assertNotIn("update", self.line())
+
+    def test_the_check_turned_off_either_way_shows_nothing(self):
+        for env in ({"LONGHAUL_UPDATE_CHECK": "off"}, {"LONGHAUL_UPDATE_CHECK": "OFF"},
+                    {"LONGHAUL_UPDATE_CHECK": "Off"}, {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                self.assertNotIn("update", self.line())
+        self.assertTrue(self.line().endswith(" · update 0.3.3"), "back on once the switch is gone")
+
+    def test_a_record_it_cannot_use_shows_nothing(self):
+        path = self.home / "release.json"
+        for junk in (b"not json", b"", b"[]", b"null", b"{}", b'{"latest": null}', b'{"latest": 3}',
+                     b'{"latest": [0, 3, 3]}', b'{"latest": "soon"}', b'{"latest": "0.3.3-beta"}',
+                     b'{"latest": "0.3"}', b'{"latest": " 0.3.3"}', b'{"error": "timeout", "checked_at": 1}',
+                     b'{"latest": "\xff"}'):
+            with self.subTest(junk=junk):
+                path.write_bytes(junk)
+                self.assertNotIn("update", self.line())
+        path.unlink()
+        self.assertNotIn("update", self.line(), "no record yet")
+        path.mkdir()
+        self.assertNotIn("update", self.line(), "a folder where the record belongs")
+
+    def test_an_unknown_running_version_shows_nothing(self):
+        path = self.plugin / ".claude-plugin" / "plugin.json"
+        for junk in ("not json", "[]", "{}", '{"version": null}', '{"version": "v0.3.2"}', '{"version": "dev"}'):
+            with self.subTest(junk=junk):
+                path.write_text(junk)
+                self.assertNotIn("update", self.line())
+        path.unlink()
+        self.assertNotIn("update", self.line(), "a copy without a manifest")
+
+    def test_the_line_only_reads_the_record(self):
+        before = (self.home / "release.json").read_bytes()
+        for _ in range(3):
+            self.assertTrue(self.line().endswith(" · update 0.3.3"))
+        self.assertEqual((self.home / "release.json").read_bytes(), before, "not marked as said, nor asked again")
+
+    def test_a_failure_in_the_word_never_blanks_the_line(self):
+        with mock.patch.object(longhaul, "release_record", side_effect=RuntimeError("boom")):
+            line = self.line()
+        self.assertTrue(line.startswith("\033[1mmain"), line)
+        self.assertIn("23%", line)
+        self.assertNotIn("update", line)
+
+    def test_the_status_line_command_shows_it(self):
+        # The command as Claude Code runs it, this checkout's own manifest the
+        # running version: a release far ahead of any is newer.
+        self.record({"latest": "999.0.0"})
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_UPDATE_CHECK="on")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}",
+                             capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "\033[1mmain\033[0m · update 999.0.0\n")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}", capture_output=True,
+                             text=True, env=dict(env, LONGHAUL_UPDATE_CHECK="off"), timeout=30)
+        self.assertEqual(out.stdout, "\033[1mmain\033[0m\n")
+
+
 class CodexUsage(unittest.TestCase):
     """`longhaul usage`'s Codex line (docs plans/2026-10-27-codex.md, X2):
     the newest rate-limits reading in Codex's rollouts, beside the Claude
@@ -17991,6 +18112,16 @@ class Display(unittest.TestCase):
         self.assertIn("longhaul.log", self.SOURCE)
         for name in ("accounts.json", "usage/"):
             self.assertIn(name, self.SOURCE)
+
+    def test_its_status_entry_ends_with_a_newer_release_as_the_terminals_line_does(self):
+        # K3 (2026-10-31): release.json and the plugin's own manifest, read
+        # and never asked for; hooks/display.test.ts tests it turn by turn
+        # under `claude plugin test .`, and ships beside it.
+        for name in ("release.json", "/.claude-plugin/plugin.json", "LONGHAUL_UPDATE_CHECK",
+                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "update ${latest}"):
+            self.assertIn(name, self.SOURCE)
+        self.assertTrue((HERE / "hooks" / "display.test.ts").is_file())
+        self.assertIn("!hooks/display.test.ts", (HERE / ".gitignore").read_text().splitlines(), "shipped, not ignored")
 
     def test_its_pop_ups_match_the_log_lines_longhaul_writes(self):
         # Each pop-up's pattern against the line the Python side logs, so a

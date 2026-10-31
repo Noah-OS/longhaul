@@ -2,9 +2,9 @@
 """longhaul - see where a Claude Code session's tokens go, and stop the waste:
 `inspect` reports a conversation's usage, `guard` warns about or blocks the
 tool calls that waste the most context, `checkpoint` puts the model's own
-state back after a compaction, `statusline` shows the allowance. Carrying
-one conversation across your own subscriptions is the advanced feature
-below, off unless you turn it on.
+state back after a compaction, `statusline` shows the allowance and a newer
+Longhaul when one is out. Carrying one conversation across your own
+subscriptions is the advanced feature below, off unless you turn it on.
 
 Why this exists: with two Claude subscriptions (say Max and Pro), when
 one hit its session or weekly limit the work stopped until the reset, often
@@ -2682,7 +2682,7 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
             path = data.get("transcript_path")
             path = path if isinstance(path, str) else last.get("transcript")
             write_json(last_path, {**row, "transcript": path} if isinstance(path, str) else row)
-    return f"\033[1m{acct}\033[0m{gauge('5h', five)}{gauge('week', week)}"
+    return f"\033[1m{acct}\033[0m{gauge('5h', five)}{gauge('week', week)}{release_word()}"
 
 
 def statusline(opts) -> int:
@@ -10186,6 +10186,11 @@ def stop_counts(sid: str) -> dict:
 #   said whatever the switch), else a newer release than the chat has, once
 #   per version a day. Each line said is one line in the log, which the
 #   display (hooks/display.ts) turns into a pop-up;
+# - the status line, the terminal's (release_word) and the panel's entry
+#   (display.ts), ends with "update 0.3.3" while the record's latest is
+#   newer than this copy (the keep-working plan's K3, 2026-10-31): said
+#   once at a start is easy to miss, and the line is there all along. It
+#   reads the record and never asks;
 # - `longhaul update` shows the versions, and turns Claude Code's
 #   auto-update on or off for Longhaul's marketplace (`autoUpdate` on its
 #   entry of known_marketplaces.json, as /plugin > Marketplaces writes
@@ -10426,6 +10431,23 @@ def release_status() -> dict:
             "latest": latest if release_version(latest) else None, "checked": None if checked is None else float(checked),
             "auto_update": release_auto_update(Path(chat_config_dir()) / "plugins" / "known_marketplaces.json"),
             "check": "off" if release_switch() else "on"}
+
+
+def release_word() -> str:
+    """The status line's end (record_usage()), " · update 0.3.3" when the
+    check is on and release.json's latest is newer than this copy runs, ""
+    otherwise. The line runs at every update and must never fail, so this
+    only reads: the record, then the manifest once the record names a
+    version; GitHub is asked by the day's check alone, and any failure
+    here leaves the word out, not the line."""
+    try:
+        if release_switch():
+            return ""
+        found = release_version(release_record().get("latest"))
+        latest = ".".join(map(str, found)) if found else None
+        return f" · update {latest}" if latest and release_newer(latest, release_running(release_manifest())) else ""
+    except Exception:
+        return ""
 
 
 def release_reload(data: dict) -> str:

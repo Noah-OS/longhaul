@@ -2,8 +2,9 @@ import type { Register } from 'claude-code'
 
 // Longhaul's display inside Claude Code (the owner, 2026-10-23): VS Code's
 // panel shows no status line and no hook message, so this shows them. It
-// only reads ~/.longhaul (accounts.json, usage/<account>.json, longhaul.log)
-// and sends nothing anywhere; any failure shows nothing.
+// only reads ~/.longhaul (accounts.json, usage/<account>.json, longhaul.log,
+// release.json) and the plugin's own manifest, and sends nothing anywhere;
+// any failure shows nothing.
 
 type Window = { used_percentage?: number; resets_at?: number }
 type Reading = { at?: number; five_hour?: Window; seven_day?: Window }
@@ -44,6 +45,35 @@ function pct(w: Window | undefined, now: number): string | undefined {
   return w && typeof w.used_percentage === 'number' && (w.resets_at ?? 0) > now ? `${Math.round(w.used_percentage)}%` : undefined
 }
 
+// [0, 3, 10] from "0.3.10" (or a tag's "v0.3.10"), as longhaul.py's
+// release_version() reads one; undefined for anything else.
+function version(text: unknown): number[] | undefined {
+  const m = typeof text === 'string' ? /^v?(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/.exec(text) : null
+  return m ? m.slice(1).map(Number) : undefined
+}
+
+// Whether a is newer than b, part by part as numbers: 0.3.10 > 0.3.9.
+function newer(a: number[], b: number[]): boolean {
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i]! > b[i]!
+  return false
+}
+
+// The latest release when it is newer than this copy, as the terminal's
+// status line shows it (release_word() in longhaul.py): release.json is the
+// day's check's answer, and the running version is the plugin's manifest.
+// Off as the check is; this only reads, and asks GitHub nothing.
+async function update($: any, lh: string): Promise<string | undefined> {
+  try {
+    if (((await $.env.get('LONGHAUL_UPDATE_CHECK')) || '').toLowerCase() === 'off') return undefined
+    if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) return undefined
+    const latest = version(JSON.parse(await $.fs.read(`${lh}/release.json`))?.latest)
+    if (!latest) return undefined
+    const running = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`))?.version
+    const have = typeof running === 'string' && !running.startsWith('v') ? version(running) : undefined
+    return have && newer(latest, have) ? latest.join('.') : undefined
+  } catch { return undefined }
+}
+
 async function status($: any): Promise<void> {
   try {
     const lh = await home($)
@@ -55,6 +85,8 @@ async function status($: any): Promise<void> {
     if (five) parts.push(`5h ${five}`)
     if (week) parts.push(`week ${week}`)
     if (context !== undefined) parts.push(`context ${Math.round(context / 1000)}k`)
+    const latest = await update($, lh)
+    if (latest) parts.push(`update ${latest}`)
     $.ui.status(parts.join(' · '))
   } catch {}
 }

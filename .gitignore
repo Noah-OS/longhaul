@@ -22,6 +22,7 @@
 !hooks/index.ts
 !hooks/autocompact.ts
 !hooks/autocompact.test.ts
+!hooks/display.test.ts
 !hooks/codex_hook.py
 !hooks/codex-hooks.json
 !.codex-plugin/

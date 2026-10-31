@@ -65,7 +65,7 @@ python3 ~/.claude/plugins/cache/longhaul/longhaul/<version>/longhaul.py setup
 
 It writes `~/.local/bin/longhaul`, a short launcher that runs the newest Longhaul Claude Code has installed, so it keeps working after each update. Then `longhaul doctor` works in a terminal too. If the shell says `longhaul: command not found`, see [Troubleshooting](#troubleshooting).
 
-**The status line** (optional): `longhaul statusline install` shows the account and its 5-hour and 7-day allowance, with the reset times, under Claude Code's prompt, and keeps each reading for `/longhaul:inspect` and `longhaul usage`. It backs up your `settings.json`, asks before replacing a status line you already have, and checks the command runs; `longhaul statusline uninstall` puts the old one back.
+**The status line** (optional): `longhaul statusline install` shows the account and its 5-hour and 7-day allowance, with the reset times, under Claude Code's prompt, with `update` and the version at its end when a newer Longhaul is out, and keeps each reading for `/longhaul:inspect` and `longhaul usage`. It backs up your `settings.json`, asks before replacing a status line you already have, and checks the command runs; `longhaul statusline uninstall` puts the old one back.
 
 ## 3. Day to day
 
