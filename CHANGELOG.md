@@ -2,6 +2,25 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.3 - 2026-11-01
+
+Longhaul's accounts get a screen of their own, `/accounts`, and the work goes on at a usage limit: the VS Code panel can ask you, and a chat can carry on by itself at the first reset. The status line says when a newer Longhaul is out.
+
+### Added
+
+- **`/accounts`: Longhaul's accounts on one screen, as `/mcp` shows its servers.** First a list, one line per account: its plan, its sign-in, its week's use or its limit, and where it may be used. Then `+ Add account` and `Settings`. The arrow keys move, Enter opens a page, and Escape or **Back** goes back. On an account's page: its 5-hour and week use with their resets, its limit, where it may be used, its folder and its email, masked (`y•••@example.com`), with **Sign in again** (or **Sign in**) and **Remove**, which asks first; its folder and sign-in stay. **Add account** has a form: the name, the email and the folders it may be used in. **Settings**: switching (`ask`, `auto` or `never`), the VS Code panel on or off, and forgetting the recorded limits. The buttons run Longhaul's own commands, one at a time. A sign-in opens in the browser: no email, password or code goes through the chat. On the phone it shows the list only. `/longhaul:manage` still does the same in words.
+- **The VS Code panel asks at a usage limit, in `ask`.** The question shows at the top of `/accounts`, which tries to open by itself; when it cannot, a pop-up says to type `/accounts`. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?": **Move and carry on** or **Wait for the reset**. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?": **Yes** or **No**, and a yes carries on by itself at that reset. No answer moves nothing. The panel asks only where Longhaul stays in its chats: with switching `auto`, or with `"switch_mid_session": true` in `~/.longhaul/vscode.json`.
+- **Carry on at the reset, in the panel.** In `auto`, with every account at its limit, the chat carries on without asking on the first account to reset; in `never`, on the same account at its own reset. A carry-on goes only to a chat that has been idle since the limit: when Claude Code's own wait, or you, carried on first, Longhaul sends nothing. The panel's status entry says `question: /accounts` while a question waits, and `carries on at 14:00 on Pro` while a carry-on waits.
+- **`longhaul answer CHAT QID CHOICE`**, what the screen's buttons run to answer the question. It refuses a chat with no open question, another question's id, a choice the question does not offer, and a chat that has closed. The plugin's `bin/longhaul`, which a chat's Claude runs, refuses it: the question is yours to answer.
+- **`longhaul status --json`**: the screen's data as one JSON object. The accounts, their sign-ins, limits and use, where each may be used, this chat's account, this folder's accounts, the switching mode and whether VS Code runs Longhaul's wrapper. Emails are masked. It only reads; exit 2 when `accounts.json` cannot be read.
+- **The status line says `update 0.3.4`** when a newer Longhaul is out, at the end of the terminal's status line and of the panel's status entry. It comes from the daily check's record: nothing new is sent. `LONGHAUL_UPDATE_CHECK=off` turns it off with the check.
+- **A failed sign-in marks its account.** When a chat stops because its sign-in failed, Longhaul keeps that account's name and the time. `/accounts` shows "sign-in failed" and offers **Sign in**; `longhaul status` says "its sign-in failed at 14:05: run longhaul setup NAME --relogin". The mark goes at the account's next reply, or after a `longhaul setup` that signs it in.
+
+### Changed
+
+- **The terminal's `ask` offers the first reset.** With every account at its limit and another one resetting first, it asks once: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" A yes waits for that account and carries on there; no, or no answer by that reset, waits for this account, as before.
+- **Three new records under `~/.longhaul`**, each readable by you alone: `questions/` (the panel's open question and its answer), `waits/` (a carry-on waiting for a reset) and `sign-in-failed.json`. They hold account names, times and ids; never message text or an email.
+
 ## 0.3.2 - 2026-10-30
 
 Longhaul runs in OpenAI's Codex, can be set up from the chat, and asks before it runs a chat on an account a folder isn't kept for. The README is now a step-by-step guide.
