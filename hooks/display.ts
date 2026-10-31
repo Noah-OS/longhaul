@@ -1,10 +1,13 @@
 import type { Register } from 'claude-code'
 
+import { carries, found } from './question.ts'
+
 // Longhaul's display inside Claude Code (the owner, 2026-10-23): VS Code's
 // panel shows no status line and no hook message, so this shows them. It
 // only reads ~/.longhaul (accounts.json, usage/<account>.json, longhaul.log,
-// release.json) and the plugin's own manifest, and sends nothing anywhere;
-// any failure shows nothing.
+// release.json), the plugin's own manifest and this chat's question and
+// carry-on as the accounts pane's look found them, and sends nothing
+// anywhere; any failure shows nothing.
 
 type Window = { used_percentage?: number; resets_at?: number }
 type Reading = { at?: number; five_hour?: Window; seven_day?: Window }
@@ -74,7 +77,10 @@ async function update($: any, lh: string): Promise<string | undefined> {
   } catch { return undefined }
 }
 
-async function status($: any): Promise<void> {
+// The status entry: the account, its allowance, the context, this chat's
+// question or carry-on, a newer release last. accounts.tsx calls it too,
+// when its look finds the question or the carry-on changed.
+export async function status($: any): Promise<void> {
   try {
     const lh = await home($)
     const name = await account($, lh)
@@ -85,10 +91,23 @@ async function status($: any): Promise<void> {
     if (five) parts.push(`5h ${five}`)
     if (week) parts.push(`week ${week}`)
     if (context !== undefined) parts.push(`context ${Math.round(context / 1000)}k`)
+    parts.push(...(await kept($)))
     const latest = await update($, lh)
     if (latest) parts.push(`update ${latest}`)
     $.ui.status(parts.join(' · '))
   } catch {}
+}
+
+// This chat's question and carry-on, as accounts.tsx's look last found them
+// (hooks/question.ts, every 3 s, the question only while its relay runs):
+// "question: /accounts" says where to answer it.
+async function kept($: any): Promise<string[]> {
+  try {
+    const { asked, waiting } = found()
+    let now = Date.now()
+    try { now = await $.clock.now() } catch {}
+    return [...(asked ? ['question: /accounts'] : []), ...(waiting ? [carries(waiting, now)] : [])]
+  } catch { return [] }
 }
 
 // A file's name from the path a log line gives, and "412,345" bytes in KB.

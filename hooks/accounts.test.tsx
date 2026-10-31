@@ -7,12 +7,15 @@ import { expect, mock, test } from 'claude-code/testing'
 // real file or account is touched. Emails are example.com, names generic.
 
 const PANE_ID = 'longhaul-accounts'
+const SID = 'fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6'
+const HOME = '/scratch/longhaul'
 const NOW = Date.UTC(2026, 9, 31, 12, 0, 0)
 const HOUR = 3600
 const AT = NOW / 1000
 const NOTE = "finish in the browser that opened, with that account's email. If the browser is signed in to claude.ai "
   + 'as someone else, copy the link into a private window.'
 const RELOAD = 'Reload VS Code: Cmd+Shift+P, Developer: Reload Window.'
+const OPEN = { id: PANE_ID, title: 'Longhaul accounts', focus: true, closeOnEscape: true }
 
 const ACCOUNTS = [
   { name: 'personal-1', email: 'a•••@example.com', signed_in: true, as_expected: true, check_failed: null, plan: 'max',
@@ -28,12 +31,28 @@ const ACCOUNTS = [
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, problem: null }
+const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-settings']
+
+// A question as longhaul.py's Relay.ask() writes it, and a wait as Relay.schedule() does.
+const RELAY = 4242
+const QUESTION = { id: 'q-0123456789ab', chat: SID, relay_pid: RELAY, asked_at: AT, kind: 'move', from: 'personal-1',
+  limit: 'weekly', resets_at: AT + 38 * HOUR, to: 'work-2', to_resets_at: null, choices: ['move', 'wait'] }
+const FIRST = { ...QUESTION, id: 'q-ba9876543210', kind: 'first_reset', to: 'work-2', to_resets_at: AT + 2 * HOUR,
+  choices: ['yes', 'no'] }
+const WAIT = { chat: SID, until: AT + 2 * HOUR, account: 'personal-1', why: 'answered' }
+const QUESTION_FILE = `${HOME}/questions/${SID}.json`
+const WAIT_FILE = `${HOME}/waits/${SID}.json`
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
 type World = {
   runs: string[][] // each longhaul.py run's arguments, after the script
   timeouts: number[] // each run's timeoutMs, in the same order
   opened: any[] // each $.ui.open's argument
+  closed: any[] // each ui.close that reached the engine: the pane closed
+  focused: string[] // each element $.ui.focus was asked to move the ring to
+  toasts: string[]
+  files: Record<string, { text: string; at: number }> // LONGHAUL_HOME's files, by path
+  alive: Set<number> // the pids `kill -0` finds
   status: Ran // what `status --json` answers
   answer: Record<string, Ran> // what each other command answers, by its first word
   slow: Set<string> // commands that answer only once the test moves the clock on
@@ -47,24 +66,32 @@ const done = (stdout = '', exitCode = 0, stderr = ''): Ran => ({ exitCode, stdou
 const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
   presentation: { isFullscreen: true, columns: 160 } } as const
 
-// The engine beneath the plugins, from memory: programs, panes, the clock,
-// and what display.ts asks at a session's start (it shows nothing here).
+// The engine beneath the plugins, from memory: programs, files, panes, the
+// clock, and what display.ts asks at a session's start.
 function world(on: any): World {
-  const w: World = { runs: [], timeouts: [], opened: [], status: done(JSON.stringify(STATUS)), answer: {},
-    slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
-  mock.env(on, { LONGHAUL_HOME: '/scratch/longhaul', HOME: '/scratch/home' })
+  const w: World = { runs: [], timeouts: [], opened: [], closed: [], focused: [], toasts: [], files: {}, alive: new Set([RELAY]),
+    status: done(JSON.stringify(STATUS)), answer: {}, slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
+  mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home' })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6' }))
+  on('session.id', () => ({ value: SID }))
   on('command.register', (_: any, e: any) => ({ value: { command: e.name } }))
-  on('fs.stat', () => ({ deny: 'no such file' }))
-  on('fs.read', () => ({ deny: 'no such file' }))
+  on('fs.stat', (_: any, e: any) => {
+    const f = w.files[e.path]
+    return f ? { value: { kind: 'file', size: f.text.length, mtimeMs: f.at, isLink: false } } : { deny: 'no such file' }
+  })
+  on('fs.read', (_: any, e: any) => (w.files[e.path] ? { value: w.files[e.path]!.text } : { deny: 'no such file' }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', (_: any, e: any) => { w.toasts.push(e.text); return { value: undefined } })
   on('ui.open', (_: any, e: any) => {
     w.opened.push(e)
     return { value: w.placed ? { isPlaced: true } : { isPlaced: false, reason: 'the terminal is 80 columns wide' } }
   })
+  on('ui.close', (_: any, e: any) => { w.closed.push(e); return { value: undefined } })
+  on('ui.focus', (_: any, e: any) => { w.focused.push(e.element ?? e.key); return { value: {} } })
   on('process.run', async (_: any, e: any) => {
     const argv: string[] = [...e.argv]
+    if (argv[0] === 'kill' && argv[1] === '-0' && argv.length === 3)
+      return { value: { ...done('', w.alive.has(Number(argv[2])) ? 0 : 1), isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] !== 'python3' || argv[1] !== '-I' || !/^\/.*\/longhaul\.py$/.test(argv[2] ?? ''))
       return { deny: 'not run here' }
     const rest = argv.slice(3)
@@ -75,6 +102,12 @@ function world(on: any): World {
     return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return w
+}
+
+// A file in LONGHAUL_HOME, written now (a later write has a later time), or gone.
+function write(w: World, path: string, value: unknown | null): void {
+  if (value === null) delete w.files[path]
+  else w.files[path] = { text: JSON.stringify(value), at: (w.files[path]?.at ?? 0) + 1 }
 }
 
 // The pane as the engine asks for it, on the surface a test names.
@@ -92,12 +125,36 @@ async function opened($: any, w: World, surface: 'terminal' | 'vscode') {
   return { said, ui }
 }
 
+// Every text the pane shows, a list line's whole text among them.
 async function texts(ui: any): Promise<string[]> {
-  return (await ui.findAll({ type: 'Text' })).map((t: any) => t.text)
+  const found = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Button' }))]
+  return found.map((t: any) => t.text)
 }
 
 async function buttons(ui: any): Promise<string[]> {
   return (await ui.findAll({ type: 'Button' })).map((b: any) => b.key)
+}
+
+// The focus ring moved by the person (the arrows, Tab), as the engine raises it.
+async function ring($: any, element: string): Promise<void> {
+  await $.ui.focus({ component: 'Pane', requestId: PANE_ID, element, origin: { kind: 'person' } })
+}
+
+// Opens a list line's page, as Enter on it does.
+async function open(ui: any, key: string): Promise<void> {
+  await ui.press({ key })
+}
+
+// A time as the pane shows it (longhaul.py's clock()): 14:05 today, Tue
+// 14:05 within six days, else 24 Nov 14:05, in this machine's time.
+function clock(seconds: number): string {
+  const d = new Date(seconds * 1000), n = new Date(NOW)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const day = (t: Date) => new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime()
+  const days = Math.abs(Math.round((day(d) - day(n)) / 86_400_000))
+  if (!days) return hm
+  if (days < 7) return `${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]} ${hm}`
+  return `${d.getDate()} ${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getMonth()]} ${hm}`
 }
 
 // Each test on the terminal and in VS Code, the two surfaces that take
@@ -107,10 +164,15 @@ function both(name: string, body: ($: any, on: any, surface: Surface) => Promise
   for (const surface of ['terminal', 'vscode'] as const) test(`${name} (${surface})`, ($, on) => body($, on, surface))
 }
 
+// The runs after the first read, each followed by the read again.
+function after(w: World): string[][] {
+  return w.runs.slice(1)
+}
+
 both('/accounts opens the pane and reads the accounts', async ($, on, surface) => {
   const w = world(on)
   const { said, ui } = await opened($, w, surface)
-  expect(w.opened).toEqual([{ id: PANE_ID, title: 'Longhaul accounts', focus: true, closeOnEscape: true }])
+  expect(w.opened).toEqual([OPEN])
   expect(said.text).toMatch(/pane/)
   expect(w.runs).toEqual([['status', '--json']])
   expect(w.timeouts).toEqual([60_000])
@@ -126,54 +188,122 @@ test('the pane that cannot be placed says why, and that /longhaul:manage does th
   expect(said.text).toContain('/longhaul:manage')
 })
 
-both('a row per account: plan, sign-in, use, limit, where, the masked email; then where we are', async ($, on, surface) => {
+both('the list: a line per account, + Add account, Settings, then where we are; no action on it', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
-  const all = (await texts(ui)).join('\n')
-  expect(all).toMatch(/personal-1 \(this chat\)/)
-  expect(all).toMatch(/max · signed in/)
-  expect(all).toMatch(/5-hour 40%/)
-  expect(all).toMatch(/week 12%/)
-  expect(all).toMatch(/work-2/)
-  expect(all).toMatch(/NOT signed in/)
-  expect(all).toMatch(/at its limit until /)
-  expect(all).toMatch(/only in ~\/work, ~\/clients/)
-  expect(all).toMatch(/signed in as someone else/)
-  expect(all).toMatch(/nowhere/)
-  expect(all).toMatch(/could not check: the check timed out/)
-  expect(all).toMatch(/anywhere/)
-  for (const email of ['a•••@example.com', 'b•••@example.com', 'c•••@example.com']) expect(all).toContain(email)
+  expect(await buttons(ui)).toEqual(ROWS)
+  const row = async (key: string) => (await ui.find({ key }))?.text
+  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · week 12%   (this chat)')
+  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · at its limit until ${clock(AT + 3 * HOUR)}   `
+    + '(only in ~/work, ~/clients)')
+  expect(await row('row-spare-3')).toBe('  spare-3     signed in as someone else   (used nowhere)')
+  expect(await row('row-team-4')).toBe('  team-4      could not check')
+  expect(await row('row-add')).toBe('  + Add account')
+  expect(await row('row-settings')).toBe('  Settings (switching: ask · VS Code panel: off)')
+  const all = await texts(ui)
+  expect(all[0]).toBe('Longhaul accounts')
   expect(all).toContain('Here, in ~/code/x: personal-1, team-4 may be used.')
+  // The keys, on the terminal; the VS Code panel may keep Escape for itself.
+  expect(all.includes('↑ ↓ to move · Enter to open · Esc to close')).toBe(surface === 'terminal')
+  // No email on the list: each is on its account's page.
+  expect(all.join('\n')).not.toMatch(/@/)
   await ui.unmount()
 })
 
-// The runs after the first read, each followed by the read again.
-function after(w: World): string[][] {
-  return w.runs.slice(1)
-}
+both('the focus starts on the first line, and the › mark follows the ring', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-personal-1' }))?.props.autoFocus).toBe(true)
+  expect((await ui.findAll({ type: 'Button' })).filter((b: any) => b.props.autoFocus).length).toBe(1)
+  await ring($, 'row-work-2')
+  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^› work-2 /)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/^ {2}personal-1 /)
+  await ring($, 'row-settings')
+  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/^› Settings/)
+  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^ {2}work-2 /)
+  await ui.unmount()
+})
+
+both("an account's page: its details, masked email, folder, and its actions; Back returns to its line", async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-personal-1')
+  let all = await texts(ui)
+  for (const t of ['personal-1 (this chat)', 'max · signed in', `5-hour 40%, resets ${clock(AT + 2 * HOUR)}`,
+                   `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used anywhere', 'a•••@example.com',
+                   'folder ~/.claude-personal-1'])
+    expect(all).toContain(t)
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'back'])
+  expect(all.includes('Esc to go back')).toBe(surface === 'terminal')
+  await ui.press({ key: 'back' })
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/^› personal-1/)
+  // The others, each on its own page.
+  await open(ui, 'row-work-2')
+  all = await texts(ui)
+  for (const t of ['pro · NOT signed in', `at its limit until ${clock(AT + 3 * HOUR)}`,
+                   'may be used only in ~/work, ~/clients', 'b•••@example.com'])
+    expect(all).toContain(t)
+  await ui.press({ key: 'back' })
+  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^› work-2/)
+  await open(ui, 'row-spare-3')
+  all = await texts(ui)
+  expect(all).toContain('signed in as someone else')
+  expect(all).toContain('may be used nowhere')
+  expect(all).toContain('c•••@example.com')
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-team-4')
+  expect(await texts(ui)).toContain('could not check: the check timed out')
+  expect(w.runs).toEqual([['status', '--json']]) // opening and going back run nothing
+  await ui.unmount()
+})
+
+both('Back cancels a Remove waiting for its yes before it leaves the page', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'remove-work-2' })
+  expect(await texts(ui)).toContain("Remove work-2 from Longhaul's list? Its folder and sign-in stay.")
+  await ui.press({ key: 'back' })
+  expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
+  expect(await ui.find({ key: 'signin-work-2' })).toBeDefined()
+  await ui.press({ key: 'back' })
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect(after(w)).toEqual([])
+  await ui.unmount()
+})
 
 both('Sign in again for a signed-in account, Sign in for one that is not, the note while it runs', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'signin-personal-1' }))?.text).toBe('Sign in again')
-  expect((await ui.find({ key: 'signin-work-2' }))?.text).toBe('Sign in')
-  expect((await ui.find({ key: 'signin-spare-3' }))?.text).toBe('Sign in')
-  expect((await ui.find({ key: 'signin-team-4' }))?.text).toBe('Sign in again')
+  for (const [name, label] of [['personal-1', 'Sign in again'], ['work-2', 'Sign in'], ['spare-3', 'Sign in'],
+                               ['team-4', 'Sign in again']]) {
+    await open(ui, `row-${name}`)
+    expect((await ui.find({ key: `signin-${name}` }))?.text).toBe(label)
+    await ui.press({ key: 'back' })
+  }
   w.slow.add('setup')
+  await open(ui, 'row-personal-1')
   await ui.press({ key: 'signin-personal-1' })
   expect(await texts(ui)).toContain(`Signing in personal-1: ${NOTE}`)
   await w.clock.advance(60_000)
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
   await ui.press({ key: 'signin-work-2' })
   await w.clock.advance(60_000)
   expect(after(w)).toEqual([['setup', 'personal-1', '--relogin'], ['status', '--json'], ['setup', 'work-2'], ['status', '--json']])
   expect(w.timeouts.slice(1)).toEqual([600_000, 60_000, 600_000, 60_000])
+  // The result shows on the page it ran from, and only there.
   expect((await texts(ui)).some(t => t.startsWith('✔') && /work-2/.test(t))).toBe(true)
+  await ui.press({ key: 'back' })
+  expect((await texts(ui)).some(t => t.startsWith('✔'))).toBe(false)
   await ui.unmount()
 })
 
-both('Remove runs only after its confirmation, and Cancel runs nothing', async ($, on, surface) => {
+both('Remove runs only after its confirmation, Cancel runs nothing, and its result shows on the list', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
   await ui.press({ key: 'remove-work-2' })
   expect(after(w)).toEqual([])
   expect(await texts(ui)).toContain("Remove work-2 from Longhaul's list? Its folder and sign-in stay.")
@@ -181,14 +311,20 @@ both('Remove runs only after its confirmation, and Cancel runs nothing', async (
   expect(after(w)).toEqual([])
   expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
   await ui.press({ key: 'remove-work-2' })
+  w.status = done(JSON.stringify({ ...STATUS, accounts: ACCOUNTS.filter(a => a.name !== 'work-2') }))
   await ui.press({ key: 'remove-yes' })
   expect(after(w)).toEqual([['remove', 'work-2'], ['status', '--json']])
+  // The account is gone, so the pane is back on the list, with the result there.
+  expect(await buttons(ui)).toEqual(ROWS.filter(k => k !== 'row-work-2'))
+  expect((await texts(ui)).some(t => t.startsWith('✔') && /Remove: work-2/.test(t))).toBe(true)
   await ui.unmount()
 })
 
 both('Add refuses a bad name, email or folder and runs nothing', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
+  await open(ui, 'row-add')
+  expect(await texts(ui)).toContain('Add an account')
   for (const [name, email, only, said] of [
     ['bad name!', 'new@example.com', '', /name/],
     ['-rf', 'new@example.com', '', /name/],
@@ -208,6 +344,7 @@ both('Add refuses a bad name, email or folder and runs nothing', async ($, on, s
 both('a good Add passes the name, the email and each folder as its own --repo, with the note while it runs', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
+  await open(ui, 'row-add')
   await ui.input({ key: 'add-name', text: 'work-5' })
   await ui.input({ key: 'add-email', text: 'new@example.com' })
   await ui.input({ key: 'add-only', text: ' ~/work , /srv/clients,' })
@@ -217,8 +354,10 @@ both('a good Add passes the name, the email and each folder as its own --repo, w
   await w.clock.advance(60_000)
   expect(after(w)).toEqual([['add', 'work-5', 'new@example.com', '--repo', '~/work', '--repo', '/srv/clients'], ['status', '--json']])
   expect(w.timeouts[1]).toBe(600_000)
+  expect((await texts(ui)).some(t => t.startsWith('✔') && /Add: work-5/.test(t))).toBe(true)
   // Once it is done the fields are empty again; with no folder, no --repo.
   w.slow.clear()
+  expect((await ui.find({ key: 'add-name' }))?.text).toBe('')
   await ui.input({ key: 'add-name', text: 'spare-6' })
   await ui.input({ key: 'add-email', text: 'other@example.com' })
   await ui.press({ key: 'add' })
@@ -226,11 +365,13 @@ both('a good Add passes the name, the email and each folder as its own --repo, w
   await ui.unmount()
 })
 
-both('switching, the VS Code panel and forgetting the limits run their commands', async ($, on, surface) => {
+both("Settings' page: switching, the VS Code panel and forgetting the limits run their commands", async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
   const all = (await texts(ui)).join('\n')
   for (const line of [/ask: asks first/, /auto: moves by itself/, /never: waits for the reset/]) expect(all).toMatch(line)
+  expect((await ui.find({ key: 'switch' }))?.props.value).toBe('ask')
   expect(await ui.find({ key: 'vscode-off' })).toBeUndefined() // it is off: only Turn on
   await ui.select({ key: 'switch', value: 'auto' })
   expect(after(w)).toEqual([['switch', 'auto'], ['status', '--json']])
@@ -244,6 +385,9 @@ both('switching, the VS Code panel and forgetting the limits run their commands'
   await ui.press({ key: 'vscode-off' })
   expect(after(w).slice(6)).toEqual([['vscode', 'off'], ['status', '--json']])
   expect(await texts(ui)).toContain(RELOAD)
+  // The list's Settings line says what the rows read last.
+  await ui.press({ key: 'back' })
+  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/Settings \(switching: ask · VS Code panel: on\)$/)
   await ui.unmount()
 })
 
@@ -253,6 +397,7 @@ both("the last action's output: its last ten lines, stdout and stderr, every ema
   const lines = Array.from({ length: 14 }, (_, i) => `line ${i + 1}`)
   w.answer.setup = done(`${lines.join('\n')}\nsigned in as first.last@example.com\n`, 1,
     'should be second@example.com, not <other+tag@example.com>\n')
+  await open(ui, 'row-personal-1')
   await ui.press({ key: 'signin-personal-1' })
   const shown = await texts(ui)
   expect(shown.some(t => t.startsWith('✘') && /personal-1/.test(t))).toBe(true)
@@ -278,32 +423,46 @@ both('a status read that fails, or is not JSON, says so with Retry', async ($, o
   expect((await texts(ui)).join('\n')).toMatch(/update Longhaul/)
   w.status = done(JSON.stringify(STATUS))
   await ui.press({ key: 'retry' })
-  expect(await ui.find({ key: 'signin-personal-1' })).toBeDefined()
+  expect(await buttons(ui)).toEqual(ROWS)
   expect(w.runs.filter(r => r[0] !== 'status')).toEqual([])
   await ui.unmount()
 })
 
-both('while an action runs no other is offered, and a press then runs nothing', async ($, on, surface) => {
+both('while an action runs no other is offered, a press then runs nothing, and the pages still open', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
   w.slow.add('clear')
   await ui.press({ key: 'clear' })
-  expect(await buttons(ui)).toEqual([])
+  expect(await buttons(ui)).toEqual(['back'])
   expect(await ui.find({ type: 'Input' })).toBeUndefined()
   expect(await ui.find({ type: 'Select' })).toBeUndefined()
+  expect(await texts(ui)).toContain('Forgetting the recorded limits…')
   await expect(ui.press({ key: 'clear' })).rejects.toBeDefined()
+  // Elsewhere too: an account's page shows its details, and no action.
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  expect(await buttons(ui)).toEqual(['back'])
+  expect(await texts(ui)).toContain('Forgetting the recorded limits…')
   await expect(ui.press({ key: 'signin-work-2' })).rejects.toBeDefined()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-add')
+  expect(await ui.find({ type: 'Input' })).toBeUndefined()
   await w.clock.advance(60_000)
   expect(after(w)).toEqual([['clear'], ['status', '--json']])
-  expect(await buttons(ui)).toContain('clear')
+  expect(await ui.find({ key: 'add-name' })).toBeDefined()
   await ui.unmount()
 })
 
-both('a name the check refuses gets no button, and nothing runs with it', async ($, on, surface) => {
+both('a name the check refuses gets no page, and nothing runs with it', async ($, on, surface) => {
   const w = world(on)
-  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[1], name: '--purge' }, ACCOUNTS[0]] }))
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[1], name: '--purge' }, ACCOUNTS[0], ACCOUNTS[0]] }))
   const { ui } = await opened($, w, surface)
   expect((await buttons(ui)).filter(k => k.includes('purge'))).toEqual([])
+  expect((await texts(ui)).some(t => /--purge/.test(t))).toBe(true) // drawn, as text
+  // A name listed twice has one line to press.
+  expect((await buttons(ui)).filter(k => k === 'row-personal-1')).toEqual(['row-personal-1'])
+  await open(ui, 'row-personal-1')
   expect(await ui.find({ key: 'signin-personal-1' })).toBeDefined()
   await ui.unmount()
 })
@@ -314,17 +473,24 @@ both('an account with no folder and times in decimals, and an odd record, are dr
   const noFolder = { ...ACCOUNTS[0], name: 'odd-5', folder: '', signed_in: null, as_expected: null, this_chat: false,
     check_failed: "its config_dir is not a folder's path", limited_until: AT + 3600.5,
     five_hour: { used: 99.6, resets_at: AT + 3600.5 } }
-  const odd = { name: 'odd-6', only_in: 'everywhere', five_hour: 'full', signed_in: 'yes' }
+  const odd = { name: 'odd-6', only_in: 'everywhere', five_hour: 'full', signed_in: 'yes', sign_in_failed_at: 'today' }
   w.status = done(JSON.stringify({ ...STATUS, accounts: [noFolder, odd, 7], here: 'x', switch: 'sometimes' }))
   const { ui } = await opened($, w, surface)
-  const all = (await texts(ui)).join('\n')
+  expect((await ui.find({ key: 'row-odd-6' }))?.text).toMatch(/^ {2}odd-6\s+could not check {3}\(used nowhere\)$/)
+  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/switching: not known/)
+  await open(ui, 'row-odd-5')
+  let all = (await texts(ui)).join('\n')
   expect(all).toContain("could not check: its config_dir is not a folder's path")
-  expect(all).toMatch(/5-hour 100%, resets \w{3} \d\d:\d\d/)
-  expect(all).toMatch(/at its limit until \w{3} \d\d:\d\d/)
+  expect(all).toContain(`5-hour 100%, resets ${clock(AT + 3600.5)}`)
+  expect(all).toContain(`at its limit until ${clock(AT + 3600.5)}`)
+  expect(all).not.toMatch(/folder |NaN|undefined/)
+  expect(await ui.find({ key: 'signin-odd-5' })).toBeDefined()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-odd-6')
+  all = (await texts(ui)).join('\n')
   expect(all).toMatch(/odd-6\n/)
   expect(all).toMatch(/may be used nowhere/)
-  expect(all).not.toMatch(/NaN|undefined/)
-  expect(await ui.find({ key: 'signin-odd-5' })).toBeDefined()
+  expect(all).not.toMatch(/NaN|undefined|failed/)
   await ui.unmount()
 })
 
@@ -336,41 +502,204 @@ both('a pane drawn before /accounts has read the rows reads them once', async ($
   await $.command.run(TYPED)
   await w.clock.settle()
   expect(w.runs).toEqual([['status', '--json']])
-  expect(await ui.find({ key: 'signin-personal-1' })).toBeDefined()
+  expect(await buttons(ui)).toEqual(ROWS)
   await ui.unmount()
 })
 
-test('on the phone: the rows, nothing to type or pick, and to manage accounts from the computer', async ($, on) => {
+test('on the phone: the list as text, no page, and to manage accounts from the computer', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/scratch/code/x', surface: 'mobile', isInteractive: true })
   await $.command.run(TYPED)
   const ui = await $.ui.mount(pane('mobile'))
   const all = (await texts(ui)).join('\n')
-  expect(all).toContain('a•••@example.com')
+  expect(all).toMatch(/personal-1\s+max · signed in · week 12%/)
   expect(all).toMatch(/NOT signed in/)
   expect(all).toMatch(/manage accounts from the computer/i)
+  expect(all).not.toMatch(/Add account|Settings/)
   expect(await buttons(ui)).toEqual([])
   expect(w.runs).toEqual([['status', '--json']])
   await ui.unmount()
 })
 
-both('an action left running by a reload shows as not known, and the rows are read again', async ($, on, surface) => {
+both('an action left running by a reload shows as not known on its page, and the rows are read again', async ($, on, surface) => {
   const w = world(on)
-  // What the module before the reload stored: its own action, running.
+  // What the module before the reload stored: its own action, running, and the page it ran from.
   let written = false
   on('state.set', (_: any, e: any, next: any) => {
     if (e.key === 'accountsRunning') written = true
     return next(e)
   })
   on('state.get', (_: any, e: any, next: any) => e.key === 'accountsRunning' && !written
-    ? { value: { value: { shape: 'accounts-running-1', value: { by: 'before', label: 'Sign in work-2', note: 'Signing in work-2' } }, version: 1 } }
+    ? { value: { value: { shape: 'accounts-running-2', value: { by: 'before', label: 'Sign in work-2',
+      note: 'Signing in work-2', page: 'account:work-2' } }, version: 1 } }
     : next(e))
   await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
   const ui = await $.ui.mount(pane(surface))
   await w.clock.settle()
-  const shown = await texts(ui)
-  expect(shown.some(t => /Sign in work-2/.test(t) && /not known/.test(t))).toBe(true)
   expect(w.runs).toEqual([['status', '--json']])
+  expect((await texts(ui)).some(t => /not known/.test(t))).toBe(false) // not on the list
+  await open(ui, 'row-work-2')
+  expect((await texts(ui)).some(t => /Sign in work-2/.test(t) && /not known/.test(t))).toBe(true)
   expect(await ui.find({ key: 'signin-work-2' })).toBeDefined()
+  await ui.unmount()
+})
+
+both('a sign-in that failed in a chat: the line says so, the page says when, and Sign in signs in again', async ($, on, surface) => {
+  const w = world(on)
+  const failed = AT - 3 * HOUR
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], sign_in_failed_at: failed }, ACCOUNTS[1]] }))
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/max · sign-in failed · week 12%/)
+  expect((await ui.find({ key: 'row-work-2' }))?.text).not.toMatch(/failed/) // null, or not there: an older Longhaul
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain(`Its sign-in failed at ${clock(failed)}.`)
+  expect((await ui.find({ key: 'signin-personal-1' }))?.text).toBe('Sign in')
+  await ui.press({ key: 'signin-personal-1' })
+  expect(after(w)).toEqual([['setup', 'personal-1', '--relogin'], ['status', '--json']])
+  await ui.unmount()
+})
+
+// The question (the keep-working plan's K1): asked by the relay in its
+// file, shown at the top of the pane while its relay runs, answered by
+// `longhaul.py answer CHAT QID CHOICE`.
+
+const MOVE_SAYS = `personal-1 hit its weekly limit (resets ${clock(AT + 38 * HOUR)}). Move this chat to work-2 and carry on?`
+
+both('a move question at the top of the list, its two answers, and Move runs answer with this chat and its id', async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, QUESTION)
+  w.answer.answer = done('Answered move: the chat acts on it within a few seconds.\n')
+  const { ui } = await opened($, w, surface)
+  expect((await texts(ui))[0]).toBe(MOVE_SAYS)
+  expect((await ui.find({ key: 'answer-move' }))?.text).toBe('Move and carry on')
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe('Wait for the reset')
+  expect((await buttons(ui)).slice(0, 2)).toEqual(['answer-move', 'answer-wait'])
+  // The focus starts on nothing while a question is open: a stray Enter answers nothing.
+  expect((await ui.findAll({ type: 'Button' })).filter((b: any) => b.props.autoFocus)).toEqual([])
+  // /accounts opened the pane itself: no second open, no pop-up.
+  expect(w.opened).toEqual([OPEN])
+  expect(w.toasts).toEqual([])
+  await ui.press({ key: 'answer-move' })
+  expect(after(w)).toEqual([['answer', SID, 'q-0123456789ab', 'move']])
+  expect(w.timeouts[1]).toBe(60_000)
+  expect(await texts(ui)).toContain('✔ Answered move: the chat acts on it within a few seconds.')
+  expect(await ui.find({ key: 'answer-wait' })).toBeUndefined()
+  // The relay takes the answer and removes the question: it goes at the next look.
+  write(w, QUESTION_FILE, null)
+  await w.clock.advance(3000)
+  expect((await texts(ui)).join('\n')).not.toMatch(/limit \(resets|Answered/)
+  expect(await buttons(ui)).toEqual(ROWS)
+  await ui.unmount()
+})
+
+both('the question shows on every page, and Wait runs answer wait', async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, QUESTION)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
+  expect((await texts(ui))[0]).toBe(MOVE_SAYS)
+  await ui.press({ key: 'answer-wait' })
+  expect(after(w)).toEqual([['answer', SID, 'q-0123456789ab', 'wait']])
+  await ui.unmount()
+})
+
+both('every account at its limit: the first reset, and the same account worded as its own reset', async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, FIRST)
+  const { ui } = await opened($, w, surface)
+  const at = clock(AT + 2 * HOUR)
+  expect((await texts(ui))[0]).toBe(`Every account is at its limit. work-2 resets first, at ${at}. Carry on there then?`)
+  expect((await ui.find({ key: 'answer-yes' }))?.text).toBe(`Yes, carry on at ${at}`)
+  expect((await ui.find({ key: 'answer-no' }))?.text).toBe("No, I'll come back")
+  await ui.press({ key: 'answer-no' })
+  expect(after(w)).toEqual([['answer', SID, 'q-ba9876543210', 'no']])
+  // A new question, for the account this chat is on: it resets first itself.
+  write(w, QUESTION_FILE, { ...FIRST, id: 'q-aaaaaaaaaaaa', to: 'personal-1' })
+  await w.clock.advance(3000)
+  expect((await texts(ui))[0]).toBe(`personal-1 resets at ${at}. Carry on then?`)
+  await ui.press({ key: 'answer-yes' })
+  expect(after(w).slice(-1)).toEqual([['answer', SID, 'q-aaaaaaaaaaaa', 'yes']])
+  await ui.unmount()
+})
+
+both('an answer refused says why in one sentence, and the answers stay', async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, QUESTION)
+  w.answer.answer = done('', 2, 'longhaul answer: the chat that asked has closed, so no one is left to act on the answer.\n')
+  const { ui } = await opened($, w, surface)
+  await ui.press({ key: 'answer-move' })
+  expect(await texts(ui)).toContain('✘ longhaul answer: the chat that asked has closed, so no one is left to act on the answer.')
+  expect(await ui.find({ key: 'answer-move' })).toBeDefined()
+  await ui.unmount()
+})
+
+both("a question whose relay has ended, another chat's, or one written oddly shows nothing", async ($, on, surface) => {
+  const w = world(on)
+  w.alive.clear() // the relay was killed: its question stayed behind
+  write(w, QUESTION_FILE, QUESTION)
+  const { ui } = await opened($, w, surface)
+  expect(await buttons(ui)).toEqual(ROWS)
+  w.alive.add(RELAY)
+  for (const odd of [{ ...QUESTION, chat: 'another-chat' }, { ...QUESTION, id: '--purge' }, { ...QUESTION, choices: ['move'] },
+                     { ...QUESTION, kind: 'first_reset' }, { ...QUESTION, relay_pid: 'x' }, [QUESTION], 'not json']) {
+    write(w, QUESTION_FILE, odd)
+    await w.clock.advance(3000)
+    expect(await buttons(ui)).toEqual(ROWS)
+  }
+  // Another chat's file is never read: only this chat's name is looked for.
+  write(w, QUESTION_FILE, null)
+  write(w, `${HOME}/questions/another-chat.json`, { ...QUESTION, chat: 'another-chat' })
+  await w.clock.advance(3000)
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect(after(w)).toEqual([])
+  expect(w.toasts).toEqual([])
+  await ui.unmount()
+})
+
+both('every 3 s it looks: a new question opens the pane, with one pop-up per question', async ($, on, surface) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  await w.clock.advance(3000)
+  expect(w.opened).toEqual([])
+  write(w, QUESTION_FILE, QUESTION)
+  await w.clock.advance(3000)
+  expect(w.opened).toEqual([OPEN])
+  expect(w.toasts).toEqual(['Longhaul: personal-1 hit its weekly limit. A question waits: type /accounts if it did not open.'])
+  await w.clock.advance(9000)
+  expect(w.opened.length).toBe(1)
+  expect(w.toasts.length).toBe(1)
+  // The pane, drawn now, has it at the top.
+  const ui = await $.ui.mount(pane(surface))
+  await w.clock.settle()
+  expect((await texts(ui))[0]).toBe(MOVE_SAYS)
+  // The next question is another: it opens and pops up once again.
+  write(w, QUESTION_FILE, FIRST)
+  await w.clock.advance(3000)
+  expect(w.opened.length).toBe(2)
+  expect(w.toasts.slice(1)).toEqual(['Longhaul: every account is at its limit. A question waits: type /accounts if it did not open.'])
+  await ui.unmount()
+})
+
+both('a carry-on scheduled for a reset shows on the list until its file goes', async ($, on, surface) => {
+  const w = world(on)
+  write(w, WAIT_FILE, WAIT)
+  const { ui } = await opened($, w, surface)
+  expect(await texts(ui)).toContain(`This chat carries on at ${clock(AT + 2 * HOUR)} on personal-1.`)
+  write(w, WAIT_FILE, null)
+  await w.clock.advance(3000)
+  expect((await texts(ui)).some(t => /carries on/.test(t))).toBe(false)
+  await ui.unmount()
+})
+
+test('on the phone the question shows, and its answers work', async ($, on) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, QUESTION)
+  await $.session.start({ cwd: '/scratch/code/x', surface: 'mobile', isInteractive: true })
+  await $.command.run(TYPED)
+  const ui = await $.ui.mount(pane('mobile'))
+  expect((await texts(ui))[0]).toBe(MOVE_SAYS)
+  expect(await buttons(ui)).toEqual(['answer-move', 'answer-wait'])
+  await ui.press({ key: 'answer-wait' })
+  expect(after(w)).toEqual([['answer', SID, 'q-0123456789ab', 'wait']])
   await ui.unmount()
 })

@@ -4874,8 +4874,9 @@ class Plugin(unittest.TestCase):
                      "skills/checkpoint/SKILL.md", "skills/doctor/SKILL.md", "skills/inspect/SKILL.md",
                      "skills/manage/SKILL.md",
                      # The hooks module's parts and their tests, and its state's contract
-                     # (the accounts screen, 2026-10-31).
+                     # (the accounts screen, 2026-10-31), and this chat's question (K1).
                      "hooks/index.ts", "hooks/display.ts", "hooks/autocompact.ts", "hooks/accounts.tsx",
+                     "hooks/question.ts",
                      "hooks/autocompact.test.ts", "hooks/display.test.ts", "hooks/accounts.test.tsx",
                      "types/index.d.ts",
                      # The Codex layer (X4): its manifest, hooks file and skills.

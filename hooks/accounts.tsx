@@ -1,16 +1,34 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { LonghaulAccount, LonghaulAccountsForm, LonghaulAccountsRead, LonghaulAccountsResult,
-  LonghaulAccountsRunning, LonghaulStatus } from '../types'
+import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsRead,
+  LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulQuestion, LonghaulStatus, LonghaulWait } from '../types'
+import { status as showStatus } from './display.ts'
+import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 
-// Longhaul's accounts screen (S2): /accounts opens a pane, as /mcp opens its
-// list, where the user manages Longhaul's accounts with buttons (the owner,
-// 2026-10-31: "add a new one, remove, get a login again if some account get
-// expired"). The pane draws `longhaul.py status --json` and runs the same
-// commands /longhaul:manage runs in words, by argv, never through a shell:
-// setup, add, remove, switch, vscode, clear. One at a time; the rows are
-// read again when the pane opens and after each one.
+// Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
+// does (the owner, 2026-10-30: "a model showing up front of us and we can do
+// some action there"). First a short list, one line per account, then
+// "+ Add account" and "Settings"; the arrows move the focus, Enter opens an
+// item's page, Escape goes back, and from the list closes the pane. An
+// account's page has its details and its actions (Sign in again or Sign in,
+// Remove); Add account's page the form; Settings' page switching, the VS
+// Code panel and forgetting the limits. The pane draws `longhaul.py status
+// --json` and runs the same commands /longhaul:manage runs in words, by
+// argv, never through a shell: setup, add, remove, switch, vscode, clear.
+// One at a time; the rows are read again when the pane opens and after each.
+//
+// Each line of the list is a Button: the pane is opened with focus and
+// closeOnEscape, so it holds the keys as a dialog does, the arrows and Tab
+// walk its Buttons and Enter presses one (the API's own "a list row is one
+// Button"). Escape raises ui.close; on a page this module keeps the pane open
+// and goes back to the list instead, then takes the keys back.
+//
+// At a usage limit in the VS Code panel, in ask, the chat's relay asks a
+// question (hooks/question.ts, the keep-working plan's K1): it shows at the
+// top of every page with its two answers, which run `longhaul.py answer`.
+// Every 3 s this module looks for it, and opens the pane for a new one with
+// a pop-up beside it, in case the pane cannot open by itself.
 //
 // What it draws comes from $.state (types/index.d.ts): a redraw follows each
 // write, and the values outlive a reload of this module, which its variables
@@ -21,6 +39,7 @@ import type { LonghaulAccount, LonghaulAccountsForm, LonghaulAccountsRead, Longh
 
 const PANE = 'longhaul-accounts'
 const TITLE = 'Longhaul accounts'
+const OPEN = { id: PANE, title: TITLE, focus: true, closeOnEscape: true } as const
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$/ // what longhaul.py takes as a name, and never an option
 const MODES = ['ask', 'auto', 'never'] as const
 // The surfaces that draw Input and Select (the phone does not), by name: the
@@ -28,6 +47,7 @@ const MODES = ['ask', 'auto', 'never'] as const
 const TYPING = ['terminal', 'desktop', 'vscode']
 const STATUS_TIMEOUT = 60_000 // ms: it checks every account's sign-in
 const SIGN_IN_TIMEOUT = 600_000 // ms: a browser sign-in, the most process.run allows
+const POLL = 3000 // ms between looks for this chat's question
 const SHOWN = 10 // lines of a command's output shown
 const NOTE = "finish in the browser that opened, with that account's email. If the browser is signed in to claude.ai "
   + 'as someone else, copy the link into a private window.'
@@ -38,19 +58,29 @@ const UPDATE = 'To update Longhaul: claude plugin marketplace update longhaul, t
 // Change a tag when its value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const lastRead = atom({ plugin: 'longhaul', key: 'accountsRead' } as const, null, { shape: 'accounts-read-1' })
-const running = atom({ plugin: 'longhaul', key: 'accountsRunning' } as const, null, { shape: 'accounts-running-1' })
-const result = atom({ plugin: 'longhaul', key: 'accountsResult' } as const, null, { shape: 'accounts-result-1' })
+const running = atom({ plugin: 'longhaul', key: 'accountsRunning' } as const, null, { shape: 'accounts-running-2' })
+const result = atom({ plugin: 'longhaul', key: 'accountsResult' } as const, null, { shape: 'accounts-result-2' })
 const confirming = atom({ plugin: 'longhaul', key: 'accountsConfirm' } as const, null, { shape: 'accounts-confirm-1' })
 const EMPTY: LonghaulAccountsForm = { name: '', email: '', only: '', problem: null }
 const form = atom({ plugin: 'longhaul', key: 'accountsForm' } as const, EMPTY, { shape: 'accounts-form-1' })
+const shown = atom({ plugin: 'longhaul', key: 'accountsPage' } as const, 'list', { shape: 'accounts-page-1' })
+const marked = atom({ plugin: 'longhaul', key: 'accountsMark' } as const, null, { shape: 'accounts-mark-1' })
+const askedFor = atom({ plugin: 'longhaul', key: 'accountsAsked' } as const, null, { shape: 'accounts-asked-1' })
+const answered = atom({ plugin: 'longhaul', key: 'accountsAnswer' } as const, null, { shape: 'accounts-answer-1' })
+// What the last look found (question.ts), for the drawing to follow.
+const question = atom({ plugin: 'longhaul', key: 'accountsQuestion' } as const, null, { shape: 'accounts-question-1' })
+const wait = atom({ plugin: 'longhaul', key: 'accountsWait' } as const, null, { shape: 'accounts-wait-1' })
 
 // This module's own mark on what it runs: a reload loads a new module, with
 // a new mark, so an action marked by another one was cut off by the reload.
 const SELF = `m${Math.random().toString(36).slice(2)}`
 let busy = false // an action of this module runs: one at a time
+let answering = false // an answer runs: apart from the actions, as a question cannot wait for a sign-in
 let kicked = false // this module looked at what it found once, from a drawing
-let asked = false // this module has read the rows, or is reading them
+let readOnce = false // this module has read the rows, or is reading them
 let reads: Promise<void> = Promise.resolve() // the reads, one after another
+let polling = false // the 3 s look for a question runs
+let looking = false // one look at a time
 
 // Every email in a text masked: its local part's first character, then
 // "•••", the domain kept. A masked one stays as it is.
@@ -66,20 +96,19 @@ function tail(stdout: string, stderr: string): string[] {
   return lines.slice(-SHOWN).map(line => mask(line.length > 300 ? `${line.slice(0, 300)}…` : line))
 }
 
-// An epoch time as the user reads it, in this machine's time: "Sat 14:05".
-function when(seconds: number): string {
-  const d = new Date(seconds * 1000)
-  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]
-  return `${day} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
-
 function base($: any): string[] {
   return ['python3', '-I', `${$.plugin.root}/longhaul.py`]
 }
 
-// Whether an account needs a first sign-in (`setup NAME`) rather than a new one (`--relogin`).
-function needsSignIn(a: LonghaulAccount): boolean {
-  return a.signed_in === false || a.as_expected === false
+// How an account signs in: a first sign-in (`setup NAME`) when it is not
+// signed in or is signed in as someone else, else a new one (`--relogin`),
+// as for a sign-in that failed in a chat (S3), which Claude Code still
+// counts as signed in.
+function signInOf(a: LonghaulAccount): { label: string; argv: string[] } {
+  const name = String(a.name)
+  if (typeof a.sign_in_failed_at === 'number') return { label: 'Sign in', argv: ['setup', name, '--relogin'] }
+  if (a.signed_in === false || a.as_expected === false) return { label: 'Sign in', argv: ['setup', name] }
+  return { label: 'Sign in again', argv: ['setup', name, '--relogin'] }
 }
 
 // The Add fields checked as longhaul.py would, so a mistake is said here and nothing runs.
@@ -129,9 +158,9 @@ function clean(s: any): LonghaulStatus {
     ? { used: w.used as number, resets_at: num(w.resets_at) ?? 0 } : null)
   const accounts = (s.accounts as any[]).filter(a => a && typeof a === 'object' && typeof a.name === 'string')
     .map(a => ({ name: a.name as string, email: str(a.email), signed_in: flag(a.signed_in), as_expected: flag(a.as_expected),
-      check_failed: str(a.check_failed), plan: str(a.plan), limited_until: num(a.limited_until),
-      five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in), folder: str(a.folder) ?? '',
-      this_chat: a.this_chat === true }))
+      check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
+      limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
+      folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   return { accounts, listed: s.listed === true, here,
@@ -141,7 +170,7 @@ function clean(s: any): LonghaulStatus {
 
 // Reads the rows again, after any read already under way.
 function refresh($: any): Promise<void> {
-  asked = true
+  readOnce = true
   reads = reads.then(async () => {
     const got = await readStatus($)
     await update($, lastRead, () => got)
@@ -156,25 +185,33 @@ type Action = {
   timeoutMs: number
   after?: string // what to do once it worked
   done?: () => Promise<void> // what the pane does once it worked
+  then?: LonghaulAccountsPage // the page it shows once it worked, with its result: Remove's account is gone
 }
 
 // Runs one action, if none runs now, then reads the rows again. The result
-// keeps the output's last lines, masked; while it runs only the rows show.
+// keeps the output's last lines, masked, for the page it ran from; while it
+// runs no other action is offered.
 async function act($: any, a: Action): Promise<void> {
   if (busy) return
   busy = true
   try {
+    const from = await read($, shown)
     await update($, confirming, () => null)
-    await update($, running, () => ({ by: SELF, label: a.label, note: a.doing }))
+    await update($, running, () => ({ by: SELF, label: a.label, note: a.doing, page: from }))
     let end: LonghaulAccountsResult
     try {
       const ran = await $.process.run([...base($), ...a.argv], { timeoutMs: a.timeoutMs })
       const ok = ran.exitCode === 0
-      end = { ok, label: a.label, lines: tail(ran.stdout, ran.stderr), after: ok ? a.after ?? null : null }
+      end = { ok, label: a.label, lines: tail(ran.stdout, ran.stderr), after: ok ? a.after ?? null : null, page: from }
     } catch (err: any) { // it could not start, or ran past its time and was stopped
-      end = { ok: false, label: a.label, lines: [mask(`It did not finish: ${err?.message || err}`)], after: null }
+      end = { ok: false, label: a.label, lines: [mask(`It did not finish: ${err?.message || err}`)], after: null, page: from }
     }
     if (end.ok && a.done) await a.done()
+    if (end.ok && a.then) {
+      const to = a.then
+      end = { ...end, page: to }
+      await update($, shown, () => to)
+    }
     await update($, result, () => end)
     await refresh($)
   } finally { // the mark goes before the next action may start, so it never clears that one's
@@ -190,17 +227,17 @@ async function act($: any, a: Action): Promise<void> {
 // itself, so this runs on the clock, just after.
 function firstLook($: any, before: LonghaulAccountsRunning | null, have: LonghaulAccountsRead | null): void {
   const stale = before !== null && before.by !== SELF
-  if (kicked || !(stale || (have === null && !asked))) return
+  if (kicked || !(stale || (have === null && !readOnce))) return
   kicked = true
   try {
     $.clock.after(0, () => {
       void (async () => {
         if (stale) {
           await update($, running, r => (r && r.by !== SELF ? null : r))
-          await update($, result, () => ({ ok: null, label: before.label, after: null,
+          await update($, result, () => ({ ok: null, label: before.label, after: null, page: before.page ?? 'list',
             lines: ['Longhaul was reloaded while this ran, so how it ended is not known. The rows were read again.'] }))
         }
-        if (!asked) await refresh($)
+        if (!readOnce) await refresh($)
       })().catch(() => {})
     })
   } catch {}
@@ -208,20 +245,23 @@ function firstLook($: any, before: LonghaulAccountsRunning | null, have: Longhau
 
 // The actions behind the buttons. A name comes from the last read alone and
 // is checked again, so nothing else reaches longhaul.py as an account.
-async function known($: any, name: string): Promise<boolean> {
+async function known($: any, name: string): Promise<LonghaulAccount | null> {
   const have = await read($, lastRead)
-  return NAME.test(name) && !!have?.status?.accounts.some(a => a.name === name)
+  return (NAME.test(name) && have?.status?.accounts.find(a => a.name === name)) || null
 }
 
-async function signIn($: any, name: string, again: boolean): Promise<void> {
-  if (busy || !(await known($, name))) return
-  await act($, { label: again ? `Sign in again: ${name}` : `Sign in: ${name}`, doing: `Signing in ${name}: ${NOTE}`,
-    argv: again ? ['setup', name, '--relogin'] : ['setup', name], timeoutMs: SIGN_IN_TIMEOUT })
+async function signIn($: any, name: string): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a) return
+  const how = signInOf(a)
+  await act($, { label: `${how.label}: ${name}`, doing: `Signing in ${name}: ${NOTE}`, argv: how.argv,
+    timeoutMs: SIGN_IN_TIMEOUT })
 }
 
 async function remove($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
-  await act($, { label: `Remove: ${name}`, doing: `Removing ${name}…`, argv: ['remove', name], timeoutMs: STATUS_TIMEOUT })
+  await act($, { label: `Remove: ${name}`, doing: `Removing ${name}…`, argv: ['remove', name], timeoutMs: STATUS_TIMEOUT,
+    then: 'list' })
 }
 
 async function add($: any): Promise<void> {
@@ -261,38 +301,204 @@ async function retry($: any): Promise<void> {
   try { await refresh($) } finally { busy = false }
 }
 
+// The page the pane can show of the one asked for: an account's page only
+// while the last read lists it under a name the check takes, a page at all
+// only once the rows were read and on a surface that draws fields.
+function pageOf(asked: LonghaulAccountsPage, status: LonghaulStatus | null, canType: boolean): LonghaulAccountsPage {
+  if (!status || !canType) return 'list'
+  if (asked.startsWith('account:')) {
+    const name = asked.slice('account:'.length)
+    return NAME.test(name) && status.accounts.some(a => a.name === name) ? asked : 'list'
+  }
+  return asked === 'add' || asked === 'settings' ? asked : 'list'
+}
+
+// The list line each page is opened from, so going back puts the focus there.
+function rowKey(p: LonghaulAccountsPage): string {
+  return p.startsWith('account:') ? `row-${p.slice('account:'.length)}` : p === 'list' ? 'row-first' : `row-${p}`
+}
+
+// Moves the focus ring onto an element the next drawing brings, where the
+// pane holds the keys; anywhere else it stays as it is.
+function focusOn($: any, key: string): void {
+  try { void Promise.resolve($.ui.focus({ requestId: PANE, key })).catch(() => {}) } catch {}
+}
+
+// Opens an item's page from the list: Enter on its line, or a click.
+async function go($: any, to: LonghaulAccountsPage, first: string): Promise<void> {
+  if (to.startsWith('account:') && !(await known($, to.slice('account:'.length)))) return
+  await update($, confirming, () => null)
+  await update($, shown, () => to)
+  focusOn($, first)
+}
+
+// One step back: a Remove waiting for its yes is cancelled, a page goes
+// back to the list with the focus on its line. False on the list: there,
+// Escape closes the pane.
+async function back($: any): Promise<boolean> {
+  if (await read($, confirming)) {
+    await update($, confirming, () => null)
+    return true
+  }
+  const [asked, have] = await Promise.all([read($, shown), read($, lastRead)])
+  const on = pageOf(asked, have?.status ?? null, true)
+  if (asked !== 'list') await update($, shown, () => 'list')
+  if (on === 'list') return false
+  await update($, marked, () => rowKey(on))
+  focusOn($, rowKey(on))
+  return true
+}
+
+// The question's answer, as its button says: `longhaul.py answer CHAT QID
+// CHOICE` (not bin/longhaul, which refuses it: the question is the user's).
+// Apart from the actions' one-at-a-time, since the chat waits on it.
+async function answer($: any, choice: string): Promise<void> {
+  if (answering) return
+  const q = await read($, question)
+  let sid = ''
+  try { sid = String(await $.session.id()) } catch {}
+  const argv = q ? answerArgs(q, choice, sid) : null
+  if (!q || !argv) return
+  answering = true
+  try {
+    await update($, answered, () => ({ by: SELF, qid: q.id, choice, ok: null, lines: [] }))
+    let end: LonghaulAccountsAnswer
+    try {
+      const ran = await $.process.run([...base($), ...argv], { timeoutMs: STATUS_TIMEOUT })
+      end = { by: SELF, qid: q.id, choice, ok: ran.exitCode === 0, lines: tail(ran.stdout, ran.stderr) }
+    } catch (err: any) {
+      end = { by: SELF, qid: q.id, choice, ok: false, lines: [mask(`It did not finish: ${err?.message || err}`)] }
+    }
+    await update($, answered, () => end)
+  } finally { answering = false }
+  await poll($) // at once: the relay may have taken it already
+}
+
+// One look for this chat's question and carry-on. A change redraws the
+// status entry; a question the pane was not opened for yet opens it, with a
+// pop-up beside it, once per question: an open the user did not ask for may
+// stay undrawn (in a terminal under 144 columns; in the VS Code panel it is
+// not known), and the pop-up says where to find it. From /accounts, which
+// opens the pane itself, it neither opens nor pops up.
+async function poll($: any, byCommand = false): Promise<void> {
+  if (looking) return
+  looking = true
+  try {
+    const { asked, waiting } = await look($)
+    const [q, w] = await Promise.all([read($, question), read($, wait)])
+    // Written only on a change, so the drawing that follows them is not drawn again for nothing.
+    const newQ = JSON.stringify(q) !== JSON.stringify(asked), newW = JSON.stringify(w) !== JSON.stringify(waiting)
+    if (newQ) await update($, question, () => asked)
+    if (newW) await update($, wait, () => waiting)
+    if (newQ || newW) await showStatus($)
+    if (asked && asked.id !== (await read($, askedFor))) {
+      await update($, askedFor, () => asked.id)
+      if (!byCommand) {
+        try { await $.ui.open(OPEN) } catch {}
+        try { $.ui.toast(mask(waits(asked)), { timeoutMs: 15000 }) } catch {}
+      }
+    }
+  } catch {} finally { looking = false }
+}
+
+// The look every POLL ms, from the first hook that can start it: a reload
+// ends this module's timer with it, and the next turn starts it again.
+function startPolling($: any): void {
+  if (polling) return
+  polling = true
+  try { $.clock.every(POLL, () => { void poll($) }) } catch { polling = false }
+}
+
 // What a part of the pane draws from: the surface's elements and the state.
 // `$` is passed beside it, as the engine takes it only spelled out.
 type Ctx = {
   E: any // the surface's elements, $.ui.resolve(e)
+  surface: string
   canType: boolean // the surface draws Input and Select (the phone does not)
-  idle: boolean // no action runs: the buttons are offered
+  idle: boolean // no action runs: the actions are offered
   have: LonghaulAccountsRead | null // null: not read yet
   status: LonghaulStatus | null
   now: LonghaulAccountsRunning | null // this module's action, running
   last: LonghaulAccountsResult | null
   confirm: string | null
   form: LonghaulAccountsForm
+  page: LonghaulAccountsPage // the page drawn (pageOf)
+  mark: string | null // the key the focus ring is on
+  question: LonghaulQuestion | null
+  wait: LonghaulWait | null
+  answer: LonghaulAccountsAnswer | null
+  nowMs: number // the clock, for times shown as longhaul.py shows them
 }
 
-// The pane, top to bottom, one part each; a part draws nothing where it has
-// nothing to say. A new part (a question at the top) is one more line here.
+// The pane, top to bottom: the question, the page, what runs, the last
+// result of this page, the way back. A part draws nothing where it has
+// nothing to say.
 function drawPane($: any, c: Ctx): any {
   const { Box } = c.E
+  const body = c.page === 'list' ? listPage($, c) : c.page === 'add' ? addPage($, c)
+    : c.page === 'settings' ? settingsPage($, c) : accountPage($, c)
   return (
     <Box flexDirection="column" gap={1}>
-      {readPart($, c)}
-      {rowsPart($, c)}
-      {herePart($, c)}
-      {phonePart($, c)}
+      {questionPart($, c)}
+      {body}
       {runningPart($, c)}
-      {addPart($, c)}
-      {switchPart($, c)}
-      {vscodePart($, c)}
-      {clearPart($, c)}
       {resultPart($, c)}
+      {footPart($, c)}
     </Box>
   )
+}
+
+// This chat's question, with its two answers, until its file goes. An
+// answer that worked leaves its result in place of the buttons; one refused
+// shows why, and the buttons again.
+function questionPart($: any, c: Ctx): any {
+  const { Box, Text, Button } = c.E
+  const q = c.question
+  if (!q) return null
+  const { says, labels } = asks(q, c.nowMs)
+  const mine = c.answer && c.answer.qid === q.id ? c.answer : null
+  const runs = mine !== null && mine.ok === null && mine.by === SELF
+  const offered = !runs && mine?.ok !== true
+  return (
+    <Box flexDirection="column">
+      <Text color="warning" bold>{mask(says)}</Text>
+      {offered && (
+        <Box flexDirection="row" gap={1}>
+          {q.choices.map(choice => (
+            <Button key={`answer-${choice}`} label={labels[choice] ?? choice} onPress={() => void answer($, choice)} />
+          ))}
+        </Box>
+      )}
+      {runs && <Text dimColor>Answering…</Text>}
+      {mine && mine.ok !== null && (
+        <Text color={mine.ok ? 'success' : 'error'}>
+          {`${mine.ok ? '✔' : '✘'} ${mine.lines.join(' ') || (mine.ok ? 'Answered.' : 'It was not answered.')}`}
+        </Text>
+      )}
+    </Box>
+  )
+}
+
+// The list: its title (the engine draws a pane's own only while several
+// are open), the carry-on waiting, then one line per account, "+ Add
+// account" and "Settings", then where we are.
+function listPage($: any, c: Ctx): any {
+  const { Box, Text } = c.E
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>{TITLE}</Text>
+      {waitPart($, c)}
+      {readPart($, c)}
+      {itemsPart($, c)}
+      {herePart($, c)}
+      {phonePart($, c)}
+    </Box>
+  )
+}
+
+function waitPart($: any, c: Ctx): any {
+  const { Text } = c.E
+  return c.wait ? <Text>{mask(`This chat ${carries(c.wait, c.nowMs)}.`)}</Text> : null
 }
 
 // Before the rows: still reading, or why they could not be read, with Retry.
@@ -311,16 +517,98 @@ function readPart($: any, c: Ctx): any {
 
 // What the sign-in check found, in a word or two.
 function signedIn(a: LonghaulAccount): string {
-  if (a.signed_in === null)
-    return `could not check${a.check_failed ? `: ${mask(String(a.check_failed))}` : ''}`
+  if (a.signed_in === null) return 'could not check'
   if (a.signed_in === false) return 'NOT signed in'
   if (a.as_expected === false) return 'signed in as someone else'
   return 'signed in'
 }
 
-function use(label: string, w: LonghaulAccount['week']): string | null {
+// An account's line in the list: its plan, its sign-in unless that is
+// fine and the limit says more, then the limit or the week's use.
+function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boolean } {
+  const limited = typeof a.limited_until === 'number'
+  const sign = typeof a.sign_in_failed_at === 'number' ? 'sign-in failed' : signedIn(a)
+  const parts = a.plan ? [mask(a.plan)] : []
+  if (!(limited && sign === 'signed in')) parts.push(sign)
+  if (limited) parts.push(`at its limit until ${clock(a.limited_until!, nowMs)}`)
+  else if (a.week) parts.push(`week ${Math.round(a.week.used)}%`)
+  return { text: parts.join(' · '), warn: limited || sign !== 'signed in' }
+}
+
+// What the line adds in brackets: this chat's account, where it is kept to.
+function extras(a: LonghaulAccount): string {
+  const said = [a.this_chat ? 'this chat' : '',
+    a.only_in === null ? 'used nowhere' : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
+  return said.length ? mask(`   (${said.join(' · ')})`) : ''
+}
+
+// The list's lines. Each is a Button on a surface that draws fields, so the
+// arrows walk them and Enter opens the page; on the phone they are text. A
+// name the check refuses, or one listed twice, gets no page. The focus ring
+// starts on the line it was last on, or the first, but on nothing while a
+// question is open, so a stray Enter cannot answer it.
+function itemsPart($: any, c: Ctx): any {
+  const { Box, Text, Button } = c.E
+  if (!c.status) return null
+  const s = c.status
+  const width = Math.min(24, Math.max(0, ...s.accounts.map(a => mask(String(a.name)).length)))
+  const keys = new Set<string>()
+  const items: { key: string | null; head: string; text: string; warn: boolean; extra: string; open?: () => void }[] = []
+  for (const a of s.accounts) {
+    const name = String(a.name)
+    const key = NAME.test(name) && !keys.has(`row-${name}`) ? `row-${name}` : null
+    if (key) keys.add(key)
+    const { text, warn } = summary(a, c.nowMs)
+    items.push({ key, head: mask(name).padEnd(width), text, warn, extra: extras(a),
+      open: key ? () => void go($, `account:${name}`, `signin-${name}`) : undefined })
+  }
+  if (c.canType) {
+    items.push({ key: 'row-add', head: '+ Add account', text: '', warn: false, extra: '',
+      open: () => void go($, 'add', 'add-name') })
+    const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
+    items.push({ key: 'row-settings', head: `Settings (switching: ${s.switch ?? 'not known'} · VS Code panel: ${vs})`,
+      text: '', warn: false, extra: '', open: () => void go($, 'settings', 'switch') })
+  }
+  const pressable = items.filter(i => c.canType && i.key && i.open)
+  const start = c.question ? null : (pressable.find(i => i.key === c.mark) ?? pressable[0])?.key ?? null
+  return (
+    <Box flexDirection="column">
+      {!s.accounts.length && (
+        <Text>{s.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
+      )}
+      {items.map(i => {
+        const parts = [`${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`, i.text ? '  ' : '']
+        const text = i.text ? <Text color={i.warn ? 'warning' : undefined}>{i.text}</Text> : null
+        const extra = i.extra ? <Text dimColor>{i.extra}</Text> : null
+        if (c.canType && i.key && i.open)
+          return (
+            <Button key={i.key} plain onPress={i.open} {...(i.key === start ? { autoFocus: true } : {})}>
+              {parts.join('')}{text}{extra}
+            </Button>
+          )
+        return <Box flexDirection="row"><Text>{parts.join('')}</Text>{text}{extra}</Box>
+      })}
+    </Box>
+  )
+}
+
+function herePart($: any, c: Ctx): any {
+  const { Text } = c.E
+  const here = c.status?.here
+  if (!here) return null
+  const may = here.may_use.length ? here.may_use.join(', ') : 'no account'
+  return <Text dimColor>{mask(`Here, in ${here.folder}: ${may} may be used.`)}</Text>
+}
+
+// The phone draws no field: it shows the list, and says where to manage it.
+function phonePart($: any, c: Ctx): any {
+  const { Text } = c.E
+  return c.canType ? null : <Text dimColor>To add, sign in or remove an account, manage accounts from the computer.</Text>
+}
+
+function use(label: string, w: LonghaulAccount['week'], nowMs: number): string | null {
   if (!w || typeof w.used !== 'number') return null
-  return `${label} ${Math.round(w.used)}%${w.resets_at > 0 ? `, resets ${when(w.resets_at)}` : ''}`
+  return `${label} ${Math.round(w.used)}%${w.resets_at > 0 ? `, resets ${clock(w.resets_at, nowMs)}` : ''}`
 }
 
 function where(a: LonghaulAccount): string {
@@ -328,29 +616,36 @@ function where(a: LonghaulAccount): string {
   return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
 }
 
-// One account: its name, what is known of it, and its buttons.
-function row($: any, c: Ctx, a: LonghaulAccount): any {
+// An account's page: what is known of it, then its actions, offered while
+// nothing runs. Remove asks first, in place of the actions.
+function accountPage($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
-  const name = String(a.name)
-  const usage = [use('5-hour', a.five_hour), use('week', a.week)].filter(Boolean).join(' · ')
-  const offered = c.idle && c.canType && NAME.test(name)
+  const name = c.page.slice('account:'.length)
+  const a = c.status!.accounts.find(x => x.name === name)!
+  const how = signInOf(a)
+  const check = a.signed_in === null && a.check_failed ? `could not check: ${mask(String(a.check_failed))}` : signedIn(a)
+  const lines = [use('5-hour', a.five_hour, c.nowMs), use('week', a.week, c.nowMs)].filter(Boolean) as string[]
   return (
     <Box flexDirection="column">
       <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
-      <Text>{[a.plan && mask(a.plan), signedIn(a)].filter(Boolean).join(' · ')}</Text>
-      {usage && <Text>{usage}</Text>}
-      {typeof a.limited_until === 'number' && <Text color="warning">{`at its limit until ${when(a.limited_until)}`}</Text>}
+      <Text>{[a.plan && mask(a.plan), check].filter(Boolean).join(' · ')}</Text>
+      {lines.map(line => <Text>{line}</Text>)}
+      {typeof a.limited_until === 'number' && (
+        <Text color="warning">{`at its limit until ${clock(a.limited_until, c.nowMs)}`}</Text>
+      )}
+      {typeof a.sign_in_failed_at === 'number' && (
+        <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`}</Text>
+      )}
       <Text dimColor>{where(a)}</Text>
       {a.email && <Text dimColor>{mask(String(a.email))}</Text>}
-      {offered && c.confirm !== name && (
+      {a.folder && <Text dimColor>{mask(`folder ${a.folder}`)}</Text>}
+      {c.idle && c.confirm !== name && (
         <Box flexDirection="row" gap={1}>
-          <Button key={`signin-${name}`} label={needsSignIn(a) ? 'Sign in' : 'Sign in again'}
-            onPress={() => void signIn($, name, !needsSignIn(a))} />
-          <Button key={`remove-${name}`} label="Remove" dimColor
-            onPress={() => void update($, confirming, () => name)} />
+          <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />
+          <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void update($, confirming, () => name)} />
         </Box>
       )}
-      {offered && c.confirm === name && (
+      {c.idle && c.confirm === name && (
         <Box flexDirection="column">
           <Text color="warning">{`Remove ${name} from Longhaul's list? Its folder and sign-in stay.`}</Text>
           <Box flexDirection="row" gap={1}>
@@ -363,26 +658,59 @@ function row($: any, c: Ctx, a: LonghaulAccount): any {
   )
 }
 
-function rowsPart($: any, c: Ctx): any {
-  const { Box, Text } = c.E
-  if (!c.status) return null
-  if (!c.status.accounts.length)
-    return <Text>{c.status.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
-  return <Box flexDirection="column" gap={1}>{c.status.accounts.map(a => row($, c, a))}</Box>
+// What a field's typing keeps: each change, and Enter, is saved as it stands.
+function keep($: any, field: 'name' | 'email' | 'only'): (value: string) => void {
+  return value => void update($, form, f => ({ ...f, [field]: value, problem: null }))
 }
 
-function herePart($: any, c: Ctx): any {
-  const { Text } = c.E
-  const here = c.status?.here
-  if (!here) return null
-  const may = here.may_use.length ? here.may_use.join(', ') : 'no account'
-  return <Text>{mask(`Here, in ${here.folder}: ${may} may be used.`)}</Text>
+// Add account's page: the form, while nothing runs.
+function addPage($: any, c: Ctx): any {
+  const { Box, Text, Button, Input } = c.E
+  return (
+    <Box flexDirection="column">
+      <Text bold>Add an account</Text>
+      {c.idle && <Input key="add-name" label="Name: " placeholder="work-2" value={c.form.name}
+        onInput={keep($, 'name')} onSubmit={keep($, 'name')} />}
+      {c.idle && <Input key="add-email" label="Email: " placeholder="name@example.com" value={c.form.email}
+        onInput={keep($, 'email')} onSubmit={keep($, 'email')} />}
+      {c.idle && <Input key="add-only" label="Only in (optional, folders split by commas): " placeholder="~/work, ~/clients"
+        value={c.form.only} onInput={keep($, 'only')} onSubmit={keep($, 'only')} />}
+      {c.idle && c.form.problem && <Text color="error">{`✘ ${c.form.problem}`}</Text>}
+      {c.idle && <Button key="add" label="Add account" onPress={() => void add($)} />}
+    </Box>
+  )
 }
 
-// The phone draws no field: it shows the rows, and says where to manage them.
-function phonePart($: any, c: Ctx): any {
-  const { Text } = c.E
-  return c.canType ? null : <Text dimColor>To add, sign in or remove an account, manage accounts from the computer.</Text>
+// Settings' page: switching at a limit, the VS Code panel, the recorded limits.
+function settingsPage($: any, c: Ctx): any {
+  const { Box, Text, Button, Select } = c.E
+  const mode = c.status!.switch
+  const problem = c.status!.switch_problem
+  const on = c.status!.vscode
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>Settings</Text>
+      <Box flexDirection="column">
+        {c.idle && <Select key="switch" label="Switching at a limit: " options={MODES.map(m => ({ value: m, label: m }))}
+          {...(mode ? { value: mode } : {})} onSelect={(value: string) => void setSwitch($, value)} />}
+        {!c.idle && <Text>{`Switching at a limit: ${mode ?? 'not known'}`}</Text>}
+        <Text dimColor>ask: asks first</Text>
+        <Text dimColor>auto: moves by itself</Text>
+        <Text dimColor>never: waits for the reset</Text>
+        {problem && <Text color="warning">{`⚠ ${mask(String(problem))}`}</Text>}
+      </Box>
+      <Box flexDirection="column">
+        <Text>{`VS Code panel on Longhaul's accounts: ${on === true ? 'on' : on === false ? 'off' : 'not known'}`}</Text>
+        {c.idle && (
+          <Box flexDirection="row" gap={1}>
+            {on !== true && <Button key="vscode-on" label="Turn on" onPress={() => void vscode($, true)} />}
+            {on !== false && <Button key="vscode-off" label="Turn off" onPress={() => void vscode($, false)} />}
+          </Box>
+        )}
+      </Box>
+      {c.idle && <Button key="clear" label="Forget recorded limits" onPress={() => void clear($)} />}
+    </Box>
+  )
 }
 
 function runningPart($: any, c: Ctx): any {
@@ -390,77 +718,11 @@ function runningPart($: any, c: Ctx): any {
   return c.now ? <Text color="warning">{c.now.note}</Text> : null
 }
 
-// The parts below act; each is offered only while nothing runs, on a
-// surface that draws fields, once the rows were read.
-function offered(c: Ctx): boolean {
-  return c.idle && c.canType && c.status !== null
-}
-
-// What a field's typing keeps: each change, and Enter, is saved as it stands.
-function keep($: any, field: 'name' | 'email' | 'only'): (value: string) => void {
-  return value => void update($, form, f => ({ ...f, [field]: value, problem: null }))
-}
-
-function addPart($: any, c: Ctx): any {
-  const { Box, Text, Button, Input } = c.E
-  if (!offered(c)) return null
-  return (
-    <Box flexDirection="column">
-      <Text bold>Add an account</Text>
-      <Input key="add-name" label="Name: " placeholder="work-2" value={c.form.name}
-        onInput={keep($, 'name')} onSubmit={keep($, 'name')} />
-      <Input key="add-email" label="Email: " placeholder="name@example.com" value={c.form.email}
-        onInput={keep($, 'email')} onSubmit={keep($, 'email')} />
-      <Input key="add-only" label="Only in (optional, folders split by commas): " placeholder="~/work, ~/clients"
-        value={c.form.only} onInput={keep($, 'only')} onSubmit={keep($, 'only')} />
-      {c.form.problem && <Text color="error">{`✘ ${c.form.problem}`}</Text>}
-      <Button key="add" label="Add account" onPress={() => void add($)} />
-    </Box>
-  )
-}
-
-function switchPart($: any, c: Ctx): any {
-  const { Box, Text, Select } = c.E
-  if (!offered(c)) return null
-  const mode = c.status!.switch
-  const problem = c.status!.switch_problem
-  return (
-    <Box flexDirection="column">
-      <Select key="switch" label="Switching at a limit: " options={MODES.map(m => ({ value: m, label: m }))}
-        {...(mode ? { value: mode } : {})} onSelect={(value: string) => void setSwitch($, value)} />
-      <Text dimColor>ask: asks first</Text>
-      <Text dimColor>auto: moves by itself</Text>
-      <Text dimColor>never: waits for the reset</Text>
-      {problem && <Text color="warning">{`⚠ ${mask(String(problem))}`}</Text>}
-    </Box>
-  )
-}
-
-function vscodePart($: any, c: Ctx): any {
-  const { Box, Text, Button } = c.E
-  if (!offered(c)) return null
-  const on = c.status!.vscode
-  return (
-    <Box flexDirection="column">
-      <Text>{`VS Code panel on Longhaul's accounts: ${on === true ? 'on' : on === false ? 'off' : 'not known'}`}</Text>
-      <Box flexDirection="row" gap={1}>
-        {on !== true && <Button key="vscode-on" label="Turn on" onPress={() => void vscode($, true)} />}
-        {on !== false && <Button key="vscode-off" label="Turn off" onPress={() => void vscode($, false)} />}
-      </Box>
-    </Box>
-  )
-}
-
-function clearPart($: any, c: Ctx): any {
-  const { Button } = c.E
-  if (!offered(c)) return null
-  return <Button key="clear" label="Forget recorded limits" onPress={() => void clear($)} />
-}
-
-// The last action's end: ✔ or ✘ (? when not known), its output's last lines, what next.
+// The last action's end, on the page it ran from: ✔ or ✘ (? when not
+// known), its output's last lines, what next.
 function resultPart($: any, c: Ctx): any {
   const { Box, Text } = c.E
-  if (!c.last || !c.canType || !c.idle) return null
+  if (!c.last || !c.canType || !c.idle || c.last.page !== c.page) return null
   const { ok, label, lines, after } = c.last
   return (
     <Box flexDirection="column">
@@ -469,6 +731,22 @@ function resultPart($: any, c: Ctx): any {
       </Text>
       {lines.map(line => <Text dimColor>{line}</Text>)}
       {after && <Text>{after}</Text>}
+    </Box>
+  )
+}
+
+// The way back from a page (a Back button: the VS Code panel may give
+// Escape to itself), and on the terminal the keys, in a dim line.
+function footPart($: any, c: Ctx): any {
+  const { Box, Text, Button } = c.E
+  if (!c.canType) return null
+  const keys = c.surface === 'terminal'
+    ? <Text dimColor>{c.page === 'list' ? '↑ ↓ to move · Enter to open · Esc to close' : 'Esc to go back'}</Text> : null
+  if (c.page === 'list') return keys
+  return (
+    <Box flexDirection="column">
+      <Button key="back" label="Back" dimColor onPress={() => void back($)} />
+      {keys}
     </Box>
   )
 }
@@ -482,16 +760,31 @@ export const register: Register = on => {
       await $.command.register({ name: 'accounts',
         description: "Longhaul's accounts in a pane: sign in again, add, remove, switching" })
     } catch {}
+    startPolling($)
     return next(e)
   })
 
-  // Opens the pane and reads the rows; where it cannot be drawn, says why.
+  // After a reload, which ends the look's timer, the next turn starts it
+  // again. The matcher, as above: display.ts hooks turn.complete without one.
+  on('turn.complete', { isAborted: [true, false] }, async ($, e, next) => {
+    startPolling($)
+    return next(e)
+  })
+
+  // Opens the pane on its list and reads the rows; where it cannot be drawn, says why.
   on('command.run', { command: 'accounts' }, async $ => {
+    startPolling($)
     // The read starts first, so the pane's first drawing finds it under way and asks for no other.
     const reading = refresh($)
+    try { // as /mcp opens: on the list, the focus on its first line
+      await update($, shown, () => 'list')
+      await update($, confirming, () => null)
+      await update($, marked, () => null)
+    } catch {}
+    await poll($, true)
     let opened: { isPlaced: boolean; reason?: string }
     try {
-      opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true })
+      opened = await $.ui.open(OPEN)
     } catch (err: any) {
       opened = { isPlaced: false, reason: String(err?.message || err) }
     }
@@ -501,14 +794,41 @@ export const register: Register = on => {
     return { text: 'Longhaul: the accounts pane is open. Escape closes it.' }
   })
 
+  // Escape: on a page, back to the list, the pane kept open; on the list it
+  // closes. Escape gave the keys back to the prompt, so the pane asks for
+  // them again once it has them (the prompt grants that over an empty composer).
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (e.origin?.kind !== 'person') return next(e)
+    let stays = false
+    try { stays = await back($) } catch {}
+    if (!stays) return next(e)
+    try { $.clock.after(0, () => { void Promise.resolve($.ui.open(OPEN)).catch(() => {}) }) } catch {}
+    return { value: undefined } // answered without next: the pane stays open
+  })
+
+  // Where the focus ring is, for the list's › mark; the ring itself is the engine's.
+  on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const done = await next(e)
+    try {
+      const at = e.element ?? null
+      if (!done?.deny && (await read($, marked)) !== at) await update($, marked, () => at)
+    } catch {}
+    return done
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed] = await Promise.all([read($, lastRead), read($, running), read($, result),
-      read($, confirming), read($, form)])
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans] = await Promise.all([read($, lastRead), read($, running),
+      read($, result), read($, confirming), read($, form), read($, shown), read($, marked), read($, question), read($, wait),
+      read($, answered)])
+    let nowMs = Date.now()
+    try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
     const mine = now && now.by === SELF ? now : null
-    const c: Ctx = { E, canType: TYPING.includes(String(e.surface)), idle: mine === null, have,
-      status: have?.status ?? null, now: mine, last, confirm, form: typed }
+    const canType = TYPING.includes(String(e.surface))
+    const status = have?.status ?? null
+    const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
+      form: typed, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans, nowMs }
     return drawPane($, c)
   })
 }
