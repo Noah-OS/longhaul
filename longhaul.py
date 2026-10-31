@@ -13536,9 +13536,12 @@ def status_window(reading, key: str, now: float):
 
 def vscode_runs_longhaul():
     """Whether VS Code's settings run Longhaul's wrapper, told as the doctor
-    and uninstall tell it: their claudeProcessWrapper line names a
-    longhaul-vscode. False when there is no settings file (nothing runs
-    it); None when there is one that cannot be read as settings. Only reads."""
+    tells it (doctor_vscode()): their claudeProcessWrapper line names a
+    longhaul-vscode that is there to run. One that is gone runs nothing,
+    and the doctor marks it bad with `longhaul vscode on` as the step, so
+    the screen must not show it on. False when there is no settings file
+    (nothing runs it); None when there is one that cannot be read as
+    settings. Only reads."""
     try:
         if not VSCODE_SETTINGS.is_file():
             return False
@@ -13548,7 +13551,10 @@ def vscode_runs_longhaul():
     if not isinstance(found, dict):
         return None
     value = found.get(VSCODE_WRAPPER_KEY)
-    return isinstance(value, str) and value.endswith("longhaul-vscode")
+    if not (isinstance(value, str) and value.endswith("longhaul-vscode")):
+        return False
+    path = doctor_expand(value)
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
 def has_folder(acct: dict) -> bool:

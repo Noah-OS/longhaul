@@ -20268,7 +20268,16 @@ class StatusJson(unittest.TestCase):
         self.write_accounts({"name": "personal-1"})
         self.assertIs(self.read(self.status())["vscode"], False, "no settings file: nothing runs it")
         self.vscode.parent.mkdir()
-        cases = {'{\n  // mine\n  "claudeCode.claudeProcessWrapper": "/opt/longhaul/longhaul-vscode",\n}': True,
+        # As the doctor tells it: a longhaul-vscode that is there to run,
+        # `~` against HOME; one gone or not runnable runs nothing.
+        for name, mode in (("bin", 0o755), ("plain", 0o644)):
+            (self.tmp / name).mkdir()
+            (self.tmp / name / "longhaul-vscode").write_text("#!/bin/sh\n")
+            (self.tmp / name / "longhaul-vscode").chmod(mode)
+        cases = {'{\n  // mine\n  "claudeCode.claudeProcessWrapper": "~/bin/longhaul-vscode",\n}': True,
+                 f'{{"claudeCode.claudeProcessWrapper": "{self.tmp}/bin/longhaul-vscode"}}': True,
+                 '{"claudeCode.claudeProcessWrapper": "~/gone/longhaul-vscode"}': False,
+                 '{"claudeCode.claudeProcessWrapper": "~/plain/longhaul-vscode"}': False,
                  '{"claudeCode.claudeProcessWrapper": "/usr/local/bin/my-wrapper"}': False,
                  '{"editor.fontSize": 14}': False, "{not json": None, "[]": None}
         for text, want in cases.items():
