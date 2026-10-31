@@ -11490,6 +11490,16 @@ class Shim(unittest.TestCase):
                          CLAUDE_CODE_SESSION_ID="s1", CLAUDE_CONFIG_DIR=str(self.tmp / "claude"),
                          LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), **env)
 
+    def test_from_a_chat_status_json_runs_and_marks_the_chats_account(self):
+        # The accounts screen (S1) runs it from inside a chat: one JSON
+        # object, this chat's account marked, no email shown whole, nothing written.
+        out = self.chat("status", "--json", FAKE_EMAILS=json.dumps({"default": "solo@example.com"}))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        found = json.loads(out.stdout)
+        self.assertEqual([(a["name"], a["signed_in"], a["this_chat"]) for a in found["accounts"]], [("Max", True, True)])
+        self.assertNotIn("solo@example.com", out.stdout)
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
     def test_the_shim_runs_the_read_only_commands_of_the_checkout_it_sits_in(self):
         out = self.shim("-h")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -19997,6 +20007,275 @@ class Accounts(unittest.TestCase):
                          "add writes back the list it read, and the field only when given")
         self.assertEqual(self.longhaul("remove", "Max").returncode, 0)
         self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
+
+
+class StatusJson(unittest.TestCase):
+    """`longhaul status --json` (S1 of the accounts screen): what the screen
+    in hooks/ reads, one JSON object on stdout and nothing else, and it
+    writes nothing. The screen is built against this contract at the same
+    time, so these tests pin each field's name and meaning. Every path is
+    scratch, HOME and VS Code's settings too; the stand-in claude
+    (fake_stream.py) answers `auth status --json` from FAKE_EMAILS, a map of
+    config folder to email ("default" for ~/.claude)."""
+
+    ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "plan", "limited_until",
+                    "five_hour", "week", "only_in", "folder", "this_chat"}
+    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "vscode", "problem"}
+
+    def setUp(self):
+        # Resolved: the folder status runs in is os.getcwd(), a real path,
+        # and HOME must be its start for `~` to be shown (/var is a link on a Mac).
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home, self.default = self.tmp / "home", self.tmp / "claude"
+        self.home.mkdir()
+        self.default.mkdir()
+        self.vscode = self.tmp / "vscode" / "settings.json"
+        self.emails = {}
+
+    def folder(self, name: str) -> Path:
+        return self.tmp / f".claude-{name}"
+
+    def write_accounts(self, *accounts):
+        (self.home / "accounts.json").write_text(json.dumps(list(accounts)))
+
+    def files(self) -> dict:
+        """Every file under the scratch folder, with its size and time:
+        status --json must leave them as they were. ~/Library is left out:
+        Apple's /usr/bin/python3 keeps its bytecode cache there, under HOME."""
+        cache = self.tmp / "Library"
+        return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.tmp.rglob("*")
+                if p.is_file() and cache not in p.parents}
+
+    def status(self, cwd=None, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_VSCODE_SETTINGS=str(self.vscode), FAKE_EMAILS=json.dumps(self.emails))
+        for k in ("LONGHAUL_SWITCH", "LONGHAUL_AUTH_TIMEOUT", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "status", "--json"], env=env,
+                              cwd=str(cwd or self.tmp), capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+
+    def read(self, out, code=0) -> dict:
+        """stdout as the one JSON object it must be: json.loads refuses
+        anything after it, a second object or a line of text."""
+        self.assertEqual((out.returncode, out.stderr), (code, ""), out.stdout)
+        found = json.loads(out.stdout)
+        self.assertIsInstance(found, dict)
+        self.assertEqual(set(found), self.KEYS)
+        for acct in found["accounts"]:
+            self.assertEqual(set(acct), self.ACCOUNT_KEYS)
+        return found
+
+    def by_name(self, found: dict) -> dict:
+        return {a["name"]: a for a in found["accounts"]}
+
+    def test_one_json_object_on_stdout_with_every_field_and_nothing_written(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com"},
+                            {"name": "work", "config_dir": str(self.folder("work")), "email": "work@example.com",
+                             "repositories": ["~/work"]})
+        self.emails = {str(self.folder("personal-1")): "first@example.com", str(self.folder("work")): "work@example.com"}
+        before = self.files()
+        out = self.status()
+        found = self.read(out)
+        self.assertEqual(out.stdout.count("\n"), 1, "one line, the object")
+        self.assertEqual(self.files(), before, "it writes nothing, not even the log")
+        self.assertEqual(found["accounts"][0], {
+            "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
+            "check_failed": None, "plan": "max", "limited_until": None, "five_hour": None, "week": None,
+            "only_in": [], "folder": "~/.claude-personal-1", "this_chat": False})
+        self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
+        self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
+        self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
+            "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
+            "switch_problem": None, "vscode": False, "problem": None})
+        self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
+
+    def test_emails_are_masked_and_never_shown_whole(self):
+        # The screen tells the accounts apart; it never shows who they are.
+        # Neither accounts.json's email nor the one signed in is shown whole.
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1")), "email": "first@example.com"},
+                            {"name": "max", "config_dir": str(self.folder("max")), "email": "a@example.com"},
+                            {"name": "work", "config_dir": str(self.folder("work")), "email": "Work.Team@Example.com"},
+                            {"name": "other", "config_dir": str(self.folder("other")), "email": "mine@example.com"},
+                            {"name": "plain", "config_dir": str(self.folder("plain"))})
+        self.emails = {str(self.folder("p1")): "first@example.com", str(self.folder("max")): "a@example.com",
+                       str(self.folder("work")): "work.team@example.com",
+                       str(self.folder("other")): "stranger@example.com", str(self.folder("plain")): "plain@example.com"}
+        out = self.status()
+        found = self.by_name(self.read(out))
+        self.assertEqual({n: a["email"] for n, a in found.items()},
+                         {"personal-1": "f•••@example.com", "max": "a•••@example.com", "work": "W•••@Example.com",
+                          "other": "m•••@example.com", "plain": None})
+        for email in ("first@example.com", "a@example.com", "Work.Team@Example.com", "work.team@example.com",
+                      "mine@example.com", "stranger@example.com", "plain@example.com", "first", "Work.Team", "stranger"):
+            self.assertNotIn(email, out.stdout)
+        self.assertIn("•", out.stdout, "one character, not \\u2022 (ensure_ascii=False)")
+        self.assertNotIn("\\u2022", out.stdout)
+        log = self.home / "longhaul.log"
+        self.assertFalse(log.exists() and "@" in log.read_text(), "nothing private in the log")
+
+    def test_signed_out_a_wrong_sign_in_and_one_with_no_email_to_match(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1")), "email": "First@Example.com"},
+                            {"name": "out", "config_dir": str(self.folder("out")), "email": "out@example.com"},
+                            {"name": "wrong", "config_dir": str(self.folder("wrong")), "email": "wrong@example.com"},
+                            {"name": "plain", "config_dir": str(self.folder("plain"))})
+        self.emails = {str(self.folder("p1")): "first@example.com",  # the case differs: still as expected
+                       str(self.folder("wrong")): "stranger@example.com", str(self.folder("plain")): "plain@example.com"}
+        found = self.by_name(self.read(self.status()))
+        pick = lambda a: (a["signed_in"], a["as_expected"], a["check_failed"], a["plan"])
+        self.assertEqual(pick(found["personal-1"]), (True, True, None, "max"))
+        self.assertEqual(pick(found["out"]), (False, False, None, None), "signed out: no plan, not as expected")
+        self.assertEqual(pick(found["wrong"]), (True, False, None, "max"), "signed in as another email")
+        self.assertEqual(pick(found["plain"]), (True, True, None, "max"), "no email in the entry: any sign-in")
+
+    def test_a_check_that_cannot_say_is_null_with_its_reason(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1")), "email": "first@example.com"})
+        self.emails = {str(self.folder("p1")): "first@example.com"}
+        pick = lambda a: (a["signed_in"], a["as_expected"], a["check_failed"], a["plan"])
+        found = self.read(self.status(FAKE_AUTH_GARBAGE="1"))
+        self.assertEqual(pick(found["accounts"][0]), (None, None, "exit 1, no JSON", None))
+        found = self.read(self.status(FAKE_AUTH_HANG="1", LONGHAUL_AUTH_TIMEOUT="1"))
+        self.assertEqual(pick(found["accounts"][0]), (None, None, "no answer in 1s", None))
+        found = self.read(self.status(LONGHAUL_CLAUDE_BIN=str(self.tmp / "no-claude")))
+        self.assertEqual(pick(found["accounts"][0])[:2], (None, None), "claude not there: not signed out")
+        self.assertIsInstance(found["accounts"][0]["check_failed"], str)
+
+    def test_the_accounts_are_checked_at_once(self):
+        # The screen waits on this: four checks that each hang until the
+        # timeout take one timeout, not four.
+        self.write_accounts(*({"name": f"personal-{n}", "config_dir": str(self.folder(f"p{n}"))} for n in range(1, 5)))
+        start = time.monotonic()
+        found = self.read(self.status(FAKE_AUTH_HANG="1", LONGHAUL_AUTH_TIMEOUT="2"))
+        self.assertLess(time.monotonic() - start, 6, "in parallel: one after another would take 8 s")
+        self.assertEqual([a["check_failed"] for a in found["accounts"]], ["no answer in 2s"] * 4)
+
+    def test_a_limit_and_a_usage_window_only_while_still_ahead(self):
+        now = time.time()
+        self.write_accounts(*({"name": n, "config_dir": str(self.folder(n))} for n in ("personal-1", "work", "max")))
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"personal-1": now + 3600, "work": now - 60}}))
+        usage = self.home / "usage"
+        usage.mkdir()
+        (usage / "personal-1.json").write_text(json.dumps({
+            "at": now, "five_hour": {"used_percentage": 40.4, "resets_at": int(now + 3600)},
+            "seven_day": {"used_percentage": 12, "resets_at": int(now - 10)}}))
+        (usage / "work.json").write_text(json.dumps({
+            "at": now, "five_hour": {"used_percentage": 40.5, "resets_at": int(now - 1)},
+            "seven_day": {"used_percentage": 40.5, "resets_at": int(now + 86400)}}))
+        (usage / "max.json").write_text("not json")
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual(found["personal-1"]["limited_until"], now + 3600)
+        self.assertIsNone(found["work"]["limited_until"], "a limit already past is no limit")
+        self.assertEqual((found["personal-1"]["five_hour"], found["personal-1"]["week"]),
+                         ({"used": 40, "resets_at": int(now + 3600)}, None))
+        # 40.5 is 41, as display.ts's Math.round has it (Python's round()
+        # gives 40): the screen and the status line show one number.
+        self.assertEqual((found["work"]["five_hour"], found["work"]["week"]),
+                         (None, {"used": 41, "resets_at": int(now + 86400)}))
+        self.assertEqual((found["max"]["five_hour"], found["max"]["week"], found["max"]["limited_until"]),
+                         (None, None, None), "no reading that can be read: no windows")
+
+    def test_only_in_for_a_list_none_an_empty_list_root_and_junk(self):
+        (self.tmp / "work").mkdir()
+        self.write_accounts({"name": "personal-1", "repositories": ["~/team", str(self.tmp / "work")]},
+                            {"name": "personal-2"}, {"name": "personal-3", "repositories": []},
+                            {"name": "max", "repositories": ["/"]}, {"name": "work", "repositories": "~/work"},
+                            {"name": "other", "repositories": ["relative/path"]})
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual({n: a["only_in"] for n, a in found.items()},
+                         {"personal-1": ["~/team", "~/work"], "personal-2": [], "personal-3": [], "max": ["/"],
+                          "work": None, "other": None})
+
+    def test_an_account_whose_folder_is_not_text_is_shown_unchecked(self):
+        # A hand edit's config_dir of 5 is no folder: the check that would
+        # run claude in it is not run, and the rest is still one object.
+        self.write_accounts({"name": "personal-1", "config_dir": 5}, {"name": "work"})
+        self.emails = {"default": "work@example.com"}
+        found = self.by_name(self.read(self.status(CLAUDE_CONFIG_DIR=str(self.default))))
+        odd = found["personal-1"]
+        self.assertEqual((odd["signed_in"], odd["as_expected"], odd["folder"], odd["this_chat"]), (None, None, "", False))
+        self.assertIsInstance(odd["check_failed"], str)
+        self.assertEqual((found["work"]["signed_in"], found["work"]["this_chat"]), (True, True))
+
+    def test_this_chat_is_the_account_whose_folder_is_claude_config_dir(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1"))},
+                            {"name": "work", "config_dir": "~/.claude-work"}, {"name": "max"})
+        self.folder("work").mkdir()
+        this = lambda **env: {n: a["this_chat"] for n, a in self.by_name(self.read(self.status(**env))).items()}
+        self.assertEqual(this(), {"personal-1": False, "work": False, "max": False}, "no CLAUDE_CONFIG_DIR: none")
+        self.assertEqual(this(CLAUDE_CONFIG_DIR=str(self.folder("work")) + "/"),
+                         {"personal-1": False, "work": True, "max": False}, "a trailing slash names the same folder")
+        self.assertEqual(this(CLAUDE_CONFIG_DIR=str(self.default)), {"personal-1": False, "work": False, "max": True},
+                         "an account with no folder of its own is on ~/.claude")
+        self.assertEqual(this(CLAUDE_CONFIG_DIR=str(self.tmp / "elsewhere")),
+                         {"personal-1": False, "work": False, "max": False})
+
+    def test_here_names_this_folder_and_the_accounts_it_may_use(self):
+        team, code = self.tmp / "team" / "app", self.tmp / "code"
+        team.mkdir(parents=True)
+        code.mkdir()
+        self.write_accounts({"name": "personal-1"}, {"name": "team-work", "repositories": ["~/team"]},
+                            {"name": "junk", "repositories": "~/team"})
+        self.assertEqual(self.read(self.status(cwd=team))["here"], {"folder": "~/team/app", "may_use": ["team-work"]})
+        self.assertEqual(self.read(self.status(cwd=code))["here"], {"folder": "~/code", "may_use": ["personal-1"]})
+        self.write_accounts({"name": "team-work", "repositories": ["~/team"]})
+        self.assertEqual(self.read(self.status(cwd=code))["here"], {"folder": "~/code", "may_use": []},
+                         "no account may be used here")
+
+    def test_no_accounts_file_is_the_one_subscription_and_not_listed(self):
+        self.emails = {"default": "solo@example.com"}
+        for case in ("no file", "an empty list"):
+            with self.subTest(case):
+                if case == "an empty list":
+                    self.write_accounts()
+                out = self.status()
+                found = self.read(out)
+                self.assertEqual((found["listed"], found["here"], found["problem"]), (False, None, None))
+                self.assertEqual(found["accounts"], [{
+                    "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
+                    "check_failed": None, "plan": "max", "limited_until": None, "five_hour": None, "week": None,
+                    "only_in": [], "folder": "~/claude", "this_chat": False}])
+                self.assertNotIn("solo@example.com", out.stdout)
+
+    def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
+        path = self.home / "accounts.json"
+        for case, text in unreadable_accounts({"name": "personal-1", "email": "first@example.com"}).items():
+            with self.subTest(case):
+                path.write_text(text)
+                out = self.status()
+                found = self.read(out, code=2)
+                self.assertEqual(found["problem"], longhaul.unreadable_text(longhaul.read_accounts_file(self.home)[1]))
+                self.assertEqual((found["accounts"], found["listed"], found["here"]), ([], False, None))
+                self.assertEqual(found["switch"], "ask", "the rest is still said")
+                self.assertNotIn("first@example.com", out.stdout, "the problem names the kind, never the text")
+                self.assertEqual(path.read_text(), text, "never written over")
+
+    def test_an_invalid_switch_mode_is_null_with_the_reason(self):
+        self.write_accounts({"name": "personal-1"})
+        with mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": "sometimes"}), self.assertRaises(ValueError) as said:
+            longhaul.switch_mode()
+        found = self.read(self.status(LONGHAUL_SWITCH="sometimes"))
+        self.assertEqual((found["switch"], found["switch_problem"]), (None, str(said.exception)))
+        self.assertEqual(found["accounts"][0]["name"], "personal-1", "the rest is still said, exit 0")
+        (self.home / "config.json").write_text('{"switch": "auto"}')
+        found = self.read(self.status())
+        self.assertEqual((found["switch"], found["switch_problem"]), ("auto", None))
+        self.assertEqual(self.read(self.status(LONGHAUL_SWITCH="never"))["switch"], "never")
+
+    def test_vscode_says_whether_its_settings_run_longhauls_wrapper(self):
+        self.write_accounts({"name": "personal-1"})
+        self.assertIs(self.read(self.status())["vscode"], False, "no settings file: nothing runs it")
+        self.vscode.parent.mkdir()
+        cases = {'{\n  // mine\n  "claudeCode.claudeProcessWrapper": "/opt/longhaul/longhaul-vscode",\n}': True,
+                 '{"claudeCode.claudeProcessWrapper": "/usr/local/bin/my-wrapper"}': False,
+                 '{"editor.fontSize": 14}': False, "{not json": None, "[]": None}
+        for text, want in cases.items():
+            with self.subTest(text):
+                self.vscode.write_text(text)
+                self.assertIs(self.read(self.status())["vscode"], want)
+                self.assertEqual(self.vscode.read_text(), text, "only read")
 
 
 class Switch(unittest.TestCase):

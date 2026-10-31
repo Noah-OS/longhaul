@@ -117,7 +117,10 @@ Usage:
                           it writes ~/.local/bin/longhaul, a launcher that runs
                           the newest Longhaul Claude Code has installed; run
                           from a checkout of your own, it links there instead
-  longhaul status               accounts, sign-ins, limits, links
+  longhaul status [--json]      accounts, sign-ins, limits, links; --json: the
+                          accounts, their usage and this folder's as one JSON
+                          object, emails masked (exit 2: accounts.json could
+                          not be read), for the accounts screen; it only reads
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
                           the status line, the VS Code panel, the accounts, the
@@ -13439,7 +13442,9 @@ def remove(opts) -> int:
     return 0
 
 
-def status(_opts) -> int:
+def status(opts) -> int:
+    if getattr(opts, "json", False):
+        return status_json()
     state = load_state()
     now = time.time()
     accounts, problem = load_accounts()
@@ -13497,6 +13502,145 @@ def status(_opts) -> int:
           "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never.")
     if settings_note():
         print(settings_note())
+    return 2 if problem else 0
+
+
+# `longhaul status --json` (S1 of the accounts screen): what the screen in
+# hooks/ shows, so that it runs one command and parses one object. The
+# field names and meanings are the screen's contract, built against at the
+# same time: change none without it. It only reads, as status does, and
+# says nothing but the object on stdout. Emails are masked: the screen
+# tells the accounts apart and never needs to show who signs in to them.
+
+def masked_email(email):
+    """An email as the screen shows it: the local part's first character,
+    then •••, then @ and the domain whole (f•••@example.com); without an @,
+    the first character and •••. None for no email."""
+    if not isinstance(email, str) or not email.strip():
+        return None
+    local, at, domain = email.strip().rpartition("@")
+    return f"{local[:1]}•••@{domain}" if at else email.strip()[:1] + "•••"
+
+
+def status_window(reading, key: str, now: float):
+    """One usage window of a status-line reading as the screen shows it,
+    only while it is open, as display.ts's pct() shows it; else None. The
+    share is rounded half up, as pct()'s Math.round() rounds, so the screen
+    and the status line show one number (Python's round() takes 40.5 to 40)."""
+    part = dict_at(reading, key)
+    used, resets = as_number(part.get("used_percentage")), as_number(part.get("resets_at"))
+    if used is None or resets is None or resets <= now:
+        return None
+    return {"used": math.floor(used + 0.5), "resets_at": resets}
+
+
+def vscode_runs_longhaul():
+    """Whether VS Code's settings run Longhaul's wrapper, told as the doctor
+    and uninstall tell it: their claudeProcessWrapper line names a
+    longhaul-vscode. False when there is no settings file (nothing runs
+    it); None when there is one that cannot be read as settings. Only reads."""
+    try:
+        if not VSCODE_SETTINGS.is_file():
+            return False
+        found = jsonc_load(VSCODE_SETTINGS.read_text(errors="replace"))
+    except OSError:  # is_file() raises a permission error before Python 3.13
+        return None
+    if not isinstance(found, dict):
+        return None
+    value = found.get(VSCODE_WRAPPER_KEY)
+    return isinstance(value, str) and value.endswith("longhaul-vscode")
+
+
+def has_folder(acct: dict) -> bool:
+    """Whether config_of() can name the account's folder: a config_dir that
+    is not text (a hand edit's 5) names none, and config_of() would raise."""
+    return acct.get("config_dir") is None or isinstance(acct.get("config_dir"), str)
+
+
+def status_checks(accounts: list[dict]) -> list:
+    """auth_status() of each account, all at once: the screen waits on
+    this, and each check may take AUTH_TIMEOUT. Each thread runs its own
+    claude and writes its own slot alone, so they share nothing. An account
+    with no folder is not checked: there is nowhere to run claude in."""
+    found = [None] * len(accounts)
+
+    def check(i: int, acct: dict) -> None:
+        found[i] = (auth_status(acct) if has_folder(acct)
+                    else {"unknown": True, "why": "its config_dir is not a folder's path"})
+
+    threads = [threading.Thread(target=check, args=(i, a), daemon=True) for i, a in enumerate(accounts)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return found
+
+
+def status_account(acct: dict, a, state: dict, now: float, this_chat: bool) -> dict:
+    """One account's entry in the screen's object, from its auth_status()
+    answer `a`. A check that could not say leaves signed_in and as_expected
+    null, never false: that is not "signed out". As expected is what
+    signed_in_as_expected() lets run: any sign-in for an entry with no
+    email, else that email, in any case."""
+    if not isinstance(a, dict):  # an answer that is JSON but not an object
+        a = {"unknown": True, "why": "the answer was not an object"}
+    unknown = bool(a.get("unknown"))
+    signed_in = None if unknown else bool(a.get("loggedIn"))
+    want = acct.get("email") if isinstance(acct.get("email"), str) and acct.get("email") else None
+    got = a.get("email") if isinstance(a.get("email"), str) else ""
+    plan = a.get("subscriptionType")
+    until = as_number(state["limited_until"].get(acct["name"]))
+    reading = read_json(USAGE_DIR / f"{acct['name']}.json")
+    allowed = repositories_of(acct)
+    return {
+        "name": acct["name"],
+        "email": masked_email(acct.get("email")),
+        "signed_in": signed_in,
+        "as_expected": None if signed_in is None else signed_in and (want is None or got.lower() == want.lower()),
+        "check_failed": str(a.get("why")) if unknown else None,
+        "plan": plan if signed_in and isinstance(plan, str) else None,
+        "limited_until": until if until is not None and until > now else None,
+        "five_hour": status_window(reading, "five_hour", now),
+        "week": status_window(reading, "seven_day", now),
+        "only_in": None if allowed is None else [home_path(p) for p in allowed],
+        "folder": home_path(str(config_of(acct))) if has_folder(acct) else "",
+        "this_chat": this_chat,
+    }
+
+
+def status_json() -> int:
+    """`longhaul status --json`: the screen's object alone on stdout; exit 2
+    when accounts.json cannot be read, the rest still said, as status does."""
+    state = load_state()
+    now = time.time()
+    accounts, problem = load_accounts()
+    accounts = accounts or []
+    listed = bool(read_accounts_file()[0])  # False for the stand-in: one subscription, nothing listed
+    # This chat's account, as display.ts finds it: the first whose folder is
+    # CLAUDE_CONFIG_DIR, by real path; none when it is not set.
+    chat = os.environ.get("CLAUDE_CONFIG_DIR")
+    mine = os.path.realpath(os.path.expanduser(chat)) if chat else None
+    ours = next((i for i, a in enumerate(accounts)
+                 if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
+    rows = [status_account(acct, a, state, now, i == ours)
+            for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
+    here = None
+    if listed:
+        try:
+            top = repository_of(os.getcwd())
+            here = {"folder": home_path(top), "may_use": eligible(accounts, top)}
+        except OSError:  # the folder it runs in was removed: no "here" to say
+            pass
+    try:
+        mode, mode_problem = switch_mode(), None
+    except ValueError as e:
+        mode, mode_problem = None, str(e)
+    found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
+             "vscode": vscode_runs_longhaul(), "problem": unreadable_text(problem) if problem else None}
+    try:
+        print(json.dumps(found, ensure_ascii=False))
+    except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped
+        print(json.dumps(found))
     return 2 if problem else 0
 
 
@@ -15221,6 +15365,9 @@ def main(argv: list[str]) -> int:
                                 "hooks/codex_hook.py runs it")
         if cmd == "usage":
             p.add_argument("--days", type=float, default=1, help="how far back (default: 1 day)")
+        if cmd == "status":
+            p.add_argument("--json", action="store_true",
+                           help="the same as one JSON object, emails masked, for the accounts screen; it only reads")
         if cmd == "checkpoint":
             p.add_argument("action", nargs="?", choices=["save"], help="save: the state on stdin (default: the hook)")
             p.add_argument("session", nargs="?",
