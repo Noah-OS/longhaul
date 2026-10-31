@@ -10116,6 +10116,15 @@ def precompact(opts) -> int:
 # read: error_details, last_assistant_message, message and title hold
 # text, and are never kept, logged or said. Claude Code ignores the
 # output and the exit code; the hooks print nothing and exit 0.
+#
+# A failed sign-in (SIGN_IN_ERRORS) is kept under the chat's account too,
+# in SIGN_IN_FAILED (S3 of the accounts screen), so the screen can mark
+# that account "Sign in": the input does not name the account, but the
+# hook runs inside the chat's claude, whose CLAUDE_CONFIG_DIR is the
+# account's folder (failed_account()). Only the account's name and the
+# time are kept. `longhaul status` shows it while no later reply has come
+# on that account (its usage reading's "at") and no setup has signed it in
+# since: a successful setup forgets it.
 
 STOPS_RECORD = "stops.json"  # under LONGHAUL_HOME: {session id: [{"event", "type", "at": epoch seconds}, ...]}
 STOPS_KEEP = 20  # rows per session, the newest kept
@@ -10129,6 +10138,10 @@ QUOTA_LOGGED = {"quota_auto_resume_fired": "quota: Claude Code continued {sid} a
                 "quota_auto_resume_disabled": "quota: Claude Code stopped waiting at a usage limit in {sid}"}
 QUOTA_TYPES = tuple(QUOTA_LOGGED)
 STOPS_STDIN_MAX = 1_000_000  # characters of the hook's input read; a bigger one is no event of Claude Code's
+SIGN_IN_FAILED = "sign-in-failed.json"  # under LONGHAUL_HOME: {account name: epoch seconds of its newest failure}
+SIGN_IN_ERRORS = ("authentication_failed", "oauth_org_not_allowed")
+SIGN_IN_LOGGED = "sign-in: {account} failed in {sid}"
+SIGN_IN_FORGOTTEN = "sign-in: {account}'s failure forgotten (signed in again)"
 
 
 def stop_signal(data, event: str):
@@ -10187,6 +10200,90 @@ def stop_keep(data, event: str, now: float | None = None) -> None:
             write_json(path, sessions)
     except OSError as e:
         log(f"stop: {sid}'s {kind} was not kept: {e.strerror or e}")
+    if event == "StopFailure" and kind in SIGN_IN_ERRORS:
+        sign_in_failed(sid, os.environ.get("CLAUDE_CONFIG_DIR"), now)
+
+
+def failed_account(config_dir):
+    """The account a chat runs as, by its claude's CLAUDE_CONFIG_DIR
+    (`config_dir`), when that is an account on the list or "main": the one
+    whose folder it is; with none set, the one account on ~/.claude, else
+    "main", as the status line names them (account_for_config()). None
+    for a folder no account on the list has: the status line names it by
+    its last part, which may be an account's name. An accounts.json that
+    cannot be read lists none."""
+    accounts = [a for a in read_accounts_file()[0] or [] if has_folder(a)]
+    if not config_dir:
+        return account_for_config(None, accounts)
+    path = Path(os.path.expanduser(config_dir)).resolve()
+    return next((a["name"] for a in accounts if a.get("config_dir") and config_of(a).resolve() == path), None)
+
+
+def sign_in_rows(found, names) -> dict:
+    """SIGN_IN_FAILED's entries in its shape whose name is in `names`, as
+    they are written; any other goes, so a rewrite keeps names and times
+    alone."""
+    return {name: int(as_number(at)) for name, at in (found.items() if isinstance(found, dict) else ())
+            if name in names and as_number(at) is not None}
+
+
+def sign_in_names() -> set:
+    """The names SIGN_IN_FAILED may hold: the accounts on the list, and "main"."""
+    return {a["name"] for a in read_accounts_file()[0] or []} | {"main"}
+
+
+def sign_in_failed(sid: str, config_dir, now: float) -> None:
+    """A chat's failed sign-in kept under its account (failed_account()),
+    in SIGN_IN_FAILED, a file only you can read, under its lock: the
+    newest time for each account. A chat on a folder no account has keeps
+    nothing. A file that cannot be written is logged: the stop is kept and
+    logged already."""
+    account = None
+    try:
+        account = failed_account(config_dir)
+        if account is None:
+            return
+        log(SIGN_IN_LOGGED.format(account=account, sid=sid))
+        path = LONGHAUL_HOME / SIGN_IN_FAILED
+        with locked("sign-in-failed"):
+            kept = sign_in_rows(read_json(path), sign_in_names())
+            kept[account] = int(now)
+            write_json(path, kept)
+    except OSError as e:
+        log(f"sign-in: {account or 'the account'}'s failure was not kept: {e.strerror or e}")
+
+
+def forget_sign_in_failure(name: str) -> None:
+    """setup's, once the account is signed in as its email: its failure in
+    SIGN_IN_FAILED is old news, so it goes, and that is logged. Nothing
+    is written or logged when there is none. A file that cannot be
+    written is logged, and setup goes on: the account's next reply says
+    it works all the same."""
+    path = LONGHAUL_HOME / SIGN_IN_FAILED
+    try:
+        if not path.exists():
+            return
+        with locked("sign-in-failed"):
+            kept = sign_in_rows(read_json(path), sign_in_names())
+            if name not in kept:
+                return
+            del kept[name]
+            write_json(path, kept)
+    except OSError as e:
+        log(f"sign-in: {name}'s failure was not forgotten: {e.strerror or e}")
+        return
+    log(SIGN_IN_FORGOTTEN.format(account=name))
+
+
+def sign_in_failed_at(failed, reading):
+    """When an account's sign-in failed in a chat (its entry of
+    SIGN_IN_FAILED, `failed`), while that is still news: after its last
+    usage reading (`reading`), which a successful reply writes. None when
+    there is no such failure, or a reply came since. A setup that signed
+    it in has forgotten it already."""
+    failed = as_number(failed)
+    replied = as_number(reading.get("at")) if isinstance(reading, dict) else None
+    return failed if failed is not None and (replied is None or failed > replied) else None
 
 
 def stop_hook(event: str) -> int:
@@ -13481,6 +13578,7 @@ def setup(opts) -> int:
     for acct in accounts:  # the panel's remembered sign-ins are out of date now
         if not opts.account or acct["name"] == opts.account:
             forget_auth(acct)
+            forget_sign_in_failure(acct["name"])  # signed in as its email: a chat's failed sign-in is old news
     if link_command():
         say("Ready: run `longhaul`.")
     else:
@@ -13926,6 +14024,7 @@ def status(opts) -> int:
     if problem:  # said, no stand-in shown in the accounts' place, and the rest shown; exit 2
         print(unreadable_text(problem))
     accounts_listed = bool(read_accounts_file()[0])  # the stand-in for no file has no rule to show
+    failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
     for acct in accounts or []:
         a = auth_status(acct)
         until = state["limited_until"].get(acct["name"], 0)
@@ -13936,6 +14035,9 @@ def status(opts) -> int:
         want = acct.get("email")
         if want and (a.get("email") or "").lower() != want.lower():
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
+        when = sign_in_failed_at(failed.get(acct["name"]), read_json(USAGE_DIR / f"{acct['name']}.json"))
+        if when is not None:  # a chat's turn ended on it (the StopFailure hook), and no reply has come since
+            print(f"       its sign-in failed at {clock(when)}: run longhaul setup {acct['name']} --relogin")
         allowed = repositories_of(acct)
         if allowed is None:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
@@ -14057,12 +14159,13 @@ def status_checks(accounts: list[dict]) -> list:
     return found
 
 
-def status_account(acct: dict, a, state: dict, now: float, this_chat: bool) -> dict:
+def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, failed: dict) -> dict:
     """One account's entry in the screen's object, from its auth_status()
     answer `a`. A check that could not say leaves signed_in and as_expected
     null, never false: that is not "signed out". As expected is what
     signed_in_as_expected() lets run: any sign-in for an entry with no
-    email, else that email, in any case."""
+    email, else that email, in any case. sign_in_failed_at is from
+    SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at())."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -14079,6 +14182,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool) -> d
         "signed_in": signed_in,
         "as_expected": None if signed_in is None else signed_in and (want is None or got.lower() == want.lower()),
         "check_failed": str(a.get("why")) if unknown else None,
+        "sign_in_failed_at": sign_in_failed_at(failed.get(acct["name"]), reading),
         "plan": plan if signed_in and isinstance(plan, str) else None,
         "limited_until": until if until is not None and until > now else None,
         "five_hour": status_window(reading, "five_hour", now),
@@ -14103,7 +14207,8 @@ def status_json() -> int:
     mine = os.path.realpath(os.path.expanduser(chat)) if chat else None
     ours = next((i for i, a in enumerate(accounts)
                  if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
-    rows = [status_account(acct, a, state, now, i == ours)
+    failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
+    rows = [status_account(acct, a, state, now, i == ours, failed)
             for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
     here = None
     if listed:

@@ -19682,6 +19682,86 @@ class Stops(unittest.TestCase):
         self.assertEqual(self.kept(), [("Notification", "quota_auto_resume_stale")])
         self.assertNotIn(self.S, self.everything())
 
+    # S3 of the accounts screen: a failed sign-in is kept under the chat's
+    # account too, the one its claude runs as (CLAUDE_CONFIG_DIR), so the
+    # screen can mark that account "Sign in".
+
+    def two_accounts(self) -> dict:
+        """personal-1 and work on the list, each in its own scratch folder: their folders by name."""
+        self.home.mkdir(exist_ok=True)
+        folders = {name: self.tmp / f".claude-{name}" for name in ("personal-1", "work")}
+        (self.home / "accounts.json").write_text(json.dumps(
+            [{"name": n, "config_dir": str(f), "email": f"{n}@example.com"} for n, f in folders.items()]))
+        return folders
+
+    def failed(self) -> dict:
+        path = self.home / longhaul.SIGN_IN_FAILED
+        return json.loads(path.read_text()) if path.is_file() else {}
+
+    def send_in(self, folder, data):
+        """The StopFailure hook as a chat's claude runs it, with CLAUDE_CONFIG_DIR `folder` (None: unset)."""
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if folder is not None:
+                os.environ["CLAUDE_CONFIG_DIR"] = str(folder)
+            return self.send("stop-failure", data)
+
+    def sign_ins_logged(self) -> list:
+        return [line[20:] for line in self.log().splitlines() if line[20:].startswith("sign-in")]
+
+    def test_a_failed_sign_in_is_kept_under_the_chats_account(self):
+        self.assertEqual(longhaul.SIGN_IN_FAILED, "sign-in-failed.json")
+        self.assertEqual(longhaul.SIGN_IN_ERRORS, ("authentication_failed", "oauth_org_not_allowed"))
+        folders = self.two_accounts()
+        self.assertEqual(self.send_in(folders["work"], self.failure("authentication_failed")), "", "nothing printed")
+        self.assertEqual(self.kept(), [("StopFailure", "authentication_failed")], "the stop is kept as before")
+        found = self.failed()
+        self.assertEqual(set(found), {"work"})
+        self.assertIsInstance(found["work"], int, "whole seconds")
+        self.assertAlmostEqual(found["work"], time.time(), delta=5)
+        path = self.home / longhaul.SIGN_IN_FAILED
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600, "private, like the rest of the home")
+        # The other kind, a folder named with a trailing slash, and "main":
+        # a chat on ~/.claude when no account on the list has it.
+        self.send_in(str(folders["personal-1"]) + "/", self.failure("oauth_org_not_allowed", sid="s2"))
+        self.send_in(None, self.failure("authentication_failed", sid="s3"))
+        self.assertEqual(set(self.failed()), {"work", "personal-1", "main"})
+        self.assertEqual(self.sign_ins_logged(), [f"sign-in: work failed in {self.SID}", "sign-in: personal-1 failed in s2",
+                                                  "sign-in: main failed in s3"])
+        # The newest failure is kept; entries for names not on the list, or
+        # not in the record's shape, go at the next write.
+        path.write_text(json.dumps({"work": 7, "personal-1": 9.5, "gone": 5, "main": True, "junk": "soon"}))
+        self.send_in(folders["work"], self.failure("authentication_failed"))
+        found = self.failed()
+        self.assertEqual(set(found), {"work", "personal-1"})
+        self.assertEqual(found["personal-1"], 9)
+        self.assertAlmostEqual(found["work"], time.time(), delta=5)
+        self.assertNotIn(self.S, self.everything(), "of the input, nothing but the time")
+        self.assertNotIn("@example.com", path.read_text() + self.log(), "no email")
+
+    def test_no_sign_in_failure_is_kept_for_another_error_a_subagent_or_a_folder_off_the_list(self):
+        folders = self.two_accounts()
+        for n, error in enumerate(e for e in longhaul.STOP_ERRORS if e not in longhaul.SIGN_IN_ERRORS):
+            self.send_in(folders["work"], self.failure(error, sid=f"s{n}"))
+        self.send_in(folders["work"], self.failure(f"authentication_failed {self.S}", sid="junk"))
+        self.send_in(folders["work"], self.failure("authentication_failed", agent_id="a1b2c3"))
+        # A folder no account has; the status line names it by its last
+        # part, and that may be an account's name.
+        for folder in (self.tmp / "elsewhere", self.tmp / "other" / "work", self.tmp / ".claude-work-2"):
+            self.send_in(folder, self.failure("authentication_failed", sid="s-off"))
+        self.assertFalse((self.home / longhaul.SIGN_IN_FAILED).exists(), "nothing kept")
+        self.assertEqual(self.sign_ins_logged(), [])
+        self.assertEqual(self.kept("s-off"), [("StopFailure", "authentication_failed")] * 3, "the stops are kept as ever")
+        # An accounts.json that cannot be read names no account on the list.
+        (self.home / "accounts.json").write_text("[{not json")
+        self.send_in(folders["work"], self.failure("authentication_failed"))
+        self.assertFalse((self.home / longhaul.SIGN_IN_FAILED).exists())
+        # One it cannot write is logged, and the hook goes on.
+        self.two_accounts()
+        (self.home / longhaul.SIGN_IN_FAILED).mkdir()
+        self.assertEqual(self.send_in(folders["work"], self.failure("authentication_failed")), "")
+        self.assertRegex(self.sign_ins_logged()[-1], r"^sign-in: work's failure was not kept: ")
+
     def test_each_log_line_matches_its_display_pattern(self):
         # The display's pop-ups for this chat's stops and waits the user must
         # act on, against the lines this code logs: the four stops, the stale
@@ -20531,8 +20611,8 @@ class StatusJson(unittest.TestCase):
     (fake_stream.py) answers `auth status --json` from FAKE_EMAILS, a map of
     config folder to email ("default" for ~/.claude)."""
 
-    ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "plan", "limited_until",
-                    "five_hour", "week", "only_in", "folder", "this_chat"}
+    ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
+                    "limited_until", "five_hour", "week", "only_in", "folder", "this_chat"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "vscode", "problem"}
 
     def setUp(self):
@@ -20560,6 +20640,10 @@ class StatusJson(unittest.TestCase):
                 if p.is_file() and cache not in p.parents}
 
     def status(self, cwd=None, **extra_env):
+        return self.longhaul("status", "--json", cwd=cwd, **extra_env)
+
+    def longhaul(self, *args, cwd=None, **extra_env):
+        """`longhaul.py ARGS` with every path scratch and the stand-in claude."""
         env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
                    LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
                    LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1",
@@ -20567,7 +20651,7 @@ class StatusJson(unittest.TestCase):
         for k in ("LONGHAUL_SWITCH", "LONGHAUL_AUTH_TIMEOUT", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
             env.pop(k, None)
         env.update(extra_env)
-        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "status", "--json"], env=env,
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env,
                               cwd=str(cwd or self.tmp), capture_output=True, text=True, timeout=60,
                               stdin=subprocess.DEVNULL)
 
@@ -20597,8 +20681,11 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(self.files(), before, "it writes nothing, not even the log")
         self.assertEqual(found["accounts"][0], {
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
-            "check_failed": None, "plan": "max", "limited_until": None, "five_hour": None, "week": None,
-            "only_in": [], "folder": "~/.claude-personal-1", "this_chat": False})
+            "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
+            "week": None, "only_in": [], "folder": "~/.claude-personal-1", "this_chat": False})
+        self.assertEqual(list(found["accounts"][0]), [
+            "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
+            "five_hour", "week", "only_in", "folder", "this_chat"], "the screen's order: sign_in_failed_at after check_failed")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -20748,8 +20835,8 @@ class StatusJson(unittest.TestCase):
                 self.assertEqual((found["listed"], found["here"], found["problem"]), (False, None, None))
                 self.assertEqual(found["accounts"], [{
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
-                    "check_failed": None, "plan": "max", "limited_until": None, "five_hour": None, "week": None,
-                    "only_in": [], "folder": "~/claude", "this_chat": False}])
+                    "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
+                    "five_hour": None, "week": None, "only_in": [], "folder": "~/claude", "this_chat": False}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
@@ -20764,6 +20851,86 @@ class StatusJson(unittest.TestCase):
                 self.assertEqual(found["switch"], "ask", "the rest is still said")
                 self.assertNotIn("first@example.com", out.stdout, "the problem names the kind, never the text")
                 self.assertEqual(path.read_text(), text, "never written over")
+
+    # S3: an account whose sign-in failed in a chat (the StopFailure hook's
+    # record, Stops) is marked until a later reply or a sign-in says it
+    # works again.
+
+    def test_sign_in_failed_at_until_a_later_reply_says_it_works(self):
+        now = int(time.time())
+        self.write_accounts(*({"name": n, "config_dir": str(self.folder(n))} for n in ("personal-1", "work", "max", "spare")))
+        failed = self.home / longhaul.SIGN_IN_FAILED
+        failed.write_text(json.dumps({"personal-1": now - 600, "work": now - 600, "max": now - 600}))
+        usage = self.home / "usage"
+        usage.mkdir()
+        (usage / "personal-1.json").write_text(json.dumps({"at": now - 60.5}))  # a reply after it: it works again
+        (usage / "work.json").write_text(json.dumps({"at": now - 3600.5}))  # the last reply was before it
+        (usage / "spare.json").write_text(json.dumps({"at": now - 60}))
+        before = self.files()
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual({n: a["sign_in_failed_at"] for n, a in found.items()},
+                         {"personal-1": None, "work": now - 600, "max": now - 600, "spare": None},
+                         "max has no reading at all; spare no failure")
+        self.assertEqual(self.files(), before, "only read")
+        # A reading or a record that is not in its shape is none.
+        (usage / "personal-1.json").write_text("not json")
+        (usage / "work.json").write_text(json.dumps({"at": "later"}))
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual((found["personal-1"]["sign_in_failed_at"], found["work"]["sign_in_failed_at"]),
+                         (now - 600, now - 600))
+        for junk in ("not json", "[]", json.dumps({"work": "soon", "max": True, "spare": None})):
+            failed.write_text(junk)
+            found = self.read(self.status())
+            self.assertEqual([a["sign_in_failed_at"] for a in found["accounts"]], [None] * 4, junk)
+
+    def test_a_setup_that_signs_the_account_in_forgets_its_failure(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("personal-1")), "email": "first@example.com"},
+                            {"name": "work", "config_dir": str(self.folder("work")), "email": "work@example.com"})
+        self.emails = {str(self.folder("personal-1")): "first@example.com", str(self.folder("work")): "work@example.com"}
+        failed, then = self.home / longhaul.SIGN_IN_FAILED, int(time.time()) - 600
+        failed.write_text(json.dumps({"personal-1": then, "work": then}))
+        forgotten = lambda: [line[20:] for line in (self.home / "longhaul.log").read_text().splitlines()
+                             if "forgotten" in line]
+        out = self.longhaul("setup", "work")  # signed in as its email already
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(failed.read_text()), {"personal-1": then}, "that account's alone")
+        self.assertEqual(failed.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(forgotten(), ["sign-in: work's failure forgotten (signed in again)"])
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual((found["personal-1"]["sign_in_failed_at"], found["work"]["sign_in_failed_at"]), (then, None))
+        out = self.longhaul("setup", "personal-1", "--relogin")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(len((self.home / "logins.jsonl").read_text().splitlines()), 1, "signed in again in the browser")
+        self.assertEqual(json.loads(failed.read_text()), {})
+        self.assertEqual(forgotten()[-1], "sign-in: personal-1's failure forgotten (signed in again)")
+        # Nothing to forget: nothing logged. A setup that ends signed in as
+        # someone else forgets nothing.
+        self.assertEqual(self.longhaul("setup", "work").returncode, 0)
+        self.assertEqual(len(forgotten()), 2)
+        failed.write_text(json.dumps({"work": then}))
+        self.emails[str(self.folder("work"))] = "stranger@example.com"
+        out = self.longhaul("setup", "work")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertEqual(json.loads(failed.read_text()), {"work": then})
+        self.assertEqual(len(forgotten()), 2)
+        self.assertNotIn("@", "".join(forgotten()), "no email in the log line")
+
+    def test_plain_status_says_when_an_accounts_sign_in_failed(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("personal-1")), "email": "first@example.com"},
+                            {"name": "work", "config_dir": str(self.folder("work")), "email": "work@example.com"})
+        self.emails = {str(self.folder("personal-1")): "first@example.com", str(self.folder("work")): "work@example.com"}
+        then = int(time.time()) - 120
+        (self.home / longhaul.SIGN_IN_FAILED).write_text(json.dumps({"work": then}))
+        out = self.longhaul("status")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lines = out.stdout.splitlines()
+        [work] = [i for i, line in enumerate(lines) if line.startswith("work ")]
+        self.assertEqual(lines[work + 1], f"       its sign-in failed at {longhaul.clock(then)}: "
+                                          "run longhaul setup work --relogin", "the line under its account")
+        self.assertEqual(out.stdout.count("sign-in failed"), 1, "personal-1's sign-in has not failed")
+        (self.home / "usage").mkdir()
+        (self.home / "usage" / "work.json").write_text(json.dumps({"at": then + 60}))
+        self.assertNotIn("sign-in failed", self.longhaul("status").stdout, "a reply since: it works again")
 
     def test_an_invalid_switch_mode_is_null_with_the_reason(self):
         self.write_accounts({"name": "personal-1"})
