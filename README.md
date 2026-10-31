@@ -65,7 +65,7 @@ python3 ~/.claude/plugins/cache/longhaul/longhaul/<version>/longhaul.py setup
 
 It writes `~/.local/bin/longhaul`, a short launcher that runs the newest Longhaul Claude Code has installed, so it keeps working after each update. Then `longhaul doctor` works in a terminal too. If the shell says `longhaul: command not found`, see [Troubleshooting](#troubleshooting).
 
-**The status line** (optional): `longhaul statusline install` shows the account and its 5-hour and 7-day allowance, with the reset times, under Claude Code's prompt, with `update` and the version at its end when a newer Longhaul is out, and keeps each reading for `/longhaul:inspect` and `longhaul usage`. It backs up your `settings.json`, asks before replacing a status line you already have, and checks the command runs; `longhaul statusline uninstall` puts the old one back.
+**The status line** (optional): `longhaul statusline install` shows the account and its 5-hour and 7-day allowance, with the reset times, under Claude Code's prompt, with `update 0.3.4` at its end when a newer Longhaul is out (from the daily check in step 8: nothing more is sent), and keeps each reading for `/longhaul:inspect` and `longhaul usage`. It backs up your `settings.json`, asks before replacing a status line you already have, and checks the command runs; `longhaul statusline uninstall` puts the old one back.
 
 ## 3. Day to day
 
@@ -80,16 +80,17 @@ Once the plugin is loaded, most of it works by itself.
 | **Auto Model**<br><sub>On, a guide</sub> | At each start Claude gets a short guide for choosing each subagent's model by how hard its job is, and every pick is logged. `longhaul models off` turns it off; `longhaul models cap sonnet` lowers a call above Sonnet. Its effect on cost and quality is not measured yet. |
 | **Output filter**<br><sub>Shadow: it only logs</sub> | After each `Bash` call it measures what it could cut from a long output, and changes nothing until a week of it is measured (`LONGHAUL_FILTERS=lossless` or `on` to use it; `off` turns it off). |
 | **[Code index](https://github.com/Noah-OS/longhaul/wiki/Code-Index)**<br><sub>On</sub> | Where CodeGraph or Trail-Code is installed and the repository has no map, builds one in the background, and tells Claude when an index exists (`LONGHAUL_INDEX=off` turns it off). Longhaul installs nothing. |
-| **Display**<br><sub>In Claude Code and the VS Code panel</sub> | A status entry with the account, its allowance and the context size, and a pop-up when a checkpoint is saved or brought back, the reminder fires, the account changes at a limit, a turn stops at a limit or on a sign-in or billing error, or a newer Longhaul is out. |
+| **Display**<br><sub>In Claude Code and the VS Code panel</sub> | A status entry with the account, its allowance and the context size, then `update 0.3.4` when a newer Longhaul is out. A pop-up when a checkpoint is saved or brought back, the reminder fires, the account changes at a limit, a question at a limit waits in `/accounts`, a turn stops at a limit or on a sign-in or billing error, or a newer Longhaul is out. |
 
 **What you type in a chat**
 
-| Skill | When to use it |
+| Command | When to use it |
 |---|---|
 | `/longhaul:checkpoint` | Before a compaction, at the end of a step, or before you stop. Claude writes the goal, the next action, your own words, the facts it found, the decisions and why, what failed and the files it changed; Longhaul puts it back after a compaction, a resume, or a `/clear` in the same folder within 6 hours. |
 | `/longhaul:inspect` | To see where a conversation's tokens went: requests and tokens by kind and model, subagents, context growth and compactions, what the cache cost, the largest tool outputs, searches, repeated reads, what the guard caught, and each hook's measured time. Every number says where it came from. |
 | `/longhaul:doctor` | To see what is set up and what to do next. |
-| `/longhaul:manage` | To set Longhaul up without a terminal: see [From the VS Code chat](#5-from-the-vs-code-chat). |
+| `/accounts` | To see your accounts and manage them with buttons: see [More than one account](#4-more-than-one-account). |
+| `/longhaul:manage` | To set Longhaul up without a terminal, in your own words: see [From the VS Code chat](#5-from-the-vs-code-chat). |
 
 **Keeping a long session on track:** let the reminder ask for the checkpoint, or type `/longhaul:checkpoint` yourself, then `/compact` or `/clear`; the work picks up from the checkpoint. For Claude Code's own compactions, `/longhaul:doctor` prints a "# Compact instructions" block to paste into your CLAUDE.md; Longhaul never writes it.
 
@@ -97,23 +98,51 @@ Once the plugin is loaded, most of it works by itself.
 
 Longhaul can run your chats across several of your own Claude subscriptions. Each account is its own claude.ai sign-in, in its own folder. This is advanced and experimental; it is off until you add a second account.
 
-**Add an account** (in a terminal). It opens the browser sign-in at once; sign in with that same email:
+**See your accounts:** type `/accounts` in a chat, in the terminal or in the VS Code panel. It opens a list, as `/mcp` does:
+
+- one line per account: its plan, its sign-in, its week's use or its limit, and where it may be used;
+- `+ Add account`;
+- `Settings`: switching, the VS Code panel on or off, and forgetting the recorded limits.
+
+Use the arrow keys to move and Enter to open a line. Escape, or **Back**, goes back to the list; Escape on the list closes it. An account's page shows its 5-hour and week use, its folder and its email, masked (`y•••@example.com`). On the phone, `/accounts` shows the list only. In a terminal, `longhaul status` lists the accounts too.
+
+**Add an account.** In `/accounts`: open `+ Add account`, type the name and the email (and, if you want, the folders it may be used in), then press **Add account**. Or in a terminal:
 
 ```
 longhaul add work you@example.com
 ```
 
-`longhaul status` lists the accounts and whether each is signed in. `longhaul setup work --relogin` signs one in again; `longhaul remove work` takes it off the list (its folder and sign-in stay).
+Either way, the browser sign-in opens at once: sign in with that same email. What you type in `/accounts` goes to Longhaul's own command, not to Claude, and a password or a code is typed only in the browser.
 
-**Use them in the VS Code panel:** `longhaul vscode on`, then reload VS Code (Cmd+Shift+P, then *Developer: Reload Window*). `longhaul vscode off` puts the panel back on its own sign-in.
+**Sign in again, or remove an account.** In `/accounts`, open the account's line: **Sign in again** (or **Sign in**), or **Remove**, which asks first. In a terminal: `longhaul setup work --relogin` signs it in again; `longhaul remove work` takes it off the list. Its folder and sign-in stay.
 
-**At a usage limit**, the switching mode decides (`longhaul switch` shows it; `longhaul switch ask` sets it):
+**A failed sign-in.** When a chat stops because its sign-in failed, Longhaul marks that account. `/accounts` shows "sign-in failed" on its line, and its page offers **Sign in**. `longhaul status` gives the line to run: `longhaul setup NAME --relogin`. The mark goes at the account's next reply, or after a sign-in that works.
+
+**Use them in the VS Code panel:** `longhaul vscode on` (or `/accounts`, then `Settings`), then reload VS Code (Cmd+Shift+P, then *Developer: Reload Window*). `longhaul vscode off` puts the panel back on its own sign-in.
+
+**At a usage limit**, the switching mode decides (`longhaul switch` shows it; `longhaul switch ask`, or `/accounts`, then `Settings`, sets it):
 
 | Mode | At a limit |
 |---|---|
-| `ask` (the default) | In a terminal `longhaul`, it asks before moving the chat to another account; in the VS Code panel the chat stays where it is. It never moves a chat early. |
-| `auto` | Moves the chat to an account with room, and early, while the chat is idle, when one is nearly full. |
-| `never` | Waits for the reset. |
+| `ask` (the default) | Asks before it moves the chat to another account: in a terminal `longhaul`, in that terminal; in the VS Code panel, in `/accounts` (below). When every account is at its limit, it offers to carry on with the first one to reset. It never moves a chat early. |
+| `auto` | Moves the chat to an account with room, and early, while the chat is idle, when one is nearly full. When every account is at its limit, it carries on with the first one to reset, without asking. |
+| `never` | Waits for the reset, and carries on with the same account. |
+
+**In the VS Code panel, in `ask`**, for example with two accounts named Max and Pro:
+
+1. Let Longhaul stay in the panel's chats, once: put this key in `~/.longhaul/vscode.json` (your file: make it if it is not there; Longhaul only reads it). It counts for the chats you open after it.
+
+   ```
+   {"switch_mid_session": true}
+   ```
+
+2. At the limit, Longhaul tries to open `/accounts` with a question at the top. If it does not open, a pop-up says so: type `/accounts`.
+3. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Press **Move and carry on**, or **Wait for the reset**.
+4. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" **Yes** carries on by itself at 14:00. **No** leaves the chat as it is.
+
+With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:00 on Pro`.
+
+Without that key, Longhaul stays in a panel chat only when the saved switching is `auto`; in `ask` and `never` the chat stays where it is at a limit, as before.
 
 **Keep a folder for one account:** `longhaul add work you@example.com --repo ~/work` uses that account only in `~/work` and the repositories inside it, and keeps the folder for it: a chat there on another account is refused before anything is sent. When the account kept for a folder is at its limit, `longhaul` in a terminal asks whether to run the chat on another one; `longhaul allow <chat id>` lets one refused chat's prompts through on its account for 30 days.
 
@@ -121,7 +150,9 @@ longhaul add work you@example.com
 
 ## 5. From the VS Code chat
 
-In a chat, ask in your own words, for example "add my work account", "turn on the panel" or "set switching to ask". `/longhaul:manage` shows the exact command and what it changes, and runs it only after your yes in the chat. From a chat it can:
+**With buttons:** type `/accounts`. It adds, signs in again and removes accounts, and in `Settings` sets switching, turns the VS Code panel on or off, and forgets the recorded limits ([More than one account](#4-more-than-one-account)). It runs Longhaul's own commands: no email, password or code goes through the chat. At a usage limit in `ask`, its question is where you answer.
+
+**In words:** ask in your own words, for example "add my work account", "turn on the panel" or "set switching to ask". `/longhaul:manage` shows the exact command and what it changes, and runs it only after your yes in the chat. From a chat it can:
 
 - add, sign in again or remove an account (the sign-in opens in your browser; never type a password or code into the chat);
 - set the switching mode and the subagent models;
@@ -129,7 +160,7 @@ In a chat, ask in your own words, for example "add my work account", "turn on th
 - install or remove the status line, and turn Claude Code's auto-update for Longhaul on or off;
 - forget the recorded limits, allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
 
-What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record.
+What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
 
 ## 6. Codex
 
@@ -172,6 +203,8 @@ To remove it: `longhaul uninstall --dry-run` lists what Longhaul put outside the
 - **`longhaul: command not found`.** The command is not set up yet: run the line `/longhaul:doctor` gives under *Terminal command* (step 2). If it is still not found, `~/.local/bin` is not on your PATH: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal.
 - **A chat says a folder "is kept for" another account.** Open it again on that account (`longhaul -r <id>`), or allow it on its own: `longhaul allow <id>` in a terminal, or ask Claude in another chat to run it.
 - **The VS Code panel ignores your accounts.** Run `longhaul vscode on`, then reload VS Code.
+- **A chat stopped because its sign-in failed.** In `/accounts`, open that account and press **Sign in**, or run `longhaul setup NAME --relogin` in a terminal; then send a message.
+- **A pop-up says a question waits, and nothing opened.** Type `/accounts`: the question is at the top.
 - **A chat open twice**, in a terminal and in the panel, writes the same conversation from two places: close one. Longhaul says so when it notices.
 - **Anything else:** `/longhaul:doctor`, then the [issue tracker](https://github.com/Noah-OS/longhaul/issues).
 
