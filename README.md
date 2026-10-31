@@ -140,7 +140,7 @@ Either way, the browser sign-in opens at once: sign in with that same email. Wha
 3. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Press **Move and carry on**, or **Wait for the reset**.
 4. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" **Yes** carries on by itself at 14:00. **No** leaves the chat as it is.
 
-With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:00 on Pro`.
+With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:01 on Pro` (a minute after the reset, to be safe).
 
 Without that key, Longhaul stays in a panel chat only when the saved switching is `auto`; in `ask` and `never` the chat stays where it is at a limit, as before.
 
@@ -188,7 +188,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_FILTERS` | `shadow` | `lossless`, `on` or `off` |
 | `LONGHAUL_INDEX` | on | `off`: no code index built |
 | `LONGHAUL_SWITCH` | `ask` | `auto` or `never`; overrides `longhaul switch` |
-| `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check |
+| `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
 
 `longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul -h`, or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).
 
