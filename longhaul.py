@@ -12817,8 +12817,7 @@ class Relay:
             stays = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
                      f"switching is {self.mode}, so the chat stays on {here['name']}")
             then = f" and carries on there at {clock(self.carry['until'])}" if self.carry else ""
-            fix = (f". To let longhaul move it, set the key switch to auto in {VSCODE_CONFIG}, or start VS Code "
-                   "with LONGHAUL_SWITCH=auto.")
+            fix = f". To let longhaul move it, {panel_switch_fix()}."
             log(f"panel: {stays}{fix}")
             notify(f"{stays}{then}{fix}")
 
@@ -12919,8 +12918,9 @@ class Relay:
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
             said = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(resets)}). "
                     f"Move this chat to {there} and carry on?")
+        # The README's way, longhaul switch auto, unless another place wins over config.json (panel_switch_fix()).
         notify(f"{said} Answer in Longhaul's pane in the panel; with no answer the chat stays on {here['name']}. "
-               f"To move without asking, set the key switch to auto in {VSCODE_CONFIG}.")
+               f"To move without asking, {panel_switch_fix()}.")
 
     def tend(self) -> None:
         """Each round of loop(): the open question's answer, a question the

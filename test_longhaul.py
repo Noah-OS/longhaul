@@ -16918,29 +16918,46 @@ class PanelSwitching(StreamHarness):
         self.assertEqual(len(self.calls()), 2)
         return self.calls()[1]
 
+    def told_at_limit(self, **env):
+        """The one notification of a chat that meets a limit."""
+        self.limit_in_chat(**env, **self.fake_notifications())
+        said = [n for n in self.notified() if "limit" in n]
+        self.assertEqual(len(said), 1, said)
+        return said[0]
+
     def test_in_ask_mode_a_panel_chat_asks_stays_on_its_account_and_says_so_once(self):
         # Keep working (K1): the panel asks now, and until an answer the chat
-        # stays where it is.
-        self.limit_in_chat(LONGHAUL_SWITCH="ask", **self.fake_notifications())
-        said = [n for n in self.notified() if "limit" in n]
-        self.assertEqual(len(said), 1, said)
-        # Review, Sprint 2: the fix is usable as written (notify() turns "
-        # into ', so a JSON snippet came out wrong).
-        self.assertRegex(said[0], r"^Max hit its session limit \(resets [^)]+\)\. Move this chat to Pro and carry on\? "
-                                  r"Answer in Longhaul's pane in the panel")
-        self.assertIn("chat stays on Max", said[0])
-        self.assertIn("set the key switch to auto in", said[0])
-        self.assertIn(str(self.relay / "vscode.json"), said[0])
-        self.assertNotIn("'switch'", said[0])
+        # stays where it is. In ask by default (no LONGHAUL_SWITCH, no file
+        # says), the way to move without asking is the README's.
+        said = self.told_at_limit(LONGHAUL_SWITCH="")
+        self.assertRegex(said, r"^Max hit its session limit \(resets [^)]+\)\. Move this chat to Pro and carry on\? "
+                               r"Answer in Longhaul's pane in the panel")
+        self.assertIn("chat stays on Max", said)
+        self.assertTrue(said.endswith("To move without asking, run longhaul switch auto."), said)
+
+    def test_the_panels_question_names_the_place_whose_mode_is_in_force(self):
+        # `longhaul switch` saves config.json, which "switch" in vscode.json
+        # and LONGHAUL_SWITCH in VS Code's environment win over: the
+        # notification names the one in force. Review, Sprint 2: the fix is
+        # usable as written (notify() turns " into ', so a JSON snippet came out wrong).
+        self.switch_mid_session(True, switch="ask")
+        said = self.told_at_limit(LONGHAUL_SWITCH="")
+        self.assertTrue(said.endswith(f"To move without asking, set the key switch to auto in "
+                                      f"{self.relay / 'vscode.json'}."), said)
+        self.assertNotIn("'switch'", said)
+        self.tearDown()  # the first chat's processes end here, not with the run
+        self.setUp()  # a fresh scratch home for the second run
+        said = self.told_at_limit(LONGHAUL_SWITCH="ask")
+        self.assertTrue(said.endswith("To move without asking, start VS Code with LONGHAUL_SWITCH=auto."), said)
 
     def test_in_never_mode_the_panels_notification_says_you_chose_it(self):
-        self.limit_in_chat(LONGHAUL_SWITCH="never", **self.fake_notifications())
-        said = [n for n in self.notified() if "limit" in n]
-        self.assertEqual(len(said), 1, said)
-        self.assertIn("switching is never", said[0])
-        self.assertNotIn("cannot ask", said[0])
+        (self.relay / "config.json").write_text(json.dumps({"switch": "never"}))  # as `longhaul switch never` saves it
+        said = self.told_at_limit(LONGHAUL_SWITCH="")
+        self.assertIn("switching is never", said)
+        self.assertNotIn("cannot ask", said)
         # Keep working (K2): it carries on here at the reset; the log line is the one it was.
-        self.assertIn("so the chat stays on Max and carries on there at ", said[0])
+        self.assertIn("so the chat stays on Max and carries on there at ", said)
+        self.assertTrue(said.endswith(". To let longhaul move it, run longhaul switch auto."), said)
         self.assertIn("switching is never, so the chat stays on Max. To let longhaul move it,", self.log_text())
         self.assertIn("wait: sid-1 carries on on Max at ", self.log_text())
 
