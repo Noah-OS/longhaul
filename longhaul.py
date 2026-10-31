@@ -287,8 +287,10 @@ Usage:
                           the plugin's StopFailure hook (a turn ended on an API
                           error) and its Notification hook for a wait at a usage
                           limit: for the main conversation, each logs one line
-                          and keeps the type and the time per session; it
-                          records only, and decides nothing
+                          and keeps the type and the time per session. A
+                          failed sign-in also marks the chat's account in
+                          LONGHAUL_HOME/sign-in-failed.json, for status and
+                          /accounts. They record only, and decide nothing
   longhaul trial start [--days N] [--kind models] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,

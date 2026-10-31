@@ -19922,6 +19922,9 @@ class Stops(unittest.TestCase):
         # The hooks run longhaul.py themselves; bin/longhaul, what the model
         # may run, is the owner's boundary and stays as it was.
         self.assertIn("longhaul stop-failure | longhaul quota-note", longhaul.__doc__)
+        usage = " ".join(longhaul.__doc__.split())
+        self.assertIn(f"A failed sign-in also marks the chat's account in LONGHAUL_HOME/{longhaul.SIGN_IN_FAILED}, "
+                      "for status and /accounts.", usage, "the S3 mark, said where the hook is")
         shim = (HERE / "bin" / "longhaul").read_text()
         for command in ("stop-failure", "quota-note"):
             self.assertNotIn(command, shim)
