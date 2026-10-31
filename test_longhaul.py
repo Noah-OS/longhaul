@@ -16877,6 +16877,10 @@ class PanelSwitching(StreamHarness):
         self.assertEqual(len(said), 1, said)
         self.assertIn("switching is never", said[0])
         self.assertNotIn("cannot ask", said[0])
+        # Keep working (K2): it carries on here at the reset; the log line is the one it was.
+        self.assertIn("so the chat stays on Max and carries on there at ", said[0])
+        self.assertIn("switching is never, so the chat stays on Max. To let longhaul move it,", self.log_text())
+        self.assertIn("wait: sid-1 carries on on Max at ", self.log_text())
 
     def test_a_slow_notification_never_holds_the_panels_lines(self):
         # Review, Sprint 2: notify() ran before the held lines were let go,

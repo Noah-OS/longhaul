@@ -12652,13 +12652,16 @@ class Relay:
             # The panel in never. It carries on here at the reset, which is
             # no move. No quotes: notify() turns " into ', which made a JSON
             # snippet wrong. The mode may come from the wrapper's LONGHAUL_SWITCH too.
+            # The log line is the one it was (the display matches log lines);
+            # schedule() logs the wait, and the notification says it.
             self.schedule(self.idx, limit["resets_at"], "never", limit, since)
+            stays = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
+                     f"switching is {self.mode}, so the chat stays on {here['name']}")
             then = f" and carries on there at {clock(self.carry['until'])}" if self.carry else ""
-            msg = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
-                   f"switching is {self.mode}, so the chat stays on {here['name']}{then}. To let longhaul move it, "
-                   f"set the key switch to auto in {VSCODE_CONFIG}, or start VS Code with LONGHAUL_SWITCH=auto.")
-            log(f"panel: {msg}")
-            notify(msg)
+            fix = (f". To let longhaul move it, set the key switch to auto in {VSCODE_CONFIG}, or start VS Code "
+                   "with LONGHAUL_SWITCH=auto.")
+            log(f"panel: {stays}{fix}")
+            notify(f"{stays}{then}{fix}")
 
     def stop_child(self, child: subprocess.Popen) -> None:
         if child.poll() is None:
