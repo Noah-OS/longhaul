@@ -128,21 +128,21 @@ Either way, the browser sign-in opens at once: sign in with that same email. Wha
 | `auto` | Moves the chat to an account with room, and early, while the chat is idle, when one is nearly full. When every account is at its limit, it carries on with the first one to reset, without asking. |
 | `never` | Waits for the reset, and carries on with the same account. |
 
-**In the VS Code panel, in `ask`**, for example with two accounts named Max and Pro:
+**In the VS Code panel, in `ask`**, for example with two accounts named Max and Pro. There is nothing to set: Longhaul stays in each panel chat to ask and to carry on.
 
-1. Let Longhaul stay in the panel's chats, once: put this key in `~/.longhaul/vscode.json` (your file: make it if it is not there; Longhaul only reads it). It counts for the chats you open after it.
-
-   ```
-   {"switch_mid_session": true}
-   ```
-
-2. At the limit, Longhaul tries to open `/accounts` with a question at the top. If it does not open, a pop-up says so: type `/accounts`.
-3. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Press **Move and carry on**, or **Wait for the reset**.
-4. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" **Yes** carries on by itself at 14:00. **No** leaves the chat as it is.
+1. At the limit, Longhaul tries to open `/accounts` with a question at the top. If it does not open, a pop-up says so: type `/accounts`.
+2. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Press **Move and carry on**, or **Wait for the reset**.
+3. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" **Yes, carry on at 14:01** carries on by itself a minute after that reset. **No** leaves the chat as it is.
 
 With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:01 on Pro` (a minute after the reset, to be safe).
 
-Without that key, Longhaul stays in a panel chat only when the saved switching is `auto`; in `ask` and `never` the chat stays where it is at a limit, as before.
+Longhaul stays in each panel chat in every mode. To turn that off, put this key in `~/.longhaul/vscode.json` (your file: make it if it is not there; Longhaul only reads it). The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. It counts for the chats you open after it.
+
+```
+{"switch_mid_session": false}
+```
+
+A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`, then `Settings`, says so.
 
 **Keep a folder for one account:** `longhaul add work you@example.com --repo ~/work` uses that account only in `~/work` and the repositories inside it, and keeps the folder for it: a chat there on another account is refused before anything is sent. When the account kept for a folder is at its limit, `longhaul` in a terminal asks whether to run the chat on another one; `longhaul allow <chat id>` lets one refused chat's prompts through on its account for 30 days.
 
