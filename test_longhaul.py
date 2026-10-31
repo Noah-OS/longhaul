@@ -20689,7 +20689,7 @@ class StatusJson(unittest.TestCase):
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
                     "limited_until", "five_hour", "week", "only_in", "folder", "this_chat"}
-    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "vscode", "problem"}
+    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -20766,7 +20766,9 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
-            "switch_problem": None, "vscode": False, "problem": None})
+            "switch_problem": None, "panel_switch": "ask", "vscode": False, "problem": None})
+        self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
+                                       "vscode", "problem"], "the screen's order: panel_switch after switch_problem")
         self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
 
     def test_emails_are_masked_and_never_shown_whole(self):
@@ -21019,6 +21021,24 @@ class StatusJson(unittest.TestCase):
         found = self.read(self.status())
         self.assertEqual((found["switch"], found["switch_problem"]), ("auto", None))
         self.assertEqual(self.read(self.status(LONGHAUL_SWITCH="never"))["switch"], "never")
+
+    def test_panel_switch_is_the_panels_own_mode_which_vscode_json_can_set_apart(self):
+        # The panel reads LONGHAUL_SWITCH, then "switch" in vscode.json, then
+        # config.json (panel_switch_mode()); the screen says so when it is not "switch".
+        self.write_accounts({"name": "personal-1"})
+        before = self.files()
+        modes = lambda found: (found["switch"], found["panel_switch"])
+        self.assertEqual(modes(self.read(self.status())), ("ask", "ask"), "both the default")
+        (self.home / "config.json").write_text('{"switch": "auto"}')
+        self.assertEqual(modes(self.read(self.status())), ("auto", "auto"), "the saved mode, for both")
+        (self.home / "vscode.json").write_text('{"switch": "never"}')
+        self.assertEqual(modes(self.read(self.status())), ("auto", "never"), "vscode.json wins in the panel")
+        self.assertEqual(modes(self.read(self.status(LONGHAUL_SWITCH="ask"))), ("ask", "ask"), "the environment, both")
+        (self.home / "vscode.json").write_text('{"switch": ["auto"]}')
+        self.assertEqual(modes(self.read(self.status())), ("auto", "never"), "not a mode: never, as the panel runs it")
+        self.assertEqual(modes(self.read(self.status(LONGHAUL_SWITCH="sometimes"))), (None, "never"))
+        self.assertFalse((self.home / "longhaul.log").exists(), "the panel's log line for a bad mode is not written")
+        self.assertEqual(set(self.files()) - set(before), {str(self.home / "config.json"), str(self.home / "vscode.json")})
 
     def test_vscode_says_whether_its_settings_run_longhauls_wrapper(self):
         self.write_accounts({"name": "personal-1"})

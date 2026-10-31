@@ -14309,8 +14309,12 @@ def status_json() -> int:
         mode, mode_problem = switch_mode(), None
     except ValueError as e:
         mode, mode_problem = None, str(e)
+    # "switch" is the terminal's (switch_mode()); the panel takes "switch" in
+    # vscode.json before config.json, so its own may differ, and the screen
+    # says so. Never null: a value that is not a mode is never, as there.
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
-             "vscode": vscode_runs_longhaul(), "problem": unreadable_text(problem) if problem else None}
+             "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
+             "problem": unreadable_text(problem) if problem else None}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped

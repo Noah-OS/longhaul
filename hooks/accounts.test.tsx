@@ -391,6 +391,31 @@ both("Settings' page: switching, the VS Code panel and forgetting the limits run
   await ui.unmount()
 })
 
+both("Settings' page names the VS Code panel's own mode when vscode.json sets it apart", async ($, on, surface) => {
+  const w = world(on)
+  const LINE = 'The VS Code panel uses never (set in ~/.longhaul/vscode.json).'
+  w.status = done(JSON.stringify({ ...STATUS, panel_switch: 'never' }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
+  expect(await texts(ui)).toContain(LINE)
+  expect((await ui.find({ key: 'switch' }))?.props.value).toBe('ask') // the Select is still the saved mode
+  // The same mode, none (an older longhaul.py), one that is not a mode, or
+  // no "switch" to differ from (its problem is said instead): no line.
+  // Each read again after Forget recorded limits, which reads the rows again.
+  const cases = [{ panel_switch: 'ask' }, {}, { panel_switch: 'sometimes' },
+    { switch: 'sometimes', switch_problem: 'LONGHAUL_SWITCH is not a mode', panel_switch: 'never' }]
+  for (const more of cases) {
+    w.status = done(JSON.stringify({ ...STATUS, ...more }))
+    await ui.press({ key: 'clear' })
+    expect(w.runs.at(-1)).toEqual(['status', '--json'])
+    expect((await texts(ui)).filter(t => t.startsWith('The VS Code panel uses'))).toEqual([])
+  }
+  w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', panel_switch: 'ask' }))
+  await ui.press({ key: 'clear' })
+  expect(await texts(ui)).toContain('The VS Code panel uses ask (set in ~/.longhaul/vscode.json).')
+  await ui.unmount()
+})
+
 both("the last action's output: its last ten lines, stdout and stderr, every email masked", async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)

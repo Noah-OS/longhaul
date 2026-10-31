@@ -34,6 +34,9 @@ export type LonghaulStatus = {
   here: { folder: string; may_use: string[] } | null
   switch: 'ask' | 'auto' | 'never' | null
   switch_problem: string | null
+  // The VS Code panel's own mode, which "switch" in ~/.longhaul/vscode.json
+  // can set apart from "switch". Optional: an older longhaul.py does not give it.
+  panel_switch?: 'ask' | 'auto' | 'never' | null
   vscode: boolean | null
   problem: string | null
 }

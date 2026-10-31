@@ -165,6 +165,7 @@ function clean(s: any): LonghaulStatus {
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   return { accounts, listed: s.listed === true, here,
     switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
+    panel_switch: (MODES as readonly unknown[]).includes(s.panel_switch) ? s.panel_switch : null,
     vscode: flag(s.vscode), problem: str(s.problem) }
 }
 
@@ -686,6 +687,10 @@ function settingsPage($: any, c: Ctx): any {
   const { Box, Text, Button, Select } = c.E
   const mode = c.status!.switch
   const problem = c.status!.switch_problem
+  // The panel's own mode: LONGHAUL_SWITCH, then "switch" in vscode.json,
+  // then config.json's. With the same environment as "switch", it differs
+  // only by vscode.json's key, which the Select above does not change.
+  const panel = c.status!.panel_switch
   const on = c.status!.vscode
   return (
     <Box flexDirection="column" gap={1}>
@@ -697,6 +702,8 @@ function settingsPage($: any, c: Ctx): any {
         <Text dimColor>ask: asks first</Text>
         <Text dimColor>auto: moves by itself</Text>
         <Text dimColor>never: waits for the reset</Text>
+        {mode && panel && panel !== mode
+          && <Text key="panel-switch">{`The VS Code panel uses ${panel} (set in ~/.longhaul/vscode.json).`}</Text>}
         {problem && <Text color="warning">{`⚠ ${mask(String(problem))}`}</Text>}
       </Box>
       <Box flexDirection="column">
