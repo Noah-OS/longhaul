@@ -52,5 +52,11 @@ Terminal only: give the user the line to type there. The trials
 alone), and starting a chat (`longhaul`, `-c`, `-r`: in VS Code the panel
 already runs the chat on the right account).
 
+With buttons: `/accounts`, typed by the user, does the account actions,
+switching, the VS Code panel and forgetting the limits in a pane, and is
+where the user answers the question at a usage limit. Tell the user of it
+when they would rather press than type; the rules above still hold for
+every command you run.
+
 If the shim refuses a command, show its message and do not try another
 form of it.
