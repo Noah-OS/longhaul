@@ -4845,6 +4845,11 @@ class Plugin(unittest.TestCase):
                      # Claude Code's skills.
                      "skills/checkpoint/SKILL.md", "skills/doctor/SKILL.md", "skills/inspect/SKILL.md",
                      "skills/manage/SKILL.md",
+                     # The hooks module's parts and their tests, and its state's contract
+                     # (the accounts screen, 2026-10-31).
+                     "hooks/index.ts", "hooks/display.ts", "hooks/autocompact.ts", "hooks/accounts.tsx",
+                     "hooks/autocompact.test.ts", "hooks/display.test.ts", "hooks/accounts.test.tsx",
+                     "types/index.d.ts",
                      # The Codex layer (X4): its manifest, hooks file and skills.
                      ".codex-plugin/plugin.json", "hooks/codex-hooks.json", "codex-skills/checkpoint/SKILL.md",
                      "codex-skills/inspect/SKILL.md", "codex-skills/doctor/SKILL.md",
