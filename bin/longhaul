@@ -35,7 +35,12 @@
 # a session must not know or set; and `advisor record-probe`, half of the
 # Advisor's gate (the rule since the plugin layout was decided, amended by
 # the owner on 2026-10-20 to let the checkpoint through, on 2026-10-29 for
-# allow and on 2026-10-30 for the setup commands). The model reads the
+# allow and on 2026-10-30 for the setup commands). `answer` is not here and
+# must not be (the keep-working plan, 2026-10-31): it answers the question a
+# VS Code panel chat asks the user at a usage limit (move, wait, carry on at
+# the first reset), which only the user may answer, with the buttons of
+# Longhaul's pane, which run longhaul.py themselves, or in a terminal; were
+# it here, Claude could answer the user's question for them. The model reads the
 # refusal through the Bash tool, so it says what to ask the user.
 # CDPATH is emptied: set, it would make cd print and could send it elsewhere.
 command -v python3 >/dev/null 2>&1 || {
@@ -117,6 +122,10 @@ case "$1" in
     # Bare, uninstall asks in a terminal before it removes anything.
     case "$#:$2:$3" in 2:--dry-run:|3:--dry-run:--purge|2:--yes:|3:--yes:--purge) exec python3 "$here/longhaul.py" "$@" ;; esac
     only uninstall "\`uninstall --dry-run [--purge]\` or \`uninstall --yes [--purge]\`" "bare \`uninstall\` asks first in a terminal" ;;
+  answer)
+    # The user's answer to Longhaul's question at a usage limit: never Claude's (the comment at the top).
+    printf '%s\n' "longhaul: \`answer\` does not run from inside a session: it answers the question Longhaul asked the user at a usage limit, which is the user's to answer, with the buttons of Longhaul's pane or in a terminal." >&2
+    exit 2 ;;
   trial)
     # The checkpoint A/B (2026-10-23): its start, stop, ratings and report
     # are the user's, and its status counts the arms, which a session is

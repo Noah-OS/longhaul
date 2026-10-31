@@ -14,12 +14,25 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
 - a limit stop: longhaul closes Claude, asks in this terminal whether to move
   the conversation to the other account, and on a yes reopens it there
   with a "carry on" message. With no yes it waits for the reset and
-  carries on where it was. `--switch auto` moves without asking (and
-  waits for the first reset when every account is at its limit);
-  `--switch never` always waits. Before Sprint 1 longhaul always moved without
-  asking: that is now `--switch auto` (or LONGHAUL_SWITCH=auto). `longhaul pipe` and
-  the VS Code panel cannot ask, so there "ask" acts as "never": they move
-  only in auto (an unattended move is never made without an explicit yes).
+  carries on where it was. With every account at its limit and another
+  resetting first, it asks once whether to carry on there at that reset.
+  `--switch auto` moves without asking (and waits for the first reset
+  when every account is at its limit); `--switch never` always waits.
+  Before Sprint 1 longhaul always moved without asking: that is now
+  `--switch auto` (or LONGHAUL_SWITCH=auto). The VS Code panel asks too,
+  in a pane of Longhaul's: at a limit its relay writes the question to
+  LONGHAUL_HOME/questions/<chat>.json, and the pane's buttons run
+  `longhaul answer`. "move" carries on on the account with room; "wait"
+  carries on on this one at its reset. With every account at its limit
+  it asks once, "Max resets first, at 14:00. Carry on there then?", and
+  that yes is the permission for that one move. No answer moves nothing,
+  and the chat stays as it is. In the panel "auto" moves, or carries on
+  at the first reset, without asking, and "never" carries on at this
+  account's reset. A carry-on waiting for a reset (LONGHAUL_HOME/waits/
+  <chat>.json) goes only to a chat idle since its limit: when Claude
+  Code's own wait or you carried on first, nothing is sent. `longhaul
+  pipe` cannot ask, so there "ask" acts as "never": it moves only in auto
+  (an unattended move is never made without an explicit yes).
   In "ask" this terminal never moves early (to ask it would close Claude),
   and, in a folder kept for accounts that are all at their limit, it asks
   before running the conversation on another account, which allows the
@@ -228,6 +241,13 @@ Usage:
                           its CLAUDE_CONFIG_DIR; unset is ~/.claude), so nothing
                           is sent on the wrong one; whatever it cannot read lets
                           the prompt through, and a chat allowed there goes through
+  longhaul answer CHAT QID CHOICE
+                          answers the question a VS Code panel chat asked at a
+                          usage limit (LONGHAUL_HOME/questions/CHAT.json): move
+                          or wait, yes or no, as the question offers; what the
+                          buttons of Longhaul's pane run. Refused when the
+                          chat has no such question open or has closed. Never
+                          from inside a chat: the question is yours to answer
   longhaul allow ID [--account NAME]
                           lets one chat's prompts through on its account (or NAME)
                           in the folder it last ran in, where other accounts keep
@@ -1381,11 +1401,12 @@ def countdown(seconds: int, text: str) -> bool:
 
 
 # How longhaul may move a conversation to another account (decision D3, Phase 0
-# report §9; "ask" is the default, D6). `longhaul pipe` and `longhaul wrap` show no
-# terminal to ask in, so there "ask" keeps the conversation where it is, as
-# "never" does; a move needs "auto" and the front end's own consent (--swap,
-# switch_mid_session). The owner's decision record on switching without a
-# terminal says why (not shipped).
+# report §9; "ask" is the default, D6). `longhaul pipe` shows no terminal to
+# ask in, so there "ask" keeps the conversation where it is, as "never"
+# does; a move needs "auto" and the front end's own consent (--swap). The
+# owner's decision record on switching without a terminal says why (not
+# shipped). `longhaul wrap`, the VS Code panel, asks in Longhaul's pane since
+# the keep-working plan (K1): a move there needs "auto", or "ask" and a yes.
 SWITCH_MODES = {
     "ask": "at a limit, longhaul asks in its terminal before it moves a conversation to another account; it never "
            "moves one early",
@@ -11712,6 +11733,16 @@ OWN_STOP_WINDOW = 120  # seconds
 ASK_PROBE = LONGHAUL_HOME / "ask-probe"
 ASK_PROBE_WAIT = setting("LONGHAUL_ASK_PROBE_SECONDS", 120, float)
 ASK_ID = "longhaul-ask-"  # the request ids of Longhaul's own cards
+# Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2). In ask, a
+# panel chat stopped at a limit asks in LONGHAUL_HOME/questions/<chat>.json,
+# which Longhaul's hooks module shows as a pane whose buttons run
+# `longhaul answer`; the relay reads the answer, <chat>.answer.json, at its
+# next poll, acts on it and removes both. A carry-on it has scheduled for a
+# reset waits in LONGHAUL_HOME/waits/<chat>.json, for the status entry and
+# /accounts to show, until it goes or is cancelled. Files 0600 in folders
+# 0700, named by the chat's id (GUARD_ID); Relay.ask() and Relay.schedule()
+# write the fields, and the pane reads them as they are.
+QUESTIONS, WAITS = "questions", "waits"  # folders under LONGHAUL_HOME
 RELAY_DEBUG = bool(os.environ.get("LONGHAUL_RELAY_DEBUG"))
 # A line's "type" is not always its first field: a 2.1.300 result line
 # starts with "duration_api_ms" and has "type":"result" 1,600 bytes in.
@@ -11722,6 +11753,45 @@ _TYPE = {k: re.compile(rb'"type":\s*"' + k.encode() + rb'"') for k in (
 
 def has_type(line: bytes, kind: str) -> bool:
     return _TYPE[kind].search(line) is not None
+
+
+def api_error(line: bytes) -> bool:
+    """Whether a stream line is one of Claude Code's error messages, a
+    limit stop's among them: an "error" at its top level. Parsed only when
+    the word is in it; a line that cannot be read is no reply either."""
+    if b'"error"' not in line:
+        return False
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return True
+    return not isinstance(msg, dict) or msg.get("error") is not None
+
+
+def chat_file(folder: str, sid, suffix: str = "") -> Path | None:
+    """LONGHAUL_HOME/<folder>/<sid><suffix>.json (QUESTIONS, WAITS), or None
+    for an id that is not a plain session id (GUARD_ID): it names a file."""
+    if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
+        return None
+    return LONGHAUL_HOME / folder / f"{sid}{suffix}.json"
+
+
+def write_private(path: Path, data) -> None:
+    """write_json (whole, 0600) in a folder only you can open: a question
+    names your accounts and a chat's id."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):  # one made before, by hand or by an older copy
+        os.chmod(path.parent, 0o700)
+    write_json(path, data)
+
+
+def quota_continued(sid, since: float) -> bool:
+    """Whether the plugin's Notification hook kept, for chat `sid`, Claude
+    Code's word that it continued the chat after a usage limit
+    (quota_auto_resume_fired) at `since` or later: its own wait carried on."""
+    kept = read_json(LONGHAUL_HOME / STOPS_RECORD)
+    rows = stop_rows(kept.get(sid)) if isinstance(kept, dict) else []
+    return any(r["type"] == "quota_auto_resume_fired" and r["at"] >= int(since) for r in rows)
 
 
 def trace(direction: str, pid, line: bytes, note: str = "") -> None:
@@ -12176,6 +12246,14 @@ class Relay:
     still reach a live claude; only if that fails too does the chat end,
     as a crash would, for the panel to reopen it.
 
+    In ask the panel's relay asks first (keep working, K1 and K2): a
+    question in QUESTIONS that Longhaul's pane shows, the chat left as
+    no_swap() leaves it until the answer (ask_at_limit() says why the held
+    lines go on); move is the swap above, wait and a yes to the first
+    reset a carry-on at that reset (schedule()), sent only to a chat still
+    idle then (carry_on()). auto, with nowhere to move, and never schedule
+    one without asking.
+
     The process ends with os._exit and claude's exit code: a normal exit
     would wait for the thread blocked on the panel's stdin and abort
     (Fatal Python error, exit 134)."""
@@ -12214,6 +12292,14 @@ class Relay:
         self.child = None
         self.watch = None
         self.limits: dict = {}
+        # Keep working (K1, K2): the question this chat has open and what it
+        # is about (the limit, when it was seen, the account offered); the
+        # carry-on scheduled for it and what for; and when its claude last
+        # replied with anything but an error, for the check that the chat
+        # is still idle when a carry-on is due.
+        self.question, self.question_for = None, {}
+        self.carry, self.carry_for = None, {}
+        self.replied_at = 0.0
 
     # -- the pipes
 
@@ -12373,6 +12459,8 @@ class Relay:
             if child is self.child:
                 if b'"rate_limit' in line:
                     self.hold_if_limit(line)
+                if has_type(line, "assistant") and not api_error(line):
+                    self.replied_at = time.time()  # work went on: carry_on() and tend() read it
                 if has_type(line, "result"):
                     self.note_cost(child, line)
             try:
@@ -12528,7 +12616,8 @@ class Relay:
         limit line was acted on, so no relay takes it for a new one."""
         def mark(state):
             state["limited_until"][here["name"]] = limit["resets_at"]
-            if limit.get("uuid"):
+            # Once: a move answered marks the stop the question was about again.
+            if limit.get("uuid") and limit["uuid"] not in state.get("handled_limits", []):
                 state["handled_limits"] = (state.get("handled_limits", []) + [limit["uuid"]])[-50:]
 
         return update_state(mark)
@@ -12540,10 +12629,13 @@ class Relay:
         elsewhere, since longhaul cannot be sure a conversation reopened with
         --resume keeps them), or the user's switching is ask or never,
         and no one can be asked here (the owner's decision record on
-        switching without a terminal, not shipped). The account is marked as switch() marks it, and the
+        switching without a terminal, not shipped), or, in the panel, it is
+        never (ask asks there: ask_at_limit()). The account is marked as switch() marks it, and the
         turn ends with claude's own limit error, which the driver or the
-        panel already has."""
+        panel already has. The panel then carries on on this account at its
+        reset (K2), if the chat is still idle then."""
         here, limit = self.accounts[self.idx], self.watch.limit
+        since = self.watch.limit_seen_at or time.time()
         self.mark_limited(here, limit)
         self.watch.limit = None
         # The held lines go first: a notification can take up to 10 s, and
@@ -12557,13 +12649,14 @@ class Relay:
             self.say_in_stream({"type": "longhaul", "subtype": "stays", "on": here["name"], "until": limit["resets_at"],
                                 "why": limit["type"], "switch": self.mode})
         else:
-            # No quotes: notify() turns " into ', which made a JSON snippet
-            # wrong. The mode may come from the wrapper's LONGHAUL_SWITCH too.
-            why = ("switching is never, so" if self.mode == "never"
-                   else "longhaul cannot ask in the panel, so")
+            # The panel in never. It carries on here at the reset, which is
+            # no move. No quotes: notify() turns " into ', which made a JSON
+            # snippet wrong. The mode may come from the wrapper's LONGHAUL_SWITCH too.
+            self.schedule(self.idx, limit["resets_at"], "never", limit, since)
+            then = f" and carries on there at {clock(self.carry['until'])}" if self.carry else ""
             msg = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
-                   f"{why} the chat stays on {here['name']}. To let longhaul move it, set the key switch to auto "
-                   f"in {VSCODE_CONFIG}, or start VS Code with LONGHAUL_SWITCH=auto.")
+                   f"switching is {self.mode}, so the chat stays on {here['name']}{then}. To let longhaul move it, "
+                   f"set the key switch to auto in {VSCODE_CONFIG}, or start VS Code with LONGHAUL_SWITCH=auto.")
             log(f"panel: {msg}")
             notify(msg)
 
@@ -12578,6 +12671,285 @@ class Relay:
         reader = self.readers.get(child.pid)
         if reader:
             reader.join(timeout=5)
+
+    # -- keep working (K1, K2)
+
+    def at_limit(self) -> None:
+        """The chat's own claude stopped at a usage limit: decide_move()'s
+        verdict. The panel asks now (K1), with Longhaul's pane; longhaul
+        pipe still cannot, so there ask stays, as never does."""
+        verdict = decide_move(self.mode, consent=self.swap, can_ask=not self.says)
+        if verdict == "move":
+            self.switch()
+        elif verdict == "ask":
+            self.ask_at_limit()
+        else:
+            self.no_swap()
+
+    def every(self) -> str:
+        return "every account allowed here" if self.denied else "every account"
+
+    def ask_at_limit(self) -> None:
+        """A limit stop in a panel chat in ask (K1, K2): marked as switch()
+        marks it, then ask()'s question. While it is open the chat is as
+        no_swap() leaves it: the held lines go on to the claude on this
+        account, and so does anything typed after. Holding them until an
+        answer would freeze the panel's own requests and commands for as
+        long as no one answers, /accounts among them, which shows the
+        question when the pane did not open. Nothing is lost that way:
+        Claude Code keeps a message typed at the limit in the conversation
+        and answers it with the limit error, so the claude the answer leaves
+        the chat on has it (a move resumes the conversation there, with the
+        carry-on after it; that stop is absorbed, as below). A stop
+        while a question is open, or a carry-on is scheduled, asks nothing
+        more: one question at a time, and a yes already given stands."""
+        here, limit, sid = self.accounts[self.idx], self.watch.limit, self.watch.sid
+        since = self.watch.limit_seen_at or time.time()
+        state = self.mark_limited(here, limit)
+        self.watch.limit = None
+        self.release()
+        if self.question or self.carry:
+            still = ("its question stays open" if self.question
+                     else f"it still carries on on {self.carry['account']} at {clock(self.carry['until'])}")
+            log(f"question: {sid} stopped at {here['name']}'s {limit['kind']} limit again; {still}")
+            return
+        self.ask(limit, since, state)
+
+    def ask(self, limit: dict, since: float, state: dict | None = None) -> None:
+        """Write this chat's question (QUESTIONS) and say it: "move" when an
+        account other than this one has room now, "first_reset" when every
+        account allowed here is at its limit, naming the one that resets
+        first (this one, it may be). None for a chat with no id yet, or
+        with no account signed in as expected: the log says why."""
+        here_idx, sid = self.idx, self.watch.sid
+        here = self.accounts[here_idx]
+        state = load_state() if state is None else state
+        path = chat_file(QUESTIONS, sid)
+        nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
+                                      wrong=set(self.bad))
+        if path is None or nxt is None or (nxt == here_idx and not until):
+            why = ("the chat has no id yet" if path is None
+                   else "no account allowed here is signed in as expected" if nxt is None
+                   else f"{here['name']} has room again")
+            log(f"question: none asked in {sid or 'a chat'}: {why}; the chat stays as it is")
+            return
+        there = self.accounts[nxt]["name"]
+        resets = max(limit["resets_at"], state["limited_until"].get(here["name"], 0))
+        # Whole seconds rounded up: a carry-on scheduled from them never comes
+        # before the reset itself.
+        q = {"id": f"q-{uuid.uuid4().hex[:12]}", "chat": sid, "relay_pid": os.getpid(), "asked_at": int(time.time()),
+             "kind": "first_reset" if until else "move", "from": here["name"], "limit": limit["kind"],
+             "resets_at": math.ceil(resets), "to": there, "to_resets_at": math.ceil(until) if until else None,
+             "choices": ["yes", "no"] if until else ["move", "wait"]}
+        try:
+            write_private(path, q)
+        except OSError as e:
+            log(f"question: could not ask in {sid} ({e!r}); the chat stays as it is")
+            return
+        self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt}
+        if until:
+            log(f"question: asked {sid} ({q['id']}) to carry on on {there} at {clock(until)} "
+                f"({self.every()} is at its limit)")
+            said = (f"{self.every().capitalize()} is at its limit. {there} resets first, at {clock(until)}. "
+                    "Carry on there then?")
+        else:
+            log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} "
+                f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
+            said = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(resets)}). "
+                    f"Move this chat to {there} and carry on?")
+        notify(f"{said} Answer in Longhaul's pane in the panel; with no answer the chat stays on {here['name']}. "
+               f"To move without asking, set the key switch to auto in {VSCODE_CONFIG}.")
+
+    def tend(self) -> None:
+        """Each round of loop(): the open question's answer, a question the
+        chat has made moot by carrying on, and a carry-on that is due
+        (past due after a sleep: then at the first round awake)."""
+        if self.question:
+            if self.replied_at > self.question_for["since"]:
+                q = self.question
+                log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: the chat carried on on "
+                    f"{q['from']} (a reply came after the limit)")
+                self.drop_question()
+            else:
+                self.read_answer()
+        if self.carry and time.time() >= self.carry["until"]:
+            self.carry_on()
+
+    def read_answer(self) -> None:
+        """`longhaul answer`'s file beside the question, acted on as it
+        says and removed with the question: move is switch() to the account
+        offered, wait a carry-on at this account's reset, yes one at the
+        offered account's, no nothing. An answer to another question, or a
+        choice not offered, is set aside: the command refuses those, so only
+        a hand could have written it."""
+        q = self.question
+        path = chat_file(QUESTIONS, q["chat"], ".answer")
+        got = read_json(path)
+        if got is None:
+            return
+        choice = got.get("choice") if isinstance(got, dict) else None
+        if not isinstance(got, dict) or got.get("id") != q["id"] or choice not in q["choices"]:
+            log(f"question: an answer in {q['chat']} that is not to its open question ({q['id']}) was set aside")
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return
+        about = self.question_for
+        self.drop_question()
+        log(f"question: {q['chat']} answered {choice} ({q['id']})")
+        limit, since, to = about["limit"], about["since"], about["to"]
+        if choice == "move":
+            self.carry_on_now(to, limit, since, "answered", swap=True)
+        elif choice == "wait":
+            self.schedule(self.idx, q["resets_at"], "answered", limit, since)
+        elif choice == "yes":
+            self.schedule(to, q["to_resets_at"], "answered", limit, since)
+        else:
+            log(f"question: {q['chat']} stays as it is on {q['from']}; nothing is scheduled")
+
+    def schedule(self, to: int, at: float, why: str, limit: dict, since: float) -> None:
+        """A carry-on for this chat on accounts[to] at `at` plus
+        RESET_MARGIN (a reset is approximate), kept in WAITS while it
+        waits; carry_on() sends it, if the chat is still idle then. One per
+        chat: a later one takes its place."""
+        sid = self.watch.sid
+        path = chat_file(WAITS, sid)
+        if path is None:
+            log("wait: none for a chat with no id yet; the chat stays as it is")
+            return
+        name = self.accounts[to]["name"]
+        self.carry = {"chat": sid, "until": math.ceil(at + RESET_MARGIN), "account": name, "why": why}
+        self.carry_for = {"to": to, "limit": limit, "since": since}
+        try:
+            write_private(path, self.carry)
+        except OSError as e:  # the status entry goes without it; the carry-on does not
+            log(f"wait: could not write {sid}'s wait ({e!r}); it carries on all the same")
+        log(f"wait: {sid} carries on on {name} at {clock(self.carry['until'])} ({why})")
+        if why == "auto":
+            notify(f"{self.every().capitalize()} is at its limit; the panel chat carries on with {name} at "
+                   f"{clock(self.carry['until'])}.")
+
+    def carry_on(self) -> None:
+        """The scheduled carry-on is due. It goes only to a chat idle since
+        its limit: a reply since then (Claude Code's own wait carried on, or
+        you did) or Claude Code's word that it continued the chat
+        (quota_auto_resume_fired) means the work goes on already, and
+        nothing is sent."""
+        c, about = self.carry, self.carry_for
+        self.drop_carry()
+        if self.replied_at > about["since"] or quota_continued(c["chat"], about["since"]):
+            log(f"wait: {c['chat']} carried on without longhaul (a turn ran after the limit), so nothing was sent "
+                f"at {clock(c['until'])}")
+            return
+        self.carry_on_now(about["to"], about["limit"], about["since"], c["why"])
+
+    def unready(self, idx: int) -> str | None:
+        """Why accounts[idx] cannot take the chat now, or None: at its limit
+        again, signed in as someone else, or not to be used here."""
+        acct = self.accounts[idx]
+        if acct["name"] in self.bad:
+            return "it may not be used here"
+        until = load_state()["limited_until"].get(acct["name"], 0)
+        if until > time.time():
+            return f"it is at its limit again, until {clock(until)}"
+        if not signed_in_cached(acct, self.binary):
+            return "it is not signed in as expected"
+        return None
+
+    def carry_on_now(self, to: int, limit: dict, since: float, why: str, swap: bool = False,
+                     again: bool = True) -> None:
+        """The chat carries on on accounts[to] now: a move answered (swap,
+        with CARRY_ON, as switch() sends it) or a scheduled carry-on (this
+        account: CARRY_ON_SAME to the claude running; another:
+        CARRY_ON_AFTER_WAIT after the swap). An account that cannot take it
+        is checked first (unready()), and then again() decides; `again`
+        False is again()'s own call, which never loops."""
+        here, sid, name = self.accounts[self.idx], self.watch.sid, self.accounts[to]["name"]
+        problem = self.unready(to)
+        if problem:
+            log(f"{'question' if swap else 'wait'}: {sid} does not carry on on {name}: {problem}")
+            if again:
+                self.again(limit, since)
+            return
+        if swap:
+            self.switch(limit, to=to)
+        elif to == self.idx:
+            self.say_to_claude(CARRY_ON_SAME.format(old=here["name"], kind=limit["kind"], new=name))
+            log(f"wait: {sid} carried on on {name} ({why})")
+            notify(f"{name} has reset; the panel chat carries on with it.")
+        elif self.move_to(to, CARRY_ON_AFTER_WAIT.format(old=here["name"], kind=limit["kind"], new=name,
+                                                         every=self.every())):
+            log(f"wait: {sid} carried on on {name}, moved from {here['name']} ({why})")
+            notify(f"{name} has reset; the panel chat carries on with it, moved from {here['name']}.")
+
+    def again(self, limit: dict, since: float) -> None:
+        """The account a carry-on was for cannot take it: ask asks again
+        (never a move unasked), auto picks again, never waits for this
+        account's next reset. In ask, this account having room again is
+        the first reset after all: the chat carries on on it, which moves
+        nothing."""
+        here_idx = self.idx
+        state = load_state()
+        nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
+                                      wrong=set(self.bad))
+        if self.mode == "never":
+            own = state["limited_until"].get(self.accounts[here_idx]["name"], 0)
+            if own > time.time():
+                self.schedule(here_idx, own, "never", limit, since)
+            else:
+                log(f"wait: {self.watch.sid} stays as it is: {self.accounts[here_idx]['name']} cannot take it")
+        elif nxt is None:
+            log(f"wait: {self.watch.sid} stays as it is: no account allowed here is signed in as expected")
+        elif self.mode == "auto" and until:
+            self.schedule(nxt, until, "auto", limit, since)
+        elif self.mode == "auto" or (nxt == here_idx and not until):
+            self.carry_on_now(nxt, limit, since, self.mode, again=False)
+        else:
+            self.ask(limit, since, state)
+
+    def say_to_claude(self, text: str) -> None:
+        """A user message of longhaul's own to the claude running now,
+        queued behind the panel's lines so the one writer to its stdin
+        sends it whole; the panel shows its replay in the chat, as after a
+        swap."""
+        line = json.dumps({"type": "user", "uuid": str(uuid.uuid4()), "session_id": "", "parent_tool_use_id": None,
+                           "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).encode() + b"\n"
+        with self.cond:
+            self.queue.append(line)
+            self.cond.notify_all()
+
+    def drop_question(self) -> None:
+        sid = self.question["chat"] if self.question else None
+        self.question, self.question_for = None, {}
+        for suffix in ("", ".answer"):
+            path = chat_file(QUESTIONS, sid, suffix)
+            if path:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+    def drop_carry(self) -> None:
+        sid = self.carry["chat"] if self.carry else None
+        self.carry, self.carry_for = None, {}
+        path = chat_file(WAITS, sid)
+        if path:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def forget_chat(self) -> None:
+        """The chat is ending: its question and its carry-on go with it,
+        since no relay is left to act on them (the log says which), and the
+        pane and the status entry show neither. Never raises: it runs on
+        the way out."""
+        try:
+            if self.question:
+                log(f"question: {self.question['chat']} closed with its question ({self.question['id']}) "
+                    "unanswered; nothing moves")
+                self.drop_question()
+            if self.carry:
+                log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} at "
+                    f"{clock(self.carry['until'])} is cancelled: the chat closed")
+                self.drop_carry()
+        except Exception:
+            pass
 
     # -- the chat
 
@@ -12615,18 +12987,19 @@ class Relay:
                     elif ours is None:
                         pass  # the stream's line may still be on its way: looked at again next round
                     elif self.watch.should_switch():
-                        # No one can be asked here, so "ask" never moves.
-                        if decide_move(self.mode, consent=self.swap, can_ask=False) == "move":
-                            self.switch()
-                        else:
-                            self.no_swap()
+                        self.at_limit()
                     elif self.held_since and time.time() - self.held_since > HOLD_MAX and not self.watch.limit:
                         log("panel: a rate_limit in the stream was not a usage limit stop; letting the panel's lines go")
                         self.release()
                 except Exception as e:  # watching must never take the chat down
                     log(f"panel relay error: {e!r}")
                     self.release()
+                try:
+                    self.tend()
+                except Exception as e:  # nor may keeping it working
+                    log(f"panel relay error: {e!r}")
         finally:
+            self.forget_chat()
             try:
                 sys.stdout.flush()
             except Exception:
@@ -12663,13 +13036,25 @@ class Relay:
             self.send(child, {**req, "request_id": rid})
         return child
 
-    def switch(self) -> None:
+    def switch(self, limit: dict | None = None, to: int | None = None) -> None:
+        """At a limit in auto, or on a move answered (K1: `limit` the stop
+        the question was about, `to` the account it offered, which
+        carry_on_now() has checked): the chat moves with CARRY_ON. With
+        nowhere to move it stays as it is; the panel in auto then carries on
+        at the first reset, as the terminal's auto does (K2)."""
         here_idx = self.idx
-        here, limit, sid = self.accounts[here_idx], self.watch.limit, self.watch.sid
+        here, sid = self.accounts[here_idx], self.watch.sid
+        limit = limit or self.watch.limit
+        since = self.watch.limit_seen_at or time.time()
         state = self.mark_limited(here, limit)
         self.watch.limit = None
-        nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
-                                      wrong=set(self.bad))
+        if self.carry:  # a later stop: what is decided now takes its place
+            self.drop_carry()
+        if to is None:
+            nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
+                                          wrong=set(self.bad))
+        else:
+            nxt, until = to, None
         if self.says and self.init_request is None:
             self.init_request = PIPE_INITIALIZE  # the driver sent none
         if nxt is None or until or nxt == here_idx or not sid or self.init_request is None:
@@ -12679,8 +13064,31 @@ class Relay:
                 # Not for an unknown conversation id: other accounts may have room.
                 self.say_in_stream({"type": "longhaul", "subtype": "all_limited", "until": until})
             self.release()
+            if not self.says and self.mode == "auto" and nxt is not None and until and sid:
+                self.schedule(nxt, until, "auto", limit, since)
             return
         new = self.accounts[nxt]["name"]
+        moved = ({"type": "longhaul", "subtype": "moved", "from": here["name"], "to": new, "why": limit["type"]}
+                 if self.says else None)
+        if self.move_to(nxt, CARRY_ON.format(old=here["name"], kind=limit["kind"], new=new), moved):
+            msg = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
+                   f"the panel chat carries on with {new}.")
+            log(msg)
+            if not self.says:  # a driver tells its user from the `moved` line; a notification would say it twice
+                notify(msg)
+
+    def move_to(self, nxt: int, text: str, moved: dict | None = None) -> bool:
+        """The swap (the class's docstring): the panel's lines held, claude
+        ended and started again on accounts[nxt] with the chat resumed,
+        `moved` said first in a driver's stream, then `text`, the carry-on
+        message, then the held lines. True when the chat runs there; False
+        when it stayed on its account (claude would not start on the
+        other) or ended (on neither)."""
+        here_idx, sid = self.idx, self.watch.sid
+        here, new = self.accounts[here_idx], self.accounts[nxt]["name"]
+        if not sid or self.init_request is None:
+            log(f"panel: the chat stays on {here['name']}: its id or the panel's initialize is not known yet")
+            return False
         with self.cond:
             self.paused = True
         self.swapping = True
@@ -12700,27 +13108,22 @@ class Relay:
                 if child is None:
                     log("panel: claude would not start again on either account; "
                         "ending the chat so the panel can reopen it")
-                    return
+                    return False
                 self.watch = Watch(here, child.pid, started, False, offsets=marks, handled=handled)
-                return
-            if self.says:  # before the carry-on, so it comes before the new claude's reply
-                self.say_in_stream({"type": "longhaul", "subtype": "moved", "from": here["name"], "to": new,
-                                    "why": limit["type"]})
-            text = CARRY_ON.format(old=here["name"], kind=limit["kind"], new=new)
+                return False
+            if moved:  # before the carry-on, so it comes before the new claude's reply
+                self.say_in_stream(moved)
             self.send(child, {"type": "user", "uuid": str(uuid.uuid4()), "session_id": "",
                               "parent_tool_use_id": None,
                               "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
             self.watch = Watch(self.accounts[nxt], child.pid, started, False, offsets=marks, handled=handled)
-            msg = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
-                   f"the panel chat carries on with {new}.")
-            log(msg)
-            if not self.says:  # a driver tells its user from the `moved` line; a notification would say it twice
-                notify(msg)
+            return True
         finally:
             self.swapping = False
             self.end_swap()
 
     def on_signal(self, sig, _frame) -> None:
+        self.forget_chat()
         child = self.child
         if child and child.poll() is None:
             child.send_signal(sig)
@@ -12729,6 +13132,44 @@ class Relay:
             except subprocess.TimeoutExpired:
                 child.kill()
         os._exit(128 + sig)
+
+
+def answer_cmd(opts) -> int:
+    """`longhaul answer CHAT QID CHOICE` (keep working, K1): what the buttons
+    of Longhaul's pane run to answer the question a panel chat's relay
+    asked at a usage limit (QUESTIONS). The answer is written beside the
+    question, whole and only yours, as {"id", "choice", "at"}; the relay
+    reads it at its next poll, acts on it and removes both. Refused, exit
+    2, one sentence and nothing written: an id that is not a chat's, a chat
+    with no open question, a QID that is not its open question's, a choice
+    it does not offer, or a question whose relay has ended, since no one is
+    left to act on it. Not in the plugin's bin/longhaul: the question is
+    the user's, and Claude must not answer it for them."""
+    def refuse(why: str) -> int:
+        print(f"longhaul answer: {why}", file=sys.stderr)
+        return 2
+    path = chat_file(QUESTIONS, opts.chat)
+    if path is None:
+        return refuse("that is not a chat's id; give the one the question names.")
+    q = read_json(path)
+    if not isinstance(q, dict):
+        return refuse(f"chat {opts.chat} has no open question.")
+    if opts.qid != q.get("id"):
+        return refuse(f"{opts.qid} is not the question chat {opts.chat} has open, which is {q.get('id')}.")
+    choices = [c for c in q.get("choices") or [] if isinstance(c, str)] if isinstance(q.get("choices"), list) else []
+    if opts.choice not in choices:
+        return refuse(f"{opts.choice} is not a choice of this question; its choices are {' and '.join(choices)}.")
+    pid = q.get("relay_pid")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid)):
+        return refuse("the chat that asked has closed, so no one is left to act on the answer.")
+    try:
+        write_private(chat_file(QUESTIONS, opts.chat, ".answer"),
+                      {"id": q["id"], "choice": opts.choice, "at": int(time.time())})
+    except OSError as e:
+        return refuse(f"the answer could not be written ({e.strerror or e}).")
+    log(f"answer: {opts.chat} {opts.choice} to {q['id']}")
+    print(f"Answered {opts.choice}: the chat acts on it within a few seconds.")
+    return 0
 
 
 # ---------------------------------------------------------------- setup
@@ -13281,8 +13722,9 @@ def switch_cmd(opts) -> int:
 
 def switch_said(mode: str) -> str:
     """What `mode` does, as SWITCH_MODES says it; ask says the panel too,
-    which cannot ask and so stays put."""
-    return SWITCH_MODES[mode] + ("; the VS Code panel cannot ask, so there it stays put" if mode == "ask" else "")
+    which asks in Longhaul's pane (keep working, K1 and K2)."""
+    return SWITCH_MODES[mode] + ("; the VS Code panel asks too, in Longhaul's pane, and with every account at its "
+                                 "limit asks once whether to carry on at the first reset" if mode == "ask" else "")
 
 
 VSCODE_SETTINGS = Path(os.environ.get("LONGHAUL_VSCODE_SETTINGS") or (
@@ -15392,7 +15834,7 @@ def main(argv: list[str]) -> int:
                             "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow", "switch"):
+                            "models-hook", "allow", "switch", "answer"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -15458,6 +15900,11 @@ def main(argv: list[str]) -> int:
                                 "names them)")
             p.add_argument("--account", metavar="NAME",
                            help="the account to allow it on (default: the one its record says it runs on)")
+        if cmd == "answer":
+            p.add_argument("chat", metavar="CHAT", help="the chat's id, as the question names it")
+            p.add_argument("qid", metavar="QID", help="the question's id (q- and 12 hex digits)")
+            p.add_argument("choice", metavar="CHOICE",
+                           help="one of the question's choices: move or wait, or yes or no")
         if cmd == "models":
             p.add_argument("args", nargs="*", metavar="guide|on|off|trial | cap MODEL|off | TYPE MODEL",
                            help="nothing: the mode, the guide, the cap and the table; guide (the default), on, off "
@@ -15510,7 +15957,7 @@ def main(argv: list[str]) -> int:
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
-                "switch": switch_cmd}[cmd](opts)
+                "switch": switch_cmd, "answer": answer_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

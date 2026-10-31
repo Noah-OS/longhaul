@@ -6,7 +6,11 @@ system/init at the first message, assistant and result lines), writes the
 session and conversation files Claude Code writes, and acts out
 stream_plan.json, one step per user message across launches:
 
-  reply | limit
+  reply | limit | limit_sub
+
+limit_sub is a subagent's limit stop, its line a sidechain's, and the
+main turn goes on. A limit resets in FAKE_RESET_IN seconds (an hour
+unless set).
 
 Without --input-format stream-json it is a short job: it records the call
 and prints one line. `auth status --json` answers from FAKE_EMAILS, a JSON
@@ -123,6 +127,20 @@ for raw in sys.stdin:
         import signal as _signal
         _signal.signal(_signal.SIGTERM, lambda *_: (sys.stdout.write('{"type":"assist'), sys.stdout.flush(), os._exit(0)))
         step = "limit"
+    if step == "limit_sub":
+        # A subagent's limit: its line in the transcript is a sidechain's,
+        # in the stream it is under the subagent's tool call, and the main
+        # turn goes on with a reply.
+        with transcript.open("a") as f:
+            f.write(json.dumps({"type": "assistant", "isSidechain": True, "isApiErrorMessage": True,
+                                "error": "rate_limit", "timestamp": now(), "sessionId": sid,
+                                "uuid": f"sub-{uuid.uuid4().hex[:6]}",
+                                "quotaLimits": {"status": "rejected", "resetsAt": time.time() + 3600,
+                                                "rateLimitType": "five_hour"}}) + "\n")
+        emit({"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "session_id": sid,
+              "parent_tool_use_id": "toolu_sub", "message": {"model": "<synthetic>", "content": [
+                  {"type": "text", "text": "You've hit your session limit"}]}})
+        step = "reply"
     if step.startswith("exit:"):
         emit({"type": "assistant", "session_id": sid, "user_message_uuid": msg["uuid"],
               "message": {"role": "assistant", "content": [{"type": "text", "text": "bye"}]}})
@@ -133,7 +151,8 @@ for raw in sys.stdin:
     if step == "limit":
         line = {"type": "assistant", "isSidechain": False, "isApiErrorMessage": True, "error": "rate_limit",
                 "timestamp": now(), "sessionId": sid, "uuid": f"limit-{os.getpid()}-{uuid.uuid4().hex[:6]}",
-                "quotaLimits": {"status": "rejected", "resetsAt": time.time() + 3600, "rateLimitType": "five_hour"},
+                "quotaLimits": {"status": "rejected", "resetsAt": time.time() + float(os.environ.get("FAKE_RESET_IN", "3600")),
+                                "rateLimitType": "five_hour"},
                 "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "You've hit your session limit"}]}}
         with transcript.open("a") as f:
             f.write(json.dumps(line) + "\n")

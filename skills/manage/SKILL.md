@@ -35,7 +35,7 @@ in the chat. If no browser opens, give the user the same line to type in a
 terminal, `longhaul` in place of the full path.
 
 Settings:
-- Switching at a usage limit (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch`. Set it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch MODE`, MODE ask (ask in the terminal first; the panel stays put), auto (move by itself) or never (wait for the reset).
+- Switching at a usage limit (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch`. Set it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch MODE`, MODE ask (ask first: in the terminal, and in the panel with Longhaul's pane, whose question only the user answers), auto (move by itself) or never (wait for the reset).
 - Subagent models (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul models`. Set them: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul models MODE` (guide, on, off or trial), `${CLAUDE_PLUGIN_ROOT}/bin/longhaul models cap MODEL` (haiku, sonnet, opus or fable; off for none), `${CLAUDE_PLUGIN_ROOT}/bin/longhaul models TYPE MODEL` (one agent type's row).
 - The VS Code panel on Longhaul's accounts: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul vscode on --yes` (it replaces any other program the panel was set to run); back to its own sign-in: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul vscode off`. Each edits VS Code's settings, a copy kept. After either, tell the user to reload VS Code: Cmd+Shift+P, then Developer: Reload Window.
 - The status line: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline install --yes` sets Claude Code's to Longhaul's, replacing one of the user's own (say so; a copy is kept); `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline uninstall` puts the one before back.

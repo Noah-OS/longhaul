@@ -11735,6 +11735,16 @@ class Shim(unittest.TestCase):
         self.assertNotIn("does not run from inside a session", out.stderr)
         self.assertIn("longhaul allow: no chat 1b2c3d4e is known", out.stderr, "longhaul's own answer")
 
+    def test_the_shim_refuses_answer_the_users_question_is_not_claudes(self):
+        # Keep working (K1): the pane's buttons run longhaul.py themselves; the
+        # question at a usage limit is the user's alone.
+        out = self.shim("answer", "sid-1", "q-0123456789ab", "move")
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertIn("`answer` does not run from inside a session", out.stderr)
+        self.assertIn("which is the user's to answer", out.stderr)
+        self.assertIn("longhaul answer CHAT QID CHOICE", longhaul.__doc__, "the help names it")
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
     def test_the_shim_runs_advisor_status_and_nothing_else_of_the_advisor(self):
         # Sprint 8: `advisor status` is the advise skill's first step. A probe
         # record is half of the Advisor's gate, so recording one is the
@@ -16846,18 +16856,19 @@ class PanelSwitching(StreamHarness):
         self.assertEqual(len(self.calls()), 2)
         return self.calls()[1]
 
-    def test_in_ask_mode_a_panel_chat_stays_on_its_account_and_says_so_once(self):
+    def test_in_ask_mode_a_panel_chat_asks_stays_on_its_account_and_says_so_once(self):
+        # Keep working (K1): the panel asks now, and until an answer the chat
+        # stays where it is.
         self.limit_in_chat(LONGHAUL_SWITCH="ask", **self.fake_notifications())
         said = [n for n in self.notified() if "limit" in n]
         self.assertEqual(len(said), 1, said)
         # Review, Sprint 2: the fix is usable as written (notify() turns "
-        # into ', so a JSON snippet came out wrong), and it names both
-        # places the mode can come from.
-        self.assertRegex(said[0], r"^Max hit its session limit")
+        # into ', so a JSON snippet came out wrong).
+        self.assertRegex(said[0], r"^Max hit its session limit \(resets [^)]+\)\. Move this chat to Pro and carry on\? "
+                                  r"Answer in Longhaul's pane in the panel")
         self.assertIn("chat stays on Max", said[0])
         self.assertIn("set the key switch to auto in", said[0])
         self.assertIn(str(self.relay / "vscode.json"), said[0])
-        self.assertIn("LONGHAUL_SWITCH=auto", said[0])
         self.assertNotIn("'switch'", said[0])
 
     def test_in_never_mode_the_panels_notification_says_you_chose_it(self):
@@ -16915,6 +16926,471 @@ class PanelSwitching(StreamHarness):
         self.wait_for(lambda m: m.get("type") == "control_response")
         self.assertEqual(self.wait_for(self.result_for(self.user(p, "hello")))["result"], "reply to: hello")
         self.assertEqual(self.calls()[0]["pid"], p.pid, "longhaul handed over: the process is claude itself")
+
+
+class PanelKeepWorking(StreamHarness):
+    """Keep working (K1, K2) end to end: the relay in ask, fake_stream.py as
+    claude, and `longhaul answer` run as the pane's buttons run it. The
+    decisions themselves are KeepWorking's, on a clock of its own."""
+
+    def wait_file(self, name, timeout=10):
+        path = self.relay / name
+        end = time.time() + timeout
+        while time.time() < end:
+            if path.exists():
+                return json.loads(path.read_text())  # written whole (write_json), so never half read
+            time.sleep(0.05)
+        self.fail(f"no {name} within {timeout}s; the log: {self.log_text()[-2000:]}")
+
+    def answer(self, q, choice):
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_NO_NOTIFY="1")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "answer", q["chat"], q["id"], choice],
+                             env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def limit_and_question(self, **env):
+        """A chat in ask that meets a limit: (the relay, its question)."""
+        self.plan(["limit", "reply"])
+        p = self.start(LONGHAUL_SWITCH="ask", **env)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        return p, self.wait_file("questions/sid-1.json")
+
+    def carry_on(self, starts):
+        """The carry-on message's replay, which the panel shows, and its reply."""
+        try:
+            line = self.wait_for(lambda m: m.get("type") == "user" and m.get("isReplay")
+                                 and m["message"]["content"][0]["text"].startswith(starts))
+        except AssertionError as e:
+            self.fail(f"{e}; the log: {self.log_text()[-3000:]}")
+        self.assertFalse(self.wait_for(self.result_for(line["uuid"]))["is_error"])
+
+    def test_the_question_is_written_and_move_carries_on_on_the_other_account(self):
+        p, q = self.limit_and_question()
+        self.assertRegex(q["id"], r"^q-[0-9a-f]{12}$")
+        self.assertEqual({k: v for k, v in q.items() if k not in ("id", "asked_at", "resets_at")},
+                         {"chat": "sid-1", "relay_pid": p.pid, "kind": "move", "from": "Max", "limit": "session",
+                          "to": "Pro", "to_resets_at": None, "choices": ["move", "wait"]})
+        self.assertAlmostEqual(q["resets_at"], time.time() + 3600, delta=30)
+        self.assertEqual((self.relay / "questions" / "sid-1.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.relay / "questions").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(len(self.calls()), 1, "nothing moves before the answer")
+        self.answer(q, "move")
+        self.carry_on("The Max account hit its session limit, so longhaul reopened this conversation on the Pro")
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+        self.assertEqual(sorted(os.listdir(self.relay / "questions")), [], "the question and its answer are gone")
+
+    def test_wait_carries_on_on_the_same_claude_at_the_reset(self):
+        # A second to the reset (the wait's file is KeepWorking's to read).
+        p, q = self.limit_and_question(FAKE_RESET_IN="1", LONGHAUL_RESET_MARGIN="0")
+        self.answer(q, "wait")
+        self.carry_on("The Max account hit its session limit, so longhaul waited for it to reset")
+        self.assertEqual(len(self.calls()), 1, "the same claude carries on")
+        self.assertFalse((self.relay / "waits" / "sid-1.json").exists())
+        self.assertIn("wait: sid-1 carries on on Max at ", self.log_text())
+        self.assertIn("wait: sid-1 carried on on Max (answered)", self.log_text())
+
+    def test_with_every_account_at_its_limit_a_yes_carries_on_on_the_first_to_reset(self):
+        # Three seconds: the question has to be asked before Pro's reset.
+        (self.relay / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3}}))
+        p, q = self.limit_and_question(LONGHAUL_RESET_MARGIN="0")
+        self.assertEqual((q["kind"], q["to"], q["choices"]), ("first_reset", "Pro", ["yes", "no"]))
+        self.answer(q, "yes")
+        self.carry_on("The Max account hit its session limit while every account was at its limit, so longhaul "
+                      "waited for the Pro account to reset")
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+
+    def test_a_subagents_limit_asks_nothing(self):
+        self.plan(["limit_sub", "reply"])
+        p = self.start(LONGHAUL_SWITCH="ask")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        time.sleep(0.5)
+        self.assertFalse((self.relay / "questions").exists())
+        self.assertEqual(len(self.calls()), 1)
+
+
+class KeepWorking(unittest.TestCase):
+    """Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2): a
+    panel chat's relay at a limit, driven in this process on a clock of the
+    test's own, so a reset an hour away comes at once. The swap is stood in
+    for (moves records it); PanelKeepWorking runs the real one."""
+
+    QUESTION_KEYS = ["asked_at", "chat", "choices", "from", "id", "kind", "limit", "relay_pid", "resets_at", "to",
+                     "to_resets_at"]
+
+    class Clock:
+        """longhaul's time module with time() the test's own."""
+        def __init__(self, at):
+            self.at = at
+
+        def time(self):
+            return self.at
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    class Watch:
+        """What the relay reads of its Watch here."""
+        def __init__(self):
+            self.sid, self.limit, self.limit_seen_at, self.status = "sid-k", None, None, "idle"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        # A whole second, so a reset and its margin are whole seconds too.
+        self.clock, self.notes, self.strangers = self.Clock(float(int(time.time()))), [], set()
+        for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                        mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"),
+                        mock.patch.object(longhaul, "RESET_MARGIN", 60),
+                        mock.patch.object(longhaul, "time", self.clock),
+                        mock.patch.object(longhaul, "notify", self.notes.append),
+                        mock.patch.object(longhaul, "signed_in_cached",
+                                          lambda acct, binary: acct["name"] not in self.strangers)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.accounts = [{"name": "Max", "config_dir": str(self.tmp / "max"), "email": "first@example.com"},
+                         {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "second@example.com"}]
+
+    def relay(self, mode="ask"):
+        r = longhaul.Relay("claude", [], self.accounts, 0, mode=mode)
+        r.watch = self.Watch()
+        r.init_request = {"type": "control_request", "request_id": "x", "request": {"subtype": "initialize"}}
+        r.moves = []
+
+        def move_to(nxt, text, moved=None):
+            r.moves.append((self.accounts[nxt]["name"], text))
+            r.idx = nxt
+            return True
+        r.move_to = move_to
+        return r
+
+    def limited(self, **until):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": until}))
+
+    def stop(self, r, resets_in=3600):
+        """r's claude stopped at its five-hour limit, as loop() acts on it."""
+        r.watch.limit = {"resets_at": self.clock.at + resets_in, "kind": "session", "uuid": f"limit-{uuid.uuid4()}",
+                         "type": "five_hour"}
+        r.watch.limit_seen_at = self.clock.at
+        r.at_limit()
+
+    def later(self, seconds):
+        self.clock.at += seconds
+
+    def question(self):
+        path = self.home / "questions" / "sid-k.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def waiting(self):
+        path = self.home / "waits" / "sid-k.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def answer(self, *argv):
+        """`longhaul answer` as the pane's button runs it: (exit code, what it said)."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = longhaul.main(["answer", *argv])
+        return code, (out.getvalue() + err.getvalue()).strip()
+
+    def said(self, r):
+        """The texts of the user lines the relay queued for its claude."""
+        return [json.loads(line)["message"]["content"][0]["text"] for line in r.queue]
+
+    def log_text(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def state(self):
+        return json.loads((self.home / "state.json").read_text())
+
+    # -- the question
+
+    def test_ask_with_room_elsewhere_writes_the_move_question_and_moves_nothing(self):
+        r = self.relay()
+        self.stop(r)
+        q = self.question()
+        self.assertEqual(sorted(q), self.QUESTION_KEYS)
+        self.assertRegex(q.pop("id"), r"^q-[0-9a-f]{12}$")
+        self.assertEqual(q, {"chat": "sid-k", "relay_pid": os.getpid(), "asked_at": int(self.clock.at), "kind": "move",
+                             "from": "Max", "limit": "session", "resets_at": int(self.clock.at + 3600), "to": "Pro",
+                             "to_resets_at": None, "choices": ["move", "wait"]})
+        self.assertEqual((r.moves, list(r.queue), r.paused), ([], [], False), "nothing moves; the lines go on")
+        self.assertIsNone(self.waiting())
+        self.assertEqual(self.state()["limited_until"]["Max"], self.clock.at + 3600)
+        self.assertIn("question: asked sid-k (q-", self.log_text())
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("Move this chat to Pro and carry on?", self.notes[0])
+
+    def test_the_question_and_its_folder_are_only_yours(self):
+        self.stop(self.relay())
+        self.assertEqual((self.home / "questions" / "sid-k.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "questions").stat().st_mode & 0o777, 0o700)
+
+    def test_no_answer_moves_nothing_however_long_it_waits(self):
+        r = self.relay()
+        self.stop(r, resets_in=60)
+        for _ in range(3):
+            self.later(86400)  # past the reset, and days after
+            r.tend()
+        self.assertEqual((r.moves, list(r.queue), self.waiting()), ([], [], None))
+        self.assertIsNotNone(self.question(), "still open: a question never times out into an action")
+
+    def test_one_question_at_a_time(self):
+        r = self.relay()
+        self.stop(r)
+        first = self.question()["id"]
+        self.later(30)
+        self.stop(r)  # a message typed at the limit stops again
+        self.assertEqual(self.question()["id"], first)
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("question: sid-k stopped at Max's session limit again; its question stays open", self.log_text())
+
+    def test_a_reply_after_the_limit_withdraws_the_question(self):
+        r = self.relay()
+        self.stop(r)
+        self.later(5)
+        r.replied_at = self.clock.at  # Claude Code's own wait carried on, or the limit lifted
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertIn("is withdrawn: the chat carried on on Max", self.log_text())
+
+    # -- the answers
+
+    def test_move_switches_to_the_account_offered_with_the_carry_on(self):
+        r = self.relay()
+        self.stop(r)
+        q = self.question()
+        self.assertEqual(self.answer("sid-k", q["id"], "move"), (0, "Answered move: the chat acts on it within a "
+                                                                    "few seconds."))
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))])
+        self.assertFalse((self.home / "questions" / "sid-k.json").exists())
+        self.assertFalse((self.home / "questions" / "sid-k.answer.json").exists())
+        self.assertIn("question: sid-k answered move", self.log_text())
+        self.assertIn("Max hit its session limit (resets ", self.log_text())
+
+    def test_wait_carries_on_on_the_same_account_at_its_reset(self):
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "wait")
+        r.tend()
+        until = int(self.clock.at + 3600 + 60)
+        self.assertEqual(self.waiting(), {"chat": "sid-k", "until": until, "account": "Max", "why": "answered"})
+        self.assertEqual((self.home / "waits" / "sid-k.json").stat().st_mode & 0o777, 0o600)
+        self.later(3600 + 30)
+        r.tend()
+        self.assertEqual(list(r.queue), [], "not before the reset and its margin")
+        self.later(31)
+        r.tend()
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertEqual((r.moves, self.waiting()), ([], None))
+        self.assertIn("wait: sid-k carried on on Max (answered)", self.log_text())
+
+    def test_after_a_sleep_a_carry_on_past_due_goes_at_the_first_round_awake(self):
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "wait")
+        r.tend()
+        self.later(5 * 3600)  # the Mac slept through the reset
+        r.tend()
+        self.assertEqual(len(self.said(r)), 1)
+
+    def test_every_account_at_its_limit_asks_once_naming_the_first_reset(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        q = self.question()
+        self.assertEqual({k: q[k] for k in ("kind", "from", "to", "to_resets_at", "resets_at", "choices")},
+                         {"kind": "first_reset", "from": "Max", "to": "Pro", "to_resets_at": int(self.clock.at + 600),
+                          "resets_at": int(self.clock.at + 3600), "choices": ["yes", "no"]})
+        self.assertIn("Every account is at its limit. Pro resets first, at ", self.notes[0])
+        self.assertIn("Carry on there then?", self.notes[0])
+
+    def test_a_yes_carries_on_on_the_other_account_at_its_reset(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "yes")
+        r.tend()
+        self.assertEqual(self.waiting()["account"], "Pro")
+        self.later(600 + 60)
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON_AFTER_WAIT.format(
+            old="Max", kind="session", new="Pro", every="every account"))])
+        self.assertEqual(list(r.queue), [])
+
+    def test_a_yes_when_this_account_resets_first_carries_on_here(self):
+        self.limited(Pro=self.clock.at + 7200)
+        r = self.relay()
+        self.stop(r)
+        q = self.question()
+        self.assertEqual((q["kind"], q["to"], q["to_resets_at"]), ("first_reset", "Max", int(self.clock.at + 3600)))
+        self.answer("sid-k", q["id"], "yes")
+        r.tend()
+        self.later(3600 + 60)
+        r.tend()
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertEqual(r.moves, [])
+
+    def test_a_no_leaves_the_chat_as_it_is(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "no")
+        r.tend()
+        self.later(86400)
+        r.tend()
+        self.assertEqual((r.moves, list(r.queue), self.question(), self.waiting()), ([], [], None, None))
+
+    # -- auto and never: no question
+
+    def test_auto_with_every_account_at_its_limit_waits_for_the_first_reset_without_asking(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertIsNone(self.question())
+        self.assertEqual(self.waiting(), {"chat": "sid-k", "until": int(self.clock.at + 660), "account": "Pro",
+                                          "why": "auto"})
+        self.later(660)
+        r.tend()
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
+
+    def test_never_waits_for_its_own_reset_and_never_moves(self):
+        r = self.relay("never")
+        self.stop(r)  # Pro has room
+        self.assertIsNone(self.question())
+        self.assertEqual(self.waiting(), {"chat": "sid-k", "until": int(self.clock.at + 3660), "account": "Max",
+                                          "why": "never"})
+        self.later(3660)
+        r.tend()
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertEqual(r.moves, [])
+
+    # -- at the time
+
+    def test_nothing_is_sent_when_a_turn_ran_after_the_limit(self):
+        r = self.relay("never")
+        self.stop(r)
+        self.later(1800)
+        r.replied_at = self.clock.at  # you carried on yourself
+        self.later(1860)
+        r.tend()
+        self.assertEqual((list(r.queue), self.waiting()), ([], None))
+        self.assertIn("wait: sid-k carried on without longhaul (a turn ran after the limit), so nothing was sent",
+                      self.log_text())
+
+    def test_nothing_is_sent_when_claude_code_continued_by_itself(self):
+        r = self.relay("never")
+        self.stop(r)
+        self.later(3601)
+        (self.home / "stops.json").write_text(json.dumps({"sid-k": [
+            {"event": "Notification", "type": "quota_auto_resume_fired", "at": int(self.clock.at)}]}))
+        self.later(59)
+        r.tend()
+        self.assertEqual(list(r.queue), [])
+
+    def test_a_limit_error_since_is_no_turn_that_carried_on(self):
+        r = self.relay("never")
+        self.stop(r)
+        self.later(60)
+        self.stop(r, resets_in=3540)  # a message typed at the limit: the same reset
+        self.later(3600)
+        r.tend()
+        self.assertEqual(len(self.said(r)), 1)
+
+    def test_in_ask_the_target_at_its_limit_again_asks_again_and_never_moves_unasked(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "yes")
+        r.tend()
+        self.limited(Max=self.clock.at + 3600, Pro=self.clock.at + 5000)  # Pro's weekly limit, say
+        self.later(660)
+        r.tend()
+        self.assertEqual((r.moves, list(r.queue)), ([], []))
+        q = self.question()
+        self.assertEqual((q["kind"], q["to"]), ("first_reset", "Max"), "asked again: Max resets first now")
+        self.assertIn("wait: sid-k does not carry on on Pro: it is at its limit again, until", self.log_text())
+
+    def test_in_auto_the_target_at_its_limit_again_waits_for_the_next(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay("auto")
+        self.stop(r)
+        self.limited(Max=self.clock.at + 3600, Pro=self.clock.at + 5000)
+        self.later(660)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertEqual(self.waiting()["account"], "Max")
+
+    def test_a_target_signed_in_as_someone_else_is_not_used(self):
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "yes")
+        r.tend()
+        self.strangers.add("Pro")
+        self.later(660)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertIn("does not carry on on Pro: it is not signed in as expected", self.log_text())
+
+    def test_the_question_and_the_wait_go_with_the_chat(self):
+        r = self.relay()
+        self.stop(r)
+        r.forget_chat()
+        self.assertIsNone(self.question())
+        self.assertIn("closed with its question", self.log_text())
+        r = self.relay("never")
+        self.stop(r)
+        r.forget_chat()
+        self.assertIsNone(self.waiting())
+        self.assertIn("is cancelled: the chat closed", self.log_text())
+
+    def test_a_subagents_limit_line_holds_nothing(self):
+        r = self.relay()
+        r.hold_if_limit(json.dumps({"type": "assistant", "error": "rate_limit", "parent_tool_use_id": "toolu_1",
+                                    "message": {"content": []}}).encode())
+        self.assertFalse(r.paused)
+        self.assertIsNone(longhaul.limit_stop({"type": "assistant", "isSidechain": True, "isApiErrorMessage": True,
+                                               "error": "rate_limit", "timestamp": "2099-01-01T00:00:00Z",
+                                               "quotaLimits": {"status": "rejected"}}, 0))
+
+    # -- longhaul answer
+
+    def test_answer_writes_the_answer_beside_the_question_only_yours(self):
+        self.stop(self.relay())
+        q = self.question()
+        self.assertEqual(self.answer("sid-k", q["id"], "wait")[0], 0)
+        path = self.home / "questions" / "sid-k.answer.json"
+        self.assertEqual(json.loads(path.read_text()), {"id": q["id"], "choice": "wait", "at": int(self.clock.at)})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_answer_refuses_what_it_cannot_answer(self):
+        self.assertEqual(self.answer("sid-k", "q-000000000000", "move"),
+                         (2, "longhaul answer: chat sid-k has no open question."))
+        self.assertEqual(self.answer("../x", "q-000000000000", "move")[0], 2)
+        self.stop(self.relay())
+        q = self.question()
+        code, said = self.answer("sid-k", "q-000000000000", "move")
+        self.assertEqual(code, 2)
+        self.assertIn(f"is not the question chat sid-k has open", said)
+        code, said = self.answer("sid-k", q["id"], "yes")
+        self.assertEqual(code, 2)
+        self.assertIn("is not a choice of this question; its choices are move and wait", said)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (self.home / "questions" / "sid-k.json").write_text(json.dumps({**q, "relay_pid": dead.pid}))
+        code, said = self.answer("sid-k", q["id"], "move")
+        self.assertEqual(code, 2)
+        self.assertIn("the chat that asked has closed", said)
+        self.assertFalse((self.home / "questions" / "sid-k.answer.json").exists(), "a refusal writes nothing")
+        for said in (s for _, s in [self.answer("../x", "q-1", "move")]):
+            self.assertEqual(said.count("."), 1, "one plain sentence")
 
 
 class Pipe(StreamHarness):
@@ -20378,9 +20854,10 @@ class Switch(unittest.TestCase):
         # What the launch and the panel read is what it saved.
         with mock.patch.object(longhaul, "CONFIG", self.config), mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}):
             self.assertEqual((longhaul.config_switch(), longhaul.switch_mode()), ("auto", "auto"))
-        # Ask in the panel stays put: it cannot ask there.
+        # Ask in the panel asks too, in Longhaul's pane (keep working, K1).
         out = self.switch("ask")
-        self.assertIn(f"{longhaul.SWITCH_MODES['ask']}; the VS Code panel cannot ask, so there it stays put.", out.stdout)
+        self.assertIn(f"{longhaul.SWITCH_MODES['ask']}; the VS Code panel asks too, in Longhaul's pane, and with "
+                      "every account at its limit asks once whether to carry on at the first reset.", out.stdout)
         # LONGHAUL_SWITCH still wins where it is set, and the line says so.
         out = self.switch("auto", LONGHAUL_SWITCH="never")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
