@@ -1451,6 +1451,25 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                     f"No answer by the reset, so longhaul carries on with {here}.")
 
 
+def ask_first_reset(here: str, there: str, resets_at: float, every: str) -> str:
+    """In "ask", with every account at its limit and `there` resetting
+    before `here` (the keep-working plan, K2): ask_here()'s answer to
+    carrying on with `there` at its reset, asked until then; "no", unasked,
+    for a reset already past. A yes is the permission for that one move;
+    with no yes longhaul waits for `here`, as before. "auto" does it
+    without asking, which a question no one can answer says."""
+    if resets_at <= time.time():  # no one could answer in time, so nothing is asked
+        return "no"
+    at = clock(resets_at)
+    return ask_here(f"{every.capitalize()} is at its limit. {there} resets first, at {at}. Carry on there then?",
+                    f"y: carry on with {there} at {at}, n: wait for {here}, q: stop",
+                    f"longhaul waits for {here} and carries on with it", resets_at,
+                    f"carry on with {there} at its reset",
+                    f"{every.capitalize()} is at its limit. Answer in longhaul's terminal: carry on with {there} "
+                    f"at {at}?",
+                    f"No answer by {there}'s reset, so longhaul waits for {here}.")
+
+
 def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, there: str) -> str:
     """In "ask", before waiting for `first` to reset at `resets_at` in a
     folder, `where`, that `kept` keep, all at their limit (the ask-first
@@ -2029,6 +2048,9 @@ def run(opts) -> int:
     # conversation resumed by id starts where it last ran for the same
     # reason (D3d); --account chooses instead, and "auto" leaves it to pick().
     stay: str | None = None
+    # What the wait for `stay` says, once, when a yes to the first reset
+    # (K2) chose it: it is not the account the conversation stays on.
+    waiting: str | None = None
     if resume and mode != "auto" and not forced:
         stay = last_account(resume, accounts)
         if stay in denied:
@@ -2065,9 +2087,9 @@ def run(opts) -> int:
             if elsewhere is not None:
                 idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
             elif resets + RESET_MARGIN > time.time():
-                if not wait_until(resets + RESET_MARGIN,
-                                  f"{stay} is at its limit, and with switching set to {mode} "
-                                  "the conversation stays on it (or start it with --account NAME)"):
+                what, waiting = waiting or (f"{stay} is at its limit, and with switching set to {mode} "
+                                            "the conversation stays on it (or start it with --account NAME)"), None
+                if not wait_until(resets + RESET_MARGIN, what):
                     return 0
                 continue
             elif not signed_in_as_expected(accounts[names.index(stay)]):
@@ -2228,6 +2250,11 @@ def run(opts) -> int:
             verdict = decide_move(mode, consent=True, can_ask=not wait and signed_in_as_expected(accounts[nxt]))
             if verdict == "ask":
                 answer = ask_to_move(acct["name"], w.limit["kind"], w.limit["resets_at"], new)
+            elif mode == "ask" and wait and nxt != idx and wait < w.limit["resets_at"] \
+                    and signed_in_as_expected(accounts[nxt]):
+                # Every account at its limit, and another resets first (K2):
+                # offered once, here; a yes waits for that one and carries on there.
+                answer = ask_first_reset(acct["name"], new, wait, every)
             else:
                 answer = "yes" if verdict == "move" else "no"
             if answer == "stop":
@@ -2235,7 +2262,10 @@ def run(opts) -> int:
             if answer == "yes":  # always, in "auto"
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
                     old=acct["name"], kind=w.limit["kind"], new=new, every=every)
-                if mode == "ask":  # the question has said the rest
+                if mode == "ask" and wait:  # the wait at the top of the loop says when
+                    msg = f"Carrying on with {new} at its reset: reopening this conversation there with a carry-on message."
+                    waiting = f"{new} resets first"
+                elif mode == "ask":  # the question has said the rest
                     msg = f"Moving to {new}: reopening this conversation there with a carry-on message."
                 elif not wait:
                     msg += f" Carrying on with {new}."

@@ -586,15 +586,43 @@ class Loop(unittest.TestCase):
         self.run_longhaul(["idle_wait"], "--account", "Max", runs=1, LONGHAUL_IDLE_MOVE_SECONDS="0", LONGHAUL_SWITCH="ask")
         self.assertIn("Max ended: completed", (self.home / "longhaul.log").read_text())
 
-    def test_in_ask_mode_with_every_account_at_its_limit_longhaul_waits_for_its_own_without_asking(self):
-        # Pro resets first, so "auto" would carry on there. With no one asked,
-        # "ask" waits for Max.
+    def test_in_ask_mode_with_every_account_at_its_limit_and_this_one_first_longhaul_waits_without_asking(self):
+        # Max resets first: there is nothing to offer, so nothing is asked.
         started = time.time()
-        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3}}))
-        out, calls = self.run_longhaul([f"limit:{time.time() + 5}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y")
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y")
         self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
-        self.assertGreaterEqual(time.time() - started, 5)
+        self.assertGreaterEqual(time.time() - started, 2)
         self.assertNotIn("Move this conversation", out.stdout)
+        self.assertNotIn("resets first", out.stdout)
+
+    # Keep working (K2): with every account at its limit and another
+    # resetting first, "ask" offers it; a yes waits for it and carries on there.
+
+    def test_in_ask_mode_with_every_account_at_its_limit_a_yes_carries_on_with_the_first_to_reset(self):
+        started = time.time()
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
+        self.assertIn("Every account is at its limit. Pro resets first, at ", out.stdout)
+        self.assertIn(". Carry on there then? (y: carry on with Pro at ", out.stdout)
+        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            "The Max account hit its session limit while every account was at its limit, so longhaul waited for "
+            "the Pro account to reset"), calls[1]["args"][-1])
+        self.assertIn("asked to carry on with Pro at its reset: yes", (self.home / "longhaul.log").read_text())
+
+    def test_in_ask_mode_with_every_account_at_its_limit_a_no_waits_for_its_own(self):
+        started = time.time()
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3}", "exit"], LONGHAUL_SWITCH="ask", answer=b"n")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertGreaterEqual(time.time() - started, 3, "after Max's own reset")
+        self.assertIn("Pro resets first", out.stdout)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            "The Max account hit its session limit while every account was at its limit, so longhaul waited for "
+            "the Max account to reset"), calls[1]["args"][-1])
 
     def test_in_never_mode_a_limit_waits_for_the_reset_without_asking(self):
         out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="never", answer=b"y")
