@@ -656,6 +656,8 @@ class Loop(unittest.TestCase):
         self.assertNotIn("never moves a chat", last)
         # Sprint 5, D3d: a resume by id is a move too.
         self.assertIn("A conversation resumed by id starts on the account it last ran on in ask and never", last)
+        self.assertIn("at that account's limit, longhaul in ask first asks whether to start it on another with room",
+                      last)
         (self.home / "vscode.json").write_text(json.dumps({"switch_mid_session": True, "switch": "never"}))
         out, _ = self.run_longhaul([], "status", LONGHAUL_SWITCH="")
         self.assertIn("it is never (from vscode.json)", out.stdout.splitlines()[-1])
@@ -1146,6 +1148,163 @@ class Loop(unittest.TestCase):
         self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
         self.assertIn("Pro is at its limit", out.stdout)
         self.assertIn("--account", out.stdout, "how to start it elsewhere instead")
+
+    # 0.3.4, the ask-first plan of 2026-10-29 at a reopen: in ask, a
+    # conversation reopened by id on an account at its limit waited for the
+    # reset without a word of the other account (three days once, with
+    # personal-1 free). Now it asks first, as the limit does; only a yes
+    # starts it elsewhere, and no answer moves nothing.
+
+    def start_question(self, here, there, until, kind=None):
+        """The reopen's question, with its keys and what no answer does."""
+        limit, at = f"its {kind} limit" if kind else "its limit", longhaul.clock(until)
+        return (f"{here} is at {limit} until {at}. Start this conversation on {there} instead? "
+                f"(y: start on {there}, n: wait for {here}, q: stop). With no answer longhaul waits and carries on "
+                f"with {here} at {at}.")
+
+    def where_ran(self, sid):
+        return json.loads((self.home / "usage" / "sessions" / f"{sid}.json").read_text())["account"]
+
+    def test_in_ask_mode_a_resumed_conversation_at_its_limit_asks_to_start_on_an_account_with_room(self):
+        until = time.time() + 3600
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": until}}))
+        self.reading("Pro", five=30, week=100, week_in=3600)  # its weekly window is the full one
+        self.transcript("sid-old")
+        self.record("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="ask", answer=b"y")
+        self.assertEqual([c["config"] for c in calls], [None], out.stdout + out.stderr)
+        self.assertEqual(calls[0]["args"][:2], ["--resume", "sid-old"])
+        self.assertFalse(any("Carry on" in a for a in calls[0]["args"]), "a plain reopen: you type, no carry-on")
+        self.assertIn(self.start_question("Pro", "Max", until, "weekly"), out.stdout)
+        self.assertIn("Starting this conversation on Max.", out.stdout)
+        self.assertEqual(self.where_ran("sid-old"), "Max", "the next reopen starts there")
+        self.assertIn("asked to start on Max instead of waiting for Pro: yes", (self.home / "longhaul.log").read_text())
+
+    def test_in_ask_mode_a_no_or_no_terminal_at_the_reopen_waits_for_the_conversations_own_account(self):
+        for answer in (b"n", None):
+            with self.subTest(answer=answer):
+                (self.home / "calls.jsonl").unlink(missing_ok=True)
+                until = time.time() + 2
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": until}}))
+                self.transcript("sid-old")
+                self.record("sid-old", "Pro")
+                started = time.time()
+                out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="ask",
+                                               answer=answer)
+                self.assertEqual([c["config"] for c in calls], [str(self.pro)], out.stdout + out.stderr)
+                self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
+                self.assertIn("Pro is at its limit, and with switching set to ask the conversation stays on it",
+                              out.stdout)
+                self.assertNotIn("Starting this conversation on", out.stdout)
+                self.assertEqual(self.where_ran("sid-old"), "Pro")
+                if answer:
+                    self.assertIn(self.start_question("Pro", "Max", until), out.stdout)
+        # No terminal: the question is said with what longhaul does instead, and nothing waits for a key.
+        self.assertIn(f"Pro is at its limit until {longhaul.clock(until)}. Start this conversation on Max instead? "
+                      "There is no terminal to answer in, so longhaul waits and carries on with Pro at ", out.stdout)
+        self.assertNotIn("(y: start on Max", out.stdout)
+        self.assertIn("asked to start on Max instead of waiting for Pro: no", (self.home / "longhaul.log").read_text())
+
+    def test_in_ask_mode_q_at_the_reopens_question_stops_before_any_launch(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        self.transcript("sid-old")
+        self.record("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="ask", answer=b"q")
+        self.assertEqual((out.returncode, calls), (0, []), out.stdout + out.stderr)
+        self.assertIn("Stopped at your request. The conversation is saved. `longhaul -r sid-old` opens it again.",
+                      out.stdout)
+        self.assertEqual(self.where_ran("sid-old"), "Pro")
+
+    def test_the_reopens_question_never_offers_an_account_at_its_limit_signed_in_as_someone_else_or_not_allowed(self):
+        work, personal = self.repositories()
+        signed = dict(FAKE_EMAIL_MAX="first@example.com", FAKE_EMAIL_PRO="second@example.com")
+        cases = [("at its limit too", {"Max": time.time() + 3600}, signed, self.tmp),
+                 ("signed in as someone else", {}, dict(signed, FAKE_EMAIL_MAX="stranger@example.com"), self.tmp),
+                 ("kept for another repository", {}, signed, personal)]
+        self.pin_emails()
+        for why, limited, env, cwd in cases:
+            with self.subTest(why):
+                if cwd == personal:
+                    self.restrict("Max", work)
+                (self.home / "calls.jsonl").unlink(missing_ok=True)
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2,
+                                                                                    **limited}}))
+                self.transcript("sid-old")
+                self.record("sid-old", "Pro")
+                started = time.time()
+                out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, cwd=cwd, LONGHAUL_SWITCH="ask",
+                                               answer=b"y", **env)
+                self.assertEqual([c["config"] for c in calls], [str(self.pro)], out.stdout + out.stderr)
+                self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
+                self.assertNotIn("Start this conversation on", out.stdout)
+
+    def test_in_a_kept_folder_the_reopen_asks_only_the_folders_own_question(self):
+        # Max allowed anywhere but not here: the kept folder's question, once,
+        # which allows the chat; never the reopen's as well (no, then yes).
+        for answer in (b"n", b"y"):
+            with self.subTest(answer=answer):
+                (self.home / "calls.jsonl").unlink(missing_ok=True)
+                work = self.kept_work(time.time() + 2)
+                self.transcript("sid-old")
+                self.record("sid-old", "Pro")
+                out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, cwd=work, LONGHAUL_SWITCH="ask",
+                                               answer=answer)
+                self.assertEqual([c["config"] for c in calls], [str(self.pro) if answer == b"n" else None],
+                                 out.stdout + out.stderr)
+                self.assertEqual(out.stdout.count("Run this conversation on Max here?"), 1, out.stdout)
+                self.assertNotIn("Start this conversation on", out.stdout)
+        # Work kept for both: Max may be used here, so the reopen's own question offers it.
+        self.restrict("Max", work)
+        (self.home / "calls.jsonl").unlink(missing_ok=True)
+        until = time.time() + 3600
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": until}}))
+        self.record("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, cwd=work, LONGHAUL_SWITCH="ask", answer=b"y")
+        self.assertEqual([c["config"] for c in calls], [None], out.stdout + out.stderr)
+        self.assertIn(self.start_question("Pro", "Max", until), out.stdout)
+        self.assertNotIn("Run this conversation on", out.stdout)
+
+    def test_the_reopens_question_is_asked_in_ask_mode_only(self):
+        for mode, config in (("never", str(self.pro)), ("auto", None)):
+            with self.subTest(mode):
+                (self.home / "calls.jsonl").unlink(missing_ok=True)
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+                self.transcript("sid-old")
+                self.record("sid-old", "Pro")
+                out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH=mode, answer=b"y")
+                self.assertEqual([c["config"] for c in calls], [config], out.stdout + out.stderr)
+                self.assertNotIn("Start this conversation on", out.stdout)
+
+    def test_after_the_limits_own_question_the_reopen_does_not_ask_again(self):
+        for answer in (b"n", None):
+            with self.subTest(answer=answer):
+                (self.home / "calls.jsonl").unlink(missing_ok=True)
+                out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="ask",
+                                               answer=answer)
+                self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+                self.assertEqual(out.stdout.count("Move this conversation to Pro now?"), 1, out.stdout)
+                self.assertNotIn("Start this conversation on", out.stdout)
+
+    def test_a_relaunch_after_a_limit_the_limit_did_not_ask_about_asks_and_carries_on(self):
+        # The limit's choice, Team, is signed in as someone else, so the
+        # limit asks nothing; before the wait the reopen offers Max, and its
+        # yes carries on there with the limit's carry-on message.
+        (self.tmp / "team").mkdir()
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "Max", "config_dir": None, "email": "first@example.com"},
+            {"name": "Pro", "config_dir": str(self.pro), "email": "second@example.com"},
+            {"name": "Team", "config_dir": str(self.tmp / "team"), "email": "third@example.com"}]))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], "--account", "Pro",
+                                       LONGHAUL_SWITCH="ask", answer=b"y", FAKE_EMAIL_MAX="first@example.com",
+                                       FAKE_EMAIL_PRO="second@example.com")
+        self.assertEqual([c["config"] for c in calls], [str(self.pro), None], out.stdout + out.stderr)
+        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertIn("Start this conversation on Max instead?", out.stdout)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            "The Pro account hit its session limit, so longhaul reopened this conversation on the Max account."),
+            calls[1]["args"][-1])
+        self.assertIn("Moving to Max: reopening this conversation there with a carry-on message.", out.stdout)
 
     def test_the_supervisor_records_the_account_a_conversation_ran_on_without_a_status_line(self):
         out, _ = self.run_longhaul(["exit"], "--account", "Pro", runs=1)

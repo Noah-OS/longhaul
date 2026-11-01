@@ -36,10 +36,12 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   runs Claude alone: no question, no carry-on, no move. `longhaul
   pipe` cannot ask, so there "ask" acts as "never": it moves only in auto
   (an unattended move is never made without an explicit yes).
-  In "ask" this terminal never moves early (to ask it would close Claude),
-  and, in a folder kept for accounts that are all at their limit, it asks
-  before running the conversation on another account, which allows the
-  chat there (`longhaul allow`); no answer never moves it;
+  In "ask" this terminal never moves early (to ask it would close Claude);
+  a conversation reopened by id on an account at its limit asks first
+  whether to start on another account with room, and waits only without
+  a yes; and, in a folder kept for accounts that are all at their limit,
+  it asks before running the conversation on another account, which
+  allows the chat there (`longhaul allow`); no answer never moves it;
 - Remote Control lost while Claude sits idle: longhaul reopens the conversation,
   which connects it again (Claude Code reconnects short drops itself; this
   is for the ones it gives up on, after a VPN change or a long outage). A
@@ -83,7 +85,8 @@ longhaul's first account to the second one. `longhaul setup` builds the folders.
 Usage:
   longhaul                      new conversation (Remote Control on)
   longhaul -c | longhaul -r [ID]      continue the latest one | resume one (given
-                          its ID, it starts where it last ran in ask and never)
+                          its ID, it starts where it last ran in ask and never;
+                          at that account's limit ask offers one with room)
   longhaul -r 557ce21f          a short ID works when only one conversation matches
   longhaul --name api           the session's name on the phone (default: the folder)
   longhaul --account Pro        start on that account
@@ -830,6 +833,26 @@ def full_window(reading, now: float):
     return found
 
 
+# How far apart a usage reading's reset and the recorded limit's may be and
+# still be the same reset: both are the API's epoch seconds, a few apart
+# at most, and a 5-hour window is far wider.
+KIND_SLACK = 600
+
+
+def limit_kind(reading, resets_at: float):
+    """"session" or "weekly", the limit that keeps an account until
+    `resets_at`, by its usage reading: the window at NEAR_FULL or over that
+    resets then (within KIND_SLACK); else None, and the words say "its
+    limit". state.json keeps the reset alone, and a stale reading's window
+    names another reset, so the time must match."""
+    for key in ("five_hour", "seven_day"):
+        part = dict_at(reading, key)
+        resets, used = as_number(part.get("resets_at")), as_number(part.get("used_percentage"))
+        if resets is not None and used is not None and used >= NEAR_FULL and abs(resets - resets_at) <= KIND_SLACK:
+            return KIND[key]
+    return None
+
+
 def expires(reading, now: float) -> float:
     """When the soonest unused allowance on this account is lost.
 
@@ -1480,6 +1503,25 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                     f"No answer by the reset, so longhaul carries on with {here}.")
 
 
+def ask_to_start(here: str, kind: str | None, resets_at: float, there: str) -> str:
+    """In "ask", before a conversation reopened on `here` waits for its
+    limit to lift at `resets_at` (the ask-first plan of 2026-10-29: at a
+    limit, ask first): ask_here()'s answer to starting it on `there`
+    instead, asked until the reset; "no", unasked, for a reset already
+    past. ask_to_move()'s question, for a conversation not yet running:
+    nothing hit a limit just now, and nothing moves mid-turn. `kind`
+    ("weekly", "session") is named when the readings give it."""
+    if resets_at <= time.time():  # no one could answer in time, so nothing is asked
+        return "no"
+    limit, at = f"its {kind} limit" if kind else "its limit", clock(resets_at)
+    return ask_here(f"{here} is at {limit} until {at}. Start this conversation on {there} instead?",
+                    f"y: start on {there}, n: wait for {here}, q: stop",
+                    f"longhaul waits and carries on with {here} at {at}", resets_at,
+                    f"start on {there} instead of waiting for {here}",
+                    f"{here} is at {limit}. Answer in longhaul's terminal: start this conversation on {there}?",
+                    f"No answer by the reset, so longhaul carries on with {here}.")
+
+
 def ask_first_reset(here: str, there: str, resets_at: float, every: str) -> str:
     """In "ask", with every account at its limit and `there` resetting
     before `here` (the keep-working plan, K2): ask_here()'s answer to
@@ -2071,15 +2113,54 @@ def run(opts) -> int:
             prompt = CARRY_ON.format(old=carry[0], kind=carry[1], new=there)
         return i
 
+    def start_elsewhere(state: dict, seen: dict, wrong: set, resets_at: float):
+        """In "ask", before waiting for `stay`, at its limit until
+        `resets_at` (the ask-first plan of 2026-10-29: at a limit, ask
+        first; before 0.3.4 a reopen by id waited days with another account
+        free): ask_to_start()'s question about the account the limit would
+        offer, pick() skipping those not allowed here and those signed in
+        as someone else (added to `wrong`, as the launch's own choice adds
+        them). On a yes the index to launch on, the record moved there so
+        the next reopen starts there too, and for a relaunch after a limit
+        (`carry`) the carry-on naming the move; "stop" for q; None to wait
+        as before (no, no answer, no terminal, no account with room)."""
+        nonlocal prompt
+        skip = wrong | {stay}
+        while True:
+            i, until = pick(accounts, state, (names.index(stay) + 1) % len(names), skip=skip, seen=seen)
+            if i is None or until:
+                return None
+            if signed_in_as_expected(accounts[i]):
+                break
+            wrong.add(names[i])
+            skip.add(names[i])
+        there = names[i]
+        answer = ask_to_start(stay, limit_kind(seen.get(stay), resets_at), resets_at, there)
+        if answer != "yes":
+            return "stop" if answer == "stop" else None
+        if resume:  # now, not only at the launch's end: a terminal closed while Claude runs never gets there
+            note_session_account(resume, there)
+        if carry:
+            prompt = CARRY_ON.format(old=carry[0], kind=carry[1], new=there)
+            say(f"Moving to {there}: reopening this conversation there with a carry-on message.")
+        else:  # a plain reopen: you type the next message
+            say(f"Starting this conversation on {there}.")
+        return i
+
     # In "ask" and "never" the conversation reopens on the account it was on,
     # whatever pick() would prefer: only a yes at a limit moves it. Before,
     # a reopen after a crash could land on another account unasked. A
     # conversation resumed by id starts where it last ran for the same
     # reason (D3d); --account chooses instead, and "auto" leaves it to pick().
+    # At its limit "ask" asks first whether to start on an account with
+    # room (start_elsewhere()); "never" waits.
     stay: str | None = None
     # What the wait for `stay` says, once, when a yes to the first reset
     # (K2) chose it: it is not the account the conversation stays on.
     waiting: str | None = None
+    # The wait a question was last asked before, (account, reset): one
+    # question a wait, so the reopen's is not asked again after the limit's.
+    asked_for: tuple | None = None
     if resume and mode != "auto" and not forced:
         stay = last_account(resume, accounts)
         if stay in denied:
@@ -2110,7 +2191,13 @@ def run(opts) -> int:
             # Within the margin too: a question unanswered until the reset
             # second otherwise reopened before the limit had lifted (review).
             resets = state["limited_until"].get(stay, 0)
-            elsewhere = run_elsewhere(state, seen, stay, resets) if resets + RESET_MARGIN > time.time() else None
+            limited = resets + RESET_MARGIN > time.time()
+            elsewhere = run_elsewhere(state, seen, stay, resets) if limited else None
+            # Not after the kept folder's question either: that one comes only
+            # when every account allowed here is at its limit, so pick() finds none.
+            if elsewhere is None and limited and mode == "ask" and asked_for != (stay, resets):
+                asked_for = (stay, resets)
+                elsewhere = start_elsewhere(state, seen, wrong, resets)
             if elsewhere == "stop":
                 return stopped()
             if elsewhere is not None:
@@ -2277,6 +2364,7 @@ def run(opts) -> int:
             # else is never offered: a yes to it used to end longhaul (review,
             # Sprint 1); signed_in_as_expected says why.
             verdict = decide_move(mode, consent=True, can_ask=not wait and signed_in_as_expected(accounts[nxt]))
+            asked = True
             if verdict == "ask":
                 answer = ask_to_move(acct["name"], w.limit["kind"], w.limit["resets_at"], new)
             elif mode == "ask" and wait and nxt != idx and wait < w.limit["resets_at"] \
@@ -2285,7 +2373,7 @@ def run(opts) -> int:
                 # offered once, here; a yes waits for that one and carries on there.
                 answer = ask_first_reset(acct["name"], new, wait, every)
             else:
-                answer = "yes" if verdict == "move" else "no"
+                answer, asked = "yes" if verdict == "move" else "no", False
             if answer == "stop":
                 return stopped()
             if answer == "yes":  # always, in "auto"
@@ -2306,6 +2394,8 @@ def run(opts) -> int:
                     old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
                 carry = (acct["name"], w.limit["kind"])
                 log(msg)  # the wait at the top of the loop says it, with the time
+            if asked:  # the wait this question was about, for start_elsewhere(): asked once
+                asked_for = (stay, state["limited_until"].get(stay, 0))
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
             # carry on, and your next message goes to the new account. Only
@@ -14178,7 +14268,8 @@ def status(opts) -> int:
                 "turns that off.")
     print(f"Switching: {mode} ({source}): {SWITCH_MODES[mode]}. Change it with `longhaul switch ask|auto|never`, "
           f"--switch or LONGHAUL_SWITCH. {tail} longhaul pipe moves a session only when its driver passes --swap and the mode "
-          "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never.")
+          "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never; "
+          "at that account's limit, longhaul in ask first asks whether to start it on another with room.")
     if settings_note():
         print(settings_note())
     return 2 if problem else 0
