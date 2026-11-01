@@ -2,6 +2,14 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.4 - 2026-11-01
+
+One fix to the terminal's `ask` after 0.3.3.
+
+### Fixed
+
+- **`longhaul -r <id>` asks before it waits at a limit, in `ask`.** A conversation reopened by id starts on the account it last ran on. When that account was at its limit, Longhaul waited for the reset, days for a weekly limit, without a word about another account that had room. Now it asks first: "Pro is at its weekly limit until Wed 23:01. Start this conversation on Max instead?" A yes opens it there, and the next `longhaul -r` starts there too. No, no answer, or no terminal waits for the reset as before, and q stops. Only an account that may be used in the folder and is signed in as expected is offered. In a folder kept for particular accounts, its own question still comes, once. `never` still waits, and `auto` still picks.
+
 ## 0.3.3 - 2026-11-01
 
 Longhaul's accounts get a screen of their own, `/accounts`, and the work goes on at a usage limit: the VS Code panel can ask you, and a chat can carry on by itself at the first reset. The status line says when a newer Longhaul is out.
