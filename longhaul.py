@@ -26,16 +26,20 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   carries on on this one at its reset. With every account at its limit
   it asks once, "Max resets first, at 14:00. Carry on there then?", and
   that yes is the permission for that one move. No answer moves nothing,
-  and the chat stays as it is. In the panel "auto" moves, or carries on
-  at the first reset, without asking, and "never" carries on at this
-  account's reset. A carry-on waiting for a reset (LONGHAUL_HOME/waits/
-  <chat>.json) goes only to a chat idle since its limit: when Claude
-  Code's own wait or you carried on first, nothing is sent. The relay
-  stays in each panel chat for this, in every mode; "switch_mid_session":
-  false in LONGHAUL_HOME/vscode.json turns it off, and the panel then
-  runs Claude alone: no question, no carry-on, no move. `longhaul
-  pipe` cannot ask, so there "ask" acts as "never": it moves only in auto
-  (an unattended move is never made without an explicit yes).
+  and the chat stays as it is. A panel chat reopened on an account at
+  its limit asks at once, before a message meets the limit, and holds
+  your messages until a move takes them to the other account ("wait"
+  lets them through, to the limit's answer). In the panel "auto" moves,
+  or carries on at the first reset, without asking, and "never" carries
+  on at this account's reset. A carry-on waiting for a reset
+  (LONGHAUL_HOME/waits/<chat>.json) goes only to a chat idle since its
+  limit: when Claude Code's own wait or you carried on first, nothing is
+  sent. The relay stays in each panel chat for this, in every mode;
+  "switch_mid_session": false in LONGHAUL_HOME/vscode.json turns it off,
+  and the panel then runs Claude alone: no question, no carry-on, no
+  move. `longhaul pipe` cannot ask, so there "ask" acts as "never": it
+  moves only in auto (an unattended move is never made without an
+  explicit yes).
   In "ask" this terminal never moves early (to ask it would close Claude);
   a conversation reopened by id on an account at its limit asks first
   whether to start on another account with room, and waits only without
@@ -1047,13 +1051,15 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
     the panel wrapper and longhaul pipe (`who` names which in the log). In
     ask and never a session starts where it last ran, limited or not: there
     it stays at a limit anyway (decision 6 of the owner's record on
-    switching without a terminal, not shipped). None when the caller picks
-    instead: in auto, for a new session, with no record, or when the record
-    names an account not signed in as expected, one in `unmanaged`
-    (pipe: no email, or ~/.claude), or one that may not be used in the
-    repository `top` (the record never overrides a restriction). Each None
-    but auto's and a new session's has its line in the log: a session is
-    never moved from where it ran without a word (review, Sprint 5)."""
+    switching without a terminal, not shipped); in ask the panel's relay
+    then asks at once whether to move (Relay.ask_at_start()). None when
+    the caller picks instead: in auto, for a new session, with no record,
+    or when the record names an account not signed in as expected, one
+    in `unmanaged` (pipe: no email, or ~/.claude), or one that may not be
+    used in the repository `top` (the record never overrides a
+    restriction). Each None but auto's and a new session's has its line
+    in the log: a session is never moved from where it ran without a
+    word (review, Sprint 5)."""
     if not resumed or mode == "auto":
         return None
     last = last_account(resumed, accounts)
@@ -12241,9 +12247,10 @@ def open_elsewhere(sid, accounts=()) -> dict | None:
 def wrap(argv: list[str]) -> int:
     """The extension's process wrapper. Runs claude as the extension asked
     on the account longhaul picks (a chat reopened by id: the account it last
-    ran on, in ask and never); if anything in longhaul fails before the chat is
-    under way, runs it unchanged, since a broken wrapper would stop every
-    new chat in the panel."""
+    ran on, in ask and never; in ask, at that account's limit, the relay asks
+    at once); if anything in longhaul fails before the chat is under way,
+    runs it unchanged, since a broken wrapper would stop every new chat in
+    the panel."""
     global QUIET
     QUIET = True
     if argv and os.path.isabs(argv[0]) and os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK):
@@ -12297,9 +12304,16 @@ def wrap(argv: list[str]) -> int:
             notify(msg)
             return 1
         idx = resumed_index(resumed, accounts, mode, "panel", binary, top=top)  # a reopened chat: where it last ran
+        ask_first = None
         if idx is not None:
             until = load_state()["limited_until"].get(accounts[idx]["name"], 0)
-            if until > time.time():
+            # As the terminal's ask_to_start() decides it: nothing is asked
+            # about a reset already past, which the chat waits out there.
+            if until > time.time() and mode == "ask" and panel_mid_session():
+                # 0.3.4: the relay asks at once (Relay.ask_at_start()). Before,
+                # nothing asked until the first message met the limit.
+                ask_first = until
+            elif until > time.time():
                 # The terminal says this and names --account, which the panel
                 # has not: without it the chat got Claude's own limit error and
                 # no word of why (review, Sprint 5).
@@ -12338,6 +12352,7 @@ def wrap(argv: list[str]) -> int:
         relay = Relay(binary, args, accounts, idx, mode=mode)
         relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
         relay.denied = denied
+        relay.ask_first = ask_first
         relay.start()
     except Exception as e:
         try:
@@ -12511,7 +12526,9 @@ class Relay:
     lines go on); move is the swap above, wait and a yes to the first
     reset a carry-on at that reset (schedule()), sent only to a chat still
     idle then (carry_on()). auto, with nowhere to move, and never schedule
-    one without asking.
+    one without asking. A chat reopened by id on an account at its limit
+    is asked at once, before any message meets the limit (0.3.4,
+    ask_at_start()), and its messages wait for a move answered.
 
     The process ends with os._exit and claude's exit code: a normal exit
     would wait for the thread blocked on the panel's stdin and abort
@@ -12559,6 +12576,12 @@ class Relay:
         self.question, self.question_for = None, {}
         self.carry, self.carry_for = None, {}
         self.replied_at = 0.0
+        # A chat reopened by id on an account at its limit (0.3.4): that
+        # limit's reset, which wrap() sets for ask_at_start() to ask about;
+        # and the panel's user messages held from claude meanwhile, a list
+        # while they are held (holds() says when), else None.
+        self.ask_first: float | None = None
+        self.held: list | None = None
 
     # -- the pipes
 
@@ -12606,6 +12629,8 @@ class Relay:
             trace("panel>", "-", line)
             if self.asked and has_type(line, "control_response") and ASK_ID.encode() in line:
                 self.card_answered(line)  # Longhaul's own card: the answer is not Claude's
+                continue
+            if self.held is not None and b'"user"' in line and self.hold_user(line):
                 continue
             if not self.asked and ASK_PROBE.exists() and self.probe_card(line):
                 continue
@@ -12677,6 +12702,37 @@ class Relay:
             with self.cond:
                 self.paused = False
                 self.cond.notify_all()
+
+    def hold_user(self, line: bytes) -> bool:
+        """While held is a list: True when the panel's line is a user
+        message, kept there from claude (let_go_user() sends it on). Only
+        those: the panel's control requests and answers go on, so it stays
+        responsive, /accounts among them, for as long as no one answers."""
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return False
+        if not (isinstance(msg, dict) and msg.get("type") == "user"):
+            return False
+        with self.cond:
+            if self.held is None:  # let go meanwhile: it goes on behind the rest
+                return False
+            self.held.append(line)
+        log(f"panel: a message in {self.watch.sid if self.watch else 'a chat'} waits for the answer to its question")
+        return True
+
+    def let_go_user(self) -> None:
+        """The held messages go on, in their order, behind the lines queued
+        for claude: to the claude running, or, in a swap (move_to()), to the
+        one it starts. Holding ends. Never more than once a hold."""
+        with self.cond:
+            held, self.held = self.held, None
+            if held:
+                self.queue.extend(held)
+                self.cond.notify_all()
+        if held:
+            log(f"panel: {len(held)} message(s) held in {self.watch.sid if self.watch else 'a chat'} go on to "
+                f"{self.accounts[self.idx]['name']}")
 
     def to_claude(self) -> None:
         while True:
@@ -12976,12 +13032,48 @@ class Relay:
             return
         self.ask(limit, since, state)
 
-    def ask(self, limit: dict, since: float, state: dict | None = None) -> None:
+    def ask_at_start(self) -> None:
+        """A chat reopened by id on an account at its limit until
+        ask_first, in ask (0.3.4; the terminal's ask_to_start() asks the
+        same of `longhaul -r`): ask()'s question at once, before any
+        message meets the limit. Before, the reopened chat sat on that
+        account and nothing asked until the first message failed. The
+        kind is the usage reading's when its reset matches (limit_kind()),
+        else "usage": the pane names it. The claude on this account runs
+        meanwhile, for the panel's initialize and requests; holds() keeps
+        the panel's messages from it while a move is offered, since there
+        a message would only meet the limit, and lets them go otherwise
+        (settle_hold())."""
+        until, self.ask_first = self.ask_first, None
+        here = self.accounts[self.idx]
+        kind = limit_kind(readings(self.accounts).get(here["name"]), until) or "usage"
+        limit = {"resets_at": until, "kind": kind, "type": {v: k for k, v in KIND.items()}.get(kind)}
+        log(f"panel: {self.watch.sid} reopened on {here['name']}, at its {kind} limit until {clock(until)}; asking first")
+        self.ask(limit, time.time(), reopened=True)
+        self.settle_hold()
+
+    def holds(self) -> bool:
+        """Whether the panel's messages are held: while a reopen's move
+        question is open, so a message typed meanwhile reaches the account
+        a move goes to rather than meeting the limit here."""
+        return bool(self.question and self.question_for.get("reopened") and self.question["kind"] == "move")
+
+    def settle_hold(self) -> None:
+        """The held messages go on (let_go_user()) once nothing holds them:
+        no question, a first_reset one (every account is at its limit, so a
+        message meets one wherever it goes, and Claude Code keeps it in the
+        conversation for the carry-on), or a question not a reopen's."""
+        if self.held is not None and not self.holds():
+            self.let_go_user()
+
+    def ask(self, limit: dict, since: float, state: dict | None = None, reopened: bool = False) -> None:
         """Write this chat's question (QUESTIONS) and say it: "move" when an
         account other than this one has room now, "first_reset" when every
         account allowed here is at its limit, naming the one that resets
         first (this one, it may be). None for a chat with no id yet, or
-        with no account signed in as expected: the log says why."""
+        with no account signed in as expected: the log says why.
+        `reopened`: asked at a reopen (ask_at_start()), which a move
+        answered and the notification's words tell apart."""
         here_idx, sid = self.idx, self.watch.sid
         here = self.accounts[here_idx]
         state = load_state() if state is None else state
@@ -13011,20 +13103,26 @@ class Relay:
         except OSError as e:
             log(f"question: could not ask in {sid} ({e!r}); the chat stays as it is")
             return
-        self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt}
+        self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt, "reopened": reopened}
         if until:
             log(f"question: asked {sid} ({q['id']}) to carry on on {there} at {clock(until)} "
                 f"({self.every()} is at its limit)")
             said = (f"{self.every().capitalize()} is at its limit. {there} resets first, at {clock(until)}. "
                     "Carry on there then?")
+        elif reopened:
+            log(f"question: asked {sid} ({q['id']}) at its reopen to move from {here['name']} to {there} "
+                f"({here['name']}'s {limit['kind']} limit resets {clock(resets)}); its messages wait for the answer")
+            said = (f"{here['name']} is at its {limit['kind']} limit until {clock(resets)}. "
+                    f"Move this reopened chat to {there}?")
         else:
             log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} "
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
             said = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(resets)}). "
                     f"Move this chat to {there} and carry on?")
+        then = ("your messages wait for the answer, and with no answer nothing moves" if reopened and not until
+                else f"with no answer the chat stays on {here['name']}")
         # The README's way, longhaul switch auto, unless another place wins over config.json (panel_switch_fix()).
-        notify(f"{said} Answer in Longhaul's pane in the panel; with no answer the chat stays on {here['name']}. "
-               f"To move without asking, {panel_switch_fix()}.")
+        notify(f"{said} Answer in Longhaul's pane in the panel; {then}. To move without asking, {panel_switch_fix()}.")
 
     def tend(self) -> None:
         """Each round of loop(): the open question's answer, a question the
@@ -13038,16 +13136,19 @@ class Relay:
                 self.drop_question()
             else:
                 self.read_answer()
+            self.settle_hold()  # held messages wait no longer than their question
         if self.carry and time.time() >= self.carry["until"]:
             self.carry_on()
 
     def read_answer(self) -> None:
         """`longhaul answer`'s file beside the question, acted on as it
         says and removed with the question: move is switch() to the account
-        offered, wait a carry-on at this account's reset, yes one at the
-        offered account's, no nothing. An answer to another question, or a
-        choice not offered, is set aside: the command refuses those, so only
-        a hand could have written it."""
+        offered (at a reopen move_at_reopen()), wait a carry-on at this
+        account's reset, yes one at the offered account's, no nothing.
+        Messages held for the question go on with a move, else to the
+        claude running (tend()'s settle_hold()). An answer to another
+        question, or a choice not offered, is set aside: the command
+        refuses those, so only a hand could have written it."""
         q = self.question
         path = chat_file(QUESTIONS, q["chat"], ".answer")
         got = read_json(path)
@@ -13063,7 +13164,9 @@ class Relay:
         self.drop_question()
         log(f"question: {q['chat']} answered {choice} ({q['id']})")
         limit, since, to = about["limit"], about["since"], about["to"]
-        if choice == "move":
+        if choice == "move" and about.get("reopened"):
+            self.move_at_reopen(to, limit, since)
+        elif choice == "move":
             self.carry_on_now(to, limit, since, "answered", swap=True)
         elif choice == "wait":
             self.schedule(self.idx, q["resets_at"], "answered", limit, since)
@@ -13071,6 +13174,27 @@ class Relay:
             self.schedule(to, q["to_resets_at"], "answered", limit, since)
         else:
             log(f"question: {q['chat']} stays as it is on {q['from']}; nothing is scheduled")
+
+    def move_at_reopen(self, to: int, limit: dict, since: float) -> None:
+        """Move answered to a reopen's question (ask_at_start()): the
+        chat moves to accounts[to] with no carry-on message, since nothing
+        was cut off just now and your own message, held meanwhile, is the
+        next turn (move_to() sends the held ones there); the record moves
+        too, so the next reopen starts there. An account that cannot take
+        it now (unready()) is asked about again, as again() asks: never a
+        move unasked."""
+        here, sid, name = self.accounts[self.idx], self.watch.sid, self.accounts[to]["name"]
+        problem = self.unready(to)
+        if problem:
+            log(f"question: {sid} does not move to {name}: {problem}")
+            self.ask(limit, since, reopened=True)
+            return
+        if self.move_to(to, None):
+            note_session_account(sid, name)
+            log(f"panel: {sid} moved at its reopen from {here['name']}, at its {limit['kind']} limit, to {name} "
+                "(answered)")
+            notify(f"The panel chat moved to {name}: {here['name']} is at its {limit['kind']} limit until "
+                   f"{clock(limit['resets_at'])}.")
 
     def schedule(self, to: int, at: float, why: str, limit: dict, since: float) -> None:
         """A carry-on for this chat on accounts[to] at `at` plus
@@ -13209,6 +13333,9 @@ class Relay:
             if self.question:
                 log(f"question: {self.question['chat']} closed with its question ({self.question['id']}) "
                     "unanswered; nothing moves")
+                if self.held:
+                    log(f"panel: {len(self.held)} held message(s) in {self.question['chat']} never reached Claude: "
+                        "the chat closed first")
                 self.drop_question()
             if self.carry:
                 log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} at "
@@ -13221,7 +13348,10 @@ class Relay:
 
     def start(self) -> None:
         """Everything that can fail before the chat is under way, run in
-        wrap()'s try so a failure still gets the panel its claude."""
+        wrap()'s try so a failure still gets the panel its claude. For a
+        question at once (ask_first): the panel's messages held from its
+        first line, and the chat's id the one it was reopened by, which
+        the question names before claude's own record does."""
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, self.on_signal)
         started = time.time()
@@ -13229,12 +13359,20 @@ class Relay:
         handled = load_state().get("handled_limits", [])
         self.child = self.spawn(self.idx, self.args)
         self.watch = Watch(self.accounts[self.idx], self.child.pid, started, False, offsets=marks, handled=handled)
+        if self.ask_first:
+            self.watch.sid, self.held = resume_id(self.args), []
 
     def loop(self) -> int:
         code = 1
         try:
             threading.Thread(target=self.from_panel, daemon=True).start()
             threading.Thread(target=self.to_claude, daemon=True).start()
+            if self.ask_first:  # here, not in start(): the panel's initialize goes on while it asks
+                try:
+                    self.ask_at_start()
+                except Exception as e:  # nor may asking take it down: the messages go on
+                    log(f"panel relay error: {e!r}")
+                    self.let_go_user()
             while True:
                 try:
                     ended = self.child.wait(timeout=POLL)
@@ -13343,13 +13481,14 @@ class Relay:
             if not self.says:  # a driver tells its user from the `moved` line; a notification would say it twice
                 notify(msg)
 
-    def move_to(self, nxt: int, text: str, moved: dict | None = None) -> bool:
+    def move_to(self, nxt: int, text: str | None, moved: dict | None = None) -> bool:
         """The swap (the class's docstring): the panel's lines held, claude
         ended and started again on accounts[nxt] with the chat resumed,
         `moved` said first in a driver's stream, then `text`, the carry-on
-        message, then the held lines. True when the chat runs there; False
-        when it stayed on its account (claude would not start on the
-        other) or ended (on neither)."""
+        message (None for none: a move at a reopen), then the held lines,
+        the messages a reopen's question held last. True when the chat
+        runs there; False when it stayed on its account (claude would not
+        start on the other) or ended (on neither)."""
         here_idx, sid = self.idx, self.watch.sid
         here, new = self.accounts[here_idx], self.accounts[nxt]["name"]
         if not sid or self.init_request is None:
@@ -13379,13 +13518,15 @@ class Relay:
                 return False
             if moved:  # before the carry-on, so it comes before the new claude's reply
                 self.say_in_stream(moved)
-            self.send(child, {"type": "user", "uuid": str(uuid.uuid4()), "session_id": "",
-                              "parent_tool_use_id": None,
-                              "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+            if text is not None:
+                self.send(child, {"type": "user", "uuid": str(uuid.uuid4()), "session_id": "",
+                                  "parent_tool_use_id": None,
+                                  "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
             self.watch = Watch(self.accounts[nxt], child.pid, started, False, offsets=marks, handled=handled)
             return True
         finally:
             self.swapping = False
+            self.let_go_user()  # queued while the lines are still held: they reach the claude now running
             self.end_swap()
 
     def on_signal(self, sig, _frame) -> None:
