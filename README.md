@@ -134,6 +134,8 @@ Either way, the browser sign-in opens at once: sign in with that same email. Wha
 2. "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Press **Move and carry on**, or **Wait for the reset**.
 3. When every account is at its limit: "Every account is at its limit. Pro resets first, at 14:00. Carry on there then?" **Yes, carry on at 14:01** carries on by itself a minute after that reset. **No** leaves the chat as it is.
 
+A chat you reopen (after a VS Code reload, or with its tab reopened) on an account that is at its limit asks at once, before your first message. What you type meanwhile waits for your answer: **Move and carry on** sends it on Pro; **Wait for the reset** lets it through, where it gets the limit's answer, and carries on by itself after the reset.
+
 With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:01 on Pro` (a minute after the reset, to be safe).
 
 Longhaul stays in each panel chat in every mode. To turn that off, put this key in `~/.longhaul/vscode.json` (your file: make it if it is not there; Longhaul only reads it). The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. It counts for the chats you open after it.

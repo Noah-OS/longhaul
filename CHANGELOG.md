@@ -4,11 +4,12 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## 0.3.4 - 2026-11-01
 
-One fix to the terminal's `ask` after 0.3.3.
+In `ask`, a chat reopened on an account at its limit asks first, in the terminal and in the VS Code panel.
 
 ### Fixed
 
 - **`longhaul -r <id>` asks before it waits at a limit, in `ask`.** A conversation reopened by id starts on the account it last ran on. When that account was at its limit, Longhaul waited for the reset, days for a weekly limit, without a word about another account that had room. Now it asks first: "Pro is at its weekly limit until Wed 23:01. Start this conversation on Max instead?" A yes opens it there, and the next `longhaul -r` starts there too. No, no answer, or no terminal waits for the reset as before, and q stops. Only an account that may be used in the folder and is signed in as expected is offered. In a folder kept for particular accounts, its own question still comes, once. `never` still waits, and `auto` still picks.
+- **A VS Code panel chat reopened at a limit asks at once, in `ask`.** A chat reopened by VS Code (a reload, or its tab reopened) starts on the account it last ran on. When that account was at its limit, nothing asked until your first message failed. Now the question comes at once: "Max hit its weekly limit (resets Fri 02:00). Move this chat to Pro and carry on?" Until you answer, what you type waits; the panel's own requests, `/accounts` among them, still go through. **Move and carry on** opens the chat on Pro and sends what you typed there, with no carry-on message of Longhaul's; the next reopen starts there too. **Wait for the reset** lets it through, where it gets the limit's answer, and carries on by itself after the reset. When every account is at its limit, the first-reset question comes at once instead, and nothing waits. No answer moves nothing. `never` and `auto` are unchanged, and so is a panel with `"switch_mid_session": false`.
 
 ## 0.3.3 - 2026-11-01
 
