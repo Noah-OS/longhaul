@@ -17781,6 +17781,21 @@ class KeepWorking(unittest.TestCase):
         self.assertEqual((list(r.queue), r.held), ([line], None), "no move to wait for: the message goes on")
         self.assertIn("question: sid-k does not move to Pro: it is not signed in as expected", self.log_text())
 
+    def test_a_reopens_question_unanswered_at_the_reset_is_withdrawn_and_the_messages_go_on(self):
+        self.limited(Max=self.clock.at + 3600)
+        r = self.reopened(self.clock.at + 3600)
+        line = self.message()
+        r.hold_user(line)
+        self.later(3000)
+        r.tend()
+        self.assertEqual((len(r.held), self.question()["kind"]), (1, "move"), "before the reset it still asks")
+        self.later(660)  # the carry-on's minute: RESET_MARGIN after the reset
+        r.tend()
+        self.assertEqual((r.moves, list(r.queue), r.held, self.question()), ([], [line], None, None),
+                         "Max has room again: nothing moves, the message goes on there")
+        self.assertIn("is withdrawn: Max's limit has reset with no answer; nothing moves", self.log_text())
+        self.assertIn("panel: 1 message(s) held in sid-k go on to Max", self.log_text())
+
     # -- longhaul answer
 
     def test_answer_writes_the_answer_beside_the_question_only_yours(self):

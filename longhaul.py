@@ -29,7 +29,8 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   and the chat stays as it is. A panel chat reopened on an account at
   its limit asks at once, before a message meets the limit, and holds
   your messages until a move takes them to the other account ("wait"
-  lets them through, to the limit's answer). In the panel "auto" moves,
+  lets them through, to the limit's answer; with no answer they go on
+  once the limit resets). In the panel "auto" moves,
   or carries on at the first reset, without asking, and "never" carries
   on at this account's reset. A carry-on waiting for a reset
   (LONGHAUL_HOME/waits/<chat>.json) goes only to a chat idle since its
@@ -13136,6 +13137,13 @@ class Relay:
                 self.drop_question()
             else:
                 self.read_answer()
+                if self.holds() and time.time() >= self.question["carries_on_at"]:
+                    # A reopen's question outlived its limit: the account has
+                    # room again, so the held messages go on there, not a move.
+                    q = self.question
+                    log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: {q['from']}'s limit has "
+                        "reset with no answer; nothing moves")
+                    self.drop_question()
             self.settle_hold()  # held messages wait no longer than their question
         if self.carry and time.time() >= self.carry["until"]:
             self.carry_on()
