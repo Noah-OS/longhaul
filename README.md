@@ -55,7 +55,7 @@ In any chat:
 /longhaul:doctor
 ```
 
-It lists what is set up, one line each with ✔, ✘ or ⚠ and the next step: the plugin, the terminal command, Claude Code, updates, the status line, the VS Code panel, your accounts, the chats running now, the code maps, the hooks and their measured time, the features, and Codex if you have it. It only reads.
+It lists what is set up, one line each with ✔, ✘ or ⚠ and the next step: the plugin, the terminal command, Claude Code, updates, the status line, the VS Code panel, your accounts, the chats running now, the code maps (and Trail-Code's hooks left with no map), the hooks and their measured time, the features, and Codex if you have it. It only reads.
 
 **The terminal command** (optional, but most of this guide uses it). Installing the plugin does not create it. `/longhaul:doctor` gives the exact line to run under *Terminal command*, such as:
 

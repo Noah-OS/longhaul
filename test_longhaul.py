@@ -23191,6 +23191,65 @@ class Doctor(unittest.TestCase):
         self.assertEqual(c["mark"], "ok", "nothing to build with")
         self.assertIn("LONGHAUL_INDEX=off", c["said"])
 
+    TRAIL_STOP = 'node "${CLAUDE_PROJECT_DIR:-.}/.trail/hook.cjs" stop'
+
+    def trail_project(self, name="project", where="settings.json", command=TRAIL_STOP, ran=True) -> Path:
+        """A project whose .claude/<where> has a Stop hook running
+        `command` (Trail-Code's init writes one), with no .trail/; `ran`:
+        Longhaul's index record says it ran Trail's init there."""
+        top = self.tmp / name
+        self.write(top / ".claude" / where,
+                   {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}})
+        if ran:
+            self.write(longhaul.index_state_path(str(top)), {"top": str(top), "runs": {"trail": {"exit": 0}}})
+        return top
+
+    def test_the_code_maps_line_names_trails_hooks_left_with_no_map(self):
+        self.program("trail")
+        top, here = self.trail_project(), self.tmp / "elsewhere"
+        here.mkdir()
+        c = longhaul.doctor_maps(str(here))
+        self.assertEqual(c["mark"], "bad")
+        said = (f"Trail-Code's hooks in {top}/.claude/settings.json run {top}/.trail/hook.cjs, which is gone: "
+                "they fail in every chat there")
+        self.assertEqual(self.items(c)[said], "bad")
+        self.assertEqual(c["step"], f"rebuild the map: cd {top} && trail init --yes --no-global --no-statusline "
+                                    f"--no-agents, or remove Trail's hooks from {top}/.claude/settings.json")
+        self.write(top / ".trail" / "hook.cjs", "")
+        self.assertEqual(longhaul.doctor_maps(str(here))["mark"], "ok", "the map is back: nothing to say")
+
+    def test_trails_hooks_in_the_local_settings_with_trail_not_installed(self):
+        top = self.trail_project(where="settings.local.json")
+        c = longhaul.doctor_maps(str(self.tmp))
+        self.assertIn(f"Trail-Code's hooks in {top}/.claude/settings.local.json run {top}/.trail/hook.cjs, "
+                      "which is gone: they fail in every chat there", self.items(c))
+        self.assertEqual(c["step"], f"install Trail-Code and rebuild the map in {top}, or remove Trail's hooks "
+                                    f"from {top}/.claude/settings.local.json")
+
+    def test_the_folder_doctor_runs_in_is_looked_at_once(self):
+        self.program("trail")
+        top = self.trail_project(ran=False)
+        (top / ".git").mkdir()
+        (top / "src").mkdir()
+        c = longhaul.doctor_maps(str(top / "src"))
+        self.assertEqual(c["mark"], "bad", "its work tree's top, though Longhaul never ran Trail there")
+        self.write(longhaul.index_state_path(str(top)), {"top": str(top), "runs": {"trail": {"exit": 0}}})
+        c = longhaul.doctor_maps(str(top / "src"))
+        self.assertEqual(sum(".trail/hook.cjs" in text for text in self.items(c)), 1, "also in the index: once")
+
+    def test_no_word_for_settings_without_trails_hook_or_a_project_gone(self):
+        self.program("trail")
+        self.trail_project("plain", command="echo done")
+        self.write(self.trail_project("broken") / ".claude" / "settings.json", "{not json")
+        gone = self.trail_project("gone")
+        shutil.rmtree(gone)
+        self.trail_project("codegraph-only")
+        record = longhaul.index_state_path(str(self.tmp / "codegraph-only"))
+        self.write(record, {"top": str(self.tmp / "codegraph-only"), "runs": {"codegraph": {"exit": 0}}})
+        c = longhaul.doctor_maps(str(self.tmp))
+        self.assertEqual((c["mark"], [t for t in self.items(c) if "hook.cjs" in t]), ("ok", []),
+                         "Longhaul never ran Trail there: its settings are not looked at")
+
     def test_the_features_line_names_each_switch_and_where_auto_model_applies(self):
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "ok")

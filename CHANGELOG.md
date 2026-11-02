@@ -2,6 +2,14 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.5 - 2026-11-02
+
+`longhaul doctor` names Trail-Code's hooks left with no map.
+
+### Fixed
+
+- **`longhaul doctor` says when Trail-Code's hooks have no map to run.** Trail-Code's init, which Longhaul runs in a project, writes hooks in the project's `.claude/settings.json` that run `.trail/hook.cjs`. When the `.trail/` folder is gone later (the folder made again, or no longer a git repository, where Longhaul builds no map), every one of those hooks fails in every chat there with "Cannot find module", and doctor said nothing. Now its code maps line marks it ✘, for the folder doctor runs in and for each project Longhaul ran Trail-Code in, with the command that builds the map again, or the hooks to remove. A project whose map is there says nothing. Doctor still only reads.
+
 ## 0.3.4 - 2026-11-01
 
 In `ask`, a chat reopened on an account at its limit asks first, in the terminal and in the VS Code panel.

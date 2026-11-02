@@ -15329,18 +15329,57 @@ def doctor_chats(processes=None) -> dict:
     return doctor_result(said, items)
 
 
-def doctor_maps() -> dict:
+def trail_tops(cwd) -> list:
+    """The folders doctor_maps() looks in for Trail-Code's hooks left
+    with no map: the one it runs in (its work tree's top, else itself) and
+    each project Longhaul ran Trail's init in (its index/<key>.json names
+    the top), each once and only while it is there; never the home folder
+    or above (home_or_above())."""
+    tops = [work_tree(cwd) or cwd]
+    for path in sorted((LONGHAUL_HOME / "index").glob("*.json")):
+        entry = read_json(path)
+        if isinstance(entry.get("top") if isinstance(entry, dict) else None, str) and "trail" in dict_at(entry, "runs"):
+            tops.append(entry["top"])
+    seen, found = set(), []
+    for top in tops:
+        real = os.path.realpath(top)
+        if real not in seen and os.path.isdir(real) and not home_or_above(real):
+            seen.add(real)
+            found.append(top)
+    return found
+
+
+def trail_hooks_without_map(top: str) -> list:
+    """The settings files in `top`'s .claude/ whose hooks run Trail-Code's
+    `.trail/hook.cjs` while `top` has no such file: each of those hooks
+    fails in every chat there ("Cannot find module"). Trail's init writes
+    them, and a map gone since (the folder made again, or no longer a work
+    tree, where Longhaul builds no map) leaves them behind. Only the
+    `hooks` value is read; a file missing, unreadable or not JSON is passed
+    over."""
+    if os.path.isfile(os.path.join(top, ".trail", "hook.cjs")):
+        return []
+    return [path for path in (os.path.join(top, ".claude", name) for name in ("settings.json", "settings.local.json"))
+            if ".trail/hook.cjs" in json.dumps(dict_at(read_json(Path(path)), "hooks"))]
+
+
+def doctor_maps(cwd=None) -> dict:
     """9. The code maps' programs, CodeGraph and Trail-Code, found on PATH
     and runnable: a file that is there but not executable is ✘, its chmod
     the step; neither installed is ⚠ while the auto-index is on. One is
-    enough."""
+    enough. And Trail-Code's hooks left with no map (trail_tops(),
+    trail_hooks_without_map()) are ✘, each project's own item, with the
+    command that builds the map again; a project with its map says
+    nothing."""
     off = index_mode() == "off"
     items, runnable = [], 0
+    trail = None
     for program, name in (("codegraph", "CodeGraph"), ("trail", "Trail-Code")):
         hits = doctor_path_hits(program)
         found = next((path for path, ok in hits if ok), None)
         if found:
             runnable += 1
+            trail = found if program == "trail" else trail
             items.append(("ok", f"{name}: {home_path(found)}", None))
         elif hits and hits[0][1] is None:
             items.append(("bad", f"{name}: {home_path(hits[0][0])} links to a file that is gone",
@@ -15351,6 +15390,15 @@ def doctor_maps() -> dict:
             items.append((None, f"{name}: not installed", None))
     missing = "ok" if runnable or off else "warn"
     items = [(mark or missing, text, step) for mark, text, step in items]
+    for top in trail_tops(os.path.abspath(cwd or os.getcwd())):
+        files = trail_hooks_without_map(top)
+        if not files:
+            continue
+        where = ", ".join(home_path(path) for path in files)
+        rebuild = (f"rebuild the map: cd {shlex.quote(top)} && {' '.join(INDEX_COMMANDS['trail'])}" if trail
+                   else f"install Trail-Code and rebuild the map in {home_path(top)}")
+        items.append(("bad", f"Trail-Code's hooks in {where} run {home_path(top)}/.trail/hook.cjs, which is gone: "
+                             "they fail in every chat there", f"{rebuild}, or remove Trail's hooks from {where}"))
     said = ("the auto-index is off (LONGHAUL_INDEX=off)" if off
             else f"{runnable} of 2 found; Longhaul builds a map with one in the background")
     return doctor_result(said, items, mark=missing,
