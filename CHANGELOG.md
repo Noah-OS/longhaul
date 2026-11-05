@@ -2,6 +2,21 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.6 - 2026-11-05
+
+Where an account may be used can be changed, in `/accounts` and with `longhaul folders`, and an account used nowhere says why.
+
+### Added
+
+- **An account's folders in `/accounts`.** Each account's page has a Folders part: "anywhere", or each folder it may be used in with **Remove**; a field to type a folder and **Add folder**; and **Anywhere**, which drops the list, while it has one. A folder may start with `~/`. The buttons run Longhaul's own command, one at a time, and the page shows the result.
+- **`longhaul folders NAME`** says where an account may be used. `--add PATH` adds a folder (repeat it for more; `~` allowed and kept as written; one not made yet is kept, with a note), `--remove PATH` takes one off (matched by real path, so `~/work/` and a link to it count), and `--anywhere` drops the list. Removing the last folder drops the list too, so the account may be used anywhere no other account keeps. Other keys in `accounts.json` and the accounts' order are kept, and each change is one line in the log. An unknown name or a path that is not absolute changes nothing (exit 2). The plugin's `bin/longhaul`, which a chat's Claude runs, does not run it yet, so `/longhaul:manage` cannot; the buttons in `/accounts` and a terminal can.
+- **`longhaul status --json` gives `kept_out_by`** for each account: for one with no list of folders, the accounts whose folders include `/`, which keep it out of every folder; `[]` for any other.
+
+### Fixed
+
+- **An account used nowhere says why.** A folder an account's list names is kept for the accounts that name it, so an account with no list is used only where no list does. Beside accounts whose folders include `/`, it is used nowhere, and nothing said so: `/accounts` and `longhaul status` said "anywhere". Now `longhaul add` without `--repo` says it at once ("Max, Pro keep every folder (their folders include /), so Team will not be used anywhere until its folders are set: in /accounts, on Team's page, or with `longhaul folders Team --add PATH` (or take / off their lists)."), and so do `longhaul status`, `longhaul folders`, the doctor (⚠) and the account's line and page in `/accounts`.
+- **The `--account` refusal says the real reason.** For an account with no list, refused where other accounts keep the folder, it said "its repositories field is not a list of absolute paths". Now: "Team may not be used in ~/code: ~/code is kept for Max, Pro (their folders include it)". The no-account line names `longhaul folders NAME --add` as a way out too.
+
 ## 0.3.5 - 2026-11-02
 
 `longhaul doctor` names Trail-Code's hooks left with no map.

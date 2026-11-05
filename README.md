@@ -148,6 +148,8 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 
 **Keep a folder for one account:** `longhaul add work you@example.com --repo ~/work` uses that account only in `~/work` and the repositories inside it, and keeps the folder for it: a chat there on another account is refused before anything is sent. When the account kept for a folder is at its limit, `longhaul` in a terminal asks whether to run the chat on another one; `longhaul allow <chat id>` lets one refused chat's prompts through on its account for 30 days.
 
+**Change an account's folders.** In `/accounts`, open the account: its Folders part lists them, each with **Remove**; type a folder and press **Add folder**, or press **Anywhere** to drop the list. In a terminal, `longhaul folders work` says where `work` may be used; `longhaul folders work --add ~/clients` adds a folder, `--remove ~/work` takes one off, and `--anywhere` drops the list. An account with no folders of its own is used only where no other account's folders reach: beside an account whose folders include `/`, it is used nowhere until it has folders of its own, and `/accounts`, `longhaul status` and `longhaul folders` say so.
+
 **From a terminal**, `longhaul` starts a chat (`-c` continues the latest, `-r <id>` resumes one) that it watches and moves at a limit. A chat moved to another account takes that account's connectors and artifacts, not the first one's. [Account switching](https://github.com/Noah-OS/longhaul/wiki/Account-Switching) has the rest.
 
 ## 5. From the VS Code chat
@@ -162,7 +164,7 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 - install or remove the status line, and turn Claude Code's auto-update for Longhaul on or off;
 - forget the recorded limits, allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
 
-What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
+What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. An account's folders change with the buttons in `/accounts` or `longhaul folders` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
 
 ## 6. Codex
 
