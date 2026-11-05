@@ -4,7 +4,7 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## 0.3.6 - 2026-11-05
 
-Where an account may be used can be changed, in `/accounts` and with `longhaul folders`, and an account used nowhere says why.
+Where an account may be used can be changed, in `/accounts` and with `longhaul folders`, and an account used nowhere says why. Running chats see account and setting changes, and a carry-on is no longer cancelled by a line that was no reply. Trail-Code's map is no longer built by default.
 
 ### Added
 
@@ -12,8 +12,18 @@ Where an account may be used can be changed, in `/accounts` and with `longhaul f
 - **`longhaul folders NAME`** says where an account may be used. `--add PATH` adds a folder (repeat it for more; `~` allowed and kept as written; one not made yet is kept, with a note), `--remove PATH` takes one off (matched by real path, so `~/work/` and a link to it count), and `--anywhere` drops the list. Removing the last folder drops the list too, so the account may be used anywhere no other account keeps. Other keys in `accounts.json` and the accounts' order are kept, and each change is one line in the log. An unknown name or a path that is not absolute changes nothing (exit 2). The plugin's `bin/longhaul`, which a chat's Claude runs, does not run it yet, so `/longhaul:manage` cannot; the buttons in `/accounts` and a terminal can.
 - **`longhaul status --json` gives `kept_out_by`** for each account: for one with no list of folders, the accounts whose folders include `/`, which keep it out of every folder; `[]` for any other.
 
+### Changed
+
+- **Longhaul no longer runs Trail-Code's `trail init` by default.** The code index is CodeGraph's alone; `LONGHAUL_INDEX=all` adds Trail-Code, and `off` turns both off. Without `all`, Longhaul runs no `trail` command, neither an init nor a rebuild. Projects that already have a `.trail/` keep it, and Longhaul deletes nothing. In a measured test, a saved lesson kept a fresh session from repeating a mistake, and one line in the project's `CLAUDE.md` did the same for about 22% less. Trail-Code's telemetry is on for the whole machine by default.
+- **`longhaul pipe`'s `moved` line** can carry `"why": "account_removed"` or `"account_not_allowed"`, for a move made while the session was idle, with no carry-on message.
+- **The doctor no longer recommends Trail-Code** unless `LONGHAUL_INDEX=all`. It still warns when Trail's hooks in `.claude/settings*.json` run a `.trail/hook.cjs` that is gone.
+
 ### Fixed
 
+- **A running chat sees account and setting changes.** The terminal, the VS Code panel and `longhaul pipe` read `accounts.json` and the switching mode only once, at launch. In real use, a chat waited hours for one account's reset while another had been allowed since; chats kept asking after `longhaul switch auto`; and one ran on an account removed since, with every prompt refused. Now each reads `accounts.json`, `config.json` and, in the panel, `vscode.json` again when they change: before each pick, limit decision, question and carry-on, and while it waits for a reset. In auto, a carry-on waiting for a reset goes at once when an account allowed there has room. In ask, a question about the first reset is asked again as a move. `--switch` and `LONGHAUL_SWITCH` still win. A file that cannot be read keeps what was read before, said once in the log.
+- **A chat on an account removed, or no longer allowed in its folder, moves off it.** In auto it moves to an allowed account the next time it is idle. In ask or never it says so once, and closing and reopening the chat moves it. Such an account is never waited for or reopened on.
+- **`longhaul remove NAME` names the chats still running on the account**, with their process, kind and folder, and says what will happen to them.
+- **A carry-on is no longer cancelled, nor a question withdrawn, by a line that was no reply.** Only a top-level assistant message of the chat's own Claude counts, not a subagent's line, Claude Code's own `<synthetic>` one, an API error, or an assistant object inside another line. After a repeat stop, only a reply after it counts. Twice in one day, a carry-on scheduled for a reset was skipped this way.
 - **An account used nowhere says why.** A folder an account's list names is kept for the accounts that name it, so an account with no list is used only where no list does. Beside accounts whose folders include `/`, it is used nowhere, and nothing said so: `/accounts` and `longhaul status` said "anywhere". Now `longhaul add` without `--repo` says it at once ("Max, Pro keep every folder (their folders include /), so Team will not be used anywhere until its folders are set: in /accounts, on Team's page, or with `longhaul folders Team --add PATH` (or take / off their lists)."), and so do `longhaul status`, `longhaul folders`, the doctor (⚠) and the account's line and page in `/accounts`.
 - **The `--account` refusal says the real reason.** For an account with no list, refused where other accounts keep the folder, it said "its repositories field is not a list of absolute paths". Now: "Team may not be used in ~/code: ~/code is kept for Max, Pro (their folders include it)". The no-account line names `longhaul folders NAME --add` as a way out too.
 

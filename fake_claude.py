@@ -8,7 +8,7 @@ Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
 rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
 exit_after_signin_change | clear_then_crash | stay |
 session_end:<reason>:<code>[:<sid>] | stop_failure:<error>[:<sid>] |
-quota_note:<type>[:<sid>]
+quota_note:<type>[:<sid>] | file:<name>=<text>
 
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
 2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
@@ -27,6 +27,9 @@ Claude Code does at a moment of its wait at a usage limit (2.1.234+), the
 same way: first in a launch, then the plan's next step. Right after a
 `limit_busy:<resetsAt>` it is the end of the wait Claude Code started at
 that stop: a second on, with the status file still saying busy.
+`file:<name>=<text>` writes <text> to LONGHAUL_HOME/<name> while Claude
+runs, as a mode or an account saved meanwhile is, then acts out the plan's
+next step in the same launch.
 `--version` prints FAKE_VERSION.
 """
 
@@ -112,6 +115,15 @@ def run_hooks(event: str, **fields) -> None:
 
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 session(status="busy")
+
+while step.startswith("file:"):
+    # file:<name>=<text>: LONGHAUL_HOME/<name> written while Claude runs (a
+    # mode or an account saved meanwhile, the log audit of 2026-11-05), then
+    # the plan's next step in the same launch.
+    name, _, text = step[len("file:"):].partition("=")
+    step = plan.pop(0) if plan else "exit"
+    save_plan()
+    (home / name).write_text(text)
 
 def quota_note(step: str) -> None:
     """A `quota_note:<type>[:<sid>]` step's Notification hooks."""
