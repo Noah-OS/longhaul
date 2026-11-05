@@ -199,9 +199,10 @@ Usage:
                           At startup it gives Auto Model's guide (longhaul models),
                           whatever LONGHAUL_GUARD is.
                           At startup in a git work tree with no code map, starts
-                          `codegraph init` or `trail init` in the background, once
-                          per project (the README says what each writes);
-                          LONGHAUL_INDEX=off turns that off. At startup, too,
+                          `codegraph init` in the background, once per project
+                          (the README says what it writes); LONGHAUL_INDEX=all
+                          adds `trail init` (Trail-Code), LONGHAUL_INDEX=off
+                          turns both off. At startup, too,
                           once a day, asks GitHub for the latest release in the
                           background (LONGHAUL_UPDATE_CHECK=off turns it off),
                           and says in one line when a newer Longhaul is out, or
@@ -5629,11 +5630,15 @@ def inspect(opts) -> int:
 # ---------------------------------------------------------------- index
 #
 # Longhaul builds a repository's code map itself (Sprint 7, G4), unless
-# told not to (LONGHAUL_INDEX=off; on by default since 2026-10-23): at a new session's start
+# told not to (LONGHAUL_INDEX=off; on by default since 2026-10-23, CodeGraph
+# alone since 2026-11-02): at a new session's start
 # in a git work tree with no map, the guard's startup hook starts
-# `codegraph init -y`, or `trail init --yes --no-global --no-statusline
-# --no-agents`, or both, in the work tree's top level, detached, and
-# returns at once; the model is told in one sentence per program.
+# `codegraph init -y`, and with LONGHAUL_INDEX=all also `trail init --yes
+# --no-global --no-statusline --no-agents`, in the work tree's top level,
+# detached, and returns at once; the model is told in one sentence per
+# program. Without `all` Longhaul runs no `trail` command at all, no init
+# and no refresh, and deletes no `.trail/` (the owner, 2026-11-02: "Stop it
+# by default", after the Trail test, which saved no tokens).
 # Nothing is installed: a program is found on the hook's PATH (its
 # absolute entries alone, and never inside the repository itself) or
 # it is not, and the runner runs it by the path it was found at. Never
@@ -5687,11 +5692,13 @@ INDEX_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
 
 def index_mode() -> str:
     """LONGHAUL_INDEX, read at call time as guard_mode() is: "off" is off,
-    anything else (unset included) is on. On by default, CodeGraph's and
-    Trail's init both, since the owner's decision of 2026-10-23 ("on by
-    default for everyone", "both by default"), which ends the opt-in of
-    2026-10-21."""
-    return "off" if os.environ.get("LONGHAUL_INDEX") == "off" else "on"
+    "all" is CodeGraph's init and Trail's both, anything else (unset
+    included) is "on", CodeGraph's alone. On by default since the owner's
+    decision of 2026-10-23, which ends the opt-in of 2026-10-21; Trail's
+    half is opt-in again since the owner's decision of 2026-11-02 ("Stop it
+    by default"): `all` is the two programs of before."""
+    value = os.environ.get("LONGHAUL_INDEX")
+    return value if value in ("off", "all") else "on"
 
 
 def index_top(cwd):
@@ -5722,14 +5729,14 @@ def index_plan(data: dict, index: str) -> list:
     a `startup` SessionStart of the main conversation (no agent_id), with
     the index on, the session attended (under Codex, not a `codex exec`
     run: codex_exec_run()) and the cwd in a work tree index_top()
-    accepts, each program found, with the path it was found at: the
+    accepts, each program found (CodeGraph alone, unless the index is "all"), with the path it was found at: the
     runner runs that path and looks nothing up again. Whether a program's
     map is there already is the state's question (index_due), not this
     one's. Nothing is started or written here, and the refusals logged
     are the unattended session's and the exec run's (review, Sprint 7,
     F9: the live check and a user's "why not" read it there); the others
     say nothing."""
-    if index != "on" or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
+    if index not in ("on", "all") or data.get("hook_event_name") != "SessionStart" or data.get("source") != "startup":
         return []
     if data.get("agent_id") is not None:
         return []  # a subagent's start is not the session's
@@ -5742,8 +5749,11 @@ def index_plan(data: dict, index: str) -> list:
     top = index_top(data.get("cwd"))
     if top is None:
         return []
-    found = {program: index_program(program, top) for program in INDEX_COMMANDS}
-    return [(program, top, found[program]) for program in INDEX_COMMANDS if found[program]]
+    # CodeGraph's alone unless the index is "all": no `trail` command runs
+    # otherwise (the owner, 2026-11-02), not even for a project with a .trail/.
+    programs = [p for p in INDEX_COMMANDS if index == "all" or p != "trail"]
+    found = {program: index_program(program, top) for program in programs}
+    return [(program, top, found[program]) for program in programs if found[program]]
 
 
 def codex_exec_run(data: dict) -> bool:
@@ -6170,8 +6180,8 @@ def index_note(program: str, top: str) -> str:
 # sessions, 87% of whose searches ran inside subagents); it is context,
 # never a denial, the record keeps the count and never the pattern, and
 # without the index it says nothing of it. At startup the same hook
-# also runs the auto-init (the index region above) when LONGHAUL_INDEX
-# is on, whatever LONGHAUL_GUARD says: the two switches are independent.
+# also runs the auto-init (the index region above, CodeGraph's alone
+# unless LONGHAUL_INDEX=all) when LONGHAUL_INDEX is not off, whatever LONGHAUL_GUARD says: the two switches are independent.
 # On Codex (the Codex plan's X7) the same hook runs through
 # hooks/codex_hook.py, on Bash: Codex has no Read tool, and every shell
 # command reaches PreToolUse as Bash, each one a code cell runs included
@@ -15562,22 +15572,24 @@ def trail_hooks_without_map(top: str) -> list:
 
 
 def doctor_maps(cwd=None) -> dict:
-    """9. The code maps' programs, CodeGraph and Trail-Code, found on PATH
-    and runnable: a file that is there but not executable is ✘, its chmod
-    the step; neither installed is ⚠ while the auto-index is on. One is
-    enough. And Trail-Code's hooks left with no map (trail_tops(),
+    """9. The code maps' programs found on PATH and runnable: CodeGraph, and
+    Trail-Code only under LONGHAUL_INDEX=all (the owner, 2026-11-02:
+    Longhaul no longer builds or recommends a Trail map by default). A file
+    that is there but not executable is ✘, its chmod the step; none
+    installed is ⚠ while the auto-index is on. One is enough. And Trail-Code's hooks left with no map (trail_tops(),
     trail_hooks_without_map()) are ✘, each project's own item, with the
     command that builds the map again; a project with its map says
     nothing."""
     off = index_mode() == "off"
     items, runnable = [], 0
-    trail = None
-    for program, name in (("codegraph", "CodeGraph"), ("trail", "Trail-Code")):
+    every = index_mode() == "all"
+    programs = (("codegraph", "CodeGraph"), ("trail", "Trail-Code")) if every else (("codegraph", "CodeGraph"),)
+    trail = next((path for path, ok in doctor_path_hits("trail") if ok), None)  # for the hooks' step below
+    for program, name in programs:
         hits = doctor_path_hits(program)
         found = next((path for path, ok in hits if ok), None)
         if found:
             runnable += 1
-            trail = found if program == "trail" else trail
             items.append(("ok", f"{name}: {home_path(found)}", None))
         elif hits and hits[0][1] is None:
             items.append(("bad", f"{name}: {home_path(hits[0][0])} links to a file that is gone",
@@ -15598,9 +15610,10 @@ def doctor_maps(cwd=None) -> dict:
         items.append(("bad", f"Trail-Code's hooks in {where} run {home_path(top)}/.trail/hook.cjs, which is gone: "
                              "they fail in every chat there", f"{rebuild}, or remove Trail's hooks from {where}"))
     said = ("the auto-index is off (LONGHAUL_INDEX=off)" if off
-            else f"{runnable} of 2 found; Longhaul builds a map with one in the background")
+            else f"{runnable} of {len(programs)} found; Longhaul builds a map with one in the background")
     return doctor_result(said, items, mark=missing,
-                         step=f"install CodeGraph (`{CODEGRAPH_INSTALL['npm']}`) or Trail-Code; Longhaul installs neither")
+                         step=f"install CodeGraph (`{CODEGRAPH_INSTALL['npm']}`)" + (" or Trail-Code" if every else "")
+                         + "; Longhaul installs neither")
 
 
 def doctor_features() -> dict:
