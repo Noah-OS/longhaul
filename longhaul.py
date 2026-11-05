@@ -1540,6 +1540,78 @@ def switch_mode(flag: str | None = None) -> str:
     return mode
 
 
+def saved_switch() -> str:
+    """The mode a running terminal chat or `longhaul pipe` session re-reads
+    (LiveSettings) when neither --switch nor LONGHAUL_SWITCH set it:
+    config.json's, else "ask", as switch_mode() reads it at launch."""
+    return config_switch() or "ask"
+
+
+def file_mark(path: Path):
+    """(mtime in ns, size) of `path`, None when it is not there: how a
+    running chat tells that a file changed since it last read it."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def settings_marks() -> dict:
+    """file_mark() of each file a running chat re-reads (LiveSettings), by
+    path: accounts.json, config.json and vscode.json. Taken before a
+    launch reads them, so a change made while it starts is seen."""
+    return {str(path): file_mark(path) for path in (LONGHAUL_HOME / "accounts.json", CONFIG, VSCODE_CONFIG)}
+
+
+class LiveSettings:
+    """accounts.json and the switching mode as a running chat sees them
+    (the log audit of 2026-11-05, #1). The terminal's supervisor and the
+    panel's relay read both once, at launch: a chat waited 3¾ h for one
+    account's reset while another had been allowed for hours, three went
+    on asking after auto was saved, and one ran on an account removed
+    since, every prompt refused. check() re-reads them before each
+    decision that uses them, and only when a file's mtime or size has
+    changed since the last look.
+
+    A file that cannot be read keeps what was read before, said once in
+    the log; so does one that lists no accounts, since the stand-in for
+    no file is a launch's, and moving a running chat onto ~/.claude by it
+    would be a move nobody chose. The mode is re-read by `reread`, the
+    launch's own reader without its log line; None when it came from
+    --switch or LONGHAUL_SWITCH, which still win over any file."""
+
+    def __init__(self, accounts: list[dict], mode: str, reread=None, marks: dict | None = None,
+                 who: str = "panel"):
+        self.accounts, self.mode, self.reread, self.who = accounts, mode, reread, who
+        self.marks = settings_marks() if marks is None else marks
+        self.problem = None
+
+    def check(self) -> set:
+        """What changed since the last look, re-read: "accounts", "mode",
+        both or neither."""
+        marks = settings_marks()
+        moved = {path for path, mark in marks.items() if mark != self.marks.get(path)}
+        if not moved:
+            return set()
+        self.marks, changed = marks, set()
+        if str(LONGHAUL_HOME / "accounts.json") in moved:
+            found, problem = read_accounts_file()
+            why = unreadable_text(problem) if problem else None if found else "accounts.json lists no accounts"
+            if why and why != self.problem:
+                log(f"{self.who}: {why}; this chat keeps the {plural(len(self.accounts), 'account')} it had")
+            self.problem = why
+            if not why and found != self.accounts:
+                self.accounts = found
+                changed.add("accounts")
+        if self.reread and moved & {str(CONFIG), str(VSCODE_CONFIG)}:
+            mode = self.reread()
+            if mode != self.mode:
+                self.mode = mode
+                changed.add("mode")
+        return changed
+
+
 def terminal_fd():
     """This terminal's stdin, to ask in, or None: no terminal, or a closed stdin."""
     try:
@@ -12342,6 +12414,7 @@ def wrap(argv: list[str]) -> int:
             log(f"panel: '{' '.join(args[:2])}' runs as the extension asked, not on an account longhaul manages")
             notify("Signing in or out in the panel does not change longhaul's accounts; use longhaul setup for those.")
             os.execv(binary, [binary] + args)
+        marks = settings_marks()  # before the read: a change made while the chat starts is seen (Relay.refresh())
         accounts, problem = load_accounts()
         chat = is_chat(args)
         if problem:
@@ -12424,9 +12497,12 @@ def wrap(argv: list[str]) -> int:
             note_session_account(resumed, acct["name"])
         if not chat or not panel_mid_session():  # only the JSON false turns the relay off
             os.execve(binary, [binary] + args, wrapper_env(acct))
-        relay = Relay(binary, args, accounts, idx, mode=mode)
+        # The mode is read again as it changes (Relay.refresh()), unless
+        # LONGHAUL_SWITCH in VS Code's environment set it, which wins.
+        reread = None if panel_switch_source()[1] == "env" else panel_switch_in_force
+        relay = Relay(binary, args, accounts, idx, mode=mode, reread=reread, marks=marks)
         relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
-        relay.denied = denied
+        relay.denied, relay.top = denied, top
         relay.ask_first = ask_first
         relay.start()
     except Exception as e:
@@ -12455,7 +12531,10 @@ def pipe(argv: list[str]) -> int:
     Times are epoch seconds; "why" is Claude's rateLimitType.
     - moved {"from", "to", "why"}: the session moved from one account to
       another. Written only with --swap, in auto, before the carry-on
-      message.
+      message. "why" is also account_removed or account_not_allowed for
+      a move, while the session was idle and with no carry-on message,
+      off an account accounts.json no longer lists or no longer allows in
+      the session's folder (2026-11-05).
     - all_limited {"until"}: a limit, and no account has room until then.
       Written only with --swap, in auto.
     - stays {"on", "until", "why", "switch"}: a limit, and the session
@@ -12510,6 +12589,7 @@ def pipe(argv: list[str]) -> int:
         # check lets through, so a missing file would have run the session
         # on the panel's own sign-in. One that cannot be read is said as the
         # terminal says it, exit 2 (UX review, Sprint 8).
+        marks = settings_marks()  # before the read, for Relay.refresh()
         accounts, problem = read_accounts_file()
         if problem:
             log(f"pipe: {unreadable_text(problem)}")
@@ -12565,10 +12645,12 @@ def pipe(argv: list[str]) -> int:
         at_limit = (", swapping at a limit" if opts.swap and mode == "auto"
                     else f", staying at a limit (switching: {mode})" if opts.swap else "")
         log(f"pipe: {opts.name or 'a session'} on {acct['name']}{at_limit}")
+        # --switch and LONGHAUL_SWITCH win; else config.json's is read again as it changes (Relay.refresh()).
+        reread = None if opts.switch or os.environ.get("LONGHAUL_SWITCH") else saved_switch
         relay = Relay(CLAUDE, args, accounts, idx, env=no_git_env if opts.no_git_sign_in else env_for,
-                      swap=opts.swap, says=True, mode=mode)
+                      swap=opts.swap, says=True, mode=mode, reread=reread, marks=marks)
         relay.bad.update(unmanaged | denied)  # switch() never moves the session onto an account in bad
-        relay.denied = denied
+        relay.denied, relay.unmanaged, relay.top, relay.managed_only = denied, unmanaged, top, True
         relay.start()
     except Exception as e:
         log(f"pipe: could not start: {e!r}")
@@ -12610,7 +12692,8 @@ class Relay:
     (Fatal Python error, exit 134)."""
 
     def __init__(self, binary: str, args: list[str], accounts: list[dict], idx: int, *,
-                 env=wrapper_env, swap: bool = True, says: bool = False, mode: str = "never"):
+                 env=wrapper_env, swap: bool = True, says: bool = False, mode: str = "never",
+                 reread=None, marks: dict | None = None):
         self.binary, self.args, self.accounts, self.idx = binary, args, accounts, idx
         # The panel's relay keeps its defaults. longhaul pipe passes its own
         # environment, whether it may swap accounts, and says=True for the
@@ -12618,6 +12701,25 @@ class Relay:
         # `swap` is the front end's consent, `mode` the user's switching: a
         # move needs both (the owner's decision record, not shipped).
         self.env, self.swap, self.says, self.mode = env, swap, says, mode
+        self.who = "pipe" if says else "panel"
+        # accounts.json and the mode as they are now, not as they were at
+        # launch (refresh(), the log audit of 2026-11-05, #1): `reread` is
+        # the mode's reader, None for one set by --switch or LONGHAUL_SWITCH;
+        # `marks` the files' as the launch found them, before it read them.
+        self.live = LiveSettings(accounts, mode, reread, marks, self.who)
+        # The chat's repository (wrap() and pipe() set it), which the
+        # accounts' folders are checked against again at each re-read;
+        # managed_only: pipe's rule, no account without an email or a
+        # folder of its own (unmanaged). gone: the accounts accounts.json
+        # no longer lists that this chat still names (its own, a question's
+        # or a carry-on's), kept at the end of self.accounts and never
+        # chosen again. off_done: the (account, off()) pairs already acted
+        # on, each once.
+        self.top = None
+        self.managed_only = False
+        self.unmanaged: set = set()
+        self.gone: set = set()
+        self.off_done: set = set()
         self.cond = threading.Condition()
         self.queue: collections.deque = collections.deque()
         self.paused = False
@@ -13064,12 +13166,131 @@ class Relay:
         if reader:
             reader.join(timeout=5)
 
+    # -- the accounts and the mode as they are now (the log audit of 2026-11-05, #1)
+
+    def refresh(self) -> None:
+        """accounts.json and the mode re-read when a file changed
+        (LiveSettings), before each decision that uses them: each round of
+        tend(), at a limit, at a reopen's question and at a carry-on. A
+        mode changes only where no --switch or LONGHAUL_SWITCH set it."""
+        changed = self.live.check()
+        sid = (self.watch.sid if self.watch else None) or "a chat"
+        if "mode" in changed:
+            log(f"{self.who}: switching in {sid} is now {self.live.mode}, as saved since it began (it was {self.mode})")
+            self.mode = self.live.mode
+        if "accounts" in changed:
+            self.use_accounts(self.live.accounts, sid)
+
+    def use_accounts(self, found: list[dict], sid: str) -> None:
+        """The accounts re-read: this chat's account found again by name
+        (self.idx), and the ones the choosers skip worked out again for the
+        chat's folder (denied_in(), and pipe's unmanaged); those claude
+        would not start on stay skipped. The open question's and the
+        carry-on's account are found again by name too. Any of those no
+        longer listed is kept at the end (gone), for the claude running on
+        it and so their indices still name it, and skipped: a carry-on
+        for one then picks again (unready()). This chat's account removed,
+        or no longer allowed here, is acted on in tend() (off)."""
+        here = self.accounts[self.idx]
+        failed = self.bad - self.denied - self.unmanaged - self.gone
+        listed, gone = list(found), set()
+        names = [a["name"] for a in listed]
+        abouts = [about for about in (self.question_for, self.carry_for) if about.get("to") is not None]
+        for acct in [here] + [self.accounts[about["to"]] for about in abouts]:
+            if acct["name"] not in names:
+                listed.append(acct)
+                names.append(acct["name"])
+                gone.add(acct["name"])
+        for about in abouts:
+            about["to"] = names.index(self.accounts[about["to"]]["name"])
+        denied = denied_in(found, self.top) if self.top else set()
+        unmanaged = ({a["name"] for a in found if not a.get("email") or not a.get("config_dir")}
+                     if self.managed_only else set())
+        self.accounts, self.idx = listed, names.index(here["name"])
+        self.denied, self.unmanaged, self.gone = denied, unmanaged, gone
+        self.bad = failed | denied | unmanaged | gone
+        log(f"{self.who}: {sid} read accounts.json again: {plural(len(found), 'account')}, "
+            f"{len(denied)} not allowed here")
+        if self.off() and (here["name"], self.off()) not in self.off_done:
+            log(f"{self.who}: {sid} runs on {self.off_text()}")
+
+    def off(self) -> str | None:
+        """Why the account this chat runs on may not be kept: "removed"
+        from accounts.json, or "not_allowed" in its folder since; None."""
+        name = self.accounts[self.idx]["name"]
+        return "removed" if name in self.gone else "not_allowed" if name in self.denied else None
+
+    def off_text(self) -> str:
+        """off() in words, naming the account."""
+        name = self.accounts[self.idx]["name"]
+        if self.off() == "removed":
+            return f"{name}, which was removed from Longhaul's accounts"
+        return f"{name}, which may no longer be used in {home_path(self.top)}"
+
+    def idle(self) -> bool:
+        """Whether the chat may be moved now: its claude idle, no swap or
+        hold under way, no question or carry-on open (each decides a move
+        of its own), and no background agent writing, which a move would
+        stop."""
+        if self.question or self.carry or self.swapping or self.paused or self.held is not None:
+            return False
+        return self.watch.status == "idle" and not self.watch.agents_busy()
+
+    def tend_off(self) -> None:
+        """The chat's account was removed, or may no longer be used here
+        (use_accounts()), once: in auto, where the front end allows a
+        move (swap), the chat moves to an account allowed here the next
+        time it is idle (move_off()); else it stays, and the notification
+        says so and that reopening the chat moves it. Never again for the
+        same reason: no loop."""
+        key = (self.accounts[self.idx]["name"], self.off())
+        if not key[1] or key in self.off_done:
+            return
+        if self.mode == "auto" and self.swap:
+            if self.idle():
+                self.off_done.add(key)
+                self.move_off()
+            return
+        self.off_done.add(key)
+        sid, text = self.watch.sid or "a chat", self.off_text()
+        log(f"{self.who}: {sid} stays on {text} (switching is {self.mode}); reopening it moves it")
+        notify(f"This chat runs on {text}. It stays there; close it and open it again to move it to an "
+               "account allowed here.")
+
+    def move_off(self) -> None:
+        """tend_off()'s move, as a limit's move goes (move_to()), with no
+        carry-on message: the chat is idle, so nothing was cut off, and your
+        next message goes there. The record moves too, so a reopen starts
+        there. With no account to move to it stays, said once."""
+        here_idx, sid, text, why = self.idx, self.watch.sid, self.off_text(), self.off()
+        here = self.accounts[here_idx]
+        nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), load_state(),
+                                      wrong=set(self.bad))
+        if nxt is None or until or nxt == here_idx:
+            none = ("no account allowed here is signed in as expected" if nxt is None
+                    else "every account allowed here is at its limit")
+            log(f"{self.who}: {sid} stays on {text}: {none}")
+            notify(f"This chat runs on {text}, and {none}, so it stays there. Close it and open it again later to "
+                   "move it.")
+            return
+        if self.says and self.init_request is None:
+            self.init_request = PIPE_INITIALIZE  # the driver sent none
+        new = self.accounts[nxt]["name"]
+        moved = ({"type": "longhaul", "subtype": "moved", "from": here["name"], "to": new, "why": f"account_{why}"}
+                 if self.says else None)
+        if self.move_to(nxt, None, moved):
+            note_session_account(sid, new)
+            log(f"{self.who}: {sid} moved, while idle, from {text}, to {new}")
+            if not self.says:
+                notify(f"The panel chat moved to {new}: it ran on {text}.")
+
     # -- keep working (K1, K2)
 
     def at_limit(self) -> None:
         """The chat's own claude stopped at a usage limit: decide_move()'s
         verdict. The panel asks now (K1), with Longhaul's pane; longhaul
         pipe still cannot, so there ask stays, as never does."""
+        self.refresh()
         verdict = decide_move(self.mode, consent=self.swap, can_ask=not self.says)
         if verdict == "move":
             self.switch()
@@ -13127,6 +13348,7 @@ class Relay:
         the panel's messages from it while a move is offered, since there
         a message would only meet the limit, and lets them go otherwise
         (settle_hold())."""
+        self.refresh()
         until, self.ask_first = self.ask_first, None
         here = self.accounts[self.idx]
         kind = limit_kind(readings(self.accounts).get(here["name"]), until) or "usage"
@@ -13210,7 +13432,12 @@ class Relay:
     def tend(self) -> None:
         """Each round of loop(): the open question's answer, a question the
         chat has made moot by carrying on, and a carry-on that is due
-        (past due after a sleep: then at the first round awake)."""
+        (past due after a sleep: then at the first round awake); and
+        first, accounts.json and the mode as they are now (refresh()), and
+        a chat whose account was removed or is no longer allowed here
+        (tend_off())."""
+        self.refresh()
+        self.tend_off()
         if self.question:
             if self.replied_at > self.question_for["since"]:
                 q = self.question
@@ -13314,6 +13541,7 @@ class Relay:
         you did) or Claude Code's word that it continued the chat
         (quota_auto_resume_fired) means the work goes on already, and
         nothing is sent."""
+        self.refresh()
         c, about = self.carry, self.carry_for
         self.drop_carry()
         if self.replied_at > about["since"] or quota_continued(c["chat"], about["since"]):
@@ -13326,6 +13554,8 @@ class Relay:
         """Why accounts[idx] cannot take the chat now, or None: at its limit
         again, signed in as someone else, or not to be used here."""
         acct = self.accounts[idx]
+        if acct["name"] in self.gone:  # removed from accounts.json since (use_accounts())
+            return "it was removed from Longhaul's accounts"
         if acct["name"] in self.bad:
             return "it may not be used here"
         until = load_state()["limited_until"].get(acct["name"], 0)

@@ -17369,6 +17369,9 @@ class KeepWorking(unittest.TestCase):
         def __init__(self):
             self.sid, self.limit, self.limit_seen_at, self.status = "sid-k", None, None, "idle"
 
+        def agents_busy(self):
+            return False
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.home = self.tmp / "home"
@@ -17377,6 +17380,9 @@ class KeepWorking(unittest.TestCase):
         self.clock, self.notes, self.strangers = self.Clock(float(int(time.time()))), [], set()
         for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
                         mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"),
+                        mock.patch.object(longhaul, "CONFIG", self.home / "config.json"),
+                        mock.patch.object(longhaul, "VSCODE_CONFIG", self.home / "vscode.json"),
+                        mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}),
                         mock.patch.object(longhaul, "RESET_MARGIN", 60),
                         mock.patch.object(longhaul, "time", self.clock),
                         mock.patch.object(longhaul, "notify", self.notes.append),
@@ -17387,14 +17393,14 @@ class KeepWorking(unittest.TestCase):
         self.accounts = [{"name": "Max", "config_dir": str(self.tmp / "max"), "email": "first@example.com"},
                          {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "second@example.com"}]
 
-    def relay(self, mode="ask"):
-        r = longhaul.Relay("claude", [], self.accounts, 0, mode=mode)
+    def relay(self, mode="ask", **kw):
+        r = longhaul.Relay("claude", [], self.accounts, 0, mode=mode, **kw)
         r.watch = self.Watch()
         r.init_request = {"type": "control_request", "request_id": "x", "request": {"subtype": "initialize"}}
         r.moves = []
 
         def move_to(nxt, text, moved=None):
-            r.moves.append((self.accounts[nxt]["name"], text))
+            r.moves.append((r.accounts[nxt]["name"], text))
             r.idx = nxt
             return True
         r.move_to = move_to
@@ -17726,6 +17732,162 @@ class KeepWorking(unittest.TestCase):
         self.stop(r)  # before any round of tend() saw the reply
         r.tend()
         self.assertEqual(self.question()["id"], first, "still open: the reply came before the latest stop")
+
+    # The log audit of 2026-11-05 (#1): a running chat sees accounts.json
+    # and the saved mode as they are now, not as they were at its launch.
+
+    def write_accounts(self, accounts):
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
+
+    def account(self, name, **more):
+        return {"name": name, "config_dir": str(self.tmp / name.lower()), "email": f"{name.lower()}@example.com",
+                **more}
+
+    def here(self, r):
+        """r's chat in a folder of its own, as wrap() sets it: the folder."""
+        here = self.tmp / "here"
+        here.mkdir(exist_ok=True)
+        r.top = str(here)
+        return here
+
+    def test_an_account_allowed_here_added_mid_chat_is_moved_to_at_the_next_limit_in_auto(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 7200)
+        r = self.relay("auto")
+        self.here(r)
+        elsewhere = self.account("Elsewhere", repositories=[str(self.tmp / "other")])
+        self.write_accounts(self.accounts + [elsewhere, self.account("Team")])
+        self.stop(r)
+        self.assertEqual(r.moves, [("Team", longhaul.CARRY_ON.format(old="Max", kind="session", new="Team"))])
+        self.assertIsNone(self.waiting())
+        self.assertIn("panel: sid-k read accounts.json again: 4 accounts, 1 not allowed here", self.log_text())
+
+    def test_without_a_change_the_accounts_file_is_not_read_again(self):
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        with mock.patch.object(longhaul, "read_accounts_file", side_effect=AssertionError("read again")):
+            for _ in range(3):
+                r.tend()
+            self.stop(r)
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
+
+    def test_a_mode_saved_mid_chat_is_used_at_the_next_limit(self):
+        config = self.home / "config.json"
+        config.write_text(json.dumps({"switch": "ask"}))
+        r = self.relay("ask", reread=longhaul.panel_switch_in_force)
+        config.write_text(json.dumps({"switch": "auto"}))  # as `longhaul switch auto` saves it
+        self.stop(r)
+        self.assertIsNone(self.question(), "auto asks nothing")
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
+        self.assertIn("panel: switching in sid-k is now auto, as saved since it began (it was ask)", self.log_text())
+
+    def test_a_mode_from_the_environment_or_a_flag_is_not_read_again(self):
+        config = self.home / "config.json"
+        config.write_text(json.dumps({"switch": "ask"}))
+        r = self.relay("ask")  # no reader: LONGHAUL_SWITCH or --switch set it
+        config.write_text(json.dumps({"switch": "auto"}))
+        self.stop(r)
+        self.assertEqual((self.question()["kind"], r.moves), ("move", []))
+
+    def test_an_unreadable_accounts_file_mid_chat_keeps_the_old_list(self):
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        (self.home / "accounts.json").write_text(unreadable_accounts(*self.accounts)["a trailing comma"])
+        for _ in range(3):
+            r.tend()
+        self.write_accounts([])
+        r.tend()
+        self.stop(r)
+        self.assertEqual([name for name, _ in r.moves], ["Pro"], "the list read at launch")
+        log = self.log_text()
+        self.assertEqual(log.count("panel: accounts.json is not readable: not JSON"), 1, "said once")
+        self.assertIn("; this chat keeps the 2 accounts it had", log)
+        self.assertIn("panel: accounts.json lists no accounts; this chat keeps the 2 accounts it had", log)
+
+    def test_the_chats_account_removed_mid_chat_moves_to_another_when_idle_in_auto(self):
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        self.write_accounts(self.accounts[1:])
+        r.watch.status = "busy"
+        r.tend()
+        self.assertEqual(r.moves, [], "not while Claude works")
+        self.assertIn("panel: sid-k runs on Max, which was removed from Longhaul's accounts", self.log_text())
+        r.watch.status = "idle"
+        for _ in range(3):
+            r.tend()
+        self.assertEqual(r.moves, [("Pro", None)], "once, and no carry-on message: nothing was cut off")
+        self.assertEqual(longhaul.last_account("sid-k", r.accounts), "Pro", "a reopen starts there")
+        self.assertIn("panel: sid-k moved, while idle, from Max, which was removed from Longhaul's accounts, to Pro",
+                      self.log_text())
+        self.assertEqual(self.notes, ["The panel chat moved to Pro: it ran on Max, which was removed from "
+                                      "Longhaul's accounts."])
+
+    def test_the_chats_account_removed_in_auto_with_nowhere_to_go_is_said_once(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay("auto")
+        self.write_accounts(self.accounts[1:])
+        for _ in range(3):
+            r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertEqual(self.notes, ["This chat runs on Max, which was removed from Longhaul's accounts, and every "
+                                      "account allowed here is at its limit, so it stays there. Close it and open it "
+                                      "again later to move it."])
+
+    def test_the_chats_account_removed_mid_chat_in_never_or_ask_is_said_once(self):
+        for mode in ("never", "ask"):
+            self.write_accounts(self.accounts)
+            r = self.relay(mode)
+            self.write_accounts(self.accounts[1:])
+            for _ in range(3):
+                r.tend()
+            self.assertEqual(r.moves, [], mode)
+            self.assertIn(f"panel: sid-k stays on Max, which was removed from Longhaul's accounts (switching is "
+                          f"{mode}); reopening it moves it", self.log_text())
+        self.assertEqual(self.notes, ["This chat runs on Max, which was removed from Longhaul's accounts. It stays "
+                                      "there; close it and open it again to move it to an account allowed here."] * 2)
+
+    def test_the_chats_account_no_longer_allowed_here_is_said_in_ask_and_left_in_auto(self):
+        restricted = [{**self.accounts[0], "repositories": [str(self.tmp / "other")]}, self.accounts[1]]
+        for mode, moves in (("ask", []), ("auto", [("Pro", None)])):
+            self.write_accounts(self.accounts)
+            r = self.relay(mode)
+            here = self.here(r)
+            self.write_accounts(restricted)
+            r.tend()
+            r.tend()
+            self.assertEqual(r.moves, moves, mode)
+        self.assertEqual(self.notes[0], f"This chat runs on Max, which may no longer be used in "
+                                        f"{longhaul.home_path(str(here))}. It stays there; close it and open it again "
+                                        "to move it to an account allowed here.")
+        self.assertEqual(len(self.notes), 2)
+
+    def test_a_carry_on_for_an_account_removed_since_picks_again(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "yes")
+        r.tend()
+        self.assertEqual(self.waiting()["account"], "Pro")
+        self.write_accounts(self.accounts[:1])
+        self.later(660)
+        r.tend()
+        self.assertEqual((r.moves, list(r.queue)), ([], []))
+        self.assertIn("wait: sid-k does not carry on on Pro: it was removed from Longhaul's accounts", self.log_text())
+        q = self.question()
+        self.assertEqual((q["kind"], q["to"]), ("first_reset", "Max"), "asked again, never moved unasked")
+
+    def test_a_carry_on_finds_its_account_again_by_name(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 600, Team=self.clock.at + 9000)
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Pro")
+        self.write_accounts([self.account("Team")] + self.accounts)  # an account before the others
+        self.later(660)
+        r.tend()
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
 
     def test_in_ask_the_target_at_its_limit_again_asks_again_and_never_moves_unasked(self):
         self.limited(Pro=self.clock.at + 600)
