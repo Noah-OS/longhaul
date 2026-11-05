@@ -1564,6 +1564,19 @@ def settings_marks() -> dict:
     return {str(path): file_mark(path) for path in (LONGHAUL_HOME / "accounts.json", CONFIG, VSCODE_CONFIG)}
 
 
+def find_account(acct: dict, accounts: list[dict]):
+    """`acct` among `accounts` read again (LiveSettings): the one with its
+    name, else the one on its config folder, by real path (renamed in the
+    file, or the stand-in for no file now listed under a name of its own);
+    None when neither is there: it was removed."""
+    named = next((a for a in accounts if a.get("name") == acct.get("name")), None)
+    if named is not None:
+        return named
+    real = os.path.realpath(config_of(acct))
+    return next((a for a in accounts if (a.get("config_dir") is None or isinstance(a.get("config_dir"), str))
+                 and os.path.realpath(config_of(a)) == real), None)
+
+
 class LiveSettings:
     """accounts.json and the switching mode as a running chat sees them
     (the log audit of 2026-11-05, #1). The terminal's supervisor and the
@@ -2213,24 +2226,30 @@ def run(opts) -> int:
         (LiveSettings), before each launch, each limit decision, during a
         wait (wait_until()) and each round of the watch (leave()): what
         changed (LiveSettings.check()). The names, the accounts not allowed
-        here, the ones that keep this folder, and `idx`, the account last
-        launched, found again by name (0 when it is gone), follow the
-        accounts; the mode changes only where --switch and LONGHAUL_SWITCH
-        did not set it. Before, a terminal kept what it read at its start:
-        it waited for one account's reset with another allowed since, and
-        asked after auto was saved."""
-        nonlocal accounts, names, denied, kept_here, mode, idx
+        here, the ones that keep this folder, `idx`, the account last
+        launched, and `stay`, the one waited for, found again
+        (find_account(): by name, else by folder; idx 0 when it is gone),
+        follow the accounts; the mode changes only where --switch and
+        LONGHAUL_SWITCH did not set it. Before, a terminal kept what it read
+        at its start: it waited for one account's reset with another
+        allowed since, and asked after auto was saved."""
+        nonlocal accounts, names, denied, kept_here, mode, idx, stay
         changed = live.check()
         if "mode" in changed:
             log(f"terminal: switching is now {live.mode}, as saved since longhaul started (it was {mode})")
             mode = live.mode
         if "accounts" in changed:
-            last = names[idx] if isinstance(idx, int) and 0 <= idx < len(names) else None
+            last = accounts[idx] if isinstance(idx, int) and 0 <= idx < len(accounts) else None
+            waited = next((a for a in accounts if a["name"] == stay), None) if stay else None
             accounts = live.accounts
             names = [a["name"] for a in accounts]
             denied = denied_in(accounts, top)
             kept_here = [a["name"] for a in accounts if covers(a, top)]
-            idx = names.index(last) if last in names else 0
+            found = find_account(last, accounts) if last else None
+            idx = next((i for i, a in enumerate(accounts) if a is found), 0)
+            found = find_account(waited, accounts) if waited else None
+            if found:  # renamed: still the one waited for (removed, the loop's top drops it)
+                stay = found["name"]
             log(f"terminal: read accounts.json again: {plural(len(accounts), 'account')}, "
                 f"{len(denied)} not allowed here")
         return changed
@@ -2494,7 +2513,7 @@ def run(opts) -> int:
                     later(f"could not allow {sid[:8]} on {here} in {home_path(top)}: {e!r}")
             return guard(sid, later)
 
-        def leave(w: Watch, here=acct["name"]) -> bool:
+        def leave(w: Watch, launched=acct) -> bool:
             """Each round of the watch: accounts.json and the mode re-read
             (refresh()). When this launch's account has been removed, or
             may no longer be used here, since (the log audit of 2026-11-05,
@@ -2504,6 +2523,8 @@ def run(opts) -> int:
             with room. Elsewhere it stays, and the notification says that
             reopening it moves it."""
             refresh()
+            found = find_account(launched, accounts)  # renamed in the file is the same account
+            here = found["name"] if found else launched["name"]
             text = off(here)
             if not text:
                 return False
@@ -13293,31 +13314,37 @@ class Relay:
             self.use_accounts(self.live.accounts, sid)
 
     def use_accounts(self, found: list[dict], sid: str) -> None:
-        """The accounts re-read: this chat's account found again by name
-        (self.idx), and the ones the choosers skip worked out again for the
-        chat's folder (denied_in(), and pipe's unmanaged); those claude
-        would not start on stay skipped. The open question's and the
-        carry-on's account are found again by name too. Any of those no
-        longer listed is kept at the end (gone), for the claude running on
-        it and so their indices still name it, and skipped: a carry-on
-        for one then picks again (unready()). This chat's account removed,
-        or no longer allowed here, is acted on in tend() (off)."""
-        here = self.accounts[self.idx]
+        """The accounts re-read: this chat's account found again
+        (find_account(): by name, else by folder) for self.idx, and the
+        ones the choosers skip worked out again for the chat's folder
+        (denied_in(), and pipe's unmanaged); those claude would not start
+        on stay skipped. The open question's and the carry-on's account
+        are found again too. Any of those no longer listed is kept at the
+        end (gone), for the claude running on it and so their indices still
+        name it, and skipped: a carry-on for one then picks again
+        (unready()). This chat's account removed, or no longer allowed
+        here, is acted on in tend() (off())."""
         failed = self.bad - self.denied - self.unmanaged - self.gone
         listed, gone = list(found), set()
-        names = [a["name"] for a in listed]
-        abouts = [about for about in (self.question_for, self.carry_for) if about.get("to") is not None]
-        for acct in [here] + [self.accounts[about["to"]] for about in abouts]:
-            if acct["name"] not in names:
+
+        def place(acct: dict) -> int:
+            match = find_account(acct, found) or next((a for a in listed[len(found):] if a is acct), None)
+            if match is None:
                 listed.append(acct)
-                names.append(acct["name"])
                 gone.add(acct["name"])
-        for about in abouts:
-            about["to"] = names.index(self.accounts[about["to"]]["name"])
+                match = acct
+            return next(i for i, a in enumerate(listed) if a is match)
+
+        here = self.accounts[self.idx]
+        idx = place(here)
+        for about in (self.question_for, self.carry_for):
+            if about.get("to") is not None:
+                about["to"] = place(self.accounts[about["to"]])
         denied = denied_in(found, self.top) if self.top else set()
         unmanaged = ({a["name"] for a in found if not a.get("email") or not a.get("config_dir")}
                      if self.managed_only else set())
-        self.accounts, self.idx = listed, names.index(here["name"])
+        self.accounts, self.idx = listed, idx
+        here = listed[idx]
         self.denied, self.unmanaged, self.gone = denied, unmanaged, gone
         self.bad = failed | denied | unmanaged | gone
         log(f"{self.who}: {sid} read accounts.json again: {plural(len(found), 'account')}, "

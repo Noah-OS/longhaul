@@ -17943,6 +17943,15 @@ class KeepWorking(unittest.TestCase):
         self.assertEqual(self.notes, ["The panel chat moved to Pro: it ran on Max, which was removed from "
                                       "Longhaul's accounts."])
 
+    def test_the_chats_account_renamed_mid_chat_is_the_same_account(self):
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        self.write_accounts([{**self.accounts[0], "name": "Main"}, self.accounts[1]])  # its folder is the same
+        for _ in range(3):
+            r.tend()
+        self.assertEqual((r.moves, self.notes, r.accounts[r.idx]["name"]), ([], [], "Main"))
+        self.assertNotIn("removed", self.log_text())
+
     def test_the_chats_account_removed_in_auto_with_nowhere_to_go_is_said_once(self):
         self.write_accounts(self.accounts)
         self.limited(Pro=self.clock.at + 600)
