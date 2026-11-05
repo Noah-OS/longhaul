@@ -1427,7 +1427,9 @@ class Loop(unittest.TestCase):
         out, calls = self.run_longhaul(["exit"], runs=1, cwd=personal)
         self.assertEqual((out.returncode, calls), (1, []), out.stdout)
         self.assertIn(f"No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work / 'sub'}. "
-                      f'Edit "repositories" in {self.home / "accounts.json"}, or run from one of those.', out.stdout)
+                      "Run from one of those, or add this folder to an account: `longhaul folders NAME --add "
+                      f'{self.shown(personal)}` (or in /accounts, or edit "repositories" in {self.home / "accounts.json"}).',
+                      out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_stops_longhaul_before_claude(self):
         # UX review, Sprint 8: load_accounts() took a file it could not read
@@ -16081,7 +16083,7 @@ class Pieces(unittest.TestCase):
         self.assertEqual(longhaul.REPOSITORIES_JUNK, "its repositories field is not a list of absolute paths")
         odd = {"name": "Odd", "repositories": "junk"}
         self.assertEqual(longhaul.where_allowed(odd), f"nowhere ({longhaul.REPOSITORIES_JUNK})")
-        self.assertEqual(longhaul.may_not_text(odd, "/x"), f"Odd may not be used in /x ({longhaul.REPOSITORIES_JUNK})")
+        self.assertEqual(longhaul.may_not_text(odd, "/x", [odd]), f"Odd may not be used in /x ({longhaul.REPOSITORIES_JUNK})")
         self.assertIn(f"Odd nowhere ({longhaul.REPOSITORIES_JUNK}). ", longhaul.no_account_text("/x", [odd]))
 
 
@@ -18207,7 +18209,8 @@ class Pipe(StreamHarness):
         self.assertEqual(p.wait(10), 1)
         self.assertEqual(self.calls_or_none(), [])
         self.assertIn(f"pipe: No account may be used in {self.shown(personal)}: Max only in {work}, Pro only in {work}. "
-                      f'Edit "repositories" in {self.relay / "accounts.json"}, or run from one of those.',
+                      "Run from one of those, or add this folder to an account: `longhaul folders NAME --add "
+                      f'{self.shown(personal)}` (or in /accounts, or edit "repositories" in {self.relay / "accounts.json"}).',
                       self.log_text())
 
     def test_pipe_with_the_allowed_account_signed_in_wrong_never_launches_the_denied_one(self):
@@ -21043,6 +21046,336 @@ class Accounts(unittest.TestCase):
         self.assertEqual(self.longhaul("remove", "Max").returncode, 0)
         self.assertEqual(self.accounts()[0], restricted, "remove writes back the rest as they were")
 
+    def test_add_with_no_repo_beside_accounts_that_keep_every_folder_says_it_will_not_be_used(self):
+        # The owner, 2026-11-05: an account added with no --repo beside two
+        # whose folders are ["/"] was used nowhere, and nothing said so.
+        team, solo = self.tmp / "team", self.tmp / "solo"
+        self.emails.update({str(team): "team@example.com", str(solo): "solo@example.com"})
+        accounts = self.accounts()
+        accounts[0]["repositories"] = ["/"]
+        accounts.append({"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "pro@example.com",
+                         "repositories": ["/"]})
+        (self.relay / "accounts.json").write_text(json.dumps(accounts))
+        out = self.longhaul("add", "Team", "team@example.com", "--dir", str(team))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Max, Pro keep every folder (their folders include /), so Team will not be used anywhere until "
+                      "its folders are set: in /accounts, on Team's page, or with `longhaul folders Team --add PATH` "
+                      "(or take / off their lists).", out.stdout)
+        self.assertEqual(out.stdout.count("will not be used anywhere"), 1, "one line")
+        # With --repo, or with no account keeping every folder, nothing is said.
+        out = self.longhaul("add", "Solo", "solo@example.com", "--dir", str(solo), "--repo", str(self.tmp / "solo-work"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("will not be used anywhere", out.stdout)
+        accounts[0].pop("repositories")
+        (self.relay / "accounts.json").write_text(json.dumps(accounts[:1]))
+        out = self.longhaul("add", "Team", "team@example.com", "--dir", str(team))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("will not be used anywhere", out.stdout)
+
+
+class Folders(unittest.TestCase):
+    """`longhaul folders NAME` (the owner, 2026-11-05: "I can't edit the
+    accounts", "I need to be able to edit it"): where an account may be
+    used, and its "repositories" changed without a hand edit, from a
+    terminal or the accounts screen's buttons. Every path is scratch, HOME
+    too, so `~` is the scratch folder; no claude runs."""
+
+    def setUp(self):
+        # Resolved, so that `~` is shown for it (/var is a link on a Mac).
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        (self.tmp / "work").mkdir()
+        self.path = self.home / "accounts.json"
+
+    def write_accounts(self, *accounts):
+        self.path.write_text(json.dumps(list(accounts)))
+        os.chmod(self.path, 0o644)  # as a hand edit may leave it
+
+    def accounts(self):
+        return json.loads(self.path.read_text())
+
+    def log(self) -> list:
+        log = self.home / "longhaul.log"
+        return [line.split(" ", 2)[2] for line in log.read_text().splitlines()] if log.exists() else []
+
+    def files(self) -> dict:
+        cache = self.tmp / "Library"  # Apple's /usr/bin/python3 keeps its bytecode there, under HOME
+        return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.tmp.rglob("*")
+                if p.is_file() and cache not in p.parents}
+
+    def longhaul(self, *args, cwd=None, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env, cwd=str(cwd or self.tmp),
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def said(self, out) -> list:
+        """stdout's lines, the terminal's colour codes dropped."""
+        return [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in out.stdout.splitlines()]
+
+    def test_with_no_option_it_says_where_the_account_may_be_used_and_writes_nothing(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work", "/srv/clients"]},
+                            {"name": "odd", "config_dir": "~/.claude-odd", "repositories": "~/work"})
+        before = self.files()
+        for name, line in (("personal-1", "personal-1 may be used anywhere."),
+                           ("WORK", "work may be used only in ~/work, /srv/clients."),
+                           ("odd", f"odd may be used nowhere ({longhaul.REPOSITORIES_JUNK}).")):
+            out = self.longhaul("folders", name)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+            self.assertEqual(self.said(out), [line])
+        self.assertEqual(self.files(), before, "it only reads: no lock, no log")
+        out = self.longhaul("folders", "nobody")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no account called nobody; the accounts are personal-1, work, odd", out.stdout)
+        self.assertEqual(self.files(), before)
+
+    def test_an_account_with_no_list_beside_accounts_that_keep_every_folder_is_said_to_be_used_nowhere(self):
+        # The owner's case: two accounts list "/", which covers every folder,
+        # so the third, with no list, is eligible nowhere (eligible()).
+        self.write_accounts({"name": "personal-1", "repositories": ["/"]}, {"name": "personal-2", "repositories": ["//"]},
+                            {"name": "spare"}, {"name": "work", "repositories": ["~/work"]})
+        out = self.longhaul("folders", "spare")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.said(out), [
+            "spare may be used anywhere.",
+            "But personal-1, personal-2 keep every folder (their folders include /), so spare will not be used "
+            "anywhere until its folders are set: in /accounts, on spare's page, or with `longhaul folders spare --add "
+            "PATH` (or take / off their lists)."])
+        out = self.longhaul("folders", "personal-1")
+        self.assertEqual(self.said(out), [
+            "personal-1 may be used only in /.",
+            "With / among its folders, personal-1 keeps every folder, so spare is used nowhere until its folders "
+            "are set."])
+        self.assertEqual(self.said(self.longhaul("folders", "work")), ["work may be used only in ~/work."],
+                         "an account with a list of its own is not kept out")
+        # One account keeping every folder is worded for one.
+        self.write_accounts({"name": "personal-1", "repositories": ["/"]}, {"name": "spare"}, {"name": "extra"})
+        self.assertEqual(self.said(self.longhaul("folders", "spare"))[1],
+                         "But personal-1 keeps every folder (its folders include /), so spare will not be used anywhere "
+                         "until its folders are set: in /accounts, on spare's page, or with `longhaul folders spare "
+                         "--add PATH` (or take / off its list).")
+        self.assertEqual(self.said(self.longhaul("folders", "personal-1"))[1],
+                         "With / among its folders, personal-1 keeps every folder, so spare, extra are used nowhere "
+                         "until their folders are set.")
+
+    def test_add_keeps_each_path_as_written_the_other_keys_and_the_order_with_one_log_line_each(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com",
+                             "note": "a key longhaul does not know"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work"]})
+        out = self.longhaul("folders", "personal-1", "--add", "~/work", "--add", "~/later", "--add", str(self.tmp / "work"))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.accounts(), [
+            {"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com",
+             "note": "a key longhaul does not know", "repositories": ["~/work", "~/later"]},
+            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work"]}])
+        said = self.said(out)
+        for line in ("longhaul added ~/work to personal-1's folders", "longhaul added ~/later to personal-1's folders",
+                     "longhaul ~/later does not exist yet; kept for when it does",
+                     "longhaul ~/work is already one of personal-1's folders"):
+            self.assertIn(line, said)
+        self.assertEqual(said[-1], "personal-1 may be used only in ~/work, ~/later.")
+        self.assertEqual(self.log(), ["added ~/work to personal-1's folders", "added ~/later to personal-1's folders"],
+                         "one log line per change, nothing else")
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "written as add writes it: only you can read it")
+        # To a list already there, at its end; one already on it, by real
+        # path through a link, is not added twice and writes nothing.
+        (self.tmp / "alias").symlink_to(self.tmp / "work")
+        out = self.longhaul("folders", "work", "--add", "/srv/clients")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1]["repositories"], ["~/work", "/srv/clients"])
+        before = self.path.read_bytes()
+        out = self.longhaul("folders", "work", "--add", "~/alias/")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("longhaul ~/alias is already one of work's folders", self.said(out))
+        self.assertEqual(self.path.read_bytes(), before, "nothing to change, nothing written")
+        self.assertEqual(len(self.log()), 3)
+
+    def test_remove_matches_by_real_path_and_a_list_left_empty_is_dropped(self):
+        (self.tmp / "alias").symlink_to(self.tmp / "work")
+        self.write_accounts({"name": "personal-1"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work", "/srv/clients"]})
+        out = self.longhaul("folders", "work", "--remove", str(self.tmp / "alias"))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertIn("longhaul removed ~/work from work's folders", self.said(out))
+        self.assertEqual(self.said(out)[-1], "work may be used only in /srv/clients.")
+        self.assertEqual(self.accounts()[1], {"name": "work", "config_dir": "~/.claude-work",
+                                              "repositories": ["/srv/clients"]})
+        # The last one: no list is left, so none is kept, as add without --repo writes none.
+        out = self.longhaul("folders", "work", "--remove", "/srv/clients/")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1], {"name": "work", "config_dir": "~/.claude-work"})
+        self.assertEqual(self.said(out)[-1], "work may be used anywhere.")
+        self.assertEqual(self.log(), ["removed ~/work from work's folders", "removed /srv/clients from work's folders"])
+        # Removes, then adds: a folder given to both is moved to the end.
+        self.write_accounts({"name": "work", "repositories": ["~/work", "/srv/clients"]})
+        out = self.longhaul("folders", "work", "--remove", "~/work", "--add", "~/work", "--remove", "/srv/clients")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts(), [{"name": "work", "repositories": ["~/work"]}])
+        # An entry that is not an absolute path is taken off as written.
+        self.write_accounts({"name": "work", "repositories": ["~/work", "relative/path"]})
+        out = self.longhaul("folders", "work")
+        self.assertEqual(self.said(out), [f"work may be used nowhere ({longhaul.REPOSITORIES_JUNK})."])
+        out = self.longhaul("folders", "work", "--remove", "relative/path")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts(), [{"name": "work", "repositories": ["~/work"]}])
+
+    def test_anywhere_drops_the_list_or_a_field_that_is_not_one(self):
+        self.write_accounts({"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work", "/srv/clients"]},
+                            {"name": "odd", "repositories": "~/work"}, {"name": "personal-1"})
+        out = self.longhaul("folders", "work", "--anywhere")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertIn("longhaul dropped work's folders (~/work, /srv/clients)", self.said(out))
+        self.assertEqual(self.said(out)[-1], "work may be used anywhere.")
+        out = self.longhaul("folders", "odd", "--anywhere")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(f"longhaul dropped odd's folders: {longhaul.REPOSITORIES_JUNK}", self.said(out))
+        self.assertEqual(self.accounts(), [{"name": "work", "config_dir": "~/.claude-work"}, {"name": "odd"},
+                                           {"name": "personal-1"}])
+        before = self.path.read_bytes()
+        out = self.longhaul("folders", "personal-1", "--anywhere")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("longhaul personal-1 has no list of folders: it may be used anywhere already", self.said(out))
+        self.assertEqual(self.path.read_bytes(), before, "nothing written")
+        self.assertEqual(self.log(), ["dropped work's folders (~/work, /srv/clients)",
+                                      f"dropped odd's folders: {longhaul.REPOSITORIES_JUNK}"])
+
+    def test_an_unknown_name_a_bad_path_or_an_unreadable_file_writes_nothing_and_exits_2(self):
+        self.write_accounts({"name": "personal-1"}, {"name": "work", "repositories": ["~/work"]},
+                            {"name": "odd", "repositories": "~/work"})
+        before = self.path.read_bytes()
+        for argv, said in (
+                (("nobody", "--add", "~/x"), "no account called nobody; the accounts are personal-1, work, odd"),
+                (("personal-1", "--add", "~/ok", "--add", "relative/path"),
+                 "--add relative/path is not an absolute path; give the folder's full path, like ~/work/repo"),
+                (("personal-1", "--add", ""), "--add  is not an absolute path"),
+                (("work", "--add", "~/ok", "--remove", "~/other"),
+                 "~/other is not one of work's folders; it may be used only in ~/work"),
+                (("personal-1", "--remove", "~/work"), "~/work is not one of personal-1's folders; it may be used anywhere"),
+                (("work", "--anywhere", "--add", "~/x"), "--anywhere drops every folder: give it alone, not with --add or "
+                                                          "--remove"),
+                (("odd", "--add", "~/x"), "odd's repositories field is not a list, so no folder can be added to it or "
+                                          "taken from it: `longhaul folders odd --anywhere` drops it, then --add sets "
+                                          "its folders")):
+            with self.subTest(argv):
+                out = self.longhaul("folders", *argv)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertTrue(any(said in line for line in self.said(out)), (said, out.stdout))
+                self.assertEqual(self.path.read_bytes(), before, "nothing written")
+                self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual([line for line in self.log() if line.startswith(("added ", "removed ", "dropped "))], [],
+                         "no change logged")
+        for case, text in unreadable_accounts({"name": "work", "repositories": ["~/work"]}).items():
+            with self.subTest(case):
+                self.path.write_text(text)
+                for argv in (("work",), ("work", "--add", "~/x")):
+                    out = self.longhaul("folders", *argv)
+                    self.assertEqual(out.returncode, 2, out.stdout)
+                    self.assertIn("accounts.json is not readable: ", out.stdout)
+                    self.assertEqual(self.path.read_text(), text, "never written over")
+        self.path.unlink()
+        out = self.longhaul("folders", "work", "--add", "~/x")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no account called work; there is no list of accounts yet: `longhaul add` adds one", out.stdout)
+        self.assertFalse(self.path.exists())
+
+    def test_the_usage_block_names_it_beside_add_and_remove_and_the_shim_refuses_it(self):
+        doc = longhaul.__doc__
+        self.assertIn("longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]", doc)
+        self.assertLess(doc.index("longhaul remove NAME"), doc.index("longhaul folders NAME"))
+        self.assertLess(doc.index("longhaul folders NAME"), doc.index("longhaul switch [ask|auto|never]"))
+        out = self.longhaul("folders", "-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul folders [-h] [--add PATH] [--remove PATH] [--anywhere] name", out.stdout)
+        # bin/longhaul, what a chat's Claude may run, is the owner's boundary:
+        # it does not run folders until the owner allows it there.
+        self.write_accounts({"name": "work", "repositories": ["~/work"]})
+        before = self.path.read_bytes()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1", HOME=str(self.tmp))
+        out = subprocess.run([str(HERE / "bin" / "longhaul"), "folders", "work", "--anywhere"], capture_output=True,
+                             text=True, env=env, timeout=30)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    # The refusals say why (the owner, 2026-11-05): an account with no list,
+    # refused where other accounts' lists reserve the folder, was said to
+    # have a repositories field that is not a list of absolute paths.
+
+    def test_the_refusal_of_an_account_with_no_list_names_the_accounts_that_keep_the_folder(self):
+        code = self.tmp / "code"
+        code.mkdir()
+        accounts = [{"name": "personal-1", "repositories": ["/"]}, {"name": "personal-2", "repositories": ["/"]},
+                    {"name": "spare"}, {"name": "work", "repositories": [str(self.tmp / "work")]}]
+        with mock.patch.object(longhaul, "HOME", self.tmp):
+            self.assertEqual(longhaul.may_not_text(accounts[2], str(code), accounts),
+                             "spare may not be used in ~/code: ~/code is kept for personal-1, personal-2 "
+                             "(their folders include it)")
+            self.assertEqual(longhaul.may_not_text(accounts[2], str(self.tmp / "work"), accounts),
+                             "spare may not be used in ~/work: ~/work is kept for personal-1, personal-2, work "
+                             "(their folders include it)")
+            one = [{"name": "work", "repositories": [str(self.tmp / "work")]}, {"name": "spare"}]
+            self.assertEqual(longhaul.may_not_text(one[1], str(self.tmp / "work" / "app"), one),
+                             "spare may not be used in ~/work/app: ~/work/app is kept for work (its folders include it)")
+            # A list of its own, or a field that is not one: as before.
+            self.assertEqual(longhaul.may_not_text(accounts[3], str(code), accounts),
+                             "work may not be used in ~/code (its repositories: ~/work)")
+            odd = {"name": "odd", "repositories": "junk"}
+            self.assertEqual(longhaul.may_not_text(odd, str(code), accounts + [odd]),
+                             f"odd may not be used in ~/code ({longhaul.REPOSITORIES_JUNK})")
+        self.write_accounts(*accounts)
+        out = self.longhaul("--account", "spare", cwd=code)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("spare may not be used in ~/code: ~/code is kept for personal-1, personal-2 (their folders "
+                      "include it); longhaul has not started Claude", self.said(out)[-1])
+        self.assertNotIn(longhaul.REPOSITORIES_JUNK, out.stdout)
+        self.assertEqual(self.longhaul("folders", "spare", "--add", str(code)).returncode, 0)
+        self.assertEqual(longhaul.eligible(self.accounts(), str(code)), ["personal-1", "personal-2", "spare"],
+                         "a folder of its own: used there beside them")
+
+    def test_the_no_account_line_names_each_rule_and_the_way_to_add_the_folder(self):
+        code = self.tmp / "code"
+        accounts = [{"name": "work", "repositories": [str(self.tmp / "work")]}, {"name": "odd", "repositories": "junk"}]
+        with mock.patch.object(longhaul, "HOME", self.tmp), mock.patch.object(longhaul, "LONGHAUL_HOME", self.home):
+            self.assertEqual(longhaul.no_account_text(str(code), accounts),
+                             f"No account may be used in ~/code: work only in ~/work, odd nowhere "
+                             f"({longhaul.REPOSITORIES_JUNK}). Run from one of those, or add this folder to an account: "
+                             '`longhaul folders NAME --add ~/code` (or in /accounts, or edit "repositories" in '
+                             "~/home/accounts.json).")
+
+    def test_status_and_doctor_name_an_account_kept_out_by_accounts_that_keep_every_folder(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "repositories": ["/"]},
+                            {"name": "spare", "config_dir": "~/.claude-spare"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work"]})
+        out = self.longhaul("status")
+        lines = self.said(out)
+        [at] = [i for i, line in enumerate(lines) if line.startswith("spare ")]
+        self.assertIn("       personal-1 keeps every folder (its folders include /), so spare will not be used anywhere "
+                      "until its folders are set: in /accounts, on spare's page, or with `longhaul folders spare --add "
+                      "PATH` (or take / off its list).", lines[at + 1:at + 4], out.stdout)
+        self.assertNotIn("       anywhere", lines, "it is used nowhere: not said to be used anywhere")
+        # The doctor, in this process, with HOME the scratch folder there too,
+        # so `~` is never the machine's.
+        for name in ("personal-1", "spare", "work"):
+            (self.tmp / f".claude-{name}").mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), mock.patch.object(longhaul, "HOME", self.tmp), \
+                mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), \
+                mock.patch.object(longhaul, "DEFAULT_CONFIG", self.tmp / "claude"), \
+                mock.patch.object(longhaul, "DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"):
+            c = longhaul.doctor_accounts()
+        self.assertEqual(c["mark"], "warn", c)
+        items = {text: mark for mark, text, *_ in c["items"]}
+        self.assertEqual(items, {"personal-1: ~/.claude-personal-1, only in /": "ok",
+                                 "spare: ~/.claude-spare, used nowhere: personal-1 keeps every folder": "warn",
+                                 "work: ~/.claude-work, only in ~/work": "ok"})
+        self.assertIn("`longhaul folders spare --add PATH`", c["step"])
+
 
 class StatusJson(unittest.TestCase):
     """`longhaul status --json` (S1 of the accounts screen): what the screen
@@ -21054,7 +21387,7 @@ class StatusJson(unittest.TestCase):
     config folder to email ("default" for ~/.claude)."""
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
-                    "limited_until", "five_hour", "week", "only_in", "folder", "this_chat"}
+                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "folder", "this_chat"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
@@ -21124,10 +21457,11 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][0], {
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
-            "week": None, "only_in": [], "folder": "~/.claude-personal-1", "this_chat": False})
+            "week": None, "only_in": [], "kept_out_by": [], "folder": "~/.claude-personal-1", "this_chat": False})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "folder", "this_chat"], "the screen's order: sign_in_failed_at after check_failed")
+            "five_hour", "week", "only_in", "kept_out_by", "folder", "this_chat"],
+            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -21231,6 +21565,22 @@ class StatusJson(unittest.TestCase):
         self.assertEqual({n: a["only_in"] for n, a in found.items()},
                          {"personal-1": ["~/team", "~/work"], "personal-2": [], "personal-3": [], "max": ["/"],
                           "work": None, "other": None})
+
+    def test_kept_out_by_names_the_accounts_whose_list_keeps_every_folder_for_one_with_no_list(self):
+        # The owner, 2026-11-05: two accounts listed "/", so a third with no
+        # list was used nowhere, and the screen said "anywhere". kept_out_by
+        # names them, for an account with no list; [] for any other.
+        self.write_accounts({"name": "personal-1", "repositories": ["/"]},
+                            {"name": "personal-2", "repositories": ["~/work", "/."]},
+                            {"name": "spare"}, {"name": "empty", "repositories": []},
+                            {"name": "work", "repositories": ["~/work"]}, {"name": "odd", "repositories": "/"})
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual({n: a["kept_out_by"] for n, a in found.items()},
+                         {"personal-1": [], "personal-2": [], "spare": ["personal-1", "personal-2"],
+                          "empty": ["personal-1", "personal-2"], "work": [], "odd": []})
+        self.write_accounts({"name": "personal-1", "repositories": ["~/work"]}, {"name": "spare"})
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual(found["spare"]["kept_out_by"], [], "a list that does not name / keeps only its folders")
 
     def test_an_account_whose_folder_is_not_text_is_shown_unchecked(self):
         # A hand edit's config_dir of 5 is no folder: the check that would
