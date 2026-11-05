@@ -2398,6 +2398,7 @@ def run(opts) -> int:
         # "Max" on the wrong account. Seeded with the accounts restricted to
         # other repositories: pick(), the limit and the early move skip them.
         wrong: set[str] = set(denied)
+        seeded = set(denied)  # the part of it refresh() may change before the limit's decision
         chosen = False
         if stay:
             # Within the margin too: a question unanswered until the reset
@@ -2592,9 +2593,11 @@ def run(opts) -> int:
             return exit_code(proc.returncode, 1)
         if MAX_RUNS and runs >= MAX_RUNS:
             return exit_code(proc.returncode, 0)
-        before = denied
-        refresh()  # the limit's decision below on the accounts and the mode as they are now
-        wrong = (wrong - before) | denied
+        # The decisions below on the accounts and the mode as they are now:
+        # refresh() ran during the launch too (leave()), so `wrong` drops
+        # the accounts not allowed here it was seeded with, not the last ones.
+        refresh()
+        wrong = (wrong - seeded) | denied
         if mode != "auto":
             stay = acct["name"]
         carry = None
@@ -2666,8 +2669,8 @@ def run(opts) -> int:
             # allowed here: as the early move, no carry-on message.
             prompt = None
             nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts))
-            msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul moved it"
-            msg += f" to {accounts[nxt]['name']}." if nxt is not None else "."
+            msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul "
+            msg += f"moved it to {accounts[nxt]['name']}." if nxt is not None else "moved it."
             say(msg)
             notify(msg)
             idx = nxt if nxt is not None else idx
@@ -14836,7 +14839,8 @@ def say_still_running(acct: dict) -> None:
     running = chats_on(acct)
     name = acct["name"]
     if running is None:
-        say(f"The chats running now could not be listed (ps did not answer); `longhaul doctor` shows any still on {name}.")
+        say(f"The chats running now could not be listed (ps did not answer); `longhaul doctor` shows any still "
+            f"on {name}.")
         return
     if not running:
         return
