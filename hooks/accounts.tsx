@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsRead,
-  LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulQuestion, LonghaulStatus, LonghaulWait } from '../types'
+import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsFolder, LonghaulAccountsForm, LonghaulAccountsPage,
+  LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulQuestion, LonghaulStatus,
+  LonghaulWait } from '../types'
 import { status as showStatus } from './display.ts'
 import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 
@@ -12,11 +13,14 @@ import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 // "+ Add account" and "Settings"; the arrows move the focus, Enter opens an
 // item's page, Escape goes back, and from the list closes the pane. An
 // account's page has its details and its actions (Sign in again or Sign in,
-// Remove); Add account's page the form; Settings' page switching, the VS
-// Code panel and forgetting the limits. The pane draws `longhaul.py status
-// --json` and runs the same commands /longhaul:manage runs in words, by
-// argv, never through a shell: setup, add, remove, switch, vscode, clear.
-// One at a time; the rows are read again when the pane opens and after each.
+// Remove), then its folders, each with Remove, a field to add one and
+// Anywhere (the owner, 2026-11-05: "I can't edit the accounts"); Add
+// account's page the form; Settings' page switching, the VS Code panel and
+// forgetting the limits. The pane draws `longhaul.py status --json` and runs
+// the same commands /longhaul:manage runs in words, by argv, never through a
+// shell: setup, add, remove, switch, vscode, clear; and folders, which
+// bin/longhaul does not run, so /longhaul:manage cannot yet. One at a time;
+// the rows are read again when the pane opens and after each.
 //
 // Each line of the list is a Button: the pane is opened with focus and
 // closeOnEscape, so it holds the keys as a dialog does, the arrows and Tab
@@ -63,6 +67,8 @@ const result = atom({ plugin: 'longhaul', key: 'accountsResult' } as const, null
 const confirming = atom({ plugin: 'longhaul', key: 'accountsConfirm' } as const, null, { shape: 'accounts-confirm-1' })
 const EMPTY: LonghaulAccountsForm = { name: '', email: '', only: '', problem: null }
 const form = atom({ plugin: 'longhaul', key: 'accountsForm' } as const, EMPTY, { shape: 'accounts-form-1' })
+const NO_FOLDER: LonghaulAccountsFolder = { account: '', path: '', problem: null }
+const folder = atom({ plugin: 'longhaul', key: 'accountsFolder' } as const, NO_FOLDER, { shape: 'accounts-folder-1' })
 const shown = atom({ plugin: 'longhaul', key: 'accountsPage' } as const, 'list', { shape: 'accounts-page-1' })
 const marked = atom({ plugin: 'longhaul', key: 'accountsMark' } as const, null, { shape: 'accounts-mark-1' })
 const askedFor = atom({ plugin: 'longhaul', key: 'accountsAsked' } as const, null, { shape: 'accounts-asked-1' })
@@ -123,6 +129,13 @@ function checkAdd(f: LonghaulAccountsForm): { argv: string[] } | { problem: stri
   return { argv: ['add', name, email, ...folders.flatMap(p => ['--repo', p])] }
 }
 
+// A folder to add, checked as longhaul.py would: absolute, or from ~/.
+// Never an option, as it starts with / or ~.
+function folderProblem(path: string): string | null {
+  if (!path) return 'Type a folder first, like ~/work.'
+  return path.startsWith('/') || path.startsWith('~/') ? null : `A folder starts with / or ~/ (not ${path}).`
+}
+
 // `status --json` read into what the pane draws: the record, or why there is none.
 async function readStatus($: any): Promise<LonghaulAccountsRead> {
   let ran: { exitCode: number; stdout: string; stderr: string }
@@ -160,7 +173,7 @@ function clean(s: any): LonghaulStatus {
     .map(a => ({ name: a.name as string, email: str(a.email), signed_in: flag(a.signed_in), as_expected: flag(a.as_expected),
       check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
-      folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
+      kept_out_by: strs(a.kept_out_by) ?? [], folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   return { accounts, listed: s.listed === true, here,
@@ -263,6 +276,34 @@ async function remove($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
   await act($, { label: `Remove: ${name}`, doing: `Removing ${name}…`, argv: ['remove', name], timeoutMs: STATUS_TIMEOUT,
     then: 'list' })
+}
+
+// The Folders part's three: a folder typed on this account's page added,
+// one of its folders from the last read taken off, or its list dropped.
+async function addFolder($: any, name: string): Promise<void> {
+  if (busy || !(await known($, name))) return
+  const typed = await read($, folder)
+  const path = typed.account === name ? typed.path.trim() : ''
+  const problem = folderProblem(path)
+  await update($, folder, f => ({ account: name, path: f.account === name ? f.path : '', problem }))
+  if (problem) return
+  await act($, { label: mask(`Add folder ${path}: ${name}`), doing: mask(`Adding ${path} to ${name}'s folders…`),
+    argv: ['folders', name, '--add', path], timeoutMs: STATUS_TIMEOUT,
+    done: async () => { await update($, folder, () => NO_FOLDER) } })
+}
+
+async function removeFolder($: any, name: string, path: string): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a?.only_in?.includes(path)) return
+  await act($, { label: mask(`Remove folder ${path}: ${name}`), doing: mask(`Taking ${path} off ${name}'s folders…`),
+    argv: ['folders', name, '--remove', path], timeoutMs: STATUS_TIMEOUT })
+}
+
+async function anywhere($: any, name: string): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a || (a.only_in !== null && !a.only_in.length)) return // no list to drop
+  await act($, { label: `Anywhere: ${name}`, doing: `Dropping ${name}'s folders…`, argv: ['folders', name, '--anywhere'],
+    timeoutMs: STATUS_TIMEOUT })
 }
 
 async function add($: any): Promise<void> {
@@ -423,6 +464,7 @@ type Ctx = {
   last: LonghaulAccountsResult | null
   confirm: string | null
   form: LonghaulAccountsForm
+  folder: LonghaulAccountsFolder // the folder typed on an account's page
   page: LonghaulAccountsPage // the page drawn (pageOf)
   mark: string | null // the key the focus ring is on
   question: LonghaulQuestion | null
@@ -536,10 +578,12 @@ function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boole
   return { text: parts.join(' · '), warn: limited || sign !== 'signed in' }
 }
 
-// What the line adds in brackets: this chat's account, where it is kept to.
+// What the line adds in brackets: this chat's account, where it is kept to;
+// used nowhere, too, for one with no list that others keep out of every folder.
 function extras(a: LonghaulAccount): string {
   const said = [a.this_chat ? 'this chat' : '',
-    a.only_in === null ? 'used nowhere' : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
+    a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
+      : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
   return said.length ? mask(`   (${said.join(' · ')})`) : ''
 }
 
@@ -614,7 +658,54 @@ function use(label: string, w: LonghaulAccount['week'], nowMs: number): string |
 
 function where(a: LonghaulAccount): string {
   if (a.only_in === null) return 'may be used nowhere'
+  if (a.kept_out_by?.length) return 'may be used nowhere for now'
   return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
+}
+
+// Its Folders: "anywhere", or each folder with Remove; a field to add one
+// and Add folder; Anywhere while it has a list to drop. A field that is not
+// a list is said, with Anywhere alone. Who keeps it out of every folder, and
+// the way out. The controls while nothing runs and no Remove waits for a yes.
+function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button, Input } = c.E
+  const name = String(a.name)
+  const offered = c.idle && c.confirm !== name
+  const kept = (a.kept_out_by ?? []).map(String)
+  const typed = c.folder.account === name ? c.folder : NO_FOLDER
+  return (
+    <Box flexDirection="column">
+      {a.only_in === null && <Text>{'Folders: its repositories field is not a list of absolute paths, so it is used '
+        + 'nowhere. Anywhere drops it.'}</Text>}
+      {a.only_in !== null && !a.only_in.length && <Text>Folders: anywhere</Text>}
+      {a.only_in !== null && a.only_in.length > 0 && <Text>Folders:</Text>}
+      {(a.only_in ?? []).map((path, i) => (
+        <Box flexDirection="row" gap={1}>
+          <Text>{`  ${mask(path)}`}</Text>
+          {offered && <Button key={`folder-remove-${i}`} label="Remove" dimColor
+            onPress={() => void removeFolder($, name, path)} />}
+        </Box>
+      ))}
+      {kept.length > 0 && (
+        <Text color="warning">{mask(`⚠ ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} every folder, so ${name} is `
+          + `used nowhere until a folder is added here (or / is removed from ${kept.length > 1 ? 'theirs' : `${kept[0]}'s`}).`)}</Text>
+      )}
+      {offered && a.only_in !== null && <Input key="folder-path" label="Add a folder: " placeholder="~/work"
+        value={typed.path} onInput={keepFolder($, name)} onSubmit={keepFolder($, name)} />}
+      {offered && typed.problem && <Text color="error">{`✘ ${typed.problem}`}</Text>}
+      {offered && (
+        <Box flexDirection="row" gap={1}>
+          {a.only_in !== null && <Button key="folder-add" label="Add folder" onPress={() => void addFolder($, name)} />}
+          {(a.only_in === null || a.only_in.length > 0)
+            && <Button key="folder-anywhere" label="Anywhere" onPress={() => void anywhere($, name)} />}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+// What the folder field's typing keeps, for the account whose page it is on.
+function keepFolder($: any, name: string): (value: string) => void {
+  return value => void update($, folder, () => ({ account: name, path: value, problem: null }))
 }
 
 // An account's page: what is known of it, then its actions, offered while
@@ -655,6 +746,7 @@ function accountPage($: any, c: Ctx): any {
           </Box>
         </Box>
       )}
+      {foldersPart($, c, a)}
     </Box>
   )
 }
@@ -825,9 +917,9 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed, asked, mark, q, w, ans] = await Promise.all([read($, lastRead), read($, running),
-      read($, result), read($, confirming), read($, form), read($, shown), read($, marked), read($, question), read($, wait),
-      read($, answered)])
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir] = await Promise.all([read($, lastRead),
+      read($, running), read($, result), read($, confirming), read($, form), read($, shown), read($, marked),
+      read($, question), read($, wait), read($, answered), read($, folder)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
@@ -835,7 +927,7 @@ export const register: Register = on => {
     const canType = TYPING.includes(String(e.surface))
     const status = have?.status ?? null
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
-      form: typed, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans, nowMs }
+      form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans, nowMs }
     return drawPane($, c)
   })
 }

@@ -695,7 +695,7 @@ both('a folders run that is refused shows why; a typed email is masked, and pass
   await ui.press({ key: 'folder-add' })
   expect(after(w).slice(-2)).toEqual([['folders', 'work-2', '--add', '/srv/first.last@example.com'], ['status', '--json']])
   all = await texts(ui)
-  expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /srv/f•••@example.com: work-2'))).toBe(true)
+  expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /•••@example.com: work-2'))).toBe(true)
   expect(all.join('\n')).not.toMatch(/first\.last/)
   await ui.unmount()
 })
