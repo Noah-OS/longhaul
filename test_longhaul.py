@@ -11055,7 +11055,7 @@ class Checkpoint(unittest.TestCase):
         for state, reason in ((self.more(facts=self.S), "facts is not a list"),
                               (self.more(owner_said=[""]), "owner_said[0] is empty"),
                               (self.more(working_set=[self.S] * 21), "working_set has 21 items; the cap is 20"),
-                              (self.more(tried_failed=["x" * 1_001]), "tried_failed[0] is 1,001 characters; the cap is 1,000"),
+                              (self.more(tried_failed=["x" * 1_101]), "tried_failed[0] is 1,101 characters; the cap is 1,000"),
                               (self.more(facts=[f"the key is sk-ant-{self.S}"]), "facts[0] holds what looks like a credential")):
             out = self.save(state, "s1")
             self.assertEqual(out.returncode, 2, reason)
@@ -11304,7 +11304,7 @@ class Checkpoint(unittest.TestCase):
         self.assertNotIn(self.S, self.log())
 
     def test_checkpoint_save_refuses_bad_json_an_unknown_key_a_wrong_type_an_oversize_field_or_a_key_shape_and_names_only_the_field(self):
-        long = "x" * 1_001
+        long = "x" * 1_101
         cases = [
             ("{not json", "not JSON"),
             ("", "nothing on stdin"),
@@ -11317,7 +11317,7 @@ class Checkpoint(unittest.TestCase):
             (self.state(decisions=self.S), "decisions is not a list"),
             (self.state(decisions=[self.S, 5]), "decisions[1] is not text"),
             (self.state(done=[""]), "done[0] is empty"),
-            (self.state(goal=long + self.S), f"goal is {1_001 + len(self.S):,} characters; the cap is 1,000"),
+            (self.state(goal=long + self.S), f"goal is {1_101 + len(self.S):,} characters; the cap is 1,000"),
             (self.state(done=[self.S] * 21), "done has 21 items; the cap is 20"),
             (self.state(verification=[f"export ANTHROPIC_API_KEY=sk-ant-{self.S}"]), "verification[0] holds what looks like a credential"),
             (self.state(next_action=f"AKIA{self.S}"), "next_action holds what looks like a credential"),
@@ -11350,6 +11350,64 @@ class Checkpoint(unittest.TestCase):
         self.assertFalse((self.home / "checkpoints").exists(), "a refusal writes nothing, not even a .tmp")
         self.assertIn("checkpoint for s1 not saved: done has 21 items; the cap is 20", self.log())
         self.assertNotIn(self.S, self.log())
+
+    def test_a_text_up_to_10_percent_over_is_cut_at_a_word_and_a_total_up_to_10_percent_over_is_saved(self):
+        # Log audit row #7, 2026-11-06: 40 saves were refused 0.2-59% over and
+        # went through on a retry. Up to 10% over is saved (a text cut at the
+        # cap on a word, ending in the ellipsis); past it, refused.
+        words = ("word " * 240)[:1_080]  # 8% over
+        state = self.state(goal=words, facts=["ok", words + "tail"], working_set=["f " * 540])
+        out = self.save(state, "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        kept = json.loads(self.file().read_text())
+        for text in (kept["goal"], kept["facts"][1], kept["working_set"][0]):
+            self.assertLessEqual(len(text), 1_000)
+            self.assertTrue(text.endswith("…"), text[-5:])
+        self.assertTrue(kept["goal"].endswith("word…"), "cut between words, not in one")
+        self.assertEqual(kept["facts"][0], "ok", "a text under its cap is as written")
+        self.assertIn("; cut to the 1,000-character cap: goal, facts[1], working_set[0]", out.stdout)
+        self.assertEqual(out.stdout.count("\n"), 1)
+        # Exactly 10% over is cut; one character more is refused, naming every field over.
+        out = self.save(self.state(goal="y" * 1_100), "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(self.file().read_text())["goal"], "y" * 999 + "…", "no space to cut at: cut where it stands")
+        out = self.save(self.state(goal="y" * 1_101, facts=["z" * 1_500, "ok", "w" * 1_300]), "s1")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("goal is 1,101 characters; the cap is 1,000; facts[0] is 1,500 characters; the cap is 1,000; "
+                      "facts[2] is 1,300 characters; the cap is 1,000", out.stderr)
+        self.assertEqual(json.loads(self.file().read_text())["goal"], "y" * 999 + "…", "a refusal changes nothing")
+        # A total a little over 16,000 bytes is saved and says so.
+        short = [f"{'d' * 740} {i:02}" for i in range(20)]
+        record = {"schema_version": 1, "session_id": "s1", "written_at": time.time(), "cwd": str(self.work),
+                  **self.state(done=short, decisions=short)}
+        size = len(json.dumps(record, indent=2)) + 1
+        self.assertTrue(16_000 < size < 17_600, size)
+        out = self.save(self.state(done=short, decisions=short), "s1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("bytes is over the 16,000 cap, saved all the same", out.stdout)
+        # Past 10% it is refused with the size against the cap.
+        out = self.save(self.state(done=[f"{'d' * 900} {i:02}" for i in range(20)], decisions=short), "s1")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertRegex(out.stderr, r"[\d,]+ bytes in all; the cap is 16,000")
+        # A checkpoint read back is held to the cap as it was: no cut there.
+        self.assertIsNone(longhaul.checkpoint_validate(self.state(goal="x" * 1_050))[0])
+
+    def test_a_refused_save_keeps_the_state_file_and_the_last_checkpoint(self):
+        # 2026-11-06: the model fixes one field with an edit; the file goes once saved.
+        folder = self.home / "checkpoints"
+        folder.mkdir()
+        file = folder / "s1.state.json"
+        file.write_text(json.dumps(self.state(goal="g" * 1_300, next_action="n" * 1_240)))
+        out = self.save("", "s1", "--file", str(file))
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("goal is 1,300 characters; the cap is 1,000; next_action is 1,240 characters; the cap is 1,000", out.stderr)
+        self.assertTrue(out.stderr.endswith("; the state file is kept: edit it and save again\n"), out.stderr)
+        self.assertTrue(file.is_file())
+        self.assertFalse(self.file().exists())
+        file.write_text(json.dumps(self.state()))  # the edit
+        out = self.save("", "s1", "--file", str(file))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(file.exists(), "saved: the file goes")
 
     def test_ago_text_says_how_long_ago_in_the_largest_unit_that_fits(self):
         # Sprint 4 review, A8: the wording the checkpoint's header uses,
@@ -11441,11 +11499,11 @@ class Checkpoint(unittest.TestCase):
         # Live check, 2026-10-20: the skill writes the state with the Write
         # tool as LONGHAUL_HOME/checkpoints/<session>.state.json (0644, the
         # model's text beside the 0600 checkpoint) and saves it with --file.
-        # Saved or refused, that file goes, and a refusal says so: left after
-        # a refusal (review, Sprint 5, A1) it kept the model's text, a
-        # credential among it perhaps, for good, in a file nothing swept
-        # and the README did not list. A file anywhere else, or named
-        # otherwise, is the user's and is left, refused or not.
+        # Saved, that file goes. A refusal keeps it and says so (2026-11-06:
+        # the model edits the one field and saves again, not the whole JSON),
+        # except a credential's, whose text would stay for good (review,
+        # Sprint 5, A1). A file anywhere else, or named otherwise, is the
+        # user's and is left, refused or not.
         folder = self.home / "checkpoints"
         folder.mkdir()
         state = folder / "s1.state.json"
@@ -11459,14 +11517,25 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
         self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"],
                          "the state file went, the checkpoint stays")
-        for refused in ("{not json", json.dumps(self.state(goal=f"sk-ant-{self.S}")), b"\xff\xfe not text"):
+        for refused in ("{not json", json.dumps(self.state(goal="x" * 1_200)), b"\xff\xfe not text"):
             state.write_bytes(refused if isinstance(refused, bytes) else refused.encode())
             out = self.save("", "s1", "--file", str(state))
             self.assertEqual((out.returncode, out.stdout), (2, ""), out.stderr)
             self.assertEqual(out.stderr.count("\n"), 1, out.stderr)
-            self.assertTrue(out.stderr.endswith("; the state file was removed, write it again\n"), out.stderr)
-            self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"], "refused: the text goes too")
+            self.assertEqual(state.read_bytes(), refused if isinstance(refused, bytes) else refused.encode(), "refused: the file stays")
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json", "s1.state.json"])
             self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
+        self.assertNotIn("; the state file", out.stderr, "an unreadable file is not the model's to edit: no note")
+        state.write_text(json.dumps(self.state(goal="x" * 1_200)))
+        out = self.save("", "s1", "--file", str(state))
+        self.assertTrue(out.stderr.endswith("; the state file is kept: edit it and save again\n"), out.stderr)
+        # A credential's refusal removes the file: its text must not stay.
+        state.write_text(json.dumps(self.state(goal=f"sk-ant-{self.S}")))
+        out = self.save("", "s1", "--file", str(state))
+        self.assertEqual((out.returncode, out.stdout), (2, ""), out.stderr)
+        self.assertTrue(out.stderr.endswith("; the state file was removed, write it again\n"), out.stderr)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["s1.carry.json", "s1.json"], "a credential: the text goes")
+        self.assertEqual(json.loads(self.file().read_text())["goal"], f"from the state file {self.S}")
         for other in (self.work / "s1.state.json", folder / "draft.json"):
             other.write_text("{not json")
             out = self.save("", "s1", "--file", str(other))
@@ -12660,14 +12729,14 @@ class CodexCheckpoint(unittest.TestCase):
                 self.assertEqual(out.stderr, "longhaul checkpoint: not saved: CODEX_THREAD_ID is not a Codex chat's "
                                              "id: letters, digits, - or _ (at most 94)\n", (bad, args))
         self.assertEqual(list(folder.iterdir()), [], "nothing was written")
-        # A refusal takes the skill's state file with it, as on Claude Code.
+        # A refusal keeps the skill's state file, as on Claude Code.
         state_file = folder / f"{self.KEY}.state.json"
         state_file.write_text(json.dumps(self.state()))
         out = self.save("", "--agent", "codex", "--file", str(state_file))
         self.assertEqual((out.returncode, out.stdout), (2, ""))
         self.assertEqual(out.stderr.count("\n"), 1, out.stderr)
-        self.assertTrue(out.stderr.endswith("; the state file was removed, write it again\n"), out.stderr)
-        self.assertEqual(list(folder.iterdir()), [])
+        self.assertTrue(out.stderr.endswith("; the state file is kept: edit it and save again\n"), out.stderr)
+        self.assertEqual([p.name for p in folder.iterdir()], [state_file.name])
         self.assertNothingClaudeOnly(out.stderr)
 
     def test_without_agent_codex_the_save_is_claude_code_s_as_before(self):

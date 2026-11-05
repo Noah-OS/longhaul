@@ -8010,7 +8010,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     removed = remove_state_file(state_file, sid) if state_file is not None and not keep else None
     if problem:
         if keep and state_file is not None and remove_state_file_is_skills(state_file):
-            problem += "; the state file is kept: edit that field in it and save again"
+            problem += "; the state file is kept: edit it and save again"
         elif removed:
             problem += "; the state file was removed, write it again"
         print(f"longhaul checkpoint: not saved: {problem}", file=sys.stderr)
