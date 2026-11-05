@@ -1142,8 +1142,11 @@ def signed_in_as_expected(acct: dict) -> bool:
         return True
     status = auth_status(acct)
     if status.get("unknown"):
+        if remembered_sign_in(acct, status):
+            return True
         log(f"{acct['name']}: could not check who is signed in ({status.get('why')}); trusting it for this launch")
         return True
+    remember_auth(acct, status.get("email"))
     got = status.get("email")
     if (got or "").lower() == want.lower():
         return True
@@ -12461,6 +12464,40 @@ def forget_auth(acct: dict) -> None:
             write_json(AUTH_CACHE, cache)
 
 
+# How old a remembered answer may be and still stand in when claude does not
+# answer the sign-in check in time (the log audit of 2026-11-05, #11).
+AUTH_STAND_IN = 24 * 3600
+
+
+def remember_auth(acct: dict, email) -> dict:
+    """Keep who `acct`'s folder is signed in as in AUTH_CACHE, the cache the
+    panel reads (signed_in_cached()); the terminal's check writes it too
+    (2026-11-06). Returns the entry."""
+    hit = {"email": email, "at": time.time()}
+    with locked("auth"):
+        cache = read_json(AUTH_CACHE) or {}
+        cache[str(config_of(acct))] = hit
+        write_json(AUTH_CACHE, cache)
+    return hit
+
+
+def remembered_sign_in(acct: dict, status: dict) -> bool:
+    """When the check got no answer (`status`, unknown): True if the cache
+    holds an answer under AUTH_STAND_IN old that the account was signed in
+    as the email in accounts.json. Then it is used quietly, one log line,
+    no notification and no "trusting it" warning (2026-11-06). False
+    leaves the caller its old way."""
+    hit = (read_json(AUTH_CACHE) or {}).get(str(config_of(acct))) or {}
+    at = as_number(hit.get("at")) if isinstance(hit, dict) else None
+    age = time.time() - at if at is not None else AUTH_STAND_IN
+    if not isinstance(hit, dict) or not (0 <= age < AUTH_STAND_IN) \
+            or str(hit.get("email") or "").lower() != str(acct.get("email") or "").lower():
+        return False
+    log(f"{acct['name']}: no sign-in answer ({status.get('why')}); using the answer from {int(age // 60)} min ago, "
+        f"signed in as expected")
+    return True
+
+
 def signed_in_cached(acct: dict, binary: str) -> bool:
     """signed_in_as_expected for the panel, remembered for AUTH_TTL. Only a
     definite answer is remembered: a check that hangs or fails says
@@ -12475,13 +12512,11 @@ def signed_in_cached(acct: dict, binary: str) -> bool:
     if fresh:
         status = auth_status(acct, binary)
         if status.get("unknown"):
+            if remembered_sign_in(acct, status):
+                return True
             log(f"{acct['name']}: could not check who is signed in ({status.get('why')}); trusting it for this launch")
             return True
-        hit = {"email": status.get("email"), "at": time.time()}
-        with locked("auth"):
-            cache = read_json(AUTH_CACHE) or {}
-            cache[key] = hit
-            write_json(AUTH_CACHE, cache)
+        hit = remember_auth(acct, status.get("email"))
     if (hit.get("email") or "").lower() == want.lower():
         return True
     if fresh:
@@ -14106,7 +14141,9 @@ def answer_cmd(opts) -> int:
 
 # ---------------------------------------------------------------- setup
 
-AUTH_TIMEOUT = setting("LONGHAUL_AUTH_TIMEOUT", 10, float)
+# 20 s, not 10: the log audit of 2026-11-05 shows "no answer in 10 s, trusting
+# it" 11 times, and each delayed a launch by the whole wait (2026-11-06).
+AUTH_TIMEOUT = setting("LONGHAUL_AUTH_TIMEOUT", 20, float)
 
 
 def auth_status(acct: dict, binary: str | None = None) -> dict:
