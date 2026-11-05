@@ -990,12 +990,17 @@ def denied_in(accounts: list[dict], top: str) -> set[str]:
     return {a["name"] for a in accounts} - set(eligible(accounts, top))
 
 
+EVERYWHERE_BY_ROOT = "everywhere (its folders include /)"
+
+
 def where_allowed(acct: dict) -> str:
     """An account's restriction in words: "only in ~/work/repo, ~/other";
     "nowhere (...)" for a field that is not a list of paths; "anywhere"."""
     allowed = repositories_of(acct)
     if allowed is None:
         return f"nowhere ({REPOSITORIES_JUNK})"
+    if allowed and keeps_everywhere(acct):  # "only in /" read as a narrow list (2026-11-06)
+        return EVERYWHERE_BY_ROOT
     return "only in " + ", ".join(home_path(p) for p in allowed) if allowed else "anywhere"
 
 
@@ -14484,7 +14489,7 @@ def add(opts) -> int:
             return 2
     for r in repos:  # the clone may come later; the guided form has said so already
         if not os.path.exists(os.path.expanduser(r)) and not getattr(opts, "noted", False):
-            say(f"--repo {home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
+            say(f"{folder_shown(r)} does not exist yet; kept for when it does")  # folders --add's words (2026-11-06)
     folder = opts.dir or f"~/.claude-{name.lower()}"
     path = Path(os.path.expanduser(folder)).resolve()
     if path in (DEFAULT_CONFIG.resolve(), (HOME / ".claude").resolve()):
@@ -14905,10 +14910,37 @@ def remove(opts) -> int:
             return 2
         write_json(LONGHAUL_HOME / "accounts.json", [a for a in accounts if a not in gone])
     forget_auth(gone[0])
+    forget_removed(gone[0]["name"])
     say(f"removed {gone[0]['name']} from longhaul's accounts. Its folder {config_of(gone[0])} and its sign-in are kept; "
         "delete the folder yourself if you no longer want them.")
     say_still_running(gone[0])
     return 0
+
+
+def forget_removed(name: str) -> None:
+    """After `remove NAME`: its recorded limit in state.json's limited_until
+    and its entry in SIGN_IN_FAILED go, as they would only sit there, and a
+    later account added under the same name would start with the old
+    ones (the log audit of 2026-11-05, #15; 2026-11-06). The usage
+    ledger and every other history stay, and the account's folder is not
+    touched. Nothing is written when there is nothing to clear; a file
+    that cannot be written is logged and remove goes on."""
+    try:
+        if name in load_state().get("limited_until", {}):
+            update_state(lambda state: state["limited_until"].pop(name, None))
+            log(f"remove: {name}'s recorded limit cleared")
+    except OSError as e:
+        log(f"remove: {name}'s recorded limit was not cleared: {e.strerror or e}")
+    path = LONGHAUL_HOME / SIGN_IN_FAILED
+    try:
+        with locked("sign-in-failed"):
+            kept = read_json(path)
+            if isinstance(kept, dict) and name in kept:
+                del kept[name]
+                write_json(path, kept)
+                log(f"remove: {name}'s sign-in failure cleared")
+    except OSError as e:
+        log(f"remove: {name}'s sign-in failure was not cleared: {e.strerror or e}")
 
 
 def chats_on(acct: dict, processes=None):
@@ -15115,6 +15147,8 @@ def status(opts) -> int:
         allowed = repositories_of(acct)
         if allowed is None:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
+        elif allowed and keeps_everywhere(acct):
+            print(f"       {EVERYWHERE_BY_ROOT}")
         elif allowed:
             print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
         elif kept_out_by(acct, accounts):  # no list of its own, and others keep every folder
