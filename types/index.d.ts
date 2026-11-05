@@ -23,6 +23,10 @@ export type LonghaulAccount = {
   five_hour: LonghaulWindow | null
   week: LonghaulWindow | null
   only_in: string[] | null // [] anywhere, null nowhere
+  // For an account with no list ([] only_in), the accounts whose folders
+  // include /, which keep it out of every folder; [] otherwise. Optional:
+  // an older longhaul.py does not give it.
+  kept_out_by?: string[]
   folder: string
   this_chat: boolean
 }
@@ -61,6 +65,10 @@ export type LonghaulAccountsResult = {
 // What the Add fields hold, and what was wrong with them.
 export type LonghaulAccountsForm = { name: string; email: string; only: string; problem: string | null }
 
+// The folder typed on an account's page to add to its list: which
+// account's page, the text, and what was wrong with it.
+export type LonghaulAccountsFolder = { account: string; path: string; problem: string | null }
+
 // The question a panel chat's relay asks at a usage limit, in ask (the
 // keep-working plan's K1): LONGHAUL_HOME/questions/<chat>.json as
 // longhaul.py's Relay.ask() writes it. Times are epoch seconds.
@@ -96,6 +104,7 @@ declare module 'claude-code' {
       accountsResult: Shaped<LonghaulAccountsResult | null>
       accountsConfirm: Shaped<string | null> // the account whose Remove waits for a yes
       accountsForm: Shaped<LonghaulAccountsForm>
+      accountsFolder: Shaped<LonghaulAccountsFolder>
       accountsPage: Shaped<LonghaulAccountsPage>
       accountsMark: Shaped<string | null> // the key of the element the focus ring is on
       accountsQuestion: Shaped<LonghaulQuestion | null> // this chat's open question

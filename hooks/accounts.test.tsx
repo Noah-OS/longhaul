@@ -233,7 +233,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
                    `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used anywhere', 'a•••@example.com',
                    'folder ~/.claude-personal-1'])
     expect(all).toContain(t)
-  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'back'])
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'back'])
   expect(all.includes('Esc to go back')).toBe(surface === 'terminal')
   await ui.press({ key: 'back' })
   expect(await buttons(ui)).toEqual(ROWS)
@@ -581,6 +581,122 @@ both('a sign-in that failed in a chat: the line says so, the page says when, and
   expect((await ui.find({ key: 'signin-personal-1' }))?.text).toBe('Sign in')
   await ui.press({ key: 'signin-personal-1' })
   expect(after(w)).toEqual([['setup', 'personal-1', '--relogin'], ['status', '--json']])
+  await ui.unmount()
+})
+
+// An account's folders (the owner, 2026-11-05: "I can't edit the accounts"):
+// the Folders part of its page runs `longhaul.py folders NAME ...`, one
+// action at a time, and reads the rows again after each.
+
+both("an account's Folders: each folder with Remove, a field to add one, and Anywhere, each running folders", async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  const all = await texts(ui)
+  for (const t of ['Folders:', '  ~/work', '  ~/clients']) expect(all).toContain(t)
+  expect(await buttons(ui)).toEqual(['signin-work-2', 'remove-work-2', 'folder-remove-0', 'folder-remove-1', 'folder-add',
+    'folder-anywhere', 'back'])
+  expect((await ui.find({ key: 'folder-remove-1' }))?.text).toBe('Remove')
+  expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Anywhere')
+  expect(await ui.find({ key: 'folder-path' })).toBeDefined()
+  await ui.press({ key: 'folder-remove-1' })
+  expect(after(w)).toEqual([['folders', 'work-2', '--remove', '~/clients'], ['status', '--json']])
+  expect(w.timeouts.slice(1)).toEqual([60_000, 60_000])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove folder ~/clients: work-2'))).toBe(true)
+  // A folder typed, trimmed, then the field empty again once it worked.
+  await ui.input({ key: 'folder-path', text: ' ~/new ' })
+  await ui.press({ key: 'folder-add' })
+  expect(after(w).slice(2)).toEqual([['folders', 'work-2', '--add', '~/new'], ['status', '--json']])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Add folder ~/new: work-2'))).toBe(true)
+  expect((await ui.find({ key: 'folder-path' }))?.text).toBe('')
+  await ui.press({ key: 'folder-anywhere' })
+  expect(after(w).slice(4)).toEqual([['folders', 'work-2', '--anywhere'], ['status', '--json']])
+  await ui.unmount()
+})
+
+both('Add folder refuses an empty or relative folder and runs nothing; the field is per page', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain('Folders: anywhere')
+  expect(await ui.find({ key: 'folder-anywhere' })).toBeUndefined() // it has no list to drop
+  for (const [typed, said] of [['', /Type a folder/], ['work/x', /starts with \/ or ~\//], ['-rf', /starts with/]] as const) {
+    await ui.input({ key: 'folder-path', text: typed, kind: 'change' })
+    await ui.press({ key: 'folder-add' })
+    expect(after(w)).toEqual([])
+    expect((await texts(ui)).some(t => t.startsWith('✘') && said.test(t))).toBe(true)
+  }
+  await ui.input({ key: 'folder-path', text: '~/half', kind: 'change' })
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  expect((await ui.find({ key: 'folder-path' }))?.text).toBe('') // what was typed for personal-1 is not offered here
+  await ui.press({ key: 'folder-add' })
+  expect(after(w)).toEqual([])
+  await ui.unmount()
+})
+
+both('an account kept out of every folder: its line says so, its page names who keeps them and the way out', async ($, on, surface) => {
+  const w = world(on)
+  const keeper = (name: string) => ({ ...ACCOUNTS[0], name, this_chat: false, only_in: ['/'], kept_out_by: [] })
+  const spare = { ...ACCOUNTS[0], name: 'spare-5', this_chat: false, only_in: [], kept_out_by: ['personal-1', 'personal-2'] }
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [keeper('personal-1'), keeper('personal-2'), spare] }))
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-spare-5' }))?.text).toMatch(/spare-5 .*\(used nowhere\)$/)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/\(only in \/\)$/)
+  await open(ui, 'row-spare-5')
+  const all = await texts(ui)
+  expect(all).toContain('may be used nowhere for now')
+  expect(all).toContain('⚠ personal-1, personal-2 keep every folder, so spare-5 is used nowhere until a folder is added '
+    + 'here (or / is removed from theirs).')
+  await ui.input({ key: 'folder-path', text: '~/code' })
+  await ui.press({ key: 'folder-add' })
+  expect(after(w)).toEqual([['folders', 'spare-5', '--add', '~/code'], ['status', '--json']])
+  // Kept out by one: worded for one.
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [keeper('personal-1'), { ...spare, kept_out_by: ['personal-1'] }] }))
+  await ui.press({ key: 'signin-spare-5' })
+  expect(await texts(ui)).toContain('⚠ personal-1 keeps every folder, so spare-5 is used nowhere until a folder is added '
+    + "here (or / is removed from personal-1's).")
+  // The keeper's own page: / with its Remove, and Anywhere.
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain('  /')
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-remove-0', 'folder-add',
+    'folder-anywhere', 'back'])
+  await ui.press({ key: 'folder-remove-0' })
+  expect(after(w).slice(-2)).toEqual([['folders', 'personal-1', '--remove', '/'], ['status', '--json']])
+  await ui.unmount()
+})
+
+both('a folders field that is not a list: the page says so, offers Anywhere and no field to add to it', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-spare-3')
+  expect(await texts(ui)).toContain('Folders: its repositories field is not a list of absolute paths, so it is used '
+    + 'nowhere. Anywhere drops it.')
+  expect(await buttons(ui)).toEqual(['signin-spare-3', 'remove-spare-3', 'folder-anywhere', 'back'])
+  expect(await ui.find({ key: 'folder-path' })).toBeUndefined()
+  await ui.press({ key: 'folder-anywhere' })
+  expect(after(w)).toEqual([['folders', 'spare-3', '--anywhere'], ['status', '--json']])
+  await ui.unmount()
+})
+
+both('a folders run that is refused shows why; a typed email is masked, and passed whole', async ($, on, surface) => {
+  const w = world(on)
+  w.answer.folders = done('', 2, "longhaul ~/clients is not one of work-2's folders; it may be used only in ~/work\n")
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'folder-remove-1' })
+  let all = await texts(ui)
+  expect(all.some(t => t.startsWith('✘') && t.includes('Remove folder ~/clients: work-2'))).toBe(true)
+  expect(all).toContain("longhaul ~/clients is not one of work-2's folders; it may be used only in ~/work")
+  expect(await ui.find({ key: 'folder-remove-1' })).toBeDefined() // the rows read again, and the buttons back
+  w.answer.folders = done('Done.')
+  await ui.input({ key: 'folder-path', text: '/srv/first.last@example.com' })
+  await ui.press({ key: 'folder-add' })
+  expect(after(w).slice(-2)).toEqual([['folders', 'work-2', '--add', '/srv/first.last@example.com'], ['status', '--json']])
+  all = await texts(ui)
+  expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /srv/f•••@example.com: work-2'))).toBe(true)
+  expect(all.join('\n')).not.toMatch(/first\.last/)
   await ui.unmount()
 })
 

@@ -111,6 +111,15 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
+  longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]
+                          where NAME may be used (with no option it only
+                          reads); --add a folder it may be used in, and those
+                          inside it (~ allowed, kept as written), --remove one
+                          (by real path), --anywhere drops its list. A folder
+                          an account's list names is kept for the accounts
+                          that name it, so one with no list is used where no
+                          list does: beside one whose folders include /, nowhere,
+                          which this says. /accounts does it with buttons
   longhaul switch [ask|auto|never]
                           the switching mode at a usage limit (see --switch):
                           with none, the one in force and where it comes from
@@ -941,6 +950,33 @@ def eligible(accounts: list[dict], top: str) -> list[str]:
     return reserved or [a["name"] for a in accounts if account_allowed(a, top)]
 
 
+def keeps_everywhere(acct: dict) -> bool:
+    """Whether `acct`'s own list names / (by real path), which covers every
+    folder, so that eligible() reserves each one for it."""
+    return any(os.path.realpath(p) == os.sep for p in repositories_of(acct) or ())
+
+
+def kept_out_by(acct: dict, accounts: list[dict]) -> list[str]:
+    """The accounts whose list keeps every folder (keeps_everywhere()), in
+    the file's order, for an account with no list: it may be used only
+    where no list reserves the folder, and / reserves them all, so it is
+    used nowhere (the owner, 2026-11-05: an account added with no --repo
+    beside two that listed "/", and nothing said why). [] for an account
+    with a list, or a field that is not one: its own rule says where."""
+    if repositories_of(acct) != []:
+        return []
+    return [a["name"] for a in accounts if keeps_everywhere(a)]
+
+
+def kept_out_text(name: str, kept: list[str]) -> str:
+    """What add, folders, status and the doctor's step say of an account
+    with no list that `kept` keep out of every folder, and the ways out."""
+    many = len(kept) > 1
+    return (f"{', '.join(kept)} keep{'' if many else 's'} every folder ({'their' if many else 'its'} folders include "
+            f"/), so {name} will not be used anywhere until its folders are set: in /accounts, on {name}'s page, or "
+            f"with `longhaul folders {name} --add PATH` (or take / off {'their lists' if many else 'its list'}).")
+
+
 def denied_in(accounts: list[dict], top: str) -> set[str]:
     """The names the choosers skip in `top`, for the skip set each has
     already (pick's `skip`, choose_for_panel's `wrong`, Relay.bad): the
@@ -962,21 +998,36 @@ def where_allowed(acct: dict) -> str:
     return "only in " + ", ".join(home_path(p) for p in allowed) if allowed else "anywhere"
 
 
-def may_not_text(acct: dict, top: str) -> str:
-    """The refusal of --account NAME where NAME may not be used (Q1):
-    "Pro may not be used in ~/personal/x (its repositories: ~/work/repo)"."""
-    allowed = repositories_of(acct)
-    why = ("its repositories: " + ", ".join(home_path(p) for p in allowed) if allowed
-           else REPOSITORIES_JUNK)
-    return f"{acct['name']} may not be used in {home_path(top)} ({why})"
+def may_not_text(acct: dict, top: str, accounts: list[dict]) -> str:
+    """The refusal of --account NAME where NAME may not be used (Q1), by
+    why: its own list leaves the folder out, "Pro may not be used in
+    ~/personal/x (its repositories: ~/work/repo)"; its field is not a list
+    (REPOSITORIES_JUNK); or, with no list of its own, the folder is kept
+    for the accounts whose lists cover it (eligible()), "spare may not be
+    used in ~/x: ~/x is kept for personal-1, personal-2 (their folders
+    include it)". That last once said REPOSITORIES_JUNK of a field that
+    was not there (the owner, 2026-11-05)."""
+    allowed, where = repositories_of(acct), home_path(top)
+    if allowed is None:
+        return f"{acct['name']} may not be used in {where} ({REPOSITORIES_JUNK})"
+    if allowed:
+        return f"{acct['name']} may not be used in {where} (its repositories: {', '.join(map(home_path, allowed))})"
+    kept = [a["name"] for a in accounts if covers(a, top)]
+    return (f"{acct['name']} may not be used in {where}: {where} is kept for {', '.join(kept) or 'other accounts'} "
+            f"({'its' if len(kept) == 1 else 'their'} folders include it)")
 
 
 def no_account_text(top: str, accounts: list[dict]) -> str:
     """The one line said when no account may be used in `top`: each
-    account's restriction, the file to edit, the other way out."""
+    account's restriction, then the ways out: a folder of those, this one
+    added to an account (`longhaul folders`, /accounts or the file). No
+    list covers `top` here, or the accounts it names would be used, so
+    each account has a list or a field that is not one."""
     each = ", ".join(f"{a['name']} {where_allowed(a)}" for a in accounts)
-    return (f"No account may be used in {home_path(top)}: {each}. "
-            f'Edit "repositories" in {home_path(str(LONGHAUL_HOME / "accounts.json"))}, or run from one of those.')
+    where = home_path(top)
+    return (f"No account may be used in {where}: {each}. Run from one of those, or add this folder to an account: "
+            f"`longhaul folders NAME --add {where}` (or in /accounts, or edit \"repositories\" in "
+            f"{home_path(str(LONGHAUL_HOME / 'accounts.json'))}).")
 
 
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
@@ -1959,7 +2010,7 @@ def run(opts) -> int:
     top = repository_of(os.getcwd())
     denied = denied_in(accounts, top)
     if opts.account in denied:
-        say(f"{may_not_text(accounts[names.index(opts.account)], top)}; longhaul has not started Claude")
+        say(f"{may_not_text(accounts[names.index(opts.account)], top, accounts)}; longhaul has not started Claude")
         return 2
     if denied and all(name in denied for name in names):
         say(no_account_text(top, accounts))
@@ -2770,7 +2821,7 @@ def allow_cmd(opts) -> int:
         return 0
     acct = accounts[names.index(name)]
     if not account_allowed(acct, top):
-        return refuse(f"{may_not_text(acct, top)}; not allowed")
+        return refuse(f"{may_not_text(acct, top, accounts)}; not allowed")
     try:
         allow_chat(sid, name, top)
     except OSError as e:
@@ -12451,7 +12502,7 @@ def pipe(argv: list[str]) -> int:
         top = repository_of(os.getcwd())
         denied = denied_in(accounts, top)
         if opts.account in denied:
-            log(f"pipe: {may_not_text(accounts[names.index(opts.account)], top)}; longhaul did not start Claude")
+            log(f"pipe: {may_not_text(accounts[names.index(opts.account)], top, accounts)}; longhaul did not start Claude")
             return 2
         if denied and all(name in denied for name in names):
             log(f"pipe: {no_account_text(top, accounts)}")
@@ -13961,6 +14012,9 @@ def add(opts) -> int:
     code = setup(argparse.Namespace(account=name, relogin=False))
     if code != 0:
         say(f"{name} is on the list but not signed in, so longhaul will not use it yet: run `longhaul setup {name}`")
+    kept = kept_out_by(entry, accounts)
+    if kept:  # the owner, 2026-11-05: added with no --repo beside accounts that list /, it was used nowhere
+        say(kept_out_text(name, kept))
     return code
 
 
@@ -14353,6 +14407,138 @@ def remove(opts) -> int:
     return 0
 
 
+def folders(opts) -> int:
+    """`longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]`
+    (the owner, 2026-11-05: "I can't edit the accounts", "I need to be
+    able to edit it"): where an account may be used, and its
+    "repositories" changed without a hand edit; the accounts screen's
+    buttons run it. With no option it only reads: where_allowed()'s words,
+    and a line when other accounts keep every folder (kept_out_by()).
+    --add keeps PATH as written, `~` and all, as add's --repo does,
+    absolute once expanded, one not there yet with a note; --remove takes
+    off each entry that is PATH, as written or by real path; removes come
+    before adds. --anywhere drops the list, as an account added with no
+    --repo has none, and so does a remove that leaves it empty.
+    accounts.json is written as add and remove write it, whole, the other
+    keys and the accounts' order kept, one log line per change; an
+    unknown NAME or a bad path writes nothing, exit 2."""
+    adds, drops = opts.add or [], opts.remove or []
+    if opts.anywhere and (adds or drops):
+        say("--anywhere drops every folder: give it alone, not with --add or --remove")
+        return 2
+    for p in adds:  # a relative path would be read against whatever folder longhaul runs in
+        if not os.path.isabs(os.path.expanduser(p)):
+            say(f"--add {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
+            return 2
+    if not (adds or drops or opts.anywhere):  # it only reads: no lock, nothing written
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem, tell=print)
+        if acct is None:
+            return 2
+        print("\n".join(folders_lines(acct, accounts)))
+        return 0
+    notes, changes = [], []
+    with locked("accounts"):
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem)
+        if acct is None:
+            return 2
+        name, found = acct["name"], acct.get("repositories")
+        entry = {k: v for k, v in acct.items() if k != "repositories"}  # the other keys, in their order
+        if opts.anywhere:
+            listed = repositories_of(acct)
+            if listed == []:
+                notes.append(f"{name} has no list of folders: it may be used anywhere already")
+            else:
+                changes.append(f"dropped {name}'s folders ({', '.join(map(home_path, listed))})" if listed
+                               else f"dropped {name}'s folders: {REPOSITORIES_JUNK}")
+        else:
+            if found is not None and not isinstance(found, list):
+                say(f"{name}'s repositories field is not a list, so no folder can be added to it or taken from it: "
+                    f"`longhaul folders {name} --anywhere` drops it, then --add sets its folders")
+                return 2
+            paths = list(found or [])
+            for p in drops:
+                hits = [e for e in paths if same_folder(e, p)]
+                if not hits:
+                    say(f"{folder_shown(p)} is not one of {name}'s folders; it may be used {where_allowed(acct)}")
+                    return 2
+                paths = [e for e in paths if e not in hits]
+                changes += [f"removed {folder_shown(e)} from {name}'s folders" for e in hits]
+            for p in adds:
+                if any(same_folder(e, p) for e in paths):
+                    notes.append(f"{folder_shown(p)} is already one of {name}'s folders")
+                    continue
+                paths.append(p)  # kept as given, `~` included, as config_dir is; expanded at use
+                changes.append(f"added {folder_shown(p)} to {name}'s folders")
+                if not os.path.exists(os.path.expanduser(p)):
+                    notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
+            if paths:  # in its place when it was there, else last; none left, none kept
+                entry = {**acct, "repositories": paths}
+        if changes:
+            accounts[accounts.index(acct)] = entry
+            write_json(LONGHAUL_HOME / "accounts.json", accounts)
+        else:
+            entry = acct
+    for line in changes:
+        say(line)
+    for line in notes:
+        show(line)
+    print("\n".join(folders_lines(entry, accounts)))
+    return 0
+
+
+def folders_account(name: str, accounts, problem, tell=say):
+    """`longhaul folders`'s account, by NAME in any case, as remove finds
+    it; None once the reason is told (`tell`: print where it only reads,
+    which logs nothing): the file cannot be read, or has no such account."""
+    if problem:
+        tell(unreadable_text(problem))
+        return None
+    found = [a for a in accounts if a["name"].lower() == name.lower()]
+    if found:
+        return found[0]
+    tell(f"no account called {name}; " + (f"the accounts are {', '.join(a['name'] for a in accounts)}" if accounts
+                                          else "there is no list of accounts yet: `longhaul add` adds one"))
+    return None
+
+
+def same_folder(entry, path: str) -> bool:
+    """Whether a "repositories" entry is the folder `path`: as written, or
+    by real path once `~` is expanded on both sides, as account_allowed()
+    compares them."""
+    if not isinstance(entry, str):
+        return False
+    if entry == path:
+        return True
+    a, b = os.path.expanduser(entry), os.path.expanduser(path)
+    return os.path.isabs(a) and os.path.isabs(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
+def folder_shown(path: str) -> str:
+    """A folder as `longhaul folders` names it: `~` expanded, a trailing /
+    dropped, then shown from the home folder (~/work for ~/work/ and for
+    the full path)."""
+    return home_path(os.path.normpath(os.path.expanduser(path)))
+
+
+def folders_lines(acct: dict, accounts: list[dict]) -> list[str]:
+    """Where `acct` may be used, in where_allowed()'s words; with no list
+    of its own, the accounts that keep it out of every folder; with / on
+    its list, the accounts it keeps out."""
+    lines = [f"{acct['name']} may be used {where_allowed(acct)}."]
+    kept = kept_out_by(acct, accounts)
+    if kept:
+        lines.append(f"But {kept_out_text(acct['name'], kept)}")
+    if keeps_everywhere(acct):
+        out = [a["name"] for a in accounts if repositories_of(a) == []]  # acct has a list: not among them
+        if out:
+            lines.append(f"With / among its folders, {acct['name']} keeps every folder, so {', '.join(out)} "
+                         f"{'are' if len(out) > 1 else 'is'} used nowhere until {'their' if len(out) > 1 else 'its'} "
+                         "folders are set.")
+    return lines
+
+
 def status(opts) -> int:
     if getattr(opts, "json", False):
         return status_json()
@@ -14381,6 +14567,8 @@ def status(opts) -> int:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
         elif allowed:
             print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
+        elif kept_out_by(acct, accounts):  # no list of its own, and others keep every folder
+            print(f"       {kept_out_text(acct['name'], kept_out_by(acct, accounts))}")
         elif accounts_listed:
             print("       anywhere")
         if acct.get("config_dir"):
@@ -14501,13 +14689,16 @@ def status_checks(accounts: list[dict]) -> list:
     return found
 
 
-def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, failed: dict) -> dict:
+def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, failed: dict,
+                   accounts: list[dict]) -> dict:
     """One account's entry in the screen's object, from its auth_status()
     answer `a`. A check that could not say leaves signed_in and as_expected
     null, never false: that is not "signed out". As expected is what
     signed_in_as_expected() lets run: any sign-in for an entry with no
     email, else that email, in any case. sign_in_failed_at is from
-    SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at())."""
+    SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at()).
+    kept_out_by names the accounts that keep it out of every folder
+    (kept_out_by(), among `accounts`), for one with no list; else []."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -14530,6 +14721,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "five_hour": status_window(reading, "five_hour", now),
         "week": status_window(reading, "seven_day", now),
         "only_in": None if allowed is None else [home_path(p) for p in allowed],
+        "kept_out_by": kept_out_by(acct, accounts),
         "folder": home_path(str(config_of(acct))) if has_folder(acct) else "",
         "this_chat": this_chat,
     }
@@ -14550,7 +14742,7 @@ def status_json() -> int:
     ours = next((i for i, a in enumerate(accounts)
                  if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
     failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
-    rows = [status_account(acct, a, state, now, i == ours, failed)
+    rows = [status_account(acct, a, state, now, i == ours, failed, accounts)
             for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
     here = None
     if listed:
@@ -15141,6 +15333,12 @@ def doctor_accounts() -> dict:
         elif repositories_of(a) is None:
             items.append(("bad", f"{a['name']}: {folder}, {where_allowed(a)}",
                           f'make its "repositories" in {where} a list of absolute paths'))
+        elif kept_out_by(a, accounts):  # no list of its own, and others keep every folder (2026-11-05)
+            kept = kept_out_by(a, accounts)
+            items.append(("warn", f"{a['name']}: {folder}, used nowhere: {', '.join(kept)} "
+                                  f"keep{'' if len(kept) > 1 else 's'} every folder",
+                          f"set its folders in /accounts, on {a['name']}'s page, or with "
+                          f"`longhaul folders {a['name']} --add PATH`"))
         else:
             items.append(("ok", f"{a['name']}: {folder}, {where_allowed(a)}", None))
     same = "keep one of them, or give the other its own subscription"
@@ -16342,7 +16540,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
+                            "add", "remove", "folders", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
                             "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
                             "models-hook", "allow", "switch", "answer"):
@@ -16405,6 +16603,15 @@ def main(argv: list[str]) -> int:
                                 "(default: anywhere)")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "folders":
+            p.add_argument("name", help="the account (with no option: where it may be used; it only reads)")
+            p.add_argument("--add", action="append", metavar="PATH",
+                           help="a folder it may be used in, and those inside it, kept as written (~ allowed); "
+                                "repeat for more")
+            p.add_argument("--remove", action="append", metavar="PATH",
+                           help="one of its folders to take off, matched by real path; repeat for more")
+            p.add_argument("--anywhere", action="store_true",
+                           help="drop its list: it may be used wherever no other account's folders keep the folder")
         if cmd == "allow":
             p.add_argument("chat", metavar="ID",
                            help="the chat: its id, or its first 8 characters or more (the account check's refusal "
@@ -16462,7 +16669,8 @@ def main(argv: list[str]) -> int:
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
-                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove, "vscode": vscode, "models": models,
+                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
+                "folders": folders, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,

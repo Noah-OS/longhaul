@@ -21630,7 +21630,8 @@ class StatusJson(unittest.TestCase):
                 self.assertEqual(found["accounts"], [{
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
-                    "five_hour": None, "week": None, "only_in": [], "folder": "~/claude", "this_chat": False}])
+                    "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "folder": "~/claude",
+                    "this_chat": False}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
