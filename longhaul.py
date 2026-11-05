@@ -12855,6 +12855,7 @@ class Relay:
         self.unmanaged: set = set()
         self.gone: set = set()
         self.off_done: set = set()
+        self.to_reconsider = False  # refresh() saw a change: reconsider() at the next round
         self.cond = threading.Condition()
         self.queue: collections.deque = collections.deque()
         self.paused = False
@@ -13307,7 +13308,9 @@ class Relay:
         """accounts.json and the mode re-read when a file changed
         (LiveSettings), before each decision that uses them: each round of
         tend(), at a limit, at a reopen's question and at a carry-on. A
-        mode changes only where no --switch or LONGHAUL_SWITCH set it."""
+        mode changes only where no --switch or LONGHAUL_SWITCH set it. A
+        change marks the open question or carry-on for reconsider(), at
+        the next round of tend(): never in the middle of another decision."""
         changed = self.live.check()
         sid = (self.watch.sid if self.watch else None) or "a chat"
         if "mode" in changed:
@@ -13315,6 +13318,53 @@ class Relay:
             self.mode = self.live.mode
         if "accounts" in changed:
             self.use_accounts(self.live.accounts, sid)
+        if changed:
+            self.to_reconsider = True
+
+    def reconsider(self) -> None:
+        """accounts.json or the mode changed while this chat waits at a
+        limit (refresh()): a chat waited 3¾ h for one account's reset while
+        another had been allowed for hours, and three went on asking after
+        auto was saved (the log audit of 2026-11-05, #1). When an account
+        allowed here has room now: in auto (with the front end's consent,
+        swap), a carry-on waiting for a reset goes now, and an open
+        question gives way to the move, as at a limit (switch(); a
+        reopen's, move_at_reopen()); in ask, a question about the first
+        reset is asked again, as a move. In auto with no room, an open
+        question gives way to the carry-on at the first reset. A carry-on
+        you answered stays as you answered it, and nothing is done for a
+        chat that has carried on since its limit."""
+        q, c = self.question, self.carry
+        auto = self.mode == "auto" and self.swap
+        if not ((q and (auto or q["kind"] == "first_reset")) or (c and not q and auto and c["why"] != "answered")):
+            return
+        about = self.question_for if q else self.carry_for
+        if self.replied_at > about["since"]:
+            return  # tend() and carry_on() see that it carried on
+        nxt, until = choose_for_panel(self.accounts, self.binary, (self.idx + 1) % len(self.accounts), load_state(),
+                                      wrong=set(self.bad))
+        if nxt is None or nxt == self.idx or (until and not (q and auto and not about.get("reopened"))):
+            return
+        limit, since, reopened = about["limit"], about["since"], about.get("reopened")
+        name = self.accounts[nxt]["name"]
+        if q:
+            room = f"{name} has room now" if not until else f"{name} resets first, at {clock(until)}"
+            log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: {room}"
+                + (" and switching is auto" if auto else ""))
+            self.drop_question()
+            if not auto:
+                self.ask(limit, since, reopened=bool(reopened))
+            elif until:
+                self.schedule(nxt, until, "auto", limit, since)
+            elif reopened:
+                self.move_at_reopen(nxt, limit, since)
+            else:
+                self.switch(limit, to=nxt)
+            self.settle_hold()
+            return
+        log(f"wait: {c['chat']}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {name} has room")
+        self.drop_carry()
+        self.switch(limit, to=nxt)
 
     def use_accounts(self, found: list[dict], sid: str) -> None:
         """The accounts re-read: this chat's account found again
@@ -13574,11 +13624,15 @@ class Relay:
         """Each round of loop(): the open question's answer, a question the
         chat has made moot by carrying on, and a carry-on that is due
         (past due after a sleep: then at the first round awake); and
-        first, accounts.json and the mode as they are now (refresh()), and
-        a chat whose account was removed or is no longer allowed here
-        (tend_off())."""
+        first, accounts.json and the mode as they are now (refresh()), a
+        chat whose account was removed or is no longer allowed here
+        (tend_off()), and the open question or carry-on looked at again
+        after such a change (reconsider())."""
         self.refresh()
         self.tend_off()
+        if self.to_reconsider:
+            self.to_reconsider = False
+            self.reconsider()
         if self.question:
             if self.replied_at > self.question_for["since"]:
                 q = self.question

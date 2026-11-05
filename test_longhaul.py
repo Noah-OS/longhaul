@@ -18008,6 +18008,64 @@ class KeepWorking(unittest.TestCase):
         q = self.question()
         self.assertEqual((q["kind"], q["to"]), ("first_reset", "Max"), "asked again, never moved unasked")
 
+    def test_in_auto_a_carry_on_waiting_for_a_reset_goes_now_to_an_account_added_with_room(self):
+        # A chat waited 3¾ h for one account's reset while another had been
+        # allowed for hours: the wait is looked at again when the file changes.
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 9000)
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Max")
+        self.later(60)
+        self.write_accounts(self.accounts + [self.account("Team")])
+        r.tend()
+        self.assertEqual(r.moves, [("Team", longhaul.CARRY_ON.format(old="Max", kind="session", new="Team"))])
+        self.assertIsNone(self.waiting())
+        self.assertIn("wait: sid-k's carry-on on Max at ", self.log_text())
+        self.assertIn(" goes now: Team has room", self.log_text())
+
+    def test_in_ask_a_first_reset_question_is_asked_again_when_an_account_gets_room(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        first = self.question()
+        self.assertEqual(first["kind"], "first_reset")
+        self.later(60)
+        self.write_accounts(self.accounts + [self.account("Team")])
+        r.tend()
+        q = self.question()
+        self.assertEqual((q["kind"], q["to"], r.moves), ("move", "Team", []), "asked, never moved unasked")
+        self.assertNotEqual(q["id"], first["id"])
+        self.assertIn(f"question: sid-k's question ({first['id']}) is withdrawn: Team has room now", self.log_text())
+
+    def test_an_answered_carry_on_stays_as_answered_when_an_account_gets_room(self):
+        self.write_accounts(self.accounts)
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "yes")
+        r.tend()
+        self.write_accounts(self.accounts + [self.account("Team")])
+        r.tend()
+        self.assertEqual((r.moves, self.waiting()["account"], self.question()), ([], "Pro", None))
+
+    def test_auto_saved_while_a_question_is_open_moves_the_chat(self):
+        # Three chats went on asking after the owner saved auto.
+        config = self.home / "config.json"
+        config.write_text(json.dumps({"switch": "ask"}))
+        r = self.relay("ask", reread=longhaul.panel_switch_in_force)
+        self.stop(r)
+        q = self.question()
+        self.assertEqual(q["kind"], "move")
+        self.later(60)
+        config.write_text(json.dumps({"switch": "auto"}))
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))])
+        self.assertIsNone(self.question())
+        self.assertIn(f"question: sid-k's question ({q['id']}) is withdrawn: Pro has room now and switching is auto",
+                      self.log_text())
+
     def test_a_carry_on_finds_its_account_again_by_name(self):
         self.write_accounts(self.accounts)
         self.limited(Pro=self.clock.at + 600, Team=self.clock.at + 9000)
@@ -18319,6 +18377,23 @@ class Pipe(StreamHarness):
         said = [m for m in self.seen if m.get("type") == "longhaul"]
         self.assertEqual(said, [{"type": "longhaul", "subtype": "moved", "from": "Max", "to": "Pro", "why": "five_hour"}])
         self.assertEqual(self.calls()[1]["config"], str(self.pro))
+
+    def test_pipe_uses_a_mode_saved_mid_session_unless_switch_set_it(self):
+        # The log audit of 2026-11-05 (#1): config.json is read again as it
+        # changes; --switch (and LONGHAUL_SWITCH) still win over it.
+        config = self.relay / "config.json"
+        for flags, said in ((("--swap",), "moved"), (("--swap", "--switch", "never"), "stays")):
+            with self.subTest(flags=flags):
+                config.write_text(json.dumps({"switch": "never"}))
+                self.plan(["reply", "limit", "reply"])
+                p = self.pipe(*flags, LONGHAUL_SWITCH="")
+                self.wait_for(self.result_for(self.user(p, "first")))
+                config.write_text(json.dumps({"switch": "auto"}))
+                self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+                self.assertEqual(self.wait_for(lambda m: m.get("type") == "longhaul", 20)["subtype"], said)
+                p.stdin.close()
+                p.wait(20)
+                (self.relay / "calls.jsonl").unlink()
 
     def test_pipe_makes_its_own_initialize_when_the_driver_sent_none(self):
         self.plan(["limit", "reply"])
