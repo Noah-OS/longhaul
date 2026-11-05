@@ -79,7 +79,7 @@ Once the plugin is loaded, most of it works by itself.
 | **The context reminder and the compaction** | At 200,000 tokens of context Claude is asked to save a checkpoint at its next stopping point; once it has, Longhaul compacts the chat at the end of that turn (`LONGHAUL_AUTO_COMPACT=off` turns that off), and the checkpoint comes back. A subagent whose own context passes 150,000 tokens is told to finish its step and report what is done and what is left (`LONGHAUL_SUBAGENT_AT` sets the size; `off` turns it off). |
 | **Auto Model**<br><sub>On, a guide</sub> | At each start Claude gets a short guide for choosing each subagent's model by how hard its job is, and every pick is logged. `longhaul models off` turns it off; `longhaul models cap sonnet` lowers a call above Sonnet. Its effect on cost and quality is not measured yet. |
 | **Output filter**<br><sub>Shadow: it only logs</sub> | After each `Bash` call it measures what it could cut from a long output, and changes nothing until a week of it is measured (`LONGHAUL_FILTERS=lossless` or `on` to use it; `off` turns it off). |
-| **[Code index](https://github.com/Noah-OS/longhaul/wiki/Code-Index)**<br><sub>On</sub> | Where CodeGraph or Trail-Code is installed and the repository has no map, builds one in the background, and tells Claude when an index exists (`LONGHAUL_INDEX=off` turns it off). Longhaul installs nothing. |
+| **[Code index](https://github.com/Noah-OS/longhaul/wiki/Code-Index)**<br><sub>On</sub> | Where CodeGraph is installed and the repository has no map, builds one in the background, and tells Claude when an index exists. `LONGHAUL_INDEX=all` adds Trail-Code; `LONGHAUL_INDEX=off` turns it off. Longhaul installs nothing. A lesson saved in a line of the project's `CLAUDE.md` works as well as one kept by a code map. |
 | **Display**<br><sub>In Claude Code and the VS Code panel</sub> | A status entry with the account, its allowance and the context size, then `update 0.3.4` when a newer Longhaul is out. A pop-up when a checkpoint is saved or brought back, the reminder fires, the account changes at a limit, a question at a limit waits in `/accounts`, a turn stops at a limit or on a sign-in or billing error, or a newer Longhaul is out. |
 
 **What you type in a chat**
@@ -190,7 +190,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_AUTO_COMPACT` | on | `off`: no compaction after a save |
 | `LONGHAUL_SUBAGENT_AT` | `150000` | a subagent's own context at which it is told to report back; `off` |
 | `LONGHAUL_FILTERS` | `shadow` | `lossless`, `on` or `off` |
-| `LONGHAUL_INDEX` | on | `off`: no code index built |
+| `LONGHAUL_INDEX` | on | CodeGraph's index only; `all`: CodeGraph's and Trail-Code's; `off`: no code index built |
 | `LONGHAUL_SWITCH` | `ask` | `auto` or `never`; overrides `longhaul switch` |
 | `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
 

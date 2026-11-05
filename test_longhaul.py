@@ -6986,7 +6986,7 @@ class Index(unittest.TestCase):
         # test says so; the runner is its own process and reads
         # LONGHAUL_HOME at its import, so the environment names this home
         # too; the variable a `-p` run sets is each test's.
-        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "LONGHAUL_INDEX": "on",
+        patcher = mock.patch.dict(os.environ, {"PATH": str(self.bin), "LONGHAUL_INDEX": "all",
                                                "LONGHAUL_HOME": str(self.home)})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -6994,7 +6994,7 @@ class Index(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX")}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
-                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_INDEX="on")
+                        LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_INDEX="all")
         for name in self.TELEMETRY:  # what the programs read of their own telemetry is each test's
             self.env.pop(name, None)
 
@@ -7042,7 +7042,7 @@ class Index(unittest.TestCase):
             data["agent_id"], data["agent_type"] = agent, "Explore"
         return data
 
-    def plan(self, data, index="on"):
+    def plan(self, data, index="all"):
         return longhaul.index_plan(data, index)
 
     def planned(self, *programs, top=None):
@@ -7050,7 +7050,7 @@ class Index(unittest.TestCase):
         with the fake index_program() found for it in bin/."""
         return [(program, str(self.repo) if top is None else top, str(self.bin / program)) for program in programs]
 
-    def check(self, data, mode="warn", index="on"):
+    def check(self, data, mode="warn", index="all"):
         return longhaul.guard_check(data, mode, index=index)
 
     def context(self, answer):
@@ -7064,9 +7064,9 @@ class Index(unittest.TestCase):
         path = self.tmp / f"{program}.calls"
         return path.read_text().splitlines() if path.exists() else []
 
-    def begin(self, data):
+    def begin(self, data, index="all"):
         """What a session's start does of the index: the pairs started."""
-        return longhaul.index_start(data, "on")[0]
+        return longhaul.index_start(data, index)[0]
 
     def said(self, answer):
         """What the user is told: the answer's systemMessage, or None."""
@@ -7111,15 +7111,19 @@ class Index(unittest.TestCase):
         self.assertEqual(self.plan(self.start()), both, "the control: a work tree with no map, both programs found")
         # On by default (the owner, 2026-10-23: "on by default for everyone",
         # "both by default"); "off" alone is off.
-        self.assertEqual(longhaul.index_mode(), "on", "the fixture's environment")
-        for value in (None, "", "1", "ON", "yes"):
+        self.assertEqual(longhaul.index_mode(), "all", "the fixture's environment")
+        for value in (None, "", "1", "ON", "yes", "on"):
             with mock.patch.dict(os.environ):
                 if value is None:
                     os.environ.pop("LONGHAUL_INDEX")
                 else:
                     os.environ["LONGHAUL_INDEX"] = value
                 self.assertEqual(longhaul.index_mode(), "on", f"LONGHAUL_INDEX={value}")
-                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), both, f"LONGHAUL_INDEX={value}")
+                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), self.planned("codegraph"),
+                                 f"LONGHAUL_INDEX={value}: CodeGraph alone")
+        with mock.patch.dict(os.environ, {"LONGHAUL_INDEX": "all"}):
+            self.assertEqual(longhaul.index_mode(), "all")
+            self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), both, "LONGHAUL_INDEX=all")
         with mock.patch.dict(os.environ, {"LONGHAUL_INDEX": "off"}):
             self.assertEqual(longhaul.index_mode(), "off")
             self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), [], "LONGHAUL_INDEX=off")
@@ -7154,6 +7158,28 @@ class Index(unittest.TestCase):
         (self.tmp / "wt" / "src").mkdir(parents=True)
         (self.tmp / "wt" / ".git").write_text("gitdir: elsewhere\n")
         self.assertEqual(longhaul.index_top(str(self.tmp / "wt" / "src")), str(self.tmp / "wt"))
+
+    def test_by_default_only_codegraph_is_planned_and_no_trail_command_runs(self):
+        # The owner, 2026-11-02 ("Stop it by default"): unset and `on` are
+        # CodeGraph's init alone; `all` plans both; `off` plans nothing.
+        for value in (None, "on", "anything"):
+            with mock.patch.dict(os.environ):
+                os.environ.pop("LONGHAUL_INDEX")
+                if value:
+                    os.environ["LONGHAUL_INDEX"] = value
+                self.assertEqual(self.plan(self.start(), index=longhaul.index_mode()), self.planned("codegraph"), value)
+        self.assertEqual(self.plan(self.start(), index="on"), self.planned("codegraph"))
+        self.assertEqual(self.plan(self.start(), index="all"), self.planned("codegraph", "trail"))
+        self.assertEqual(self.plan(self.start(), index="off"), [])
+        # Through the guard: only CodeGraph starts, even with a .trail/ there
+        # already (it is left as it is: no init, no refresh, nothing deleted).
+        (self.repo / ".trail").mkdir()
+        (self.repo / ".trail" / "keep.txt").write_text("mine")
+        self.assertEqual(self.begin(self.start(), index="on"), [("codegraph", str(self.repo))])
+        self.wait("codegraph")
+        self.assertEqual(self.calls("trail"), [], "no trail command ran")
+        self.assertNotIn("trail", self.state()["runs"])
+        self.assertEqual((self.repo / ".trail" / "keep.txt").read_text(), "mine")
 
     def test_the_switch_off_starts_nothing_through_the_hook_or_guard_check(self):
         # Review, Sprint 7 (F11): the switch as the hook reads it from its
@@ -23516,7 +23542,21 @@ class Doctor(unittest.TestCase):
         os.environ["PATH"] = str(self.tmp / "nowhere")
         self.assertIsNone(longhaul.doctor_processes(), "no ps: nothing listed, nothing guessed")
 
+    def test_by_default_the_code_maps_line_leaves_trail_out_and_recommends_it_not(self):
+        # The owner, 2026-11-02: Longhaul no longer builds or recommends Trail-Code.
+        c = longhaul.doctor_maps()
+        self.assertEqual(c["mark"], "warn")
+        self.assertEqual(self.items(c), {"CodeGraph: not installed": "warn"})
+        self.assertNotIn("Trail", c["step"])
+        self.assertIn("0 of 1 found", c["said"])
+        self.program("trail", mode=0o644)  # a Trail that cannot run is nothing to say by default
+        self.assertEqual(self.items(longhaul.doctor_maps()), {"CodeGraph: not installed": "warn"})
+        self.program("codegraph")
+        c = longhaul.doctor_maps()
+        self.assertEqual((c["mark"], list(self.items(c))), ("ok", [f"CodeGraph: {self.bin}/codegraph"]))
+
     def test_the_code_maps_line_finds_each_program_and_says_when_one_cannot_run(self):
+        os.environ["LONGHAUL_INDEX"] = "all"
         c = longhaul.doctor_maps()
         self.assertEqual(c["mark"], "warn")
         self.assertIn(longhaul.CODEGRAPH_INSTALL["npm"], c["step"])
@@ -23557,6 +23597,7 @@ class Doctor(unittest.TestCase):
 
     def test_the_code_maps_line_names_trails_hooks_left_with_no_map(self):
         self.program("trail")
+        self.program("codegraph")  # by default CodeGraph alone is the line's own mark (the owner, 2026-11-02)
         top, here = self.trail_project(), self.tmp / "elsewhere"
         here.mkdir()
         c = longhaul.doctor_maps(str(here))
@@ -23590,6 +23631,7 @@ class Doctor(unittest.TestCase):
 
     def test_no_word_for_settings_without_trails_hook_or_a_project_gone(self):
         self.program("trail")
+        self.program("codegraph")
         self.trail_project("plain", command="echo done")
         self.write(self.trail_project("broken") / ".claude" / "settings.json", "{not json")
         gone = self.trail_project("gone")
