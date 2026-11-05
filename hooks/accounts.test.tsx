@@ -642,7 +642,7 @@ both('an account kept out of every folder: its line says so, its page names who 
   w.status = done(JSON.stringify({ ...STATUS, accounts: [keeper('personal-1'), keeper('personal-2'), spare] }))
   const { ui } = await opened($, w, surface)
   expect((await ui.find({ key: 'row-spare-5' }))?.text).toMatch(/spare-5 .*\(used nowhere\)$/)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/\(only in \/\)$/)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/\(everywhere \(its folders include \/\)\)$/)
   await open(ui, 'row-spare-5')
   const all = await texts(ui)
   expect(all).toContain('may be used nowhere for now')
@@ -660,6 +660,7 @@ both('an account kept out of every folder: its line says so, its page names who 
   await ui.press({ key: 'back' })
   await open(ui, 'row-personal-1')
   expect(await texts(ui)).toContain('  /')
+  expect(await texts(ui)).toContain('may be used everywhere (its folders include /)')
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-remove-0', 'folder-add',
     'folder-anywhere', 'back'])
   await ui.press({ key: 'folder-remove-0' })

@@ -578,12 +578,16 @@ function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boole
   return { text: parts.join(' · '), warn: limited || sign !== 'signed in' }
 }
 
+// A list that holds / covers every folder, so "only in /" read as a narrow one
+// (2026-11-06); the same words as longhaul.py's EVERYWHERE_BY_ROOT.
+const EVERYWHERE = 'everywhere (its folders include /)'
+
 // What the line adds in brackets: this chat's account, where it is kept to;
 // used nowhere, too, for one with no list that others keep out of every folder.
 function extras(a: LonghaulAccount): string {
   const said = [a.this_chat ? 'this chat' : '',
     a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
-      : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
+      : a.only_in.includes('/') ? EVERYWHERE : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
   return said.length ? mask(`   (${said.join(' · ')})`) : ''
 }
 
@@ -659,6 +663,7 @@ function use(label: string, w: LonghaulAccount['week'], nowMs: number): string |
 function where(a: LonghaulAccount): string {
   if (a.only_in === null) return 'may be used nowhere'
   if (a.kept_out_by?.length) return 'may be used nowhere for now'
+  if (a.only_in.includes('/')) return `may be used ${EVERYWHERE}`
   return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
 }
 
