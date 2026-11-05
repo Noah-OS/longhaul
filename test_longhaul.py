@@ -17159,6 +17159,60 @@ class PanelSwitching(StreamHarness):
         self.limit_in_chat(LONGHAUL_SWITCH="")
         self.assertNotIn("is not ask, auto or never", (self.relay / "longhaul.log").read_text())
 
+    # The log audit of 2026-11-05 (#1): a running chat sees accounts.json
+    # and the saved mode as they are now, not as they were at its launch.
+
+    def changed_then_limit(self, change, **env):
+        """A chat that replies once, then `change` (the files as they change
+        while it runs), then meets a limit: the limit's message id."""
+        self.plan(["reply", "limit", "reply"])
+        p = self.start(**env)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "first")))["is_error"])
+        change()
+        u = self.user(p, "build it")
+        self.assertTrue(self.wait_for(self.result_for(u))["is_error"])
+        return u
+
+    def moved_after(self, u):
+        """The carry-on after the limit `u` met: its claude's launch."""
+        self.wait_for(self.result_for(self.wait_for(lambda m: m.get("type") == "user" and m.get("uuid") != u)["uuid"]))
+        self.assertEqual(len(self.calls()), 2)
+        return self.calls()[1]
+
+    def test_a_mode_saved_while_the_chat_runs_is_used_at_its_next_limit(self):
+        # Three chats went on asking after the owner saved auto.
+        config = self.relay / "config.json"
+        config.write_text(json.dumps({"switch": "ask"}))
+        u = self.changed_then_limit(lambda: config.write_text(json.dumps({"switch": "auto"})), LONGHAUL_SWITCH="")
+        self.assertEqual(self.moved_after(u)["config"], str(self.pro))
+        self.assertFalse((self.relay / "questions").exists(), "auto asks nothing")
+        self.assertIn("panel: switching in sid-1 is now auto, as saved since it began (it was ask)", self.log_text())
+
+    def test_longhaul_switch_wins_over_a_mode_saved_while_the_chat_runs(self):
+        config = self.relay / "config.json"
+        self.changed_then_limit(lambda: config.write_text(json.dumps({"switch": "auto"})), LONGHAUL_SWITCH="ask")
+        end = time.time() + 10
+        while not (self.relay / "questions" / "sid-1.json").exists() and time.time() < end:
+            time.sleep(0.05)
+        self.assertTrue((self.relay / "questions" / "sid-1.json").exists(), self.log_text()[-2000:])
+        self.assertEqual(len(self.calls()), 1, "asked, not moved")
+        self.assertNotIn("switching in sid-1 is now", self.log_text())
+
+    def test_an_account_added_while_the_chat_runs_is_moved_to_at_its_next_limit(self):
+        # A chat waited 3¾ h for one account's reset while another had
+        # been allowed for hours.
+        team = self.tmp / "team"
+        team.mkdir()
+        self.emails[str(team)] = "third@example.com"
+        (self.relay / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 7200}}))
+        listed = json.loads((self.relay / "accounts.json").read_text())
+        u = self.changed_then_limit(lambda: self.accounts(listed + [
+            {"name": "Team", "config_dir": str(team), "email": "third@example.com"}]))
+        self.assertEqual(self.moved_after(u)["config"], str(team))
+        self.assertIn("panel: sid-1 read accounts.json again: 3 accounts, 0 not allowed here", self.log_text())
+
     def test_an_unknown_switch_in_vscode_json_runs_the_chat_and_never_moves_it(self):
         self.switch_mid_session(True, switch=["auto"])
         self.limit_in_chat(LONGHAUL_SWITCH="")
