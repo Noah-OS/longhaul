@@ -6,11 +6,14 @@ system/init at the first message, assistant and result lines), writes the
 session and conversation files Claude Code writes, and acts out
 stream_plan.json, one step per user message across launches:
 
-  reply | limit | limit_sub
+  reply | limit | limit_sub | limit_then_sub
 
 limit_sub is a subagent's limit stop, its line a sidechain's, and the
-main turn goes on. A limit resets in FAKE_RESET_IN seconds (an hour
-unless set).
+main turn goes on. limit_then_sub is a limit stop followed, a second
+later, by lines that are no reply of the chat's: a subagent's assistant
+line (parent_tool_use_id set) and a <synthetic> one (the log audit of
+2026-11-05, #3). A limit resets in FAKE_RESET_IN seconds (an hour unless
+set).
 
 Without --input-format stream-json it is a short job: it records the call
 and prints one line. `auth status --json` answers from FAKE_EMAILS, a JSON
@@ -148,6 +151,9 @@ for raw in sys.stdin:
               "user_message_uuid": msg["uuid"], "total_cost_usd": 0.1})
         status("idle")
         sys.exit(int(step.split(":", 1)[1]))
+    after_limit = step == "limit_then_sub"
+    if after_limit:
+        step = "limit"
     if step == "limit":
         line = {"type": "assistant", "isSidechain": False, "isApiErrorMessage": True, "error": "rate_limit",
                 "timestamp": now(), "sessionId": sid, "uuid": f"limit-{os.getpid()}-{uuid.uuid4().hex[:6]}",
@@ -163,6 +169,15 @@ for raw in sys.stdin:
                   "five_hour": {"utilization": 1.0, "resetsAt": line["quotaLimits"]["resetsAt"]}}}})
         emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
               "result": "You've hit your session limit", "session_id": sid, "user_message_uuid": msg["uuid"]})
+        if after_limit:
+            status("idle")
+            time.sleep(1)
+            emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": "toolu_sub",
+                  "message": {"model": "claude-opus-5-5", "role": "assistant",
+                              "content": [{"type": "text", "text": "a subagent's work"}]}})
+            emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+                  "message": {"model": "<synthetic>", "role": "assistant",
+                              "content": [{"type": "text", "text": "No response requested."}]}})
     else:
         text = msg["message"]["content"][0]["text"]
         emit({"type": "assistant", "session_id": sid, "user_message_uuid": msg["uuid"],

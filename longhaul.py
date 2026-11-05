@@ -12021,6 +12021,29 @@ def api_error(line: bytes) -> bool:
     return not isinstance(msg, dict) or msg.get("error") is not None
 
 
+def main_reply(line: bytes) -> bool:
+    """Whether a stream line is a reply of the chat's own Claude: a
+    top-level assistant message of the main thread (no parent_tool_use_id),
+    not an API error (an "error" at its top level, as api_error() reads
+    it) and not one Claude Code made up itself (model "<synthetic>").
+    has_type()'s match anywhere in the line is the cheap first look, then
+    the line is parsed once; one that cannot be read is no reply. Before,
+    that match alone counted, so a subagent's line or an assistant object
+    nested in another line cancelled a carry-on and withdrew questions as
+    "a reply after the limit" (the log audit of 2026-11-05, #3)."""
+    if not has_type(line, "assistant"):
+        return False
+    try:
+        msg = json.loads(line)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(msg, dict) or msg.get("type") != "assistant" or msg.get("error") is not None \
+            or msg.get("parent_tool_use_id") is not None:
+        return False
+    inner = msg.get("message")
+    return not (isinstance(inner, dict) and inner.get("model") == "<synthetic>")
+
+
 def chat_file(folder: str, sid, suffix: str = "") -> Path | None:
     """LONGHAUL_HOME/<folder>/<sid><suffix>.json (QUESTIONS, WAITS), or None
     for an id that is not a plain session id (GUARD_ID): it names a file."""
@@ -12826,7 +12849,7 @@ class Relay:
             if child is self.child:
                 if b'"rate_limit' in line:
                     self.hold_if_limit(line)
-                if has_type(line, "assistant") and not api_error(line):
+                if main_reply(line):
                     self.replied_at = time.time()  # work went on: carry_on() and tend() read it
                 if has_type(line, "result"):
                     self.note_cost(child, line)
@@ -13081,6 +13104,14 @@ class Relay:
             still = ("its question stays open" if self.question
                      else f"it still carries on on {self.carry['account']} at {clock(self.carry['until'])}")
             log(f"question: {sid} stopped at {here['name']}'s {limit['kind']} limit again; {still}")
+            # Only a reply after the latest stop is the chat carrying on: a
+            # reply between the first stop and this one (Claude Code's own
+            # wait carried on, then stopped again) withdrew the question or
+            # skipped the carry-on (the log audit of 2026-11-05, #3). The
+            # time is kept here alone: neither file holds it.
+            for about in (self.question_for, self.carry_for):
+                if about:
+                    about["since"] = max(about.get("since", 0), since)
             return
         self.ask(limit, since, state)
 

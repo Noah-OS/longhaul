@@ -17232,6 +17232,18 @@ class PanelKeepWorking(StreamHarness):
         self.assertIn("wait: sid-1 carries on on Max at ", self.log_text())
         self.assertIn("wait: sid-1 carried on on Max (answered)", self.log_text())
 
+    def test_a_subagents_line_after_the_limit_does_not_cancel_the_carry_on(self):
+        # The log audit of 2026-11-05 (#3): a subagent's assistant line, or
+        # a <synthetic> one, after the stop was "a reply after the limit".
+        self.plan(["limit_then_sub", "reply"])
+        p = self.start(LONGHAUL_SWITCH="never", FAKE_RESET_IN="2", LONGHAUL_RESET_MARGIN="0")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        self.wait_for(lambda m: m.get("type") == "assistant" and m.get("parent_tool_use_id") == "toolu_sub")
+        self.carry_on("The Max account hit its session limit, so longhaul waited for it to reset")
+        self.assertNotIn("carried on without longhaul", self.log_text())
+
     def test_with_every_account_at_its_limit_a_yes_carries_on_on_the_first_to_reset(self):
         # Three seconds: the question has to be asked before Pro's reset.
         (self.relay / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3}}))
@@ -17626,6 +17638,94 @@ class KeepWorking(unittest.TestCase):
         self.later(3600)
         r.tend()
         self.assertEqual(len(self.said(r)), 1)
+
+    # The log audit of 2026-11-05 (#3): a carry-on skipped, and questions
+    # withdrawn, for "a reply after the limit" that was a subagent's line.
+
+    def stream(self, r, *lines):
+        """`lines` (objects, or bytes as they are) from r's claude through its
+        reader, from_claude(), as the relay reads them; what it passes on
+        to the panel is kept in r.passed."""
+        child = mock.Mock(pid=4242)
+        child.stdout = [line if isinstance(line, bytes) else json.dumps(line).encode() + b"\n" for line in lines]
+        r.child, out = child, io.BytesIO()
+        with mock.patch.object(sys, "stdout", mock.Mock(buffer=out)):
+            r.from_claude(child)
+        r.passed = out.getvalue()
+
+    REPLY = {"type": "assistant", "parent_tool_use_id": None, "session_id": "sid-k",
+             "message": {"model": "claude-opus-5-5", "role": "assistant", "content": [{"type": "text", "text": "x"}]}}
+
+    def not_replies(self):
+        """Lines that are no reply of the chat's: a subagent's, Claude
+        Code's own <synthetic> one, an API error, an assistant object
+        nested in another line, and a line that is not JSON."""
+        return [{**self.REPLY, "parent_tool_use_id": "toolu_1"},
+                {**self.REPLY, "message": {**self.REPLY["message"], "model": "<synthetic>"}},
+                {**self.REPLY, "error": "server_error"},
+                {"type": "system", "subtype": "task_progress", "data": {"type": "assistant", "message": {}}},
+                b'{"type":"assistant","message":{"model":"claude-opus-5-5"\n']
+
+    def test_a_subagents_synthetic_or_error_line_after_the_limit_does_not_cancel_the_carry_on(self):
+        r = self.relay("never")
+        self.stop(r)
+        self.later(60)
+        self.stream(r, *self.not_replies())
+        self.assertEqual(r.passed.count(b"\n"), 5, "every line still reaches the panel")
+        self.later(3600)
+        r.tend()
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertNotIn("carried on without longhaul", self.log_text())
+
+    def test_a_real_reply_after_the_limit_still_cancels_the_carry_on(self):
+        r = self.relay("never")
+        self.stop(r)
+        self.later(60)
+        self.stream(r, self.REPLY)
+        self.later(3600)
+        r.tend()
+        self.assertEqual(list(r.queue), [])
+        self.assertIn("wait: sid-k carried on without longhaul (a turn ran after the limit)", self.log_text())
+
+    def test_a_subagents_line_after_the_limit_does_not_withdraw_the_question(self):
+        r = self.relay()
+        self.stop(r)
+        self.later(5)
+        self.stream(r, *self.not_replies())
+        r.tend()
+        self.assertIsNotNone(self.question())
+        self.stream(r, self.REPLY)
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertIn("is withdrawn: the chat carried on on Max", self.log_text())
+
+    def test_after_a_repeat_stop_a_reply_before_it_does_not_cancel_the_carry_on(self):
+        # The repeat stop moves the carry-on's "since" to its own time: only
+        # a reply after the latest stop is the chat carrying on.
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "wait")
+        r.tend()
+        self.later(30)
+        self.stream(r, self.REPLY)  # Claude Code's own wait carried on, then stopped again
+        self.later(30)
+        self.stop(r, resets_in=3540)
+        self.assertIn("question: sid-k stopped at Max's session limit again; it still carries on on Max at ",
+                      self.log_text())
+        self.later(3600)
+        r.tend()
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+
+    def test_after_a_repeat_stop_a_reply_before_it_does_not_withdraw_the_question(self):
+        r = self.relay()
+        self.stop(r)
+        first = self.question()["id"]
+        self.later(10)
+        self.stream(r, self.REPLY)
+        self.later(10)
+        self.stop(r)  # before any round of tend() saw the reply
+        r.tend()
+        self.assertEqual(self.question()["id"], first, "still open: the reply came before the latest stop")
 
     def test_in_ask_the_target_at_its_limit_again_asks_again_and_never_moves_unasked(self):
         self.limited(Pro=self.clock.at + 600)
