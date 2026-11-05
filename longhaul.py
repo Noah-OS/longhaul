@@ -7728,6 +7728,11 @@ CHECKPOINT_ITEMS_MAX = 20  # per list
 # whole entries in CHECKPOINT_ORDER, then a line naming what is left in the
 # file (checkpoint_text).
 CHECKPOINT_BYTES_MAX = 16_000
+# A text or a total up to this much over its cap is saved (a text cut at the
+# cap), not refused. 40 saves in two weeks were refused 0.2-59% over and went
+# through on a retry, so the near misses cost a rewrite for nothing
+# (log audit, 2026-11-06). Past it the save still refuses.
+CHECKPOINT_OVER_MAX = 1.10
 CHECKPOINT_PUTBACK_MAX = 9_000
 CHECKPOINT_FILE_MAX = 4 * CHECKPOINT_BYTES_MAX  # what the hook will read of a file: a save never writes more than the cap
 CHECKPOINT_SECRET_SHAPES = ("sk-ant-", "AKIA", "-----BEGIN", "ghp_")  # the start of a known kind of credential
@@ -7782,16 +7787,33 @@ def checkpoint_path(sid: str | None):
     return LONGHAUL_HOME / "checkpoints" / f"{sid}.json"
 
 
-def checkpoint_validate(state):
+def checkpoint_cut(value: str, limit: int) -> str:
+    """A text a little over its cap, cut to `limit` characters with the
+    ellipsis counted, on a word boundary when the cut holds a space in its
+    second half (one long word is cut where it stands, not to nothing).
+    2026-11-06."""
+    head = value[:limit - 1]
+    if not value[limit - 1:limit].isspace():
+        space = head.rfind(" ")
+        if space >= limit // 2:
+            head = head[:space]
+    return head.rstrip() + "…"
+
+
+def checkpoint_validate(state, cuts: list | None = None):
     """The model's part of a checkpoint against schema v1 and Checkpoint
     2's lists: (the state, cleaned, with every list present, None, None),
     or (None, why not, why not for the log). The reason names a key and a
-    length and never
-    a value: it is printed, logged and read by the model. An unknown
+    length and never a value, and every text over its cap, not the first
+    (2026-11-06). With `cuts` (a save's list), a text up to
+    CHECKPOINT_OVER_MAX times its cap is cut and its name added to the
+    list; without it (a checkpoint read back) any text over is refused.
+    The reason is printed, logged and read by the model. An unknown
     key's name is the model's text too: the line printed names it when
     it is not shaped like a credential, the line logged never does.
     Control characters go, as shown() prints them, so a text can never
     move or retitle a terminal."""
+    over = []  # texts too long to cut, whole sentences for the reason
     if not isinstance(state, dict):
         return None, "the state is not a JSON object", "the state is not a JSON object"
     for key in state:
@@ -7805,11 +7827,18 @@ def checkpoint_validate(state):
             return f"{name} is not text"
         if not value.strip():
             return f"{name} is empty"
-        if len(value) > CHECKPOINT_TEXT_MAX:
-            return f"{name} is {len(value):,} characters; the cap is {CHECKPOINT_TEXT_MAX:,}"
         if any(shape in value for shape in CHECKPOINT_SECRET_SHAPES):
             return f"{name} holds what looks like a credential"
+        if len(value) > CHECKPOINT_TEXT_MAX and (cuts is None or len(value) > CHECKPOINT_TEXT_MAX * CHECKPOINT_OVER_MAX):
+            over.append(f"{name} is {len(value):,} characters; the cap is {CHECKPOINT_TEXT_MAX:,}")
         return None
+
+    def text(name, value):
+        value = shown(value, len(value))  # control characters first, so the cut counts what is kept
+        if len(value) > CHECKPOINT_TEXT_MAX and not over:
+            cuts.append(name)
+            return checkpoint_cut(value, CHECKPOINT_TEXT_MAX)
+        return shown(value, CHECKPOINT_TEXT_MAX)
 
     clean = {}
     for key in CHECKPOINT_TEXTS:
@@ -7818,7 +7847,7 @@ def checkpoint_validate(state):
         why = problem(key, state[key])
         if why:
             return None, why, why
-        clean[key] = shown(state[key], CHECKPOINT_TEXT_MAX)
+        clean[key] = text(key, state[key])
     for key in CHECKPOINT_LISTS + CHECKPOINT_MORE:
         items = state.get(key, [])
         if not isinstance(items, list):
@@ -7830,8 +7859,21 @@ def checkpoint_validate(state):
             why = problem(f"{key}[{i}]", item)
             if why:
                 return None, why, why
-        clean[key] = [shown(item, CHECKPOINT_TEXT_MAX) for item in items]
+        clean[key] = [text(f"{key}[{i}]", item) for i, item in enumerate(items)]
+    if over:
+        why = "; ".join(over)
+        return None, why, why
     return clean, None, None
+
+
+def remove_state_file_is_skills(state_file: str) -> bool:
+    """True when `state_file` is the skill's own (see remove_state_file): the
+    only file a refusal says is kept. 2026-11-06."""
+    try:
+        file = Path(state_file).resolve()
+        return file.name.endswith(".state.json") and file.parent == (LONGHAUL_HOME / "checkpoints").resolve() and file.is_file()
+    except (OSError, RuntimeError):
+        return False
 
 
 def remove_state_file(state_file: str, sid) -> bool | None:
@@ -7897,13 +7939,15 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     on stdin or in `state_file`, checked, capped and written whole and
     private (write_json: mkstemp, 0600, then replace, in a checkpoints/
     folder made 0700 when the save makes it), with one line saying so; or
-    refused with one line naming the problem, exit 2, nothing written.
+    refused with one line naming every problem, exit 2, nothing written.
     `here` is the session the command runs in, from the Bash tool's
     environment, or None in a terminal: it is the session when none is
     given, and the only one a save may name, so no session can plant a
     state for another (the skill's command passes no id for that reason).
-    Saved or refused, the skill's state file goes (remove_state_file), and
-    a refusal says so: the model writes it again. Under Codex (`agent`
+    The skill's state file goes once saved (remove_state_file); a refusal
+    keeps it, and says so, so the model edits it and saves again (a
+    credential's refusal removes it). A text up to 10% over its cap is cut
+    to it and a total up to 10% over is saved; the line says which. Under Codex (`agent`
     "codex") the session is a Codex chat's, keyed codex-<id> as
     codex_hook_input() keys the hook's: `here` from CODEX_THREAD_ID, and a
     session given keyed the same way, so no Codex save is ever a Claude
@@ -7915,6 +7959,8 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
     path = checkpoint_path(sid)
     state = problem = logged = None
     recorded = False
+    cuts: list = []
+    over_note = ""
     if agent == "codex" and here is not None and checkpoint_path(here) is None:
         # A CODEX_THREAD_ID that could not name a file (codex- and an id
         # CODEX_HOOK_ID takes make a GUARD_ID): this chat cannot be told from
@@ -7928,7 +7974,7 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
         problem = "nothing on stdin: the state goes there, as JSON"
     else:
         try:
-            state, problem, logged = checkpoint_validate(json.loads(raw))
+            state, problem, logged = checkpoint_validate(json.loads(raw), cuts)
         except json.JSONDecodeError as e:
             problem = f"not JSON: {e.msg} at line {e.lineno} column {e.colno}"
     dropped = ""
@@ -7937,9 +7983,11 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
         body = state if more else {k: v for k, v in state.items() if k not in CHECKPOINT_MORE}
         record = {"schema_version": 2 if more else 1, "session_id": sid, "written_at": time.time(), "cwd": cwd, **body}
         size = len(json.dumps(record, indent=2)) + 1  # what write_json writes: ASCII, so characters are bytes
-        if size > CHECKPOINT_BYTES_MAX:
+        if size > CHECKPOINT_BYTES_MAX * CHECKPOINT_OVER_MAX:
             problem = f"{size:,} bytes in all; the cap is {CHECKPOINT_BYTES_MAX:,}"
         else:
+            if size > CHECKPOINT_BYTES_MAX:
+                over_note = f"; {size:,} bytes is over the {CHECKPOINT_BYTES_MAX:,} cap, saved all the same"
             try:
                 if not path.parent.is_dir():
                     # write_json() would make the folder with the umask's mode
@@ -7954,19 +8002,28 @@ def checkpoint_save(sid: str | None, raw: str, cwd: str, here: str | None, state
                 problem = f"could not write the file: {e.strerror or e}"
             else:
                 recorded = checkpoint_record_folder(sid, record["written_at"], cwd)
-    removed = remove_state_file(state_file, sid) if state_file is not None else None
+    # A refusal keeps the file, so the model edits the one field and saves
+    # again instead of writing it all out (40 refusals in two weeks, each
+    # followed by a full rewrite; 2026-11-06). A credential is the exception:
+    # that text would stay on disk in a file nothing sweeps (review, Sprint 5).
+    keep = bool(problem) and "what looks like a credential" not in problem
+    removed = remove_state_file(state_file, sid) if state_file is not None and not keep else None
     if problem:
-        if removed:
+        if keep and state_file is not None and remove_state_file_is_skills(state_file):
+            problem += "; the state file is kept: edit that field in it and save again"
+        elif removed:
             problem += "; the state file was removed, write it again"
         print(f"longhaul checkpoint: not saved: {problem}", file=sys.stderr)
         if path is not None:
             log(f"checkpoint for {sid} not saved: {logged or problem}")
         return 2
     log(f"checkpoint for {sid} saved ({size:,} bytes)")
+    if cuts:
+        over_note = f"; cut to the {CHECKPOINT_TEXT_MAX:,}-character cap: {', '.join(cuts)}" + over_note
     hours = checkpoint_carry_hours() if recorded else 0  # the window as it is now; the hook reads it when it runs
     carry = f", and once after {words['clear']} in this folder within {hours:g} h" if hours else ""
     print(f"longhaul checkpoint: saved for {sid} ({size:,} bytes); it comes back after a compaction or a resume"
-          f"{carry}{dropped}"
+          f"{carry}{over_note}{dropped}"
           f"{'; the state file could not be removed' if removed is False else ''}")
     return 0
 
@@ -8332,10 +8389,7 @@ def checkpoint(opts) -> int:
                     raw = f.read(1_000_000)
             except (OSError, ValueError) as e:  # a UnicodeDecodeError is a ValueError
                 why = e.strerror if isinstance(e, OSError) and e.strerror else "not UTF-8 text"
-                # A refusal too: the skill's state file goes with it (a file
-                # that could not be opened is not there to remove).
-                if isinstance(e, ValueError) and remove_state_file(opts.file, opts.session or here):
-                    why += "; the state file was removed, write it again"
+                # Kept like any refusal's (2026-11-06): the model fixes it or writes it again.
                 print(f"longhaul checkpoint: not saved: could not read {home_path(opts.file) or '?'}: {why}", file=sys.stderr)
                 return 2
         else:
