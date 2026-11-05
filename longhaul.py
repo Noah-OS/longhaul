@@ -14776,7 +14776,53 @@ def remove(opts) -> int:
     forget_auth(gone[0])
     say(f"removed {gone[0]['name']} from longhaul's accounts. Its folder {config_of(gone[0])} and its sign-in are kept; "
         "delete the folder yourself if you no longer want them.")
+    say_still_running(gone[0])
     return 0
+
+
+def chats_on(acct: dict, processes=None):
+    """The chats running now (doctor_processes(), or the list given) whose
+    claude runs on `acct`'s config folder, by real path, Claude's own
+    background work passed over as the doctor passes it; None when they
+    cannot be listed."""
+    processes = doctor_processes() if processes is None else processes
+    if processes is None:
+        return None
+    want, found = os.path.realpath(config_of(acct)), []
+    for chat in processes:
+        cwd, value = chat.get("cwd"), chat.get("config_dir")
+        if isinstance(cwd, str) and doctor_own_folder(cwd):
+            continue
+        if os.path.realpath(os.path.abspath(doctor_expand(value)) if value else str(DEFAULT_CONFIG)) == want:
+            found.append(chat)
+    return found
+
+
+def say_still_running(acct: dict) -> None:
+    """After `remove NAME`: how many chats still run on the account, which
+    (pid, kind, folder) and what happens to them (the log audit of
+    2026-11-05, #1: one ran on an account removed hours before, every
+    prompt refused). Each reads accounts.json again (LiveSettings): with
+    the switching saved as auto it moves to an account allowed in its
+    folder the next time it is idle; else it is told once, and reopening
+    it moves it. A chat started with --switch or LONGHAUL_SWITCH keeps its own."""
+    running = chats_on(acct)
+    name = acct["name"]
+    if running is None:
+        say(f"The chats running now could not be listed (ps did not answer); `longhaul doctor` shows any still on {name}.")
+        return
+    if not running:
+        return
+    panel = vscode_config().get("switch")  # what panel_switch_in_force() reads, but this process's environment
+    panel = panel if isinstance(panel, str) and panel in SWITCH_MODES else saved_switch()
+    each = ", ".join(f"pid {c['pid']} ({'a VS Code tab' if c.get('panel') else 'a terminal chat'}, "
+                     f"{panel if c.get('panel') else saved_switch()}) in "
+                     f"{home_path(c['cwd']) if isinstance(c.get('cwd'), str) else 'a folder not known'}"
+                     for c in running)
+    say(f"{plural(len(running), 'chat')} still run{'s' if len(running) == 1 else ''} on {name}: {each}. In auto a "
+        f"chat moves to an account allowed in its folder the next time it is idle; in ask or never it stays on {name} "
+        "and is told so once, and closing and opening it again moves it. A chat started with --switch or "
+        "LONGHAUL_SWITCH keeps that mode.")
 
 
 def folders(opts) -> int:

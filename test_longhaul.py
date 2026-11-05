@@ -21314,6 +21314,50 @@ class Accounts(unittest.TestCase):
         self.assertEqual([a["name"] for a in self.accounts()], ["Max"])
         self.assertTrue(team.exists())
 
+    def remove_in_process(self, name, processes):
+        """`longhaul remove NAME` in this process, with `processes` as the
+        chats running now (doctor_processes()): (exit code, what it said)."""
+        out = io.StringIO()
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", self.relay), \
+                mock.patch.object(longhaul, "CONFIG", self.relay / "config.json"), \
+                mock.patch.object(longhaul, "VSCODE_CONFIG", self.relay / "vscode.json"), \
+                mock.patch.object(longhaul, "AUTH_CACHE", self.relay / "auth-cache.json"), \
+                mock.patch.object(longhaul, "doctor_processes", return_value=processes), \
+                mock.patch.object(longhaul, "QUIET", False), contextlib.redirect_stdout(out):
+            code = longhaul.main(["remove", name])
+        return code, out.getvalue()
+
+    def test_longhaul_remove_names_the_chats_still_running_on_the_account_and_what_happens(self):
+        # The log audit of 2026-11-05 (#1): a chat ran on an account removed
+        # hours before, and every prompt was refused.
+        team, work = self.tmp / "team", self.tmp / "work"
+        team.mkdir()
+        work.mkdir()
+        listed = self.accounts() + [{"name": "Team", "config_dir": str(team), "email": "team@example.com"}]
+        (self.relay / "accounts.json").write_text(json.dumps(listed))
+        (self.relay / "config.json").write_text(json.dumps({"switch": "auto"}))
+        chats = [{"pid": 111, "panel": True, "resume": None, "config_dir": str(team), "cwd": str(work)},
+                 {"pid": 222, "panel": False, "resume": None, "config_dir": str(team) + "/", "cwd": None},
+                 {"pid": 333, "panel": False, "resume": None, "config_dir": str(self.max), "cwd": str(work)}]
+        code, said = self.remove_in_process("Team", chats)
+        self.assertEqual(code, 0, said)
+        self.assertIn(f"2 chats still run on Team: pid 111 (a VS Code tab, auto) in {longhaul.home_path(str(work))}, "
+                      "pid 222 (a terminal chat, auto) in a folder not known. In auto a chat moves to an account "
+                      "allowed in its folder the next time it is idle; in ask or never it stays on Team and is told so "
+                      "once, and closing and opening it again moves it.", said)
+        self.assertNotIn("333", said, "a chat on another account is not named")
+        (self.relay / "accounts.json").write_text(json.dumps(listed))
+        (self.relay / "config.json").write_text(json.dumps({"switch": "never"}))
+        code, said = self.remove_in_process("Team", chats[:1])
+        self.assertIn("1 chat still runs on Team: pid 111 (a VS Code tab, never) in ", said)
+        (self.relay / "accounts.json").write_text(json.dumps(listed))
+        code, said = self.remove_in_process("Team", [chats[2]])
+        self.assertNotIn("still run", said, "none on it: nothing more said")
+        (self.relay / "accounts.json").write_text(json.dumps(listed))
+        code, said = self.remove_in_process("Team", None)
+        self.assertIn("The chats running now could not be listed (ps did not answer); `longhaul doctor` shows any "
+                      "still on Team.", said)
+
     def test_longhaul_remove_keeps_the_last_account(self):
         self.assertEqual(self.longhaul("remove", "Max").returncode, 2)
         self.assertEqual(len(self.accounts()), 1)
