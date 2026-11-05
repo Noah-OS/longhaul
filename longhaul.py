@@ -1769,12 +1769,20 @@ def ask_here(question: str, keys: str, then: str, until: float, about: str, noti
             termios.tcsetattr(fd, termios.TCSANOW, old)
 
 
-def wait_until(until: float, what: str) -> bool:
+def wait_until(until: float, what: str, changed=lambda: False) -> bool:
+    """Wait until `until`: True to carry on, False on Ctrl+C. `changed` is
+    asked every few seconds, and True from it ends the wait early, for the
+    caller to decide again: accounts.json or the mode saved meanwhile (the
+    log audit of 2026-11-05, #1; a terminal waited 3¾ h for one account's
+    reset while another had been allowed for hours)."""
     say(f"{what}. Waiting until {clock(until)}, then carrying on (Ctrl+C stops).")
     notify(f"{what}. Carrying on at {clock(until)}.")
     try:
         while time.time() < until:
-            time.sleep(min(30, max(0.1, until - time.time())))
+            time.sleep(min(5, max(0.1, until - time.time())))
+            if changed():
+                log("the wait ends early: accounts.json or the switching mode changed, so longhaul decides again")
+                return True
         return True
     except KeyboardInterrupt:
         print()
@@ -1792,7 +1800,7 @@ def stop(proc: subprocess.Popen) -> None:
 
 
 def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
-              may_reconnect=lambda: True, claim=lambda sid: True) -> str:
+              may_reconnect=lambda: True, claim=lambda sid: True, leave=lambda w: False) -> str:
     while proc.poll() is None:
         try:
             proc.wait(timeout=POLL)
@@ -1819,6 +1827,9 @@ def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
             if w.should_move(other_has_room):
                 stop(proc)
                 return "move"
+            if leave(w):  # the account was removed, or is no longer allowed here, since (2026-11-05)
+                stop(proc)
+                return "leave"
         except Exception as e:  # watching must never take the session down
             log(f"watch error: {e!r}")
     try:  # a limit written in the last moments before Claude closed
@@ -2063,6 +2074,7 @@ def session_id_arg(args: list[str]):
 
 
 def run(opts) -> int:
+    files_at_start = settings_marks()  # before the reads: a change made while longhaul starts is seen (refresh())
     try:
         mode = switch_mode(getattr(opts, "switch", None))
     except ValueError as e:
@@ -2072,6 +2084,11 @@ def run(opts) -> int:
     if problem:
         say(unreadable_text(problem))
         return 2
+    # accounts.json and the mode as they are now, not as they were at
+    # launch (refresh(), the log audit of 2026-11-05, #1); --switch and
+    # LONGHAUL_SWITCH win over config.json, so their mode is not re-read.
+    live = LiveSettings(accounts, mode, None if getattr(opts, "switch", None) or os.environ.get("LONGHAUL_SWITCH")
+                        else saved_switch, files_at_start, "terminal")
     names = [a["name"] for a in accounts]
     if opts.account and opts.account not in names:
         say(f"no account called {opts.account}; the accounts are {', '.join(names)}")
@@ -2188,6 +2205,42 @@ def run(opts) -> int:
     allowing: set[str] = set()
     allowed_ids: set[str] = set()
     carry, new_id = None, None
+    off_told: set = set()  # (account, what) said by leave(), each once
+    left = None  # `carry` when the account waited for was dropped since (the loop's top)
+
+    def refresh() -> set:
+        """accounts.json and the mode re-read when a file changed
+        (LiveSettings), before each launch, each limit decision, during a
+        wait (wait_until()) and each round of the watch (leave()): what
+        changed (LiveSettings.check()). The names, the accounts not allowed
+        here, the ones that keep this folder, and `idx`, the account last
+        launched, found again by name (0 when it is gone), follow the
+        accounts; the mode changes only where --switch and LONGHAUL_SWITCH
+        did not set it. Before, a terminal kept what it read at its start:
+        it waited for one account's reset with another allowed since, and
+        asked after auto was saved."""
+        nonlocal accounts, names, denied, kept_here, mode, idx
+        changed = live.check()
+        if "mode" in changed:
+            log(f"terminal: switching is now {live.mode}, as saved since longhaul started (it was {mode})")
+            mode = live.mode
+        if "accounts" in changed:
+            last = names[idx] if isinstance(idx, int) and 0 <= idx < len(names) else None
+            accounts = live.accounts
+            names = [a["name"] for a in accounts]
+            denied = denied_in(accounts, top)
+            kept_here = [a["name"] for a in accounts if covers(a, top)]
+            idx = names.index(last) if last in names else 0
+            log(f"terminal: read accounts.json again: {plural(len(accounts), 'account')}, "
+                f"{len(denied)} not allowed here")
+        return changed
+
+    def off(name: str) -> str:
+        """`name` when accounts.json no longer lists it, or no longer allows
+        it here, and why, in words; "" when it may be used."""
+        if name not in names:
+            return f"{name}, which was removed from Longhaul's accounts"
+        return f"{name}, which may no longer be used in {home_path(top)}" if name in denied else ""
 
     def stopped() -> int:
         again = f" `longhaul -r {resume}` opens it again." if resume else ""
@@ -2308,6 +2361,16 @@ def run(opts) -> int:
             # opened wherever pick() chose with no word of why (review, Sprint 5).
             say(f"no record of where {resume[:8]} last ran; picking an account")
     while True:
+        refresh()
+        if stay and off(stay):
+            # Removed since, or no longer allowed here: never waited for or
+            # reopened on (2026-11-05), as a record naming one is not.
+            say(f"{off(stay)}; picking an account")
+            stay = waiting = None
+            left = carry
+        elif stay and mode == "auto":  # auto saved since: pick() decides, as at a launch in auto
+            stay = waiting = None
+            left = carry
         state = load_state()
         seen = readings(accounts)
         # Checked before every launch, not once: on 2026-10-15 a sign-in in
@@ -2335,7 +2398,7 @@ def run(opts) -> int:
             elif resets + RESET_MARGIN > time.time():
                 what, waiting = waiting or (f"{stay} is at its limit, and with switching set to {mode} "
                                             "the conversation stays on it (or start it with --account NAME)"), None
-                if not wait_until(resets + RESET_MARGIN, what):
+                if not wait_until(resets + RESET_MARGIN, what, refresh):
                     return 0
                 continue
             elif not signed_in_as_expected(accounts[names.index(stay)]):
@@ -2371,11 +2434,16 @@ def run(opts) -> int:
                 return stopped()
             if elsewhere is None:
                 which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
-                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit"):
+                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit", refresh):
                     return 0
                 continue
             idx, forced, stay = elsewhere, None, (names[elsewhere] if mode != "auto" else None)
         acct = accounts[idx]
+        if left and acct["name"] != left[0]:
+            # The carry-on was for the account waited for, which the chat no
+            # longer stays on: it names the move instead.
+            prompt = CARRY_ON.format(old=left[0], kind=left[1], new=acct["name"])
+        left = None
         prepare(acct)
 
         cmd = [CLAUDE]
@@ -2426,13 +2494,43 @@ def run(opts) -> int:
                     later(f"could not allow {sid[:8]} on {here} in {home_path(top)}: {e!r}")
             return guard(sid, later)
 
+        def leave(w: Watch, here=acct["name"]) -> bool:
+            """Each round of the watch: accounts.json and the mode re-read
+            (refresh()). When this launch's account has been removed, or
+            may no longer be used here, since (the log audit of 2026-11-05,
+            #1), that is said once; in auto the conversation then leaves it
+            as the early move does, once Claude has been idle IDLE_MOVE,
+            with no background agent writing and an account allowed here
+            with room. Elsewhere it stays, and the notification says that
+            reopening it moves it."""
+            refresh()
+            text = off(here)
+            if not text:
+                return False
+            if (here, text) not in off_told:
+                off_told.add((here, text))
+                if mode == "auto":
+                    log(f"terminal: this conversation runs on {text}; it moves once Claude is idle")
+                else:
+                    again = f"`longhaul -r {w.sid[:8]}`" if w.sid else "`longhaul -c`"
+                    msg = (f"This conversation runs on {text}. It stays there; quit Claude and run {again} to "
+                           "reopen it on an account allowed here.")
+                    later(msg)
+                    notify(msg)
+            if mode != "auto" or w.status != "idle" or not w.status_since \
+                    or time.time() - w.status_since < IDLE_MOVE or w.agents_busy():
+                return False
+            st, now = load_state(), time.time()
+            return any(a["name"] not in denied and st["limited_until"].get(a["name"], 0) <= now for a in accounts)
+
         try:
             # The early move to an account with room happens in "auto" only:
             # to ask, the terminal would close Claude first, and a chat
             # followed from a phone would be gone while it waited (the owner,
             # 2026-10-29: in "ask", ask at the limit and never early here).
-            why = supervise(proc, w, other_has_room if mode == "auto" else (lambda: False), may_reconnect,
-                            claim=claim)
+            # The mode as it is now: a saved one is read again (refresh()).
+            why = supervise(proc, w, lambda: mode == "auto" and other_has_room(), may_reconnect,
+                            claim=claim, leave=leave)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -2473,6 +2571,9 @@ def run(opts) -> int:
             return exit_code(proc.returncode, 1)
         if MAX_RUNS and runs >= MAX_RUNS:
             return exit_code(proc.returncode, 0)
+        before = denied
+        refresh()  # the limit's decision below on the accounts and the mode as they are now
+        wrong = (wrong - before) | denied
         if mode != "auto":
             stay = acct["name"]
         carry = None
@@ -2539,6 +2640,16 @@ def run(opts) -> int:
             say(msg)
             notify(msg)
             idx = nxt
+        elif why == "leave":
+            # leave()'s move in auto, off an account removed or no longer
+            # allowed here: as the early move, no carry-on message.
+            prompt = None
+            nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts))
+            msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul moved it"
+            msg += f" to {accounts[nxt]['name']}." if nxt is not None else "."
+            say(msg)
+            notify(msg)
+            idx = nxt if nxt is not None else idx
         elif why == "reconnect":
             prompt = None
             reconnects.append(time.time())

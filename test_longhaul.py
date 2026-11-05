@@ -1611,6 +1611,73 @@ class Loop(unittest.TestCase):
                 self.assertNotIn("Run this conversation on", out.stdout)
         self.assertEqual(self.allowed(), {})
 
+    # The log audit of 2026-11-05 (#1): the terminal kept the accounts and
+    # the mode it read at its start, for the whole run.
+
+    def test_a_mode_saved_while_claude_runs_is_used_at_its_next_limit(self):
+        (self.home / "config.json").write_text(json.dumps({"switch": "never"}))
+        out, calls = self.run_longhaul(['file:config.json={"switch": "auto"}', f"limit:{time.time() + 3}", "exit"],
+                                       LONGHAUL_SWITCH="")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertIn("terminal: switching is now auto, as saved since longhaul started (it was never)",
+                      (self.home / "longhaul.log").read_text())
+
+    def test_longhaul_switch_wins_over_a_mode_saved_while_claude_runs(self):
+        out, calls = self.run_longhaul(['file:config.json={"switch": "auto"}', f"limit:{time.time() + 2}", "exit"],
+                                       LONGHAUL_SWITCH="never")
+        self.assertEqual([c["config"] for c in calls], [None, None], "it waited for Max: " + out.stdout + out.stderr)
+        self.assertNotIn("switching is now", (self.home / "longhaul.log").read_text())
+
+    def test_an_account_added_while_claude_runs_is_used_at_its_next_limit(self):
+        team = self.tmp / "team"
+        team.mkdir()
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        listed = json.loads((self.home / "accounts.json").read_text()) + [{"name": "Team", "config_dir": str(team)}]
+        out, calls = self.run_longhaul([f"file:accounts.json={json.dumps(listed)}", f"limit:{time.time() + 3}", "exit"])
+        self.assertEqual([c["config"] for c in calls], [None, str(team)], out.stdout + out.stderr)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            longhaul.CARRY_ON.format(old="Max", kind="session", new="Team")[:60]))
+        self.assertIn("terminal: read accounts.json again: 3 accounts, 0 not allowed here",
+                      (self.home / "longhaul.log").read_text())
+
+    def test_a_mode_saved_during_a_wait_ends_the_wait(self):
+        # A terminal waited 3¾ h for one account's reset while another had
+        # been allowed for hours: the wait now looks at the files too.
+        (self.home / "config.json").write_text(json.dumps({"switch": "never"}))
+        saved = threading.Timer(2, lambda: (self.home / "config.json").write_text(json.dumps({"switch": "auto"})))
+        saved.start()
+        self.addCleanup(saved.cancel)
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], LONGHAUL_SWITCH="")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro")[:60]), "the carry-on names the move")
+        self.assertIn("the wait ends early", (self.home / "longhaul.log").read_text())
+
+    def test_the_account_waited_for_removed_meanwhile_is_not_reopened_on(self):
+        (self.home / "config.json").write_text(json.dumps({"switch": "never"}))
+        only_pro = json.dumps([{"name": "Pro", "config_dir": str(self.pro)}])
+        out, calls = self.run_longhaul([f"file:accounts.json={only_pro}", f"limit:{time.time() + 3600}", "exit"],
+                                       LONGHAUL_SWITCH="")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertIn("Max, which was removed from Longhaul's accounts; picking an account", out.stdout)
+
+    def test_in_auto_a_conversation_leaves_an_account_removed_meanwhile_once_idle(self):
+        only_pro = json.dumps([{"name": "Pro", "config_dir": str(self.pro)}])
+        out, calls = self.run_longhaul([f"file:accounts.json={only_pro}", "idle_wait", "exit"],
+                                       LONGHAUL_IDLE_MOVE_SECONDS="1")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertIn("This conversation ran on Max, which was removed from Longhaul's accounts, so while ", out.stdout)
+        self.assertIn("Max ended: leave", (self.home / "longhaul.log").read_text())
+
+    def test_in_ask_a_conversation_on_an_account_removed_meanwhile_is_told_once(self):
+        only_pro = json.dumps([{"name": "Pro", "config_dir": str(self.pro)}])
+        out, calls = self.run_longhaul([f"file:accounts.json={only_pro}", "idle_wait", "exit"], runs=1,
+                                       LONGHAUL_SWITCH="ask", LONGHAUL_IDLE_MOVE_SECONDS="1")
+        self.assertEqual(len(calls), 1, out.stdout + out.stderr)
+        self.assertEqual(out.stdout.count("This conversation runs on Max, which was removed from Longhaul's accounts. "
+                                          "It stays there; quit Claude and run `longhaul -r sid-1`"), 1, out.stdout)
+
 
 class Usage(unittest.TestCase):
     """The status line reading, the ledger and `longhaul usage`."""
