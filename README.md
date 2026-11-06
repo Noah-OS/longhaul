@@ -150,6 +150,8 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 
 **Change an account's folders.** In `/accounts`, open the account: its Folders part lists them, each with **Remove**; type a folder and press **Add folder**, or press **Anywhere** to drop the list. In a terminal, `longhaul folders work` says where `work` may be used; `longhaul folders work --add ~/clients` adds a folder, `--remove ~/work` takes one off, and `--anywhere` drops the list. An account with no folders of its own is used only where no other account's folders reach: beside an account whose folders include `/`, it is used nowhere until it has folders of its own, and `/accounts`, `longhaul status` and `longhaul folders` say so.
 
+**Keep an account as a fallback.** In `/accounts`, open the account and press **Use as fallback**; in a terminal, `longhaul fallback work on` (`off` makes it a normal account again; `longhaul add NAME EMAIL --fallback` marks a new one). A fallback is used only when no other account allowed in that folder has room: at a limit the chat moves to a normal account first, the early move never goes to it, and a chat already on it stays there.
+
 **From a terminal**, `longhaul` starts a chat (`-c` continues the latest, `-r <id>` resumes one) that it watches and moves at a limit. A chat moved to another account takes that account's connectors and artifacts, not the first one's. [Account switching](https://github.com/Noah-OS/longhaul/wiki/Account-Switching) has the rest.
 
 ## 5. From the VS Code chat
@@ -159,12 +161,13 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 **In words:** ask in your own words, for example "add my work account", "turn on the panel" or "set switching to ask". `/longhaul:manage` shows the exact command and what it changes, and runs it only after your yes in the chat. From a chat it can:
 
 - add, sign in again or remove an account (the sign-in opens in your browser; never type a password or code into the chat);
+- change where an account may be used (`longhaul folders`);
 - set the switching mode and the subagent models;
 - turn the VS Code panel's use of your accounts on or off;
 - install or remove the status line, and turn Claude Code's auto-update for Longhaul on or off;
 - forget the recorded limits, allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
 
-What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. An account's folders change with the buttons in `/accounts` or `longhaul folders` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
+What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The fallback mark changes with the button in `/accounts` or `longhaul fallback` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
 
 ## 6. Codex
 

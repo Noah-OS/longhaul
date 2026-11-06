@@ -2,6 +2,21 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.8 - 2026-11-06
+
+An account can be a fallback, used only when no other account has room. `/longhaul:manage` can change where an account may be used. The output filter is off by default, and Claude Code is checked up to 2.1.318.
+
+### Added
+
+- **A fallback account.** `"fallback": true` on an account in `~/.longhaul/accounts.json` means it is used only when no other account allowed in that folder has room. At a limit, a chat moves to a normal account with room first, even when the fallback's allowance expires sooner. It goes to the fallback only when every normal account is at its limit or not allowed there. The early move off a nearly full account never goes to a fallback, and a chat on a fallback is not moved off it when a normal account has room again. When every account is at its limit, the first reset still wins; at the same reset, a normal account goes first.
+- **`longhaul fallback NAME [on|off]`** says whether an account is a fallback, or sets it, and writes `accounts.json` the way `longhaul folders` does. `longhaul add NAME EMAIL --fallback` marks a new account at once. `longhaul status`, `status --json` (`fallback`), the doctor ("(fallback)") and `/accounts` show it: the account's line says "fallback", and its page has **Use as fallback** or **Use as a normal account**. A chat's `/longhaul:manage` can't run it: the plugin refuses it.
+- **`/longhaul:manage` changes an account's folders.** The plugin's `bin/longhaul` now runs `longhaul folders NAME`, with `--add PATH` and `--remove PATH` (repeatable) or `--anywhere`, so a chat's Claude can run it after your yes in the chat. Other forms are refused.
+
+### Changed
+
+- **The output filter is off by default** (it was `shadow`). In a week of shadow measuring, `lossless` would have cut 0.35% of Bash output and `on` 1.24%. Unless `LONGHAUL_FILTERS` names `shadow`, `lossless` or `on`, the Bash hook now stops before it loads Longhaul, in Claude Code and in Codex alike. That saves about 90 ms on 4 in 10 Bash outputs. An unknown value now means off. The three modes work as before.
+- **Claude Code 2.1.311 to 2.1.318 count as tested.** The doctor no longer warns about them. A week of real use on 2.1.311 (a terminal) and 2.1.318 (the VS Code panel) saw limits read, chats carried on, and a chat moved at a limit.
+
 ## 0.3.7 - 2026-11-06
 
 A turn stopped by an API server error is carried on once in the VS Code panel, and the log audit's smaller fixes: short ids for `longhaul -r`, checkpoint saves a little over their caps, a calmer log, no 20 s hold for a rate limit that never stops the turn.
