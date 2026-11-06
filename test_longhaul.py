@@ -13566,6 +13566,9 @@ class Reminder(unittest.TestCase):
     # context it read, the threshold, the highest multiple told, and fired or
     # the reason it said nothing; numbers and codes alone.
 
+    def test_the_help_names_the_log_switch(self):
+        self.assertIn("LONGHAUL_LOG=debug", longhaul.__doc__)
+
     def test_without_debug_the_log_leaves_out_the_checks_below_the_threshold_and_keeps_every_other(self):
         # Log audit row #18, 2026-11-06: 2,487 of 9,357 lines were "below-threshold"
         # checks. Only that code is routine; no code reads these lines. The text
