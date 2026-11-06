@@ -12246,6 +12246,8 @@ SERVER_ERROR_NOTE = "This turn stopped on an API server error; prompt again to c
 def api_retry_on() -> bool:
     """LONGHAUL_API_RETRY, read at call time: "off" is off, anything else on."""
     return (os.environ.get("LONGHAUL_API_RETRY") or "").strip().lower() != "off"
+
+
 # A line's "type" is not always its first field: a 2.1.300 result line
 # starts with "duration_api_ms" and has "type":"result" 1,600 bytes in.
 # Matching only the start of a line missed every result (2026-10-16).
