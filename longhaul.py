@@ -990,12 +990,17 @@ def denied_in(accounts: list[dict], top: str) -> set[str]:
     return {a["name"] for a in accounts} - set(eligible(accounts, top))
 
 
+EVERYWHERE_BY_ROOT = "everywhere (its folders include /)"
+
+
 def where_allowed(acct: dict) -> str:
     """An account's restriction in words: "only in ~/work/repo, ~/other";
     "nowhere (...)" for a field that is not a list of paths; "anywhere"."""
     allowed = repositories_of(acct)
     if allowed is None:
         return f"nowhere ({REPOSITORIES_JUNK})"
+    if allowed and keeps_everywhere(acct):  # "only in /" read as a narrow list (2026-11-06)
+        return EVERYWHERE_BY_ROOT
     return "only in " + ", ".join(home_path(p) for p in allowed) if allowed else "anywhere"
 
 
@@ -1142,8 +1147,11 @@ def signed_in_as_expected(acct: dict) -> bool:
         return True
     status = auth_status(acct)
     if status.get("unknown"):
+        if remembered_sign_in(acct, status):
+            return True
         log(f"{acct['name']}: could not check who is signed in ({status.get('why')}); trusting it for this launch")
         return True
+    remember_auth(acct, status.get("email"))
     got = status.get("email")
     if (got or "").lower() == want.lower():
         return True
@@ -2036,6 +2044,18 @@ def hold(sid: str):
     return f
 
 
+def drop_lock(sid: str, lock) -> None:
+    """Let go of the lock hold() took for `sid` and remove its file, for a
+    conversation that never began. Only the file this longhaul locked is
+    removed, and never raises."""
+    try:
+        if lock is not None and lock is not NO_LOCK:
+            lock.close()
+            (LONGHAUL_HOME / "locks" / f"{sid}.lock").unlink()
+    except OSError as e:
+        log(f"could not remove the lock of {sid}: {e!r}")
+
+
 def exit_code(code, default: int) -> int:
     """A process's return code as longhaul's own exit code: a signal comes back
     negative, which sys.exit would turn into 247 or 245."""
@@ -2046,14 +2066,46 @@ HELD_ELSEWHERE = ("another longhaul is already looking after this conversation. 
                   "Use that one, or stop it first.")
 
 
-def full_session_id(prefix: str) -> str:
+SHORT_ID_MIN = 4  # the fewest characters of an id that longhaul expands
+ID_SHAPED = re.compile(r"[0-9a-fA-F-]+")  # what a conversation's id is made of: anything else may be a name
+
+
+def full_session_id(prefix: str, accounts=()) -> str:
     """`longhaul -r 557ce21f`: you read short IDs off a list; claude wants
-    the whole one (a part opens its picker instead). Expanded only when
-    exactly one conversation starts with it."""
-    if not prefix or len(prefix) >= 36:
+    the whole one (2.1.311 exits 1 on a part, which the supervisor took
+    for a crash and reopened: the log audit of 2026-11-05, #6). Expanded
+    when one conversation starts with it, in any case of letters, in any
+    project folder of the default config folder and of each account's
+    (usually one linked folder: a real file counts once); only file
+    names are listed, never a transcript read. A whole id (36 characters),
+    one under SHORT_ID_MIN, and a name that is not id-shaped are returned
+    as typed, as is a short id of letters no id holds, which claude may
+    take for a name. Raises ValueError with the words to say when several
+    conversations start with it, or none does (2026-11-06)."""
+    if not prefix or len(prefix) >= 36 or len(prefix) < SHORT_ID_MIN:
         return prefix
-    hits = {p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{prefix}*.jsonl"))}
-    return hits.pop() if len(hits) == 1 else prefix
+    folders, seen, found = [DEFAULT_CONFIG] + [config_of(a) for a in accounts if isinstance(a.get("config_dir"), str)], set(), {}
+    for folder in folders:
+        for p in files_of(q for q in (folder / "projects").glob("*/*.jsonl") if q.name.lower().startswith(prefix.lower())):
+            try:
+                real = os.path.realpath(p)
+                if real in seen:
+                    continue
+                seen.add(real)
+                found.setdefault(p.stem, []).append((p.parent, os.stat(real).st_mtime))
+            except OSError:
+                pass
+    if len(found) == 1:
+        return next(iter(found))
+    if not found:
+        if ID_SHAPED.fullmatch(prefix):
+            raise ValueError(f"no conversation starting with {prefix}; `longhaul -r` with no id opens Claude's picker")
+        return prefix
+    lines = [f"{len(found)} conversations start with {prefix}; give more of the id:"]
+    for sid, where in sorted(found.items(), key=lambda kv: -max(t for _, t in kv[1])):
+        folder, mtime = max(where, key=lambda w: w[1])
+        lines.append(f"  {sid}  {home_path(str(folder))}  {dt.datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}")
+    raise ValueError("\n".join(lines))
 
 
 def first_message(path: str) -> str | None:
@@ -2119,7 +2171,13 @@ def run(opts) -> int:
         say(no_account_text(top, accounts))
         return 1
     idx = names.index(opts.account) if opts.account else 0
-    resume, cont, prompt = full_session_id(opts.resume), opts.cont, None
+    try:
+        resume, cont, prompt = full_session_id(opts.resume, accounts), opts.cont, None
+    except ValueError as e:
+        say(str(e))
+        return 2
+    if resume and resume != opts.resume:
+        say(f"resuming {resume}")
     if opts.first is not None:
         # Goes with the first launch only: after every launch the loop
         # below sets `prompt` again, to the carry-on message or to nothing.
@@ -2589,6 +2647,15 @@ def run(opts) -> int:
 
         if w.sid:
             resume, cont = w.sid, False
+        elif resume and proc.returncode and why == "crashed" and time.time() - started < 10:
+            # `--resume` that Claude refused before a conversation began (no
+            # session record): not a crash to reopen, and the lock taken for
+            # the id would only stay behind (2026-11-06, #6).
+            drop_lock(resume, lock if locked_sid == resume else None)
+            say(f"Claude exited with code {proc.returncode} straight away on `--resume {resume}`, before it opened a "
+                "conversation, so longhaul did not reopen it. Check the id (`longhaul -r` with no id opens its picker) and "
+                "`longhaul status`.")
+            return exit_code(proc.returncode, 1)
         elif why in ("completed", "crashed") and time.time() - started < 10:
             say("Claude closed straight away before a conversation began. Run `longhaul status` to check the sign-ins.")
             return exit_code(proc.returncode, 1)
@@ -12461,6 +12528,40 @@ def forget_auth(acct: dict) -> None:
             write_json(AUTH_CACHE, cache)
 
 
+# How old a remembered answer may be and still stand in when claude does not
+# answer the sign-in check in time (the log audit of 2026-11-05, #11).
+AUTH_STAND_IN = 24 * 3600
+
+
+def remember_auth(acct: dict, email) -> dict:
+    """Keep who `acct`'s folder is signed in as in AUTH_CACHE, the cache the
+    panel reads (signed_in_cached()); the terminal's check writes it too
+    (2026-11-06). Returns the entry."""
+    hit = {"email": email, "at": time.time()}
+    with locked("auth"):
+        cache = read_json(AUTH_CACHE) or {}
+        cache[str(config_of(acct))] = hit
+        write_json(AUTH_CACHE, cache)
+    return hit
+
+
+def remembered_sign_in(acct: dict, status: dict) -> bool:
+    """When the check got no answer (`status`, unknown): True if the cache
+    holds an answer under AUTH_STAND_IN old that the account was signed in
+    as the email in accounts.json. Then it is used quietly, one log line,
+    no notification and no "trusting it" warning (2026-11-06). False
+    leaves the caller its old way."""
+    hit = (read_json(AUTH_CACHE) or {}).get(str(config_of(acct))) or {}
+    at = as_number(hit.get("at")) if isinstance(hit, dict) else None
+    age = time.time() - at if at is not None else AUTH_STAND_IN
+    if not isinstance(hit, dict) or not (0 <= age < AUTH_STAND_IN) \
+            or str(hit.get("email") or "").lower() != str(acct.get("email") or "").lower():
+        return False
+    log(f"{acct['name']}: no sign-in answer ({status.get('why')}); using the answer from {int(age // 60)} min ago, "
+        f"signed in as expected")
+    return True
+
+
 def signed_in_cached(acct: dict, binary: str) -> bool:
     """signed_in_as_expected for the panel, remembered for AUTH_TTL. Only a
     definite answer is remembered: a check that hangs or fails says
@@ -12471,17 +12572,16 @@ def signed_in_cached(acct: dict, binary: str) -> bool:
         return True
     key = str(config_of(acct))
     hit = (read_json(AUTH_CACHE) or {}).get(key) or {}
-    fresh = time.time() - hit.get("at", 0) >= AUTH_TTL
+    hit = hit if isinstance(hit, dict) else {}  # junk in the file is no answer (2026-11-06)
+    fresh = time.time() - (as_number(hit.get("at")) or 0) >= AUTH_TTL
     if fresh:
         status = auth_status(acct, binary)
         if status.get("unknown"):
+            if remembered_sign_in(acct, status):
+                return True
             log(f"{acct['name']}: could not check who is signed in ({status.get('why')}); trusting it for this launch")
             return True
-        hit = {"email": status.get("email"), "at": time.time()}
-        with locked("auth"):
-            cache = read_json(AUTH_CACHE) or {}
-            cache[key] = hit
-            write_json(AUTH_CACHE, cache)
+        hit = remember_auth(acct, status.get("email"))
     if (hit.get("email") or "").lower() == want.lower():
         return True
     if fresh:
@@ -14106,7 +14206,9 @@ def answer_cmd(opts) -> int:
 
 # ---------------------------------------------------------------- setup
 
-AUTH_TIMEOUT = setting("LONGHAUL_AUTH_TIMEOUT", 10, float)
+# 20 s, not 10: the log audit of 2026-11-05 shows "no answer in 10 s, trusting
+# it" 11 times, and each delayed a launch by the whole wait (2026-11-06).
+AUTH_TIMEOUT = setting("LONGHAUL_AUTH_TIMEOUT", 20, float)
 
 
 def auth_status(acct: dict, binary: str | None = None) -> dict:
@@ -14447,7 +14549,7 @@ def add(opts) -> int:
             return 2
     for r in repos:  # the clone may come later; the guided form has said so already
         if not os.path.exists(os.path.expanduser(r)) and not getattr(opts, "noted", False):
-            say(f"--repo {home_path(os.path.expanduser(r))} does not exist yet; kept for when it does")
+            say(f"{folder_shown(r)} does not exist yet; kept for when it does")  # folders --add's words (2026-11-06)
     folder = opts.dir or f"~/.claude-{name.lower()}"
     path = Path(os.path.expanduser(folder)).resolve()
     if path in (DEFAULT_CONFIG.resolve(), (HOME / ".claude").resolve()):
@@ -14868,10 +14970,37 @@ def remove(opts) -> int:
             return 2
         write_json(LONGHAUL_HOME / "accounts.json", [a for a in accounts if a not in gone])
     forget_auth(gone[0])
+    forget_removed(gone[0]["name"])
     say(f"removed {gone[0]['name']} from longhaul's accounts. Its folder {config_of(gone[0])} and its sign-in are kept; "
         "delete the folder yourself if you no longer want them.")
     say_still_running(gone[0])
     return 0
+
+
+def forget_removed(name: str) -> None:
+    """After `remove NAME`: its recorded limit in state.json's limited_until
+    and its entry in SIGN_IN_FAILED go, as they would only sit there, and a
+    later account added under the same name would start with the old
+    ones (the log audit of 2026-11-05, #15; 2026-11-06). The usage
+    ledger and every other history stay, and the account's folder is not
+    touched. Nothing is written when there is nothing to clear; a file
+    that cannot be written is logged and remove goes on."""
+    try:
+        if name in load_state().get("limited_until", {}):
+            update_state(lambda state: state["limited_until"].pop(name, None))
+            log(f"remove: {name}'s recorded limit cleared")
+    except OSError as e:
+        log(f"remove: {name}'s recorded limit was not cleared: {e.strerror or e}")
+    path = LONGHAUL_HOME / SIGN_IN_FAILED
+    try:
+        with locked("sign-in-failed"):
+            kept = read_json(path)
+            if isinstance(kept, dict) and name in kept:
+                del kept[name]
+                write_json(path, kept)
+                log(f"remove: {name}'s sign-in failure cleared")
+    except OSError as e:
+        log(f"remove: {name}'s sign-in failure was not cleared: {e.strerror or e}")
 
 
 def chats_on(acct: dict, processes=None):
@@ -15078,6 +15207,8 @@ def status(opts) -> int:
         allowed = repositories_of(acct)
         if allowed is None:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
+        elif allowed and keeps_everywhere(acct):
+            print(f"       {EVERYWHERE_BY_ROOT}")
         elif allowed:
             print(f"       only in: {', '.join(home_path(p) for p in allowed)}")
         elif kept_out_by(acct, accounts):  # no list of its own, and others keep every folder
