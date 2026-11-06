@@ -2044,6 +2044,18 @@ def hold(sid: str):
     return f
 
 
+def drop_lock(sid: str, lock) -> None:
+    """Let go of the lock hold() took for `sid` and remove its file, for a
+    conversation that never began. Only the file this longhaul locked is
+    removed, and never raises."""
+    try:
+        if lock is not None and lock is not NO_LOCK:
+            lock.close()
+            (LONGHAUL_HOME / "locks" / f"{sid}.lock").unlink()
+    except OSError as e:
+        log(f"could not remove the lock of {sid}: {e!r}")
+
+
 def exit_code(code, default: int) -> int:
     """A process's return code as longhaul's own exit code: a signal comes back
     negative, which sys.exit would turn into 247 or 245."""
@@ -2054,14 +2066,46 @@ HELD_ELSEWHERE = ("another longhaul is already looking after this conversation. 
                   "Use that one, or stop it first.")
 
 
-def full_session_id(prefix: str) -> str:
+SHORT_ID_MIN = 4  # the fewest characters of an id that longhaul expands
+ID_SHAPED = re.compile(r"[0-9a-fA-F-]+")  # what a conversation's id is made of: anything else may be a name
+
+
+def full_session_id(prefix: str, accounts=()) -> str:
     """`longhaul -r 557ce21f`: you read short IDs off a list; claude wants
-    the whole one (a part opens its picker instead). Expanded only when
-    exactly one conversation starts with it."""
-    if not prefix or len(prefix) >= 36:
+    the whole one (2.1.311 exits 1 on a part, which the supervisor took
+    for a crash and reopened: the log audit of 2026-11-05, #6). Expanded
+    when one conversation starts with it, in any case of letters, in any
+    project folder of the default config folder and of each account's
+    (usually one linked folder: a real file counts once); only file
+    names are listed, never a transcript read. A whole id (36 characters),
+    one under SHORT_ID_MIN, and a name that is not id-shaped are returned
+    as typed, as is a short id of letters no id holds, which claude may
+    take for a name. Raises ValueError with the words to say when several
+    conversations start with it, or none does (2026-11-06)."""
+    if not prefix or len(prefix) >= 36 or len(prefix) < SHORT_ID_MIN:
         return prefix
-    hits = {p.stem for p in files_of((DEFAULT_CONFIG / "projects").glob(f"*/{prefix}*.jsonl"))}
-    return hits.pop() if len(hits) == 1 else prefix
+    folders, seen, found = [DEFAULT_CONFIG] + [config_of(a) for a in accounts if isinstance(a.get("config_dir"), str)], set(), {}
+    for folder in folders:
+        for p in files_of(q for q in (folder / "projects").glob("*/*.jsonl") if q.name.lower().startswith(prefix.lower())):
+            try:
+                real = os.path.realpath(p)
+                if real in seen:
+                    continue
+                seen.add(real)
+                found.setdefault(p.stem, []).append((p.parent, os.stat(real).st_mtime))
+            except OSError:
+                pass
+    if len(found) == 1:
+        return next(iter(found))
+    if not found:
+        if ID_SHAPED.fullmatch(prefix):
+            raise ValueError(f"no conversation starting with {prefix}; `longhaul -r` with no id opens Claude's picker")
+        return prefix
+    lines = [f"{len(found)} conversations start with {prefix}; give more of the id:"]
+    for sid, where in sorted(found.items(), key=lambda kv: -max(t for _, t in kv[1])):
+        folder, mtime = max(where, key=lambda w: w[1])
+        lines.append(f"  {sid}  {home_path(str(folder))}  {dt.datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}")
+    raise ValueError("\n".join(lines))
 
 
 def first_message(path: str) -> str | None:
@@ -2127,7 +2171,13 @@ def run(opts) -> int:
         say(no_account_text(top, accounts))
         return 1
     idx = names.index(opts.account) if opts.account else 0
-    resume, cont, prompt = full_session_id(opts.resume), opts.cont, None
+    try:
+        resume, cont, prompt = full_session_id(opts.resume, accounts), opts.cont, None
+    except ValueError as e:
+        say(str(e))
+        return 2
+    if resume and resume != opts.resume:
+        say(f"resuming {resume}")
     if opts.first is not None:
         # Goes with the first launch only: after every launch the loop
         # below sets `prompt` again, to the carry-on message or to nothing.
@@ -2597,6 +2647,15 @@ def run(opts) -> int:
 
         if w.sid:
             resume, cont = w.sid, False
+        elif resume and proc.returncode and why == "crashed" and time.time() - started < 10:
+            # `--resume` that Claude refused before a conversation began (no
+            # session record): not a crash to reopen, and the lock taken for
+            # the id would only stay behind (2026-11-06, #6).
+            drop_lock(resume, lock if locked_sid == resume else None)
+            say(f"Claude exited with code {proc.returncode} straight away on `--resume {resume}`, before it opened a "
+                "conversation, so longhaul did not reopen it. Check the id (`longhaul -r` with no id opens its picker) and "
+                "`longhaul status`.")
+            return exit_code(proc.returncode, 1)
         elif why in ("completed", "crashed") and time.time() - started < 10:
             say("Claude closed straight away before a conversation began. Run `longhaul status` to check the sign-ins.")
             return exit_code(proc.returncode, 1)

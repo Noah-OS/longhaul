@@ -4,12 +4,14 @@ Code writes (sessions/<pid>.json, projects/*/<sid>.jsonl) and acts out one
 step of FAKE_PLAN per launch, so longhaul's loop runs without an account, a
 network or a terminal.
 
-Steps: limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
+Steps: refuse | limit:<resetsAt> | limit_busy:<resetsAt> | exit | crash | killed |
 rc_drop | rc_drop_then_exit | idle_wait | idle_wait_agents |
 exit_after_signin_change | clear_then_crash | stay |
 session_end:<reason>:<code>[:<sid>] | stop_failure:<error>[:<sid>] |
 quota_note:<type>[:<sid>] | file:<name>=<text>
 
+`refuse` ends with code 1 at once and writes no session record and no
+transcript, as Claude Code 2.1.311 does for a `--resume` id it cannot find.
 `exit` ends with code 0, as `/exit` and Ctrl+C twice do in Claude Code
 2.1.304; `crash` ends with code 1; `killed` dies of SIGKILL, which the parent
 sees as -9. `session_end` runs the SessionEnd hooks hooks/hooks.json
@@ -79,6 +81,9 @@ def save_plan() -> None:
 plan = json.loads(plan_file.read_text())
 step = plan.pop(0) if plan else "exit"
 save_plan()
+
+if step == "refuse":
+    sys.exit(1)
 
 # A new conversation is sid-1, or the id --session-id gives it, as Claude Code's is.
 sid = (args[args.index("--resume") + 1] if "--resume" in args
