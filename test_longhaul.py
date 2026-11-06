@@ -12942,7 +12942,10 @@ class CheckpointSkill(unittest.TestCase):
         self.assertIn("${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint save --file", body)
         self.assertNotIn("CLAUDE_SESSION_ID", body.replace(step, ""), "no id on the command line")
         self.assertNotIn("<<", text, "no heredoc anywhere: the allowed-tools rule does not match one")
-        self.assertIn("removed", body, "it says the state file goes once saved")
+        self.assertIn("removed once the save has saved it", body.replace("\n", " "), "it says the state file goes once saved")
+        self.assertIn("the file stays", body.replace("\n", " "), "a refusal keeps it: the model edits it")
+        self.assertIn("Edit", body)
+        self.assertIn("10% over", body.replace("\n", " "), "a text a little over is cut")
         for key in longhaul.CHECKPOINT_TEXTS + longhaul.CHECKPOINT_LISTS + longhaul.CHECKPOINT_MORE:
             self.assertIn(f'"{key}"', body, "the schema's twelve fields, as the save takes them")
         for cap in ("1,000 characters", "20 entries", "16,000 bytes"):

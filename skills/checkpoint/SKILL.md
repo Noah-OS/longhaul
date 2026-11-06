@@ -42,8 +42,10 @@ Rules:
 - Nothing secret: no tokens, keys or passwords. The save refuses a value
   shaped like one.
 - Caps: 1,000 characters per text, 20 entries per list, 16,000 bytes in
-  all. Over a cap the save refuses and names the field; shorten it and
-  save again. What comes back is in the order above, up to about 9,000
+  all. A text up to 10% over is cut at the cap on a word and ends in
+  `…`; the save's line says which. Further over, or a total more than
+  10% over, the save refuses and names each field with its size against
+  the cap; shorten those and save again. What comes back is in the order above, up to about 9,000
   characters, with one line naming what stayed in the file.
 - One line per text; no tabs. A newline or a tab in a text comes back
   as `?`.
@@ -69,9 +71,11 @@ ${CLAUDE_PLUGIN_ROOT}/bin/longhaul checkpoint save --file <that path>
 ```
 
 Repeat the command's one line to the user as it is; do not show the JSON.
-The state file is removed once the save has read it, saved or refused. If
-it refuses, it names the field: write the file again with that fixed, and
-save again. The checkpoint is private (0600)
+The state file is removed once the save has saved it. If the save
+refuses, the file stays and the refusal names each field that is over:
+fix those with Edit, not by writing the whole file again, and save again.
+(A refusal for a credential removes the file: write it again without
+it.) The checkpoint is private (0600)
 under Longhaul's own folder, keyed to this session, and is read only by
 Longhaul's SessionStart hook, which puts the state back after a
 compaction or a resume, with its age and what changed since. If the user

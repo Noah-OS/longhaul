@@ -40,8 +40,10 @@ Rules:
 - Nothing secret: no tokens, keys or passwords. The save refuses a value
   shaped like one.
 - Caps: 1,000 characters per text, 20 entries per list, 16,000 bytes in
-  all. Over a cap the save refuses and names the field; shorten it and
-  save again. What comes back is in the order above, up to about 9,000
+  all. A text up to 10% over is cut at the cap on a word and ends in
+  `…`; the save's line says which. Further over, or a total more than
+  10% over, the save refuses and names each field with its size against
+  the cap; shorten those and save again. What comes back is in the order above, up to about 9,000
   characters, with one line naming what stayed in the file.
 - One line per text; no tabs. A newline or a tab in a text comes back
   as `?`.
@@ -73,7 +75,7 @@ the workspace: if the sandbox refuses the write, run the same command
 again with escalated permissions, saying it saves Longhaul's checkpoint.
 
 Repeat the command's one line to the user as it is; do not show the JSON.
-If it refuses, it names the field: fix that and run the command again.
+If it refuses, it names each field that is over: fix those and run the command again.
 The checkpoint is private (0600) under Longhaul's own folder, keyed to
 this chat, and is read only by Longhaul's SessionStart hook, which puts
 the state back after a compaction, a resume or a clear, with its age and
