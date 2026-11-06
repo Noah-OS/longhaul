@@ -219,9 +219,12 @@ Usage:
                           the model's own state for conversation ID (default: the
                           one this runs in), JSON on stdin or in the file, kept
                           private under LONGHAUL_HOME/checkpoints; 16,000 bytes
-                          in all. The /longhaul:checkpoint skill writes the file
-                          there as <ID>.state.json, removed once read, saved or
-                          refused
+                          in all. A text up to 10% over 1,000 characters is cut
+                          to it, and a total up to 10% over is saved; further
+                          over is refused, naming each field. The
+                          /longhaul:checkpoint skill writes the file there as
+                          <ID>.state.json, removed once saved and kept on a
+                          refusal, for the model to edit
   longhaul checkpoint           the plugin's SessionStart hook: puts that state back
                           after a compaction or a resume, and once after a /clear
                           in the folder it was saved in, within
@@ -325,6 +328,10 @@ Usage:
                           the finished chains to rate, without their arms; with
                           CHAIN N, records a rating from 1 to 5
   longhaul clear                forget the recorded limits
+  (log)                         LONGHAUL_HOME/longhaul.log leaves out its routine
+                          lines (a prompt's reminder check below the threshold,
+                          a short panel job) unless LONGHAUL_LOG=debug, which
+                          writes everything
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
                           a limit the session moves only with --swap and
@@ -595,9 +602,21 @@ def append(path: Path, text: str, cap: int):
     return problem
 
 
-def log(msg: str) -> None:
+def log_debug() -> bool:
+    """LONGHAUL_LOG=debug, in any case, read at call time as the other
+    switches are: the log keeps its routine lines too. Without it they are
+    dropped (2026-11-06: 73% of a two-week log was lines nothing reads)."""
+    return (os.environ.get("LONGHAUL_LOG") or "").strip().lower() == "debug"
+
+
+def log(msg: str, routine: bool = False) -> None:
     """Never raises: it runs in the panel wrapper's fail-safe path, where a
-    log that cannot be written must not stop the panel getting its Claude."""
+    log that cannot be written must not stop the panel getting its Claude.
+    A `routine` line (one that records nothing changing, and that no code
+    reads) is written only with LONGHAUL_LOG=debug; the text is the same
+    either way."""
+    if routine and not log_debug():
+        return
     try:
         stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # A log that cannot be moved aside grows on; there is nowhere to say so.
@@ -10337,7 +10356,9 @@ def reminder(opts) -> int:
         found = {**found, "code": "error"}
     finally:
         try:
-            log(reminder_check_line(sid, found))
+            # Routine when below the threshold: no reminder, nothing changed.
+            # Fired, reset, errors and the rest stay (2026-11-06).
+            log(reminder_check_line(sid, found), routine=found.get("code") == "below-threshold")
         except Exception:  # the line is a diagnosis: it never costs the prompt anything
             pass
     return 0
@@ -12684,7 +12705,9 @@ def wrap(argv: list[str]) -> int:
         prepare(acct, chat)
         shown = " ".join(a for a in args if not a.startswith("--debug"))
         where = f" in {home_path(top)}" if chat else ""
-        log(f"panel {'chat' if chat else 'job'} on {acct['name']}{where}: {shown[:240]}")
+        # A short job is routine (639 lines of 9,357 in two weeks, none read);
+        # a chat's launch is not (2026-11-06).
+        log(f"panel {'chat' if chat else 'job'} on {acct['name']}{where}: {shown[:240]}", routine=not chat)
         if resumed:
             # The record the next reopen reads (D3d). With switch_mid_session
             # false claude runs in this process's place and nothing of longhaul
