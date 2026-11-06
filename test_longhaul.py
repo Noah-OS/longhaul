@@ -13093,7 +13093,8 @@ class Reminder(unittest.TestCase):
         self.n = 0
         self.env = {k: v for k, v in os.environ.items() if (not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX") and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
-                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1")
+                        LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                        LONGHAUL_LOG="debug")  # the check lines below the threshold are routine: kept only in debug (2026-11-06)
 
     def tearDown(self):
         longhaul.LONGHAUL_HOME = self.saved
@@ -13564,6 +13565,38 @@ class Reminder(unittest.TestCase):
     # Each call of the prompt's hook now logs one line: the session, the
     # context it read, the threshold, the highest multiple told, and fired or
     # the reason it said nothing; numbers and codes alone.
+
+    def test_without_debug_the_log_leaves_out_the_checks_below_the_threshold_and_keeps_every_other(self):
+        # Log audit row #18, 2026-11-06: 2,487 of 9,357 lines were "below-threshold"
+        # checks. Only that code is routine; no code reads these lines. The text
+        # of the line is the same in debug.
+        for size in (150_000, 205_400):
+            self.grow(size)
+            self.remind(LONGHAUL_LOG=None)
+        self.remind(LONGHAUL_LOG=None)
+        self.assertEqual(self.checks(), [
+            "reminder check: s1 context=205400 threshold=200000 told=0 fired",
+            "reminder check: s1 context=205400 threshold=200000 told=200000 already-reminded"])
+        self.remind(LONGHAUL_LOG="off")  # anything but debug is the default
+        self.assertEqual(len(self.checks()), 3)
+        self.grow(10_000)
+        self.remind(LONGHAUL_LOG=" DEBUG ")
+        self.assertEqual(self.checks()[-1], "reminder check: s1 context=10000 threshold=200000 told=200000 reset")
+        self.grow(150_000)
+        self.remind(LONGHAUL_LOG="Debug")
+        self.assertEqual(self.checks()[-1], "reminder check: s1 context=150000 threshold=200000 told=0 below-threshold")
+
+    def test_log_drops_a_routine_line_unless_debug_and_never_changes_the_text(self):
+        for value, kept in ((None, False), ("", False), ("off", False), ("debug", True), ("DEBUG", True)):
+            env = {k: v for k, v in os.environ.items() if k != "LONGHAUL_LOG"}
+            if value is not None:
+                env["LONGHAUL_LOG"] = value
+            with mock.patch.dict(os.environ, env, clear=True):
+                (self.home / "longhaul.log").unlink(missing_ok=True)
+                longhaul.log("routine line", routine=True)
+                longhaul.log("plain line")
+            lines = [entry.split(" ", 2)[2] for entry in self.log().splitlines()]
+            self.assertEqual(lines, ["routine line", "plain line"] if kept else ["plain line"], value)
 
     def test_each_prompt_logs_one_check_line_with_fired_or_why_not(self):
         self.remind()
@@ -14044,7 +14077,7 @@ class CodexReminder(unittest.TestCase):
                     if not k.startswith(("LONGHAUL_", "CODEX_")) and k not in Checkpoint.SESSION_VARS}
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
-                        LONGHAUL_INDEX="off", CODEX_HOME=str(self.tmp / "codex"))
+                        LONGHAUL_INDEX="off", CODEX_HOME=str(self.tmp / "codex"), LONGHAUL_LOG="debug")
 
     # ------------------------------------------------ records, as Codex writes them
 
