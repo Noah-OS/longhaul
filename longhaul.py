@@ -12572,7 +12572,8 @@ def signed_in_cached(acct: dict, binary: str) -> bool:
         return True
     key = str(config_of(acct))
     hit = (read_json(AUTH_CACHE) or {}).get(key) or {}
-    fresh = time.time() - hit.get("at", 0) >= AUTH_TTL
+    hit = hit if isinstance(hit, dict) else {}  # junk in the file is no answer (2026-11-06)
+    fresh = time.time() - (as_number(hit.get("at")) or 0) >= AUTH_TTL
     if fresh:
         status = auth_status(acct, binary)
         if status.get("unknown"):
