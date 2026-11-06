@@ -20,14 +20,16 @@ const OPEN = { id: PANE_ID, title: 'Longhaul accounts', focus: true, closeOnEsca
 const ACCOUNTS = [
   { name: 'personal-1', email: 'a•••@example.com', signed_in: true, as_expected: true, check_failed: null, plan: 'max',
     limited_until: null, five_hour: { used: 40, resets_at: AT + 2 * HOUR }, week: { used: 12, resets_at: AT + 50 * HOUR },
-    only_in: [], folder: '~/.claude-personal-1', this_chat: true },
+    only_in: [], fallback: false, folder: '~/.claude-personal-1', this_chat: true },
   { name: 'work-2', email: 'b•••@example.com', signed_in: false, as_expected: null, check_failed: null, plan: 'pro',
-    limited_until: AT + 3 * HOUR, five_hour: null, week: null, only_in: ['~/work', '~/clients'],
+    limited_until: AT + 3 * HOUR, five_hour: null, week: null, only_in: ['~/work', '~/clients'], fallback: false,
     folder: '~/.claude-work-2', this_chat: false },
   { name: 'spare-3', email: 'c•••@example.com', signed_in: true, as_expected: false, check_failed: null, plan: null,
-    limited_until: null, five_hour: null, week: null, only_in: null, folder: '~/.claude-spare-3', this_chat: false },
+    limited_until: null, five_hour: null, week: null, only_in: null, fallback: false, folder: '~/.claude-spare-3',
+    this_chat: false },
   { name: 'team-4', email: null, signed_in: null, as_expected: null, check_failed: 'the check timed out', plan: null,
-    limited_until: null, five_hour: null, week: null, only_in: [], folder: '~/.claude-team-4', this_chat: false },
+    limited_until: null, five_hour: null, week: null, only_in: [], fallback: false, folder: '~/.claude-team-4',
+    this_chat: false },
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, problem: null }
@@ -233,7 +235,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
                    `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used anywhere', 'a•••@example.com',
                    'folder ~/.claude-personal-1'])
     expect(all).toContain(t)
-  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'back'])
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'fallback', 'back'])
   expect(all.includes('Esc to go back')).toBe(surface === 'terminal')
   await ui.press({ key: 'back' })
   expect(await buttons(ui)).toEqual(ROWS)
@@ -595,7 +597,7 @@ both("an account's Folders: each folder with Remove, a field to add one, and Any
   const all = await texts(ui)
   for (const t of ['Folders:', '  ~/work', '  ~/clients']) expect(all).toContain(t)
   expect(await buttons(ui)).toEqual(['signin-work-2', 'remove-work-2', 'folder-remove-0', 'folder-remove-1', 'folder-add',
-    'folder-anywhere', 'back'])
+    'folder-anywhere', 'fallback', 'back'])
   expect((await ui.find({ key: 'folder-remove-1' }))?.text).toBe('Remove')
   expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Anywhere')
   expect(await ui.find({ key: 'folder-path' })).toBeDefined()
@@ -662,7 +664,7 @@ both('an account kept out of every folder: its line says so, its page names who 
   expect(await texts(ui)).toContain('  /')
   expect(await texts(ui)).toContain('may be used everywhere (its folders include /)')
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-remove-0', 'folder-add',
-    'folder-anywhere', 'back'])
+    'folder-anywhere', 'fallback', 'back'])
   await ui.press({ key: 'folder-remove-0' })
   expect(after(w).slice(-2)).toEqual([['folders', 'personal-1', '--remove', '/'], ['status', '--json']])
   await ui.unmount()
@@ -674,7 +676,7 @@ both('a folders field that is not a list: the page says so, offers Anywhere and 
   await open(ui, 'row-spare-3')
   expect(await texts(ui)).toContain('Folders: its repositories field is not a list of absolute paths, so it is used '
     + 'nowhere. Anywhere drops it.')
-  expect(await buttons(ui)).toEqual(['signin-spare-3', 'remove-spare-3', 'folder-anywhere', 'back'])
+  expect(await buttons(ui)).toEqual(['signin-spare-3', 'remove-spare-3', 'folder-anywhere', 'fallback', 'back'])
   expect(await ui.find({ key: 'folder-path' })).toBeUndefined()
   await ui.press({ key: 'folder-anywhere' })
   expect(after(w)).toEqual([['folders', 'spare-3', '--anywhere'], ['status', '--json']])
@@ -698,6 +700,66 @@ both('a folders run that is refused shows why; a typed email is masked, and pass
   all = await texts(ui)
   expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /•••@example.com: work-2'))).toBe(true)
   expect(all.join('\n')).not.toMatch(/first\.last/)
+  await ui.unmount()
+})
+
+// A fallback account (the owner, 2026-11-06: "A fallback mark"): used only
+// when no other account allowed here has room. Its line says so, its page
+// says what it is, and a button runs `longhaul.py fallback NAME on|off`.
+
+both('a fallback: its line and page say so, and the button runs fallback NAME off or on', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], fallback: true }, ...ACCOUNTS.slice(1)] }))
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toBe('  personal-1  max · signed in · week 12%   '
+    + '(this chat · fallback)')
+  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/\(only in ~\/work, ~\/clients\)$/) // normal: no word
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain('Fallback: used only when no other account allowed here has room')
+  expect((await ui.find({ key: 'fallback' }))?.text).toBe('Use as a normal account')
+  w.status = done(JSON.stringify(STATUS)) // what the read after it finds
+  await ui.press({ key: 'fallback' })
+  expect(after(w)).toEqual([['fallback', 'personal-1', 'off'], ['status', '--json']])
+  expect(w.timeouts.slice(1)).toEqual([60_000, 60_000])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Use as a normal account: personal-1')))
+    .toBe(true)
+  // The rows read again: a normal account now, with the button the other way.
+  expect(await texts(ui)).toContain('Normal account')
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  expect(await texts(ui)).toContain('Normal account')
+  expect((await ui.find({ key: 'fallback' }))?.text).toBe('Use as fallback')
+  await ui.press({ key: 'fallback' })
+  expect(after(w).slice(2)).toEqual([['fallback', 'work-2', 'on'], ['status', '--json']])
+  await ui.unmount()
+})
+
+both('no fallback button while Remove waits for its yes, and a refused run shows why', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'remove-work-2' })
+  expect(await ui.find({ key: 'fallback' })).toBeUndefined()
+  await ui.press({ key: 'remove-no' })
+  w.answer.fallback = done('', 2, 'longhaul no account called work-2; the accounts are personal-1\n')
+  await ui.press({ key: 'fallback' })
+  const all = await texts(ui)
+  expect(all.some(t => t.startsWith('✘') && t.includes('Use as fallback: work-2'))).toBe(true)
+  expect(all).toContain('longhaul no account called work-2; the accounts are personal-1')
+  await ui.unmount()
+})
+
+both('an older Longhaul that does not say: no fallback line and no button', async ($, on, surface) => {
+  const w = world(on)
+  const older = ACCOUNTS.map(({ fallback: _, ...a }) => a)
+  w.status = done(JSON.stringify({ ...STATUS, accounts: older }))
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text)
+    .toBe('  personal-1  max · signed in · week 12%   (this chat)')
+  await open(ui, 'row-personal-1')
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'back'])
+  const all = await texts(ui)
+  expect(all.some(t => /fallback|Normal account/i.test(t))).toBe(false)
   await ui.unmount()
 })
 

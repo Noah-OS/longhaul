@@ -1122,6 +1122,66 @@ class Loop(unittest.TestCase):
         _, calls = self.run_longhaul(["exit"], runs=1)
         self.assertEqual(calls[0]["config"], str(self.pro))
 
+    # A fallback account (the owner, 2026-11-06): Work, second in the file,
+    # used only when neither Max nor Pro has room. Its allowance expires
+    # first in each test, which before made it the one picked.
+
+    def with_fallback(self):
+        self.work = self.tmp / "claude-work"
+        self.work.mkdir()
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "Max", "config_dir": None}, {"name": "Work", "config_dir": str(self.work), "fallback": True},
+            {"name": "Pro", "config_dir": str(self.pro)}]))
+        self.reading("Work", five=10, five_in=600, week=20, week_in=1200)
+
+    def test_a_limit_moves_the_conversation_to_a_normal_account_before_the_fallback(self):
+        self.with_fallback()
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"])
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertIn("Max hit its session limit", out.stdout)
+        self.assertIn("Carrying on with Pro.", out.stdout)
+
+    def test_a_limit_moves_to_the_fallback_when_every_normal_account_is_at_its_limit(self):
+        self.with_fallback()
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"])
+        self.assertEqual([c["config"] for c in calls], [None, str(self.work)], out.stderr)
+        self.assertIn("Carrying on with Work.", out.stdout)
+
+    def test_a_new_launch_starts_on_a_normal_account_before_the_fallback(self):
+        self.with_fallback()
+        self.reading("Max", five=96)  # nearly full: still before the fallback
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        _, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual([c["config"] for c in calls], [None])
+
+    def test_a_nearly_full_idle_session_moves_early_to_a_normal_account_not_the_fallback(self):
+        self.with_fallback()
+        self.reading("Max", five=96)
+        out, calls = self.run_longhaul(["idle_wait", "exit"], "--account", "Max", LONGHAUL_IDLE_MOVE_SECONDS="0")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertIn("longhaul moved it to Pro", out.stdout)
+
+    def test_a_nearly_full_idle_session_never_moves_early_to_the_fallback(self):
+        # The early move is for an account only nearly full: the fallback,
+        # used only when no normal account has room, is never its goal.
+        self.with_fallback()
+        self.reading("Max", five=96)
+        self.reading("Pro", week=98)
+        out, calls = self.run_longhaul(["idle_wait"], "--account", "Max", runs=1, LONGHAUL_IDLE_MOVE_SECONDS="0")
+        self.assertEqual([c["config"] for c in calls], [None], out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: move", log)
+
+    def test_a_session_on_the_fallback_is_not_moved_off_it_because_a_normal_account_has_room(self):
+        self.with_fallback()
+        out, calls = self.run_longhaul(["idle_wait"], "--account", "Work", runs=1, LONGHAUL_IDLE_MOVE_SECONDS="0")
+        self.assertEqual([c["config"] for c in calls], [str(self.work)], out.stderr)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Work ended: completed", log)
+        self.assertNotIn("ended: move", log)
+
     def test_a_launch_goes_where_unused_allowance_expires_first(self):
         self.reading("Max", five=50, five_in=7200)
         self.reading("Pro", five=10, week=40, week_in=1200)
@@ -15879,6 +15939,57 @@ class Pieces(unittest.TestCase):
         self.assertEqual(longhaul.pick(self.ACCOUNTS, {}, 0, now=100, seen=seen), (1, None),
                          "Max's window already reset; Pro's weekly room is the one that expires")
 
+    # A fallback account (the owner, 2026-11-06: "A fallback mark"): the
+    # work account, used everywhere but only when no other allowed account
+    # has room. Before, a limit on one personal account moved the chat to
+    # the work account, whose week reset sooner, while the other had room.
+    WITH_FALLBACK = [{"name": "personal-1"}, {"name": "work", "fallback": True}, {"name": "personal-2"}]
+
+    def test_pick_takes_a_normal_account_with_room_before_a_fallback_whose_allowance_expires_sooner(self):
+        seen = {"personal-1": self.seen(five=50, five_at=500), "work": self.seen(five=10, five_at=110, week=20,
+                                                                                     week_at=150)}
+        for start in (0, 1, 2):
+            self.assertEqual(longhaul.pick(self.WITH_FALLBACK, {}, start, now=100, seen=seen), (0, None), start)
+        # personal-1 at its limit: personal-2, with no reading, still before work.
+        state = {"limited_until": {"personal-1": 200}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 0, now=100, seen=seen), (2, None))
+        # First in the file is no reason either.
+        first = [{"name": "work", "fallback": True}, {"name": "personal-1"}]
+        self.assertEqual(longhaul.pick(first, {}, 0, now=100), (1, None))
+
+    def test_pick_takes_a_nearly_full_normal_account_before_a_fallback_with_room(self):
+        seen = {"personal-1": self.seen(five=96, five_at=500)}
+        state = {"limited_until": {"personal-2": 900}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 1, now=100, seen=seen), (0, None))
+
+    def test_pick_takes_the_fallback_when_every_normal_account_is_at_its_limit_or_skipped(self):
+        state = {"limited_until": {"personal-1": 200, "personal-2": 300}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 0, now=100), (1, None))
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, {"limited_until": {"personal-1": 200}}, 0, now=100,
+                                       skip={"personal-2"}), (1, None), "personal-2 not allowed here")
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, {}, 0, now=100, skip={"personal-1", "personal-2"}),
+                         (1, None))
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, {}, 0, now=100, skip={"personal-1", "work", "personal-2"}),
+                         (None, None))
+        # Among fallbacks, the usual rules: the allowance that expires first.
+        two = self.WITH_FALLBACK + [{"name": "work-2", "fallback": True}]
+        seen = {"work": self.seen(five=10, five_at=900), "work-2": self.seen(five=10, five_at=300)}
+        self.assertEqual(longhaul.pick(two, state, 0, now=100, seen=seen), (3, None))
+
+    def test_pick_with_every_account_at_its_limit_takes_the_first_reset_and_a_normal_one_at_the_same_reset(self):
+        state = {"limited_until": {"personal-1": 300, "work": 200, "personal-2": 400}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 0, now=100), (1, 200), "the fallback resets first")
+        state = {"limited_until": {"personal-1": 300, "work": 200, "personal-2": 200}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 0, now=100), (2, 200))
+        state = {"limited_until": {"personal-1": 200, "work": 200, "personal-2": 200}}
+        self.assertEqual(longhaul.pick(self.WITH_FALLBACK, state, 2, now=100), (0, 200),
+                         "ties as before: the file's order")
+
+    def test_only_a_fallback_of_true_marks_an_account(self):
+        for value, marked in ((True, True), (False, False), (None, False), ("yes", False), (1, False), ("true", False)):
+            self.assertEqual(longhaul.is_fallback({"name": "work", "fallback": value}), marked, repr(value))
+        self.assertFalse(longhaul.is_fallback({"name": "work"}))
+
     def test_last_account_reads_the_sessions_record_and_ignores_junk_main_and_a_removed_account(self):
         usage = Path(tempfile.mkdtemp()) / "usage"
         (usage / "sessions").mkdir(parents=True)
@@ -17970,6 +18081,74 @@ class KeepWorking(unittest.TestCase):
         r.tend()
         self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
         self.assertEqual(r.moves, [])
+
+    # -- a fallback account (the owner, 2026-11-06): Work, before Pro in the
+    # file and with its allowance expiring first, is used only when Pro has
+    # no room.
+
+    def with_fallback(self):
+        self.accounts.insert(1, {"name": "Work", "config_dir": str(self.tmp / "work"), "email": "work@example.com",
+                                 "fallback": True})
+        (self.home / "usage").mkdir(exist_ok=True)
+        (self.home / "usage" / "Work.json").write_text(json.dumps({
+            "five_hour": {"used_percentage": 10, "resets_at": self.clock.at + 600},
+            "seven_day": {"used_percentage": 20, "resets_at": self.clock.at + 1200}}))
+
+    def test_at_a_limit_the_chat_moves_to_a_normal_account_before_the_fallback(self):
+        self.with_fallback()
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))])
+        r = self.relay("ask")
+        self.stop(r)
+        self.assertEqual((self.question()["kind"], self.question()["to"]), ("move", "Pro"))
+
+    def test_at_a_limit_the_chat_moves_to_the_fallback_when_every_normal_account_is_at_its_limit(self):
+        self.with_fallback()
+        self.limited(Pro=self.clock.at + 600)
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertEqual(r.moves, [("Work", longhaul.CARRY_ON.format(old="Max", kind="session", new="Work"))])
+
+    def test_with_every_account_at_its_limit_a_normal_one_resetting_with_the_fallback_is_the_first_reset(self):
+        self.with_fallback()
+        self.limited(Work=self.clock.at + 600, Pro=self.clock.at + 600)
+        r = self.relay("auto")
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Pro")
+        self.limited(Work=self.clock.at + 300, Pro=self.clock.at + 600)
+        r = self.relay("ask")
+        self.stop(r)
+        self.assertEqual((self.question()["kind"], self.question()["to"]), ("first_reset", "Work"), "it resets first")
+
+    def test_a_chat_on_the_fallback_is_not_moved_off_it_when_a_normal_account_has_room_again(self):
+        self.with_fallback()
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        r.idx = 1  # on Work
+        for _ in range(3):
+            self.later(60)
+            r.tend()
+        self.assertEqual((r.moves, list(r.queue), self.question(), self.waiting()), ([], [], None, None))
+
+    def test_a_chat_moved_off_a_removed_account_goes_to_a_normal_account_before_the_fallback(self):
+        self.with_fallback()
+        self.write_accounts(self.accounts)
+        r = self.relay("auto")
+        self.write_accounts(self.accounts[1:])
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)])
+
+    def test_a_carry_on_whose_account_is_at_its_limit_again_picks_a_normal_account_before_the_fallback(self):
+        self.with_fallback()
+        self.limited(Work=self.clock.at + 600, Pro=self.clock.at + 900)
+        r = self.relay("auto")
+        self.stop(r, resets_in=300)
+        self.assertEqual(self.waiting()["account"], "Max", "it resets first")
+        self.later(360)
+        self.limited(Max=self.clock.at + 3000)  # Max at its limit again; Work and Pro have room
+        r.tend()
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
 
     # -- at the time
 
@@ -22168,6 +22347,20 @@ class Accounts(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("will not be used anywhere", out.stdout)
 
+    def test_add_with_fallback_marks_the_new_account_a_fallback_at_once(self):
+        # The owner, 2026-11-06: the work account, used everywhere, but only
+        # when no other account has room.
+        work = self.tmp / "work"
+        self.emails[str(work)] = "work@example.com"
+        out = self.longhaul("add", "Work", "work@example.com", "--dir", str(work), "--repo", "/srv/work", "--fallback")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[-1], {"name": "Work", "config_dir": str(work), "email": "work@example.com",
+                                               "repositories": ["/srv/work"], "fallback": True})
+        self.assertIn(f"added Work (work@example.com), folder {work}, only in /srv/work, as a fallback (used only when "
+                      "no other account allowed there has room); signing it in now", out.stdout)
+        out = self.longhaul("add", "-h")
+        self.assertIn("--fallback", out.stdout)
+
 
 class Folders(unittest.TestCase):
     """`longhaul folders NAME` (the owner, 2026-11-05: "I can't edit the
@@ -22495,6 +22688,182 @@ class Folders(unittest.TestCase):
         self.assertIn("`longhaul folders spare --add PATH`", c["step"])
 
 
+class Fallback(unittest.TestCase):
+    """`longhaul fallback NAME [on|off]` (the owner, 2026-11-06: "A fallback
+    mark"): an account used only when no other account allowed there has
+    room, as the owner's work account is, read and set without a hand edit,
+    from a terminal or the accounts screen's button. Written as `longhaul
+    folders` writes. Every path is scratch, HOME too; no claude runs."""
+
+    NORMAL = "is a normal account."
+    MARKED = "is a fallback: used only when no other account allowed there has room."
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.path = self.home / "accounts.json"
+
+    def write_accounts(self, *accounts):
+        self.path.write_text(json.dumps(list(accounts)))
+        os.chmod(self.path, 0o644)  # as a hand edit may leave it
+
+    def accounts(self):
+        return json.loads(self.path.read_text())
+
+    def log(self) -> list:
+        log = self.home / "longhaul.log"
+        return [line.split(" ", 2)[2] for line in log.read_text().splitlines()] if log.exists() else []
+
+    def files(self) -> dict:
+        cache = self.tmp / "Library"  # Apple's /usr/bin/python3 keeps its bytecode there, under HOME
+        return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.tmp.rglob("*")
+                if p.is_file() and cache not in p.parents}
+
+    def env(self, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return env
+
+    def longhaul(self, *args, **extra_env):
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=self.env(**extra_env),
+                              cwd=str(self.tmp), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def said(self, out) -> list:
+        """stdout's lines, the terminal's colour codes dropped."""
+        return [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in out.stdout.splitlines()]
+
+    def test_with_no_word_it_says_whether_the_account_is_a_fallback_and_writes_nothing(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1"},
+                            {"name": "work", "config_dir": "~/.claude-work", "fallback": True},
+                            {"name": "spare", "fallback": False}, {"name": "odd", "fallback": "yes"})
+        before = self.files()
+        for name, line in (("personal-1", f"personal-1 {self.NORMAL}"), ("WORK", f"work {self.MARKED}"),
+                           ("spare", f"spare {self.NORMAL}"), ("odd", f"odd {self.NORMAL}")):
+            out = self.longhaul("fallback", name)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+            self.assertEqual(self.said(out), [line])
+        self.assertEqual(self.files(), before, "it only reads: no lock, no log")
+
+    def test_on_and_off_write_the_mark_keep_the_other_keys_and_the_order_with_one_log_line_each(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com"},
+                            {"name": "work", "config_dir": "~/.claude-work", "email": "work@example.com",
+                             "repositories": ["~/work"], "note": "a key longhaul does not know"})
+        out = self.longhaul("fallback", "work", "on")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.accounts(), [
+            {"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com"},
+            {"name": "work", "config_dir": "~/.claude-work", "email": "work@example.com", "repositories": ["~/work"],
+             "note": "a key longhaul does not know", "fallback": True}])
+        self.assertEqual(self.said(out), ["longhaul marked work as a fallback", f"work {self.MARKED}"])
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "written as add writes it: only you can read it")
+        self.assertEqual(self.log(), ["marked work as a fallback"], "one log line per change, nothing else")
+        # Again: nothing to change, nothing written.
+        before = self.path.read_bytes()
+        out = self.longhaul("fallback", "work", "on")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.said(out), ["longhaul work is a fallback already", f"work {self.MARKED}"])
+        self.assertEqual(self.path.read_bytes(), before)
+        # Off drops the mark, as an account added with no --fallback has none.
+        out = self.longhaul("fallback", "work", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1], {"name": "work", "config_dir": "~/.claude-work",
+                                              "email": "work@example.com", "repositories": ["~/work"],
+                                              "note": "a key longhaul does not know"})
+        self.assertEqual(self.said(out), ["longhaul marked work as a normal account", f"work {self.NORMAL}"])
+        before = self.path.read_bytes()
+        out = self.longhaul("fallback", "personal-1", "off")
+        self.assertEqual(self.said(out), ["longhaul personal-1 is a normal account already",
+                                          f"personal-1 {self.NORMAL}"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.log(), ["marked work as a fallback", "marked work as a normal account"])
+        # A mark already there, true or not, is set in its place; off drops one that is not false.
+        self.write_accounts({"name": "work", "fallback": False, "email": "work@example.com"},
+                            {"name": "odd", "fallback": "yes", "email": "odd@example.com"})
+        self.assertEqual(self.longhaul("fallback", "work", "on").returncode, 0)
+        self.assertEqual(list(self.accounts()[0].items()), [("name", "work"), ("fallback", True),
+                                                            ("email", "work@example.com")])
+        self.assertEqual(self.longhaul("fallback", "odd", "off").returncode, 0)
+        self.assertEqual(self.accounts()[1], {"name": "odd", "email": "odd@example.com"})
+        self.assertEqual(self.longhaul("fallback", "work", "off").returncode, 0)
+        self.assertEqual(self.accounts()[0], {"name": "work", "email": "work@example.com"})
+
+    def test_an_unknown_name_or_an_unreadable_file_writes_nothing_and_exits_2(self):
+        self.write_accounts({"name": "personal-1"}, {"name": "work", "fallback": True})
+        before = self.path.read_bytes()
+        for argv in (("nobody",), ("nobody", "on"), ("nobody", "off")):
+            with self.subTest(argv):
+                out = self.longhaul("fallback", *argv)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("no account called nobody; the accounts are personal-1, work", out.stdout)
+                self.assertEqual(self.path.read_bytes(), before, "nothing written")
+        out = self.longhaul("fallback", "work", "maybe")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("invalid choice: 'maybe'", out.stderr)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual([line for line in self.log() if line.startswith("marked ")], [], "no change logged")
+        for case, text in unreadable_accounts({"name": "work", "fallback": True}).items():
+            with self.subTest(case):
+                self.path.write_text(text)
+                for argv in (("work",), ("work", "on"), ("work", "off")):
+                    out = self.longhaul("fallback", *argv)
+                    self.assertEqual(out.returncode, 2, out.stdout)
+                    self.assertIn("accounts.json is not readable: ", out.stdout)
+                    self.assertEqual(self.path.read_text(), text, "never written over")
+        self.path.unlink()
+        out = self.longhaul("fallback", "work", "on")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no account called work; there is no list of accounts yet: `longhaul add` adds one", out.stdout)
+        self.assertFalse(self.path.exists())
+
+    def test_the_usage_block_names_it_after_folders_and_the_shim_refuses_it(self):
+        doc = longhaul.__doc__
+        self.assertIn("longhaul fallback NAME [on|off]", doc)
+        self.assertLess(doc.index("longhaul folders NAME"), doc.index("longhaul fallback NAME"))
+        self.assertLess(doc.index("longhaul fallback NAME"), doc.index("longhaul switch [ask|auto|never]"))
+        out = self.longhaul("fallback", "-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul fallback [-h] name [{on,off}]", out.stdout)
+        # bin/longhaul, what a chat's Claude may run, is the owner's boundary:
+        # it runs no fallback form, and no add with --fallback, until the
+        # owner allows it there.
+        self.write_accounts({"name": "work", "fallback": True})
+        before = self.files()
+        env = {k: v for k, v in self.env().items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+        for args in (("fallback", "work"), ("fallback", "work", "on"), ("fallback", "work", "off"), ("fallback",),
+                     ("add", "spare", "spare@example.com", "--fallback")):
+            out = subprocess.run([str(HERE / "bin" / "longhaul"), *args], capture_output=True, text=True, env=env,
+                                 timeout=30)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("Ask the user to run it in a terminal.", out.stderr, args)
+        self.assertEqual(self.files(), before, "a refused form writes nothing")
+
+    def test_status_says_it_under_the_account_and_the_doctor_names_it(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/work"],
+                             "fallback": True})
+        lines = self.said(self.longhaul("status"))
+        [at] = [i for i, line in enumerate(lines) if line.startswith("work ")]
+        self.assertEqual(lines[at + 1:at + 3], ["       only in: ~/work",
+                                                "       fallback: used only when no other account allowed here has room"])
+        self.assertNotIn("fallback", "\n".join(lines[:at]), "personal-1 is a normal account: nothing said")
+        for name in ("personal-1", "work"):
+            (self.tmp / f".claude-{name}").mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), mock.patch.object(longhaul, "HOME", self.tmp), \
+                mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), \
+                mock.patch.object(longhaul, "DEFAULT_CONFIG", self.tmp / "claude"), \
+                mock.patch.object(longhaul, "DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"):
+            c = longhaul.doctor_accounts()
+        self.assertEqual([text for _, text, *_ in c["items"]], ["personal-1: ~/.claude-personal-1, anywhere",
+                                                               "work (fallback): ~/.claude-work, only in ~/work"])
+
+
 class StatusJson(unittest.TestCase):
     """`longhaul status --json` (S1 of the accounts screen): what the screen
     in hooks/ reads, one JSON object on stdout and nothing else, and it
@@ -22505,7 +22874,7 @@ class StatusJson(unittest.TestCase):
     config folder to email ("default" for ~/.claude)."""
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
-                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "folder", "this_chat"}
+                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
@@ -22575,11 +22944,12 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][0], {
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
-            "week": None, "only_in": [], "kept_out_by": [], "folder": "~/.claude-personal-1", "this_chat": False})
+            "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
+            "this_chat": False})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "kept_out_by", "folder", "this_chat"],
-            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in")
+            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"],
+            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -22700,6 +23070,15 @@ class StatusJson(unittest.TestCase):
         found = self.by_name(self.read(self.status()))
         self.assertEqual(found["spare"]["kept_out_by"], [], "a list that does not name / keeps only its folders")
 
+    def test_fallback_is_true_for_an_account_marked_a_fallback_and_false_for_any_other(self):
+        # The owner, 2026-11-06: the screen shows "fallback" on the account's
+        # line and page, and its button turns it on or off.
+        self.write_accounts({"name": "personal-1"}, {"name": "work", "fallback": True},
+                            {"name": "spare", "fallback": False}, {"name": "odd", "fallback": "yes"})
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual({n: a["fallback"] for n, a in found.items()},
+                         {"personal-1": False, "work": True, "spare": False, "odd": False})
+
     def test_an_account_whose_folder_is_not_text_is_shown_unchecked(self):
         # A hand edit's config_dir of 5 is no folder: the check that would
         # run claude in it is not run, and the rest is still one object.
@@ -22748,8 +23127,8 @@ class StatusJson(unittest.TestCase):
                 self.assertEqual(found["accounts"], [{
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
-                    "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "folder": "~/claude",
-                    "this_chat": False}])
+                    "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
+                    "folder": "~/claude", "this_chat": False}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):

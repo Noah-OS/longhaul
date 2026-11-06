@@ -14,13 +14,16 @@ import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 // item's page, Escape goes back, and from the list closes the pane. An
 // account's page has its details and its actions (Sign in again or Sign in,
 // Remove), then its folders, each with Remove, a field to add one and
-// Anywhere (the owner, 2026-11-05: "I can't edit the accounts"); Add
+// Anywhere (the owner, 2026-11-05: "I can't edit the accounts"), then
+// whether it is a fallback, with the button that turns it (2026-11-06); Add
 // account's page the form; Settings' page switching, the VS Code panel and
 // forgetting the limits. The pane draws `longhaul.py status --json` and runs
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
-// /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06). One at a time;
-// the rows are read again when the pane opens and after each.
+// /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06); and
+// fallback, which it does not (bin/longhaul refuses it until the owner says
+// otherwise). One at a time; the rows are read again when the pane opens and
+// after each.
 //
 // Each line of the list is a Button: the pane is opened with focus and
 // closeOnEscape, so it holds the keys as a dialog does, the arrows and Tab
@@ -173,7 +176,8 @@ function clean(s: any): LonghaulStatus {
     .map(a => ({ name: a.name as string, email: str(a.email), signed_in: flag(a.signed_in), as_expected: flag(a.as_expected),
       check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
-      kept_out_by: strs(a.kept_out_by) ?? [], folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
+      kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
+      folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   return { accounts, listed: s.listed === true, here,
@@ -304,6 +308,17 @@ async function anywhere($: any, name: string): Promise<void> {
   if (!a || (a.only_in !== null && !a.only_in.length)) return // no list to drop
   await act($, { label: `Anywhere: ${name}`, doing: `Dropping ${name}'s folders…`, argv: ['folders', name, '--anywhere'],
     timeoutMs: STATUS_TIMEOUT })
+}
+
+// Its fallback mark turned the other way (the owner, 2026-11-06): `fallback
+// NAME on|off`, only from what the last read said, so a press on a page drawn
+// before a change never sets what is set already.
+async function setFallback($: any, name: string, on: boolean): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a || typeof a.fallback !== 'boolean' || a.fallback === on) return
+  await act($, { label: `${on ? 'Use as fallback' : 'Use as a normal account'}: ${name}`,
+    doing: on ? `Marking ${name} as a fallback…` : `Marking ${name} as a normal account…`,
+    argv: ['fallback', name, on ? 'on' : 'off'], timeoutMs: STATUS_TIMEOUT })
 }
 
 async function add($: any): Promise<void> {
@@ -583,13 +598,18 @@ function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boole
 const EVERYWHERE = 'everywhere (its folders include /)'
 
 // What the line adds in brackets: this chat's account, where it is kept to;
-// used nowhere, too, for one with no list that others keep out of every folder.
+// used nowhere, too, for one with no list that others keep out of every
+// folder; and fallback, for one used only when the others have no room.
 function extras(a: LonghaulAccount): string {
   const said = [a.this_chat ? 'this chat' : '',
     a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
-      : a.only_in.includes('/') ? EVERYWHERE : a.only_in.length ? `only in ${a.only_in.join(', ')}` : ''].filter(Boolean)
+      : a.only_in.includes('/') ? EVERYWHERE : a.only_in.length ? `only in ${a.only_in.join(', ')}` : '',
+    a.fallback === true ? 'fallback' : ''].filter(Boolean)
   return said.length ? mask(`   (${said.join(' · ')})`) : ''
 }
+
+// What a fallback is, on its page: longhaul.py's FALLBACK_RULE, "here".
+const FALLBACK = 'used only when no other account allowed here has room'
 
 // The list's lines. Each is a Button on a surface that draws fields, so the
 // arrows walk them and Enter opens the page; on the phone they are text. A
@@ -708,6 +728,23 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
   )
 }
 
+// Whether it is a fallback (the owner, 2026-11-06), and the button that
+// turns it the other way, while nothing runs and no Remove waits for a yes.
+// Nothing for a record that does not say: an older longhaul.py has no
+// `fallback` to run.
+function fallbackPart($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button } = c.E
+  if (typeof a.fallback !== 'boolean') return null
+  const name = String(a.name), on = a.fallback
+  return (
+    <Box flexDirection="column">
+      <Text>{on ? `Fallback: ${FALLBACK}` : 'Normal account'}</Text>
+      {c.idle && c.confirm !== name && <Button key="fallback" label={on ? 'Use as a normal account' : 'Use as fallback'}
+        onPress={() => void setFallback($, name, !on)} />}
+    </Box>
+  )
+}
+
 // What the folder field's typing keeps, for the account whose page it is on.
 function keepFolder($: any, name: string): (value: string) => void {
   return value => void update($, folder, () => ({ account: name, path: value, problem: null }))
@@ -752,6 +789,7 @@ function accountPage($: any, c: Ctx): any {
         </Box>
       )}
       {foldersPart($, c, a)}
+      {fallbackPart($, c, a)}
     </Box>
   )
 }

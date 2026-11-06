@@ -27,6 +27,10 @@ export type LonghaulAccount = {
   // include /, which keep it out of every folder; [] otherwise. Optional:
   // an older longhaul.py does not give it.
   kept_out_by?: string[]
+  // A fallback account, used only when no other account allowed there has
+  // room (the owner, 2026-11-06). Optional: an older longhaul.py does not
+  // give it, and the pane then offers no button for it.
+  fallback?: boolean
   folder: string
   this_chat: boolean
 }

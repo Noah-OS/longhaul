@@ -105,11 +105,12 @@ Usage:
   longhaul -- --model opus      anything after -- goes to claude on every launch
   longhaul add                  a new account, guided: it asks for each part and
                           explains it, then signs it in (in a terminal)
-  longhaul add NAME EMAIL [--dir DIR] [--repo PATH]...
+  longhaul add NAME EMAIL [--dir DIR] [--repo PATH]... [--fallback]
                           the same in one line: its own folder (--dir: another
                           than ~/.claude-NAME), one browser
                           sign-in; with --repo, used only in those
-                          repositories and those inside them (repeat it)
+                          repositories and those inside them (repeat it);
+                          --fallback marks it a fallback (see below)
   longhaul remove NAME          off the list (its folder and sign-in are kept)
   longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]
                           where NAME may be used (with no option it only
@@ -120,6 +121,15 @@ Usage:
                           that name it, so one with no list is used where no
                           list does: beside one whose folders include /, nowhere,
                           which this says. /accounts does it with buttons
+  longhaul fallback NAME [on|off]
+                          whether NAME is a fallback, used only when no other
+                          account allowed there has room (with neither word
+                          it only reads); on marks it, off makes it a normal
+                          account again. At a limit a chat moves to a normal
+                          account with room first, the early move never goes
+                          to a fallback, and a chat on one is not moved off it
+                          when a normal account has room again. /accounts does
+                          it with a button
   longhaul switch [ask|auto|never]
                           the switching mode at a usage limit (see --switch):
                           with none, the one in force and where it comes from
@@ -1064,17 +1074,35 @@ def no_account_text(top: str, accounts: list[dict]) -> str:
             f"{home_path(str(LONGHAUL_HOME / 'accounts.json'))}).")
 
 
+def is_fallback(acct: dict) -> bool:
+    """Whether `acct` is a fallback account: "fallback": true in
+    accounts.json (the owner, 2026-11-06: "A fallback mark"), used only
+    when no normal account allowed there has room. Absent, false or any
+    other value is a normal account, as every account was before."""
+    return acct.get("fallback") is True
+
+
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
          seen: dict | None = None):
     """The account to launch on.
 
-    Among accounts not at a limit, those not nearly full come first, and
-    among them the one whose unused allowance expires soonest; ties (and no
-    readings at all) go in order from `start`. Returns (index, None), or
-    (index, until) when every account is at a limit: the one that resets
-    first, and when. Accounts in `skip` (signed in to the wrong email, or
-    restricted to other repositories) are never picked; (None, None) when
-    none is left.
+    Among accounts not at a limit, a fallback account (is_fallback()) is
+    used only when no normal one is left: the owner's work account, used
+    everywhere as a fallback, took a chat at a personal account's 5-hour
+    limit because its week reset sooner, while the other personal account
+    had room (2026-11-06). Then within the group, those not nearly full
+    come first, and among them the one whose unused allowance expires
+    soonest; ties (and no readings at all) go in order from `start`.
+    Returns (index, None), or (index, until) when every account is at a
+    limit: the one that resets first, and when, a normal one before a
+    fallback at the same reset. Accounts in `skip` (signed in to the wrong
+    email, or restricted to other repositories) are never picked; (None,
+    None) when none is left.
+
+    A chat already on a fallback account is not moved off it when a
+    normal account has room again: nothing calls this for that, since it
+    would be a move nobody asked for. A limit, the early move off a nearly
+    full account, or a reopen in auto picks again, and then this rule.
     """
     now = time.time() if now is None else now
     seen = seen or {}
@@ -1085,10 +1113,11 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
         return None, None
     free = [i for i in usable if limited.get(accounts[i]["name"], 0) <= now]
     if free:
-        roomy = [i for i in free if not near_full(seen.get(accounts[i]["name"]), now)]
-        i = min(roomy or free, key=lambda j: (expires(seen.get(accounts[j]["name"]), now), (j - start) % n))
+        group = [i for i in free if not is_fallback(accounts[i])] or free
+        roomy = [i for i in group if not near_full(seen.get(accounts[i]["name"]), now)]
+        i = min(roomy or group, key=lambda j: (expires(seen.get(accounts[j]["name"]), now), (j - start) % n))
         return i, None
-    i = min(usable, key=lambda j: limited.get(accounts[j]["name"], 0))
+    i = min(usable, key=lambda j: (limited.get(accounts[j]["name"], 0), is_fallback(accounts[j])))
     return i, limited[accounts[i]["name"]]
 
 
@@ -2583,9 +2612,13 @@ def run(opts) -> int:
                   handled=state.get("handled_limits", []), label=opts.name, stops=True)
 
         def other_has_room(here=acct["name"], skip=frozenset(wrong)) -> bool:
+            # A normal account only: the early move leaves an account that is
+            # nearly full, not at its limit, and a fallback account is used
+            # only when no normal one has room (the owner, 2026-11-06). So
+            # pick() then finds a normal account with room for the move.
             st, now = load_state(), time.time()
             fresh = readings(accounts)
-            return any(a["name"] != here and a["name"] not in skip
+            return any(a["name"] != here and a["name"] not in skip and not is_fallback(a)
                        and st["limited_until"].get(a["name"], 0) <= now
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
@@ -14815,16 +14848,20 @@ def setup(opts) -> int:
 
 
 def add(opts) -> int:
-    """longhaul add NAME EMAIL [--repo PATH]...: a new account in its own
-    folder, signed in once in the browser. Only that email is accepted for
-    it from then on. With --repo it is used only in those repositories (and
-    those inside them); without, anywhere, and its entry has no
-    "repositories" at all. With neither NAME nor EMAIL, in a terminal, it
-    asks for each part (add_guided())."""
+    """longhaul add NAME EMAIL [--repo PATH]... [--fallback]: a new account
+    in its own folder, signed in once in the browser. Only that email is
+    accepted for it from then on. With --repo it is used only in those
+    repositories (and those inside them); without, anywhere, and its entry
+    has no "repositories" at all. --fallback marks it a fallback at once
+    (is_fallback(), 2026-11-06); without, its entry has no "fallback". With
+    neither NAME nor EMAIL, in a terminal, it asks for each part
+    (add_guided()), which does not offer the mark: `longhaul fallback NAME
+    on` or /accounts sets it afterwards."""
     if opts.name is None and opts.email is None:
         if terminal():
             return add_guided()
-        say("longhaul add NAME EMAIL [--dir FOLDER] [--repo PATH]...; with no arguments, in a terminal, it asks for each part")
+        say("longhaul add NAME EMAIL [--dir FOLDER] [--repo PATH]... [--fallback]; with no arguments, in a terminal, "
+            "it asks for each part")
         return 2
     if opts.name is None or opts.email is None:
         say("longhaul add takes a NAME and an EMAIL, or neither (then, in a terminal, it asks for each part)")
@@ -14867,9 +14904,13 @@ def add(opts) -> int:
         entry = {"name": name, "config_dir": folder, "email": email}
         if repos:  # kept as given, `~` included, as config_dir is; expanded at use
             entry["repositories"] = repos
+        if getattr(opts, "fallback", False):  # as `longhaul fallback NAME on` marks it (2026-11-06)
+            entry["fallback"] = True
         accounts.append(entry)
         write_json(LONGHAUL_HOME / "accounts.json", accounts)
     only = f", only in {', '.join(home_path(os.path.expanduser(r)) for r in repos)}" if repos else ""
+    if is_fallback(entry):
+        only += f", as a fallback ({FALLBACK_RULE.format(where='there')})"
     say(f"added {name} ({email}), folder {folder}{only}; signing it in now")
     code = setup(argparse.Namespace(account=name, relogin=False))
     if code != 0:
@@ -15424,10 +15465,68 @@ def folders(opts) -> int:
     return 0
 
 
+# What `longhaul fallback`, status and the accounts screen say of a fallback
+# account (the owner, 2026-11-06): where the rule is, "there" or "here".
+FALLBACK_RULE = "used only when no other account allowed {where} has room"
+
+
+def fallback_line(acct: dict) -> str:
+    """Whether `acct` is a fallback, as `longhaul fallback NAME` says it."""
+    if is_fallback(acct):
+        return f"{acct['name']} is a fallback: {FALLBACK_RULE.format(where='there')}."
+    return f"{acct['name']} is a normal account."
+
+
+def fallback_cmd(opts) -> int:
+    """`longhaul fallback NAME [on|off]` (the owner, 2026-11-06: "A fallback
+    mark"): whether an account is a fallback, used only when no other
+    account allowed there has room (pick()), and the mark set or dropped
+    without a hand edit; the accounts screen's button runs it. With no
+    word it only reads. On sets "fallback": true, in its place when the
+    key is there, else last; off drops the key, as an account added with
+    no --fallback has none (false is kept as it is: already normal).
+    accounts.json is written as `longhaul folders` writes it, under the
+    accounts lock, whole, the other keys and the accounts' order kept, one
+    log line per change; an unknown NAME or a file that cannot be read
+    writes nothing, exit 2."""
+    if opts.action is None:  # it only reads: no lock, nothing written
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem, tell=print)
+        if acct is None:
+            return 2
+        print(fallback_line(acct))
+        return 0
+    on = opts.action == "on"
+    change = note = None
+    with locked("accounts"):
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem)
+        if acct is None:
+            return 2
+        name, entry = acct["name"], acct
+        if on and not is_fallback(acct):
+            entry, change = {**acct, "fallback": True}, f"marked {name} as a fallback"
+        elif not on and acct.get("fallback", False) is not False:  # true, or a value that is not false
+            entry = {k: v for k, v in acct.items() if k != "fallback"}  # the other keys, in their order
+            change = f"marked {name} as a normal account"
+        else:
+            note = f"{name} is a fallback already" if on else f"{name} is a normal account already"
+        if change:
+            accounts[accounts.index(acct)] = entry
+            write_json(LONGHAUL_HOME / "accounts.json", accounts)
+    if change:
+        say(change)
+    else:
+        show(note)
+    print(fallback_line(entry))
+    return 0
+
+
 def folders_account(name: str, accounts, problem, tell=say):
-    """`longhaul folders`'s account, by NAME in any case, as remove finds
-    it; None once the reason is told (`tell`: print where it only reads,
-    which logs nothing): the file cannot be read, or has no such account."""
+    """`longhaul folders`'s account, and `longhaul fallback`'s, by NAME in
+    any case, as remove finds it; None once the reason is told (`tell`:
+    print where it only reads, which logs nothing): the file cannot be
+    read, or has no such account."""
     if problem:
         tell(unreadable_text(problem))
         return None
@@ -15509,6 +15608,8 @@ def status(opts) -> int:
             print(f"       {kept_out_text(acct['name'], kept_out_by(acct, accounts))}")
         elif accounts_listed:
             print("       anywhere")
+        if is_fallback(acct):  # the owner, 2026-11-06: the work account, only when the others have no room
+            print(f"       fallback: {FALLBACK_RULE.format(where='here')}")
         if acct.get("config_dir"):
             broken = [i for i in SHARED if (DEFAULT_CONFIG / i).exists() and not (config_of(acct) / i).is_symlink()]
             if broken:
@@ -15636,7 +15737,8 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     email, else that email, in any case. sign_in_failed_at is from
     SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at()).
     kept_out_by names the accounts that keep it out of every folder
-    (kept_out_by(), among `accounts`), for one with no list; else []."""
+    (kept_out_by(), among `accounts`), for one with no list; else [].
+    fallback is is_fallback(): true for "fallback": true alone (2026-11-06)."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -15660,6 +15762,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "week": status_window(reading, "seven_day", now),
         "only_in": None if allowed is None else [home_path(p) for p in allowed],
         "kept_out_by": kept_out_by(acct, accounts),
+        "fallback": is_fallback(acct),
         "folder": home_path(str(config_of(acct))) if has_folder(acct) else "",
         "this_chat": this_chat,
     }
@@ -16253,10 +16356,11 @@ def doctor_default_email():
 
 def doctor_accounts() -> dict:
     """7. The accounts: accounts.json readable, each account's folder
-    there, the folders each is kept for; and two accounts that sign in as
-    one email (the default sign-in among them) are one subscription with
-    one allowance, so a switch between them never helps (the owner's
-    Mac, 2026-10-25). Names, never emails."""
+    there, the folders each is kept for, "(fallback)" after the name of
+    one used only when the others have no room (2026-11-06); and two
+    accounts that sign in as one email (the default sign-in among them)
+    are one subscription with one allowance, so a switch between them
+    never helps (the owner's Mac, 2026-10-25). Names, never emails."""
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
     if problem:
@@ -16266,19 +16370,20 @@ def doctor_accounts() -> dict:
     items = []
     for a in accounts:
         folder = home_path(str(config_of(a)))
+        named = f"{a['name']} (fallback)" if is_fallback(a) else a["name"]  # used only when the others have no room
         if not config_of(a).is_dir():
-            items.append(("bad", f"{a['name']}: {folder} is missing", f"`longhaul setup {a['name']}`"))
+            items.append(("bad", f"{named}: {folder} is missing", f"`longhaul setup {a['name']}`"))
         elif repositories_of(a) is None:
-            items.append(("bad", f"{a['name']}: {folder}, {where_allowed(a)}",
+            items.append(("bad", f"{named}: {folder}, {where_allowed(a)}",
                           f'make its "repositories" in {where} a list of absolute paths'))
         elif kept_out_by(a, accounts):  # no list of its own, and others keep every folder (2026-11-05)
             kept = kept_out_by(a, accounts)
-            items.append(("warn", f"{a['name']}: {folder}, used nowhere: {', '.join(kept)} "
+            items.append(("warn", f"{named}: {folder}, used nowhere: {', '.join(kept)} "
                                   f"keep{'' if len(kept) > 1 else 's'} every folder",
                           f"set its folders in /accounts, on {a['name']}'s page, or with "
                           f"`longhaul folders {a['name']} --add PATH`"))
         else:
-            items.append(("ok", f"{a['name']}: {folder}, {where_allowed(a)}", None))
+            items.append(("ok", f"{named}: {folder}, {where_allowed(a)}", None))
     same = "keep one of them, or give the other its own subscription"
     by_email = collections.defaultdict(list)
     for a in accounts:
@@ -17481,8 +17586,9 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "folders", "advisor", "advisor-hook", "advisor-result", "advisor-note", "reminder",
-                            "account-check", "session-end", "autocompact-note", "stop-failure", "quota-note", "trial",
+                            "add", "remove", "folders", "fallback", "advisor", "advisor-hook", "advisor-result",
+                            "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
+                            "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
                             "models-hook", "allow", "switch", "answer"):
         cmd, rest = argv[0], argv[1:]
@@ -17542,8 +17648,15 @@ def main(argv: list[str]) -> int:
             p.add_argument("--repo", action="append", metavar="PATH",
                            help="a repository it may be used in, and those inside it; repeat for more "
                                 "(default: anywhere)")
+            p.add_argument("--fallback", action="store_true",
+                           help="a fallback: used only when no other account allowed there has room")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "fallback":
+            p.add_argument("name", help="the account")
+            p.add_argument("action", nargs="?", choices=["on", "off"],
+                           help="on: a fallback, used only when no other account allowed there has room; off: a "
+                                "normal account (with neither: whether it is one; it only reads)")
         if cmd == "folders":
             p.add_argument("name", help="the account (with no option: where it may be used; it only reads)")
             p.add_argument("--add", action="append", metavar="PATH",
@@ -17611,7 +17724,7 @@ def main(argv: list[str]) -> int:
         opts = p.parse_args(rest)
         return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
                 "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
-                "folders": folders, "vscode": vscode, "models": models,
+                "folders": folders, "fallback": fallback_cmd, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
