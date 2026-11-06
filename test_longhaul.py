@@ -16561,6 +16561,26 @@ class Panel(StreamHarness):
                          ["control_response", "auth_status", "system", "user", "assistant", "rate_limit_event", "result"])
         self.assertEqual(self.calls()[0]["args"], self.EXT_ARGS)
 
+    def test_a_rejected_rate_limit_event_with_no_stop_after_it_holds_no_message_for_long(self):
+        # The log audit of 2026-11-05 (#10): the panel's lines were held for
+        # HOLD_MAX (20 s) after a rejected rate_limit_event, 18 times with no
+        # stop after it. The main thread's is held until its reply; a
+        # subagent's, as the fake gives it, not at all.
+        self.plan(["rejected_event", "rejected_event_sub", "reply"])
+        p = self.start(LONGHAUL_HOLD_MAX_SECONDS="60")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        for text in ("one", "two", "three"):
+            self.assertEqual(self.wait_for(self.result_for(self.user(p, text)), timeout=10)["result"],
+                             f"reply to: {text}")
+        log = self.log_text()
+        self.assertEqual(log.count("panel: the lines held for a rate_limit in sid-1 go on after"), 1, log)
+        self.assertIn(": a reply came", log)
+        self.assertNotIn("was not a usage limit stop", log)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual([m["rate_limit_info"]["status"] for m in self.seen if m["type"] == "rate_limit_event"],
+                         ["rejected", "allowed", "rejected", "allowed", "allowed"], "every line reaches the panel")
+
     def test_a_limit_moves_the_panel_chat_to_the_other_account(self):
         self.plan(["limit", "reply"])
         p = self.start()
@@ -18150,6 +18170,126 @@ class KeepWorking(unittest.TestCase):
         r.forget_chat()
         self.assertIsNone(self.waiting())
         self.assertIn("is cancelled: the chat closed", self.log_text())
+
+    # The log audit of 2026-11-05 (#10): a rejected rate_limit_event held the
+    # panel's lines for HOLD_MAX, 18 times with no stop after it.
+
+    def rejected(self, **more):
+        """A rejected rate_limit_event as Claude Code 2.1.318 builds it:
+        type, rate_limit_info, uuid and session_id, and nothing that names
+        a thread; `more` adds fields (a subagent's parent_tool_use_id)."""
+        return {"type": "rate_limit_event", "uuid": str(uuid.uuid4()), "session_id": "sid-k", **more,
+                "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour",
+                                    "resetsAt": self.clock.at + 3600}}
+
+    LIMIT_LINE = {"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "session_id": "sid-k",
+                  "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "x"}]}}
+    LIMIT_RESULT = {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+                    "result": "x", "session_id": "sid-k"}
+    DONE = {"type": "result", "subtype": "success", "is_error": False, "result": "x", "session_id": "sid-k"}
+
+    def test_a_subagents_rejected_rate_limit_event_holds_nothing(self):
+        r = self.relay()
+        self.stream(r, self.rejected(parent_tool_use_id="toolu_sub"))
+        self.assertEqual((r.paused, r.held_since), (False, None))
+        self.assertEqual(r.passed.count(b"\n"), 1, "the line still reaches the panel")
+
+    def test_the_main_threads_rejected_event_and_limit_line_hold_as_before(self):
+        for line in (self.rejected(), self.rejected(parent_tool_use_id=None), self.LIMIT_LINE):
+            r = self.relay()
+            self.stream(r, line)
+            self.assertEqual((r.paused, r.held_since), (True, self.clock.at), line)
+            self.assertEqual(len(r.own_stops), 1, line)
+
+    def test_no_hold_while_the_account_is_limited_or_a_question_or_a_carry_on_is_open(self):
+        self.limited(Max=self.clock.at + 600)
+        r = self.relay()
+        self.stream(r, self.rejected(), self.LIMIT_LINE)
+        self.assertEqual((r.paused, r.held_since), (False, None), "Max is at its limit already")
+        self.assertEqual(len(r.own_stops), 2, "still this claude's stops, for limit_ours()")
+        for mode, open_ in (("ask", "question"), ("never", "carry")):
+            r = self.relay(mode)
+            self.stop(r)
+            self.limited()  # only the question or the carry-on is left to say no
+            self.assertIsNotNone(getattr(r, open_), mode)
+            self.stream(r, self.rejected(), self.LIMIT_LINE)
+            self.assertEqual((r.paused, r.held_since), (False, None), mode)
+        self.limited(Max=self.clock.at - 1)  # a limit past is no limit
+        r = self.relay()
+        self.stream(r, self.rejected())
+        self.assertTrue(r.paused)
+
+    def test_a_hold_ends_early_on_a_main_reply_or_a_result_that_is_no_limit_stop(self):
+        for ending, why in ((self.REPLY, "a reply came"), (self.DONE, "the turn ended with no limit stop"),
+                            ({**self.LIMIT_RESULT, "api_error_status": 500}, "the turn ended with no limit stop")):
+            r = self.relay()
+            self.stream(r, self.rejected())
+            self.assertTrue(r.paused)
+            self.later(2)
+            self.stream(r, ending)
+            self.assertEqual((r.paused, r.held_since), (False, None), why)
+            self.assertIn(f"panel: the lines held for a rate_limit in sid-k go on after 2 s: {why}", self.log_text())
+        self.assertNotIn('"text"', self.log_text())
+
+    def test_a_hold_stays_for_a_limit_stops_own_lines_and_for_lines_that_are_no_reply(self):
+        r = self.relay()
+        self.stream(r, self.rejected(), self.LIMIT_LINE, self.LIMIT_RESULT, *self.not_replies(),
+                    {**self.LIMIT_RESULT, "api_error_status": None})
+        self.assertEqual((r.paused, r.held_since), (True, self.clock.at))
+        self.assertNotIn("go on after", self.log_text())
+
+    def test_a_reply_never_ends_a_swaps_own_pause(self):
+        r = self.relay()
+        self.stream(r, self.rejected())
+        r.swapping = True
+        self.stream(r, self.REPLY)
+        self.assertTrue(r.paused, "end_swap() ends it")
+        r.swapping, r.held_since = False, None
+        self.stream(r, self.REPLY)
+        self.assertTrue(r.paused, "a pause that is no hold of hold_if_limit()'s: the probe's, or a swap's")
+
+    # 0.3.6's use_accounts() stored the list and the index one after the
+    # other, on the tending thread, while other threads read the pair.
+
+    def test_the_accounts_and_the_index_change_as_one_for_the_readers_on_other_threads(self):
+        stores = []
+
+        class Watched(longhaul.Relay):
+            def __setattr__(self, name, value):
+                if name in ("accounts", "idx") and "pair_lock" in self.__dict__:
+                    stores.append((name, self.pair_lock.locked()))
+                super().__setattr__(name, value)
+
+        team = {"name": "Team", "config_dir": str(self.tmp / "team"), "email": "third@example.com"}
+        r = Watched("claude", [], [*self.accounts, team], 2, mode="ask")
+        r.watch = self.Watch()
+        del stores[:]
+        r.use_accounts([team], "sid-k")  # 3 accounts to 1: the index goes from 2 to 0
+        self.assertEqual(stores, [("accounts", True), ("idx", True)], "both stores under the lock")
+        self.assertEqual((r.idx, r.running_on()), (0, team))
+        record = []
+        readers = {
+            "remember": lambda: r.remember({"type": "control_request",
+                                            "request": {"subtype": "claude_authenticate"}}),
+            "note_cost": lambda: r.note_cost(mock.Mock(pid=4242), json.dumps(self.DONE).encode()),
+            "hold_if_limit": lambda: r.hold_if_limit(json.dumps(self.rejected()).encode()),
+        }
+        r.limits = {"five_hour": {"used_percentage": 10, "resets_at": self.clock.at + 3600}}
+        with mock.patch.object(longhaul, "forget_auth", lambda acct: record.append(acct["name"])), \
+                mock.patch.object(longhaul, "record_usage", lambda row, cfg: record.append(Path(cfg).name)):
+            for name, read in readers.items():
+                with r.pair_lock:  # the swap half done: the new list, the old index
+                    r.accounts, r.idx = [self.accounts[0]], 2
+                    t = threading.Thread(target=read)
+                    t.start()
+                    t.join(0.3)
+                    self.assertTrue(t.is_alive(), f"{name} waits for the swap to be done")
+                    r.idx = 0
+                t.join(5)
+                self.assertFalse(t.is_alive(), name)
+        self.assertEqual(record, ["Max", "max"], "the account the chat runs on, never an IndexError")
+        self.assertTrue(r.paused, "Max is not at its limit: the hold")
+        self.assertNotIn("relay error", self.log_text())
 
     def test_a_subagents_limit_line_holds_nothing(self):
         r = self.relay()
