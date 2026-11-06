@@ -18291,6 +18291,128 @@ class KeepWorking(unittest.TestCase):
         self.assertTrue(r.paused, "Max is not at its limit: the hold")
         self.assertNotIn("relay error", self.log_text())
 
+    # One retry after a turn ends on an API server error, in the panel (the
+    # owner's decision of 2026-11-06; the log audit of 2026-11-05, #4).
+
+    SERVER_ERROR = ({"type": "assistant", "error": "server_error", "is_api_error_message": True, "session_id": "sid-k",
+                     "parent_tool_use_id": None, "message": {"model": "<synthetic>", "role": "assistant",
+                                                             "content": [{"type": "text", "text": "API Error: 500"}]}},
+                    {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 500,
+                     "result": "API Error: 500", "session_id": "sid-k"})
+
+    def server_error(self, r, **more):
+        """r's main thread's turn ends on a server error; `more` goes into its error line."""
+        self.stream(r, {**self.SERVER_ERROR[0], **more}, self.SERVER_ERROR[1])
+
+    def typed(self, r, text="hello"):
+        """A message of yours from the panel, through r's reader of the panel, from_panel()."""
+        line = json.dumps({"type": "user", "uuid": str(uuid.uuid4()), "session_id": "", "parent_tool_use_id": None,
+                           "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).encode()
+        with mock.patch.object(sys, "stdin", mock.Mock(buffer=[line + b"\n"])):
+            r.from_panel()
+
+    def test_a_turn_that_ends_on_a_server_error_carries_on_once_a_minute_later(self):
+        r = self.relay()
+        self.server_error(r)
+        self.later(59)
+        r.tend()
+        self.assertEqual(self.said(r), [], "not before the minute is up")
+        self.later(1)
+        r.tend()
+        self.assertEqual(self.said(r), ["The last turn stopped on an API server error. Carry on where you left off."])
+        self.assertEqual(json.loads(r.queue[0])["type"], "user", "a user message, which the panel shows replayed")
+        self.later(600)
+        r.tend()
+        self.assertEqual(len(self.said(r)), 1, "once")
+        self.assertEqual(self.notes, [])
+        self.assertRegex(self.log_text(), r"retry: sid-k carried on after its turn stopped on an API server error at "
+                                          r"[^(\n]+ \(60 s ago\)\n")
+        self.assertNotIn("API Error", self.log_text())
+
+    def test_no_retry_when_you_typed_claude_replied_or_a_question_carry_on_hold_or_swap_is_under_way(self):
+        def none_after(r, why):
+            self.later(60)
+            r.tend()
+            self.assertNotIn(longhaul.API_RETRY_TEXT, self.said(r), why)
+            self.assertIn(f"gets no retry: {why}", self.log_text())
+
+        r = self.relay()
+        self.server_error(r)
+        self.later(5)
+        self.typed(r)
+        none_after(r, "you typed since")
+        r = self.relay()
+        self.server_error(r)
+        self.later(5)
+        self.stream(r, self.REPLY)
+        none_after(r, "Claude replied since")
+        for mode, why in (("ask", "a question is open"), ("never", "a carry-on is scheduled")):
+            r = self.relay(mode)
+            self.stop(r)
+            self.server_error(r)
+            none_after(r, why)
+        for name, value, why in (("swapping", True, "a swap is under way"), ("held", [], "messages are held"),
+                                 ("held_since", 1.0, "lines are held")):
+            r = self.relay()
+            self.server_error(r)
+            setattr(r, name, value)
+            none_after(r, why)
+
+    def test_only_the_main_threads_server_error_counts(self):
+        r = self.relay()
+        self.server_error(r, parent_tool_use_id="toolu_1")
+        for line in ({**self.LIMIT_LINE}, {**self.SERVER_ERROR[0], "error": "overloaded"},
+                     {**self.SERVER_ERROR[0], "error": "authentication_failed"}):
+            self.stream(r, line, self.SERVER_ERROR[1])
+        self.later(60)
+        r.tend()
+        self.assertEqual(self.said(r), [])
+
+    def test_one_retry_a_streak_and_then_one_notification(self):
+        r = self.relay()
+        self.server_error(r)
+        self.later(60)
+        r.tend()
+        self.server_error(r)  # the retried turn stopped again
+        r.tend()
+        self.assertEqual(self.notes, ["The turn stopped on an API server error again; prompt again when ready."])
+        self.later(60)
+        r.tend()
+        self.typed(r)
+        self.server_error(r)  # yours too
+        self.later(60)
+        r.tend()
+        self.assertEqual(self.said(r).count(longhaul.API_RETRY_TEXT), 1, "once in a streak")
+        self.assertEqual(len(self.notes), 1, "said once")
+        self.stream(r, self.REPLY, self.DONE)  # a turn that ended as turns do: the streak is over
+        self.later(1)
+        self.server_error(r)
+        self.later(60)
+        r.tend()
+        self.assertEqual(self.said(r).count(longhaul.API_RETRY_TEXT), 2)
+
+    def test_no_retry_in_longhaul_pipe_or_with_the_switch_off(self):
+        for value in ("off", "OFF", " off "):
+            with mock.patch.dict(os.environ, {"LONGHAUL_API_RETRY": value}):
+                r = self.relay()
+                self.server_error(r)
+                self.later(60)
+                r.tend()
+                self.assertEqual(self.said(r), [], value)
+                self.assertNotIn(longhaul.API_RETRY_MARK, r.child_env(0), value)
+        r = self.relay(says=True)
+        self.server_error(r)
+        self.later(60)
+        r.tend()
+        self.assertEqual((self.said(r), self.notes), ([], []))
+        self.assertNotIn(longhaul.API_RETRY_MARK, r.child_env(0))
+        with mock.patch.dict(os.environ, {"LONGHAUL_API_RETRY": "on", longhaul.API_RETRY_MARK: "1"}):
+            r = self.relay()
+            self.assertEqual(r.child_env(0)[longhaul.API_RETRY_MARK], "1", "the StopFailure hook is quiet there")
+            self.assertEqual(r.child_env(1)["CLAUDE_CONFIG_DIR"], str(longhaul.config_of(self.accounts[1])))
+            r = self.relay(says=True)
+            self.assertNotIn(longhaul.API_RETRY_MARK, r.child_env(0), "not even one passed down")
+
     def test_a_subagents_limit_line_holds_nothing(self):
         r = self.relay()
         r.hold_if_limit(json.dumps({"type": "assistant", "error": "rate_limit", "parent_tool_use_id": "toolu_1",
@@ -20629,6 +20751,25 @@ class Stops(unittest.TestCase):
     def everything(self) -> str:
         """Every file under LONGHAUL_HOME, as text."""
         return "".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+
+    def test_a_server_error_notifies_once_unless_a_panel_relay_retries_it(self):
+        # The owner's decision of 2026-11-06 (the log audit of 2026-11-05,
+        # #4): a turn that stops on a server error says so where no panel
+        # relay retries it; the relay's claude carries API_RETRY_MARK.
+        notes = []
+        with mock.patch.object(longhaul, "notify", notes.append), mock.patch.dict(os.environ):
+            os.environ.pop(longhaul.API_RETRY_MARK, None)
+            self.send("stop-failure", self.failure("server_error"))
+            self.assertEqual(notes, ["This turn stopped on an API server error; prompt again to carry on."])
+            for other in ("rate_limit", "overloaded", "authentication_failed", "unknown"):
+                self.send("stop-failure", self.failure(other))
+            self.send("stop-failure", self.failure("server_error", agent_id="agent-1"))  # a subagent's
+            self.assertEqual(len(notes), 1, "the main conversation's server error alone")
+            os.environ[longhaul.API_RETRY_MARK] = "1"
+            self.send("stop-failure", self.failure("server_error"))
+            self.assertEqual(len(notes), 1, "the panel's relay retries it, and says so when it cannot")
+        self.assertEqual(self.kept().count(("StopFailure", "server_error")), 2, "kept as before")
+        self.assertNotIn(self.S, notes[0])
 
     def test_each_documented_error_is_kept_and_any_other_is_unknown(self):
         # As code.claude.com/docs/en/hooks lists StopFailure's error (2026-10-26).
