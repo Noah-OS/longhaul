@@ -142,7 +142,10 @@ Usage:
                           Code's settings for you, a copy kept, on after a yes
                           in a terminal (--yes: without asking). On, Longhaul
                           stays in each panel chat to ask and carry on at a
-                          limit; "switch_mid_session": false in
+                          limit, and to carry on once, a minute after a turn
+                          stopped on an API server error while nothing else
+                          happened in the chat (LONGHAUL_API_RETRY=off: not);
+                          "switch_mid_session": false in
                           ~/.longhaul/vscode.json runs Claude alone there
   longhaul setup [NAME] [--relogin]
                           sign each account in to its own folder (a browser
@@ -311,7 +314,9 @@ Usage:
                           and keeps the type and the time per session. A
                           failed sign-in also marks the chat's account in
                           LONGHAUL_HOME/sign-in-failed.json, for status and
-                          /accounts. They record only, and decide nothing
+                          /accounts. A server error is said in a notification,
+                          except in a panel chat whose Longhaul carries on
+                          after it (see vscode). They decide nothing
   longhaul trial start [--days N] [--kind models] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -466,6 +471,7 @@ SESSION_ENV = [
     "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID", "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
     "CLAUDE_CODE_EXECPATH", "CLAUDE_AGENT_SDK_VERSION",
+    "LONGHAUL_API_RETRY_BY",  # API_RETRY_MARK: a panel relay's claude, never one started from inside it (2026-11-06)
 ]
 # These outrank the claude.ai sign-in, so with any of them set every
 # account would bill the same key and Remote Control would refuse it.
@@ -10612,7 +10618,9 @@ def precompact(opts) -> int:
 # test, 2026-10-26) StopFailure `rate_limit` fired in the same second as the
 # transcript's line, and no quota notification did: Claude Code ended the
 # turn rather than wait. `longhaul stop-failure` and `longhaul quota-note`
-# only record and log them, and decide nothing themselves. The terminal
+# only record and log them, and decide nothing themselves; a server_error
+# of the main conversation is also said in one notification, except under
+# a panel relay that retries it (API_RETRY_MARK; 2026-11-06). The terminal
 # supervisor reads the rows too (Watch._read_stops, L1): a rate_limit
 # StopFailure of its session kept during its launch is a limit stop when
 # the account's own reading has a full window (full_window()), which gives
@@ -10717,6 +10725,10 @@ def stop_keep(data, event: str, now: float | None = None) -> None:
         log(f"stop: {sid}'s {kind} was not kept: {e.strerror or e}")
     if event == "StopFailure" and kind in SIGN_IN_ERRORS:
         sign_in_failed(sid, os.environ.get("CLAUDE_CONFIG_DIR"), now)
+    if event == "StopFailure" and kind == "server_error" and not os.environ.get(API_RETRY_MARK):
+        # Once per stop: the hook runs once for it. A panel relay that
+        # retries (API_RETRY_MARK) says it itself when it cannot (2026-11-06).
+        notify(SERVER_ERROR_NOTE)
 
 
 def failed_account(config_dir):
@@ -12356,11 +12368,33 @@ ASK_ID = "longhaul-ask-"  # the request ids of Longhaul's own cards
 # write the fields, and the pane reads them as they are.
 QUESTIONS, WAITS = "questions", "waits"  # folders under LONGHAUL_HOME
 RELAY_DEBUG = bool(os.environ.get("LONGHAUL_RELAY_DEBUG"))
+# One retry after a server error (the owner's decision of 2026-11-06; the
+# log audit of 2026-11-05, #4: 72 turns, 16 in 48 h, ended on an API
+# server_error, each after Claude Code's own retries, and the work stopped
+# until the next prompt). In a panel chat whose main thread's turn ends on
+# one, the relay waits API_RETRY_WAIT and, if nothing else has happened in
+# the chat, sends API_RETRY_TEXT, once in a streak of such turns; when the
+# retried turn stops the same way, it says API_RETRY_AGAIN once. Never in
+# longhaul pipe; LONGHAUL_API_RETRY=off turns it off (api_retry_on()). The
+# claude of a relay that retries has API_RETRY_MARK in its environment,
+# for the StopFailure hook, which says SERVER_ERROR_NOTE everywhere else.
+API_RETRY_WAIT = 60  # seconds
+API_RETRY_TEXT = "The last turn stopped on an API server error. Carry on where you left off."
+API_RETRY_AGAIN = "The turn stopped on an API server error again; prompt again when ready."
+API_RETRY_MARK = "LONGHAUL_API_RETRY_BY"
+SERVER_ERROR_NOTE = "This turn stopped on an API server error; prompt again to carry on."
+
+
+def api_retry_on() -> bool:
+    """LONGHAUL_API_RETRY, read at call time: "off" is off, anything else on."""
+    return (os.environ.get("LONGHAUL_API_RETRY") or "").strip().lower() != "off"
+
+
 # A line's "type" is not always its first field: a 2.1.300 result line
 # starts with "duration_api_ms" and has "type":"result" 1,600 bytes in.
 # Matching only the start of a line missed every result (2026-10-16).
 _TYPE = {k: re.compile(rb'"type":\s*"' + k.encode() + rb'"') for k in (
-    "result", "assistant", "stream_event", "control_response", "control_request", "auth_status")}
+    "result", "assistant", "stream_event", "control_response", "control_request", "auth_status", "user")}
 
 
 def has_type(line: bytes, kind: str) -> bool:
@@ -12401,6 +12435,39 @@ def main_reply(line: bytes) -> bool:
         return False
     inner = msg.get("message")
     return not (isinstance(inner, dict) and inner.get("model") == "<synthetic>")
+
+
+def main_error(line: bytes):
+    """The API error a stream line names when it is the main thread's
+    assistant message for one (no parent_tool_use_id): its "error", the
+    word the StopFailure hook gets (STOP_ERRORS), "server_error" among
+    them; else None (2026-11-06)."""
+    if b'"error"' not in line or not has_type(line, "assistant"):
+        return None
+    try:
+        msg = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(msg, dict) or msg.get("type") != "assistant" or msg.get("parent_tool_use_id") is not None:
+        return None
+    error = msg.get("error")
+    return error if isinstance(error, str) else None
+
+
+def no_limit_result(line: bytes) -> bool:
+    """Whether a result line ended its turn with no limit stop, as far as
+    the line says: no error, or an API error whose status is not 429. An
+    error with no status may be a limit's; so may a line that cannot be
+    read. Relay.from_claude() ends a rate_limit hold on it (2026-11-06)."""
+    try:
+        msg = json.loads(line)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(msg, dict) or msg.get("type") != "result":
+        return False
+    status = msg.get("api_error_status")
+    return msg.get("is_error") is False or (msg.get("is_error") is True and isinstance(status, int)
+                                            and status != 429)
 
 
 def chat_file(folder: str, sid, suffix: str = "") -> Path | None:
@@ -13007,7 +13074,9 @@ class Relay:
     idle then (carry_on()). auto, with nowhere to move, and never schedule
     one without asking. A chat reopened by id on an account at its limit
     is asked at once, before any message meets the limit (0.3.4,
-    ask_at_start()), and its messages wait for a move answered.
+    ask_at_start()), and its messages wait for a move answered. A turn
+    that ends on an API server error is carried on once, a minute later,
+    if nothing else happened in the chat (tend_retry(), 2026-11-06).
 
     The process ends with os._exit and claude's exit code: a normal exit
     would wait for the thread blocked on the panel's stdin and abort
@@ -13043,6 +13112,9 @@ class Relay:
         self.gone: set = set()
         self.off_done: set = set()
         self.to_reconsider = False  # refresh() saw a change: reconsider() at the next round
+        # self.accounts and self.idx change together under pair_lock, and a
+        # reader on another thread reads them through running_on() (2026-11-06).
+        self.pair_lock = threading.Lock()
         self.cond = threading.Condition()
         self.queue: collections.deque = collections.deque()
         self.paused = False
@@ -13082,21 +13154,52 @@ class Relay:
         # while they are held (holds() says when), else None.
         self.ask_first: float | None = None
         self.held: list | None = None
+        # One retry after a server error (API_RETRY_WAIT's comment): when
+        # the panel last sent a message of yours or an interrupt; the main
+        # thread's API error in the turn under way (main_error()); when a
+        # turn last ended on a server error, for tend_retry(); and the
+        # streak of such turns: 0, 1 once its retry is sent, 2 once
+        # API_RETRY_AGAIN is said. A turn that ends with no error ends it.
+        self.typed_at = 0.0
+        self.turn_error = None
+        self.server_error_at: float | None = None
+        self.retry_streak = 0
 
     # -- the pipes
 
     def spawn(self, idx: int, args: list[str], hide: dict | None = None) -> subprocess.Popen:
         child = subprocess.Popen([self.binary] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 env=self.env(self.accounts[idx]))
+                                 env=self.child_env(idx))
         self.hidden[child.pid] = hide
         reader = threading.Thread(target=self.from_claude, args=(child,), daemon=True)
         self.readers[child.pid] = reader
         reader.start()
         return child
 
+    def child_env(self, idx: int) -> dict:
+        """The environment of a claude on accounts[idx]: self.env's, with
+        API_RETRY_MARK while this relay retries after a server error
+        (tend_retry()), so the StopFailure hook leaves that stop to it,
+        and with none passed down otherwise (2026-11-06)."""
+        env = self.env(self.accounts[idx])
+        env.pop(API_RETRY_MARK, None)
+        if not self.says and api_retry_on():
+            env[API_RETRY_MARK] = "1"
+        return env
+
     def next_id(self, kind: str) -> str:
         self.ids += 1
         return f"longhaul-{kind}-{self.ids}"
+
+    def running_on(self) -> dict:
+        """The account the chat runs on, self.accounts[self.idx] read as
+        one, for the readers on other threads: remember() on the panel's,
+        note_cost() and hold_if_limit() on claude's. use_accounts(), on the
+        tending thread, replaces the list and the index; read between the
+        two stores, the pair named the wrong account, or raised IndexError
+        when the list had shrunk (2026-11-06)."""
+        with self.pair_lock:
+            return self.accounts[self.idx]
 
     def remember(self, req: dict) -> None:
         r = req.get("request") or {}
@@ -13105,7 +13208,7 @@ class Relay:
             self.init_request = req
             return
         if sub in SIGN_IN:
-            acct = self.accounts[self.idx]
+            acct = self.running_on()
             forget_auth(acct)
             log(f"panel: a sign-in started in a chat on {acct['name']}; longhaul checks who {acct['name']} is "
                 "before its next launch")
@@ -13127,6 +13230,8 @@ class Relay:
     def from_panel(self) -> None:
         for line in sys.stdin.buffer:
             trace("panel>", "-", line)
+            if has_type(line, "user") or b'"interrupt"' in line:
+                self.typed_at = time.time()  # you acted in the chat: tend_retry() reads it
             if self.asked and has_type(line, "control_response") and ASK_ID.encode() in line:
                 self.card_answered(line)  # Longhaul's own card: the answer is not Claude's
                 continue
@@ -13276,8 +13381,15 @@ class Relay:
                     self.hold_if_limit(line)
                 if main_reply(line):
                     self.replied_at = time.time()  # work went on: carry_on() and tend() read it
+                    self.end_hold("a reply came")
+                error = main_error(line)
+                if error:
+                    self.turn_error = error
                 if has_type(line, "result"):
                     self.note_cost(child, line)
+                    if no_limit_result(line):
+                        self.end_hold("the turn ended with no limit stop")
+                    self.turn_ended(line)
             try:
                 with self.out_lock:
                     out.write(line)
@@ -13314,24 +13426,78 @@ class Relay:
         lines from now, before the panel even shows the stop, so a message
         typed straight after it reaches the next account rather than this
         one. The conversation file confirms the stop (and its reset time)
-        a moment later; without that, the lines are let go after HOLD_MAX."""
+        a moment later; without that, the lines are let go after HOLD_MAX,
+        or at once when the turn goes on (end_hold()).
+
+        Only the main thread's: a line with a parent_tool_use_id is a
+        subagent's, and one without it is taken for the main thread's, as
+        before, since Claude Code 2.1.318 builds its rate_limit_event with
+        no field that names a thread. Nothing is held while this chat's
+        account is at its limit already, or a question or a carry-on is
+        open: that limit has been acted on, and a message typed then meets
+        it wherever it waits. A rejected event held the lines 18 times with
+        no stop after it (the log audit of 2026-11-05, #10; 2026-11-06).
+        The stop is kept in own_stops all the same, for limit_ours()."""
         try:
             msg = json.loads(line)
         except ValueError:
             return
+        if not isinstance(msg, dict):
+            return
         info = msg.get("rate_limit_info") or {}
         if msg.get("type") == "rate_limit_event":
             self.note_reading(info)
-        stop = (msg.get("type") == "assistant" and msg.get("error") == "rate_limit"
-                and not msg.get("parent_tool_use_id")) or (
-                msg.get("type") == "rate_limit_event" and info.get("status") == "rejected")
-        if stop:
-            self.own_stops.append((self.child.pid if self.child else None, msg.get("uuid"), time.time()))
-            with self.cond:
-                self.paused = True
-                self.held_since = time.time()
+        stop = not msg.get("parent_tool_use_id") and (
+            (msg.get("type") == "assistant" and msg.get("error") == "rate_limit")
+            or (msg.get("type") == "rate_limit_event" and info.get("status") == "rejected"))
+        if not stop:
+            return
+        self.own_stops.append((self.child.pid if self.child else None, msg.get("uuid"), time.time()))
+        # as_number(): junk in state.json must not end this thread, claude's reader.
+        until = as_number(load_state()["limited_until"].get(self.running_on()["name"])) or 0
+        why = ("a question is open" if self.question else "a carry-on is scheduled" if self.carry
+               else "the account is at its limit already" if until > time.time() else None)
+        if why:
             if RELAY_DEBUG:
-                log("relay HOLD: a rate_limit stop in the stream")
+                log(f"relay: a rate_limit stop in the stream, not held: {why}")
+            return
+        with self.cond:
+            self.paused = True
+            self.held_since = time.time()
+        if RELAY_DEBUG:
+            log("relay HOLD: a rate_limit stop in the stream")
+
+    def end_hold(self, why: str) -> None:
+        """hold_if_limit()'s hold ended before HOLD_MAX: the turn went on
+        (`why`), so no stop follows. Logged once, with the reason. Never
+        during a swap, whose pause is move_to()'s, and end_swap() decides
+        a hold set meanwhile; never a pause that is no such hold, the ask
+        probe's (2026-11-06)."""
+        with self.cond:
+            since = self.held_since
+            if since is None or self.swapping or self.asked:
+                return
+            self.paused, self.held_since = False, None
+            self.cond.notify_all()
+        sid = (self.watch.sid if self.watch else None) or "a chat"
+        log(f"{self.who}: the lines held for a rate_limit in {sid} go on after {time.time() - since:.0f} s: {why}")
+
+    def turn_ended(self, line: bytes) -> None:
+        """A result line, on claude's reader: the turn ended. On a server
+        error of the main thread's (main_error()), when, for tend_retry();
+        with no error, the streak of those is over (2026-11-06)."""
+        error, self.turn_error = self.turn_error, None
+        try:
+            msg = json.loads(line)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(msg, dict) or msg.get("type") != "result":
+            return
+        with self.cond:
+            if not msg.get("is_error"):
+                self.retry_streak = 0
+            elif error == "server_error":
+                self.server_error_at = time.time()
 
     def limit_ours(self, limit) -> bool | None:
         """Whether the conversation file's limit stop `limit` is this relay's
@@ -13385,7 +13551,7 @@ class Relay:
         try:
             record_usage({"session_id": msg.get("session_id"), "rate_limits": self.limits, "proc": child.pid,
                           "cost": {"total_cost_usd": msg.get("total_cost_usd") or 0}},
-                         str(config_of(self.accounts[self.idx])))
+                         str(config_of(self.running_on())))
         except Exception as e:
             log(f"panel usage not recorded: {e!r}")
 
@@ -13583,7 +13749,8 @@ class Relay:
         denied = denied_in(found, self.top) if self.top else set()
         unmanaged = ({a["name"] for a in found if not a.get("email") or not a.get("config_dir")}
                      if self.managed_only else set())
-        self.accounts, self.idx = listed, idx
+        with self.pair_lock:  # as one, for running_on()'s readers
+            self.accounts, self.idx = listed, idx
         here = listed[idx]
         self.denied, self.unmanaged, self.gone = denied, unmanaged, gone
         self.bad = failed | denied | unmanaged | gone
@@ -13838,6 +14005,45 @@ class Relay:
             self.settle_hold()  # held messages wait no longer than their question
         if self.carry and time.time() >= self.carry["until"]:
             self.carry_on()
+        self.tend_retry()
+
+    def tend_retry(self) -> None:
+        """One retry after a server error (API_RETRY_WAIT's comment), at
+        tend()'s first round API_RETRY_WAIT after the turn ended: sent as
+        a carry-on is (say_to_claude()), so the panel shows it, unless
+        anything happened in the chat since: you typed, Claude replied, or
+        a question, carry-on, hold or swap is under way. Once in a streak:
+        a retried turn that stops the same way is said once
+        (API_RETRY_AGAIN), and nothing more until a turn ends with no
+        error. Only in the panel (not longhaul pipe), and not with
+        LONGHAUL_API_RETRY=off. Its log lines hold ids and times only."""
+        with self.cond:
+            at, streak = self.server_error_at, self.retry_streak
+            if at is None or not (streak or self.says or not api_retry_on() or time.time() >= at + API_RETRY_WAIT):
+                return
+            self.server_error_at = None
+            if streak == 1:
+                self.retry_streak = 2
+        if self.says or not api_retry_on():
+            return
+        sid = (self.watch.sid if self.watch else None) or "a chat"
+        if streak:
+            if streak == 1:
+                log(f"retry: {sid}'s retried turn stopped on an API server error again at {clock(at)}; no retry")
+                notify(API_RETRY_AGAIN)
+            return
+        why = ("you typed since" if self.typed_at > at else "Claude replied since" if self.replied_at > at
+               else "a question is open" if self.question else "a carry-on is scheduled" if self.carry
+               else "a swap is under way" if self.swapping else "messages are held" if self.held is not None
+               else "lines are held" if self.paused or self.held_since else None)
+        if why:
+            log(f"retry: {sid}'s turn that stopped on an API server error at {clock(at)} gets no retry: {why}")
+            return
+        with self.cond:
+            self.retry_streak = 1  # before the message: its turn may end before this thread goes on
+        self.say_to_claude(API_RETRY_TEXT)
+        log(f"retry: {sid} carried on after its turn stopped on an API server error at {clock(at)} "
+            f"({time.time() - at:.0f} s ago)")
 
     def read_answer(self) -> None:
         """`longhaul answer`'s file beside the question, acted on as it
@@ -14122,7 +14328,8 @@ class Relay:
         init_id = self.next_id("initialize")
         hide = {"ids": {init_id}, "init_id": init_id, "auth": True}
         self.answered.clear()
-        self.idx = idx
+        with self.pair_lock:
+            self.idx = idx
         child = self.spawn(idx, without_resume(self.args) + [f"--resume={sid}"], hide)
         self.child = child
         try:
@@ -14196,9 +14403,9 @@ class Relay:
         if not sid or self.init_request is None:
             log(f"panel: the chat stays on {here['name']}: its id or the panel's initialize is not known yet")
             return False
-        with self.cond:
+        with self.cond:  # together: end_hold(), on claude's reader, reads both under cond
             self.paused = True
-        self.swapping = True
+            self.swapping = True
         self.swap_started = time.time()
         try:
             self.stop_child(self.child)

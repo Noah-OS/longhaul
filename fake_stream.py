@@ -6,10 +6,15 @@ system/init at the first message, assistant and result lines), writes the
 session and conversation files Claude Code writes, and acts out
 stream_plan.json, one step per user message across launches:
 
-  reply | limit | limit_sub | limit_then_sub
+  reply | limit | limit_sub | limit_then_sub | rejected_event | rejected_event_sub
 
 limit_sub is a subagent's limit stop, its line a sidechain's, and the
-main turn goes on. limit_then_sub is a limit stop followed, a second
+main turn goes on. rejected_event is a rejected rate_limit_event that no
+stop follows, then the main turn's reply: Claude Code got past it, or it
+was a subagent's. Claude Code 2.1.318 builds the event with type,
+rate_limit_info, uuid and session_id alone; rejected_event_sub gives it a
+subagent's parent_tool_use_id, as a subagent's other lines have (the log
+audit of 2026-11-05, #10). limit_then_sub is a limit stop followed, a second
 later, by lines that are no reply of the chat's: a subagent's assistant
 line (parent_tool_use_id set) and a <synthetic> one (the log audit of
 2026-11-05, #3). A limit resets in FAKE_RESET_IN seconds (an hour unless
@@ -143,6 +148,15 @@ for raw in sys.stdin:
         emit({"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "session_id": sid,
               "parent_tool_use_id": "toolu_sub", "message": {"model": "<synthetic>", "content": [
                   {"type": "text", "text": "You've hit your session limit"}]}})
+        step = "reply"
+    if step in ("rejected_event", "rejected_event_sub"):
+        event = {"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour", "resetsAt": time.time() + 3600,
+            "unifiedWindows": {"five_hour": {"utilization": 1.0, "resetsAt": time.time() + 3600}}},
+            "uuid": str(uuid.uuid4()), "session_id": sid}
+        if step == "rejected_event_sub":
+            event["parent_tool_use_id"] = "toolu_sub"
+        emit(event)
         step = "reply"
     if step.startswith("exit:"):
         emit({"type": "assistant", "session_id": sid, "user_message_uuid": msg["uuid"],
