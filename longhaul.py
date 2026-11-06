@@ -12261,6 +12261,22 @@ def main_reply(line: bytes) -> bool:
     return not (isinstance(inner, dict) and inner.get("model") == "<synthetic>")
 
 
+def no_limit_result(line: bytes) -> bool:
+    """Whether a result line ended its turn with no limit stop, as far as
+    the line says: no error, or an API error whose status is not 429. An
+    error with no status may be a limit's; so may a line that cannot be
+    read. Relay.from_claude() ends a rate_limit hold on it (2026-11-06)."""
+    try:
+        msg = json.loads(line)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(msg, dict) or msg.get("type") != "result":
+        return False
+    status = msg.get("api_error_status")
+    return msg.get("is_error") is False or (msg.get("is_error") is True and isinstance(status, int)
+                                            and status != 429)
+
+
 def chat_file(folder: str, sid, suffix: str = "") -> Path | None:
     """LONGHAUL_HOME/<folder>/<sid><suffix>.json (QUESTIONS, WAITS), or None
     for an id that is not a plain session id (GUARD_ID): it names a file."""
@@ -12866,6 +12882,9 @@ class Relay:
         self.gone: set = set()
         self.off_done: set = set()
         self.to_reconsider = False  # refresh() saw a change: reconsider() at the next round
+        # self.accounts and self.idx change together under pair_lock, and a
+        # reader on another thread reads them through running_on() (2026-11-06).
+        self.pair_lock = threading.Lock()
         self.cond = threading.Condition()
         self.queue: collections.deque = collections.deque()
         self.paused = False
@@ -12921,6 +12940,16 @@ class Relay:
         self.ids += 1
         return f"longhaul-{kind}-{self.ids}"
 
+    def running_on(self) -> dict:
+        """The account the chat runs on, self.accounts[self.idx] read as
+        one, for the readers on other threads: remember() on the panel's,
+        note_cost() and hold_if_limit() on claude's. use_accounts(), on the
+        tending thread, replaces the list and the index; read between the
+        two stores, the pair named the wrong account, or raised IndexError
+        when the list had shrunk (2026-11-06)."""
+        with self.pair_lock:
+            return self.accounts[self.idx]
+
     def remember(self, req: dict) -> None:
         r = req.get("request") or {}
         sub = r.get("subtype")
@@ -12928,7 +12957,7 @@ class Relay:
             self.init_request = req
             return
         if sub in SIGN_IN:
-            acct = self.accounts[self.idx]
+            acct = self.running_on()
             forget_auth(acct)
             log(f"panel: a sign-in started in a chat on {acct['name']}; longhaul checks who {acct['name']} is "
                 "before its next launch")
@@ -13099,8 +13128,11 @@ class Relay:
                     self.hold_if_limit(line)
                 if main_reply(line):
                     self.replied_at = time.time()  # work went on: carry_on() and tend() read it
+                    self.end_hold("a reply came")
                 if has_type(line, "result"):
                     self.note_cost(child, line)
+                    if no_limit_result(line):
+                        self.end_hold("the turn ended with no limit stop")
             try:
                 with self.out_lock:
                     out.write(line)
@@ -13137,24 +13169,61 @@ class Relay:
         lines from now, before the panel even shows the stop, so a message
         typed straight after it reaches the next account rather than this
         one. The conversation file confirms the stop (and its reset time)
-        a moment later; without that, the lines are let go after HOLD_MAX."""
+        a moment later; without that, the lines are let go after HOLD_MAX,
+        or at once when the turn goes on (end_hold()).
+
+        Only the main thread's: a line with a parent_tool_use_id is a
+        subagent's, and one without it is taken for the main thread's, as
+        before, since Claude Code 2.1.318 builds its rate_limit_event with
+        no field that names a thread. Nothing is held while this chat's
+        account is at its limit already, or a question or a carry-on is
+        open: that limit has been acted on, and a message typed then meets
+        it wherever it waits. A rejected event held the lines 18 times with
+        no stop after it (the log audit of 2026-11-05, #10; 2026-11-06).
+        The stop is kept in own_stops all the same, for limit_ours()."""
         try:
             msg = json.loads(line)
         except ValueError:
             return
+        if not isinstance(msg, dict):
+            return
         info = msg.get("rate_limit_info") or {}
         if msg.get("type") == "rate_limit_event":
             self.note_reading(info)
-        stop = (msg.get("type") == "assistant" and msg.get("error") == "rate_limit"
-                and not msg.get("parent_tool_use_id")) or (
-                msg.get("type") == "rate_limit_event" and info.get("status") == "rejected")
-        if stop:
-            self.own_stops.append((self.child.pid if self.child else None, msg.get("uuid"), time.time()))
-            with self.cond:
-                self.paused = True
-                self.held_since = time.time()
+        stop = not msg.get("parent_tool_use_id") and (
+            (msg.get("type") == "assistant" and msg.get("error") == "rate_limit")
+            or (msg.get("type") == "rate_limit_event" and info.get("status") == "rejected"))
+        if not stop:
+            return
+        self.own_stops.append((self.child.pid if self.child else None, msg.get("uuid"), time.time()))
+        # as_number(): junk in state.json must not end this thread, claude's reader.
+        until = as_number(load_state()["limited_until"].get(self.running_on()["name"])) or 0
+        why = ("a question is open" if self.question else "a carry-on is scheduled" if self.carry
+               else "the account is at its limit already" if until > time.time() else None)
+        if why:
             if RELAY_DEBUG:
-                log("relay HOLD: a rate_limit stop in the stream")
+                log(f"relay: a rate_limit stop in the stream, not held: {why}")
+            return
+        with self.cond:
+            self.paused = True
+            self.held_since = time.time()
+        if RELAY_DEBUG:
+            log("relay HOLD: a rate_limit stop in the stream")
+
+    def end_hold(self, why: str) -> None:
+        """hold_if_limit()'s hold ended before HOLD_MAX: the turn went on
+        (`why`), so no stop follows. Logged once, with the reason. Never
+        during a swap, whose pause is move_to()'s, and end_swap() decides
+        a hold set meanwhile; never a pause that is no such hold, the ask
+        probe's (2026-11-06)."""
+        with self.cond:
+            since = self.held_since
+            if since is None or self.swapping or self.asked:
+                return
+            self.paused, self.held_since = False, None
+            self.cond.notify_all()
+        sid = (self.watch.sid if self.watch else None) or "a chat"
+        log(f"{self.who}: the lines held for a rate_limit in {sid} go on after {time.time() - since:.0f} s: {why}")
 
     def limit_ours(self, limit) -> bool | None:
         """Whether the conversation file's limit stop `limit` is this relay's
@@ -13208,7 +13277,7 @@ class Relay:
         try:
             record_usage({"session_id": msg.get("session_id"), "rate_limits": self.limits, "proc": child.pid,
                           "cost": {"total_cost_usd": msg.get("total_cost_usd") or 0}},
-                         str(config_of(self.accounts[self.idx])))
+                         str(config_of(self.running_on())))
         except Exception as e:
             log(f"panel usage not recorded: {e!r}")
 
@@ -13406,7 +13475,8 @@ class Relay:
         denied = denied_in(found, self.top) if self.top else set()
         unmanaged = ({a["name"] for a in found if not a.get("email") or not a.get("config_dir")}
                      if self.managed_only else set())
-        self.accounts, self.idx = listed, idx
+        with self.pair_lock:  # as one, for running_on()'s readers
+            self.accounts, self.idx = listed, idx
         here = listed[idx]
         self.denied, self.unmanaged, self.gone = denied, unmanaged, gone
         self.bad = failed | denied | unmanaged | gone
@@ -13945,7 +14015,8 @@ class Relay:
         init_id = self.next_id("initialize")
         hide = {"ids": {init_id}, "init_id": init_id, "auth": True}
         self.answered.clear()
-        self.idx = idx
+        with self.pair_lock:
+            self.idx = idx
         child = self.spawn(idx, without_resume(self.args) + [f"--resume={sid}"], hide)
         self.child = child
         try:
@@ -14019,9 +14090,9 @@ class Relay:
         if not sid or self.init_request is None:
             log(f"panel: the chat stays on {here['name']}: its id or the panel's initialize is not known yet")
             return False
-        with self.cond:
+        with self.cond:  # together: end_hold(), on claude's reader, reads both under cond
             self.paused = True
-        self.swapping = True
+            self.swapping = True
         self.swap_started = time.time()
         try:
             self.stop_child(self.child)

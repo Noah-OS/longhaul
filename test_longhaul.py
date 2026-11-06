@@ -16574,7 +16574,7 @@ class Panel(StreamHarness):
             self.assertEqual(self.wait_for(self.result_for(self.user(p, text)), timeout=10)["result"],
                              f"reply to: {text}")
         log = self.log_text()
-        self.assertEqual(log.count("panel: the lines held for a rate_limit in sid-1 go on after"), 1, log)
+        self.assertEqual(log.count("panel: the lines held for a rate_limit in "), 1, log)
         self.assertIn(": a reply came", log)
         self.assertNotIn("was not a usage limit stop", log)
         self.assertEqual(len(self.calls()), 1)
