@@ -22373,7 +22373,7 @@ class Folders(unittest.TestCase):
         self.assertIn("no account called work; there is no list of accounts yet: `longhaul add` adds one", out.stdout)
         self.assertFalse(self.path.exists())
 
-    def test_the_usage_block_names_it_beside_add_and_remove_and_the_shim_refuses_it(self):
+    def test_the_usage_block_names_it_beside_add_and_remove_and_the_shim_runs_it(self):
         doc = longhaul.__doc__
         self.assertIn("longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]", doc)
         self.assertLess(doc.index("longhaul remove NAME"), doc.index("longhaul folders NAME"))
@@ -22382,15 +22382,34 @@ class Folders(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("usage: longhaul folders [-h] [--add PATH] [--remove PATH] [--anywhere] name", out.stdout)
         # bin/longhaul, what a chat's Claude may run, is the owner's boundary:
-        # it does not run folders until the owner allows it there.
+        # it runs folders since the owner's yes of 2026-11-06, in its forms
+        # alone (ShimCommands has the refused ones).
         self.write_accounts({"name": "work", "repositories": ["~/work"]})
-        before = self.path.read_bytes()
         env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
         env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1", HOME=str(self.tmp))
-        out = subprocess.run([str(HERE / "bin" / "longhaul"), "folders", "work", "--anywhere"], capture_output=True,
-                             text=True, env=env, timeout=30)
-        self.assertEqual((out.returncode, out.stdout), (2, ""))
-        self.assertEqual(self.path.read_bytes(), before)
+
+        def shim(*args):
+            return subprocess.run([str(HERE / "bin" / "longhaul"), "folders", *args], capture_output=True, text=True,
+                                  env=env, timeout=30)
+        out = shim("work")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("work may be used only in ~/work.", out.stdout)
+        out = shim("work", "--add", "~/later", "--remove", "~/work")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(self.path.read_text())[0]["repositories"], ["~/later"])
+        out = shim("work", "--anywhere")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("repositories", json.loads(self.path.read_text())[0])
+        before = self.path.read_bytes()
+        for args in (("work", "--add"), ("work", "--add", "--remove"), ("work", "--anywhere", "x"), ("-h",),
+                     ("work", "--anywhere", "--add", "/x"), ("work", "--dir", "/x")):
+            out = shim(*args)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("longhaul: from here `folders` runs only as", out.stderr, args)
+        out = shim("work", "--add", "relative")  # the shim's form; longhaul.py refuses the path itself
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertNotIn("from here", out.stderr + out.stdout)
+        self.assertEqual(self.path.read_bytes(), before, "a refused form or path writes nothing")
 
     # The refusals say why (the owner, 2026-11-05): an account with no list,
     # refused where other accounts' lists reserve the folder, was said to

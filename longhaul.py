@@ -58,7 +58,7 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
 
 How it sees what Claude is doing. Claude Code documents no API for most of
 it, so longhaul reads the files Claude Code itself writes (checked on 2.1.295 to
-2.1.310; if a later version moves them, longhaul stops switching but Claude runs
+2.1.318; if a later version moves them, longhaul stops switching but Claude runs
 as normal):
 
 - <config>/sessions/<pid>.json: the running process's sessionId, its
@@ -437,10 +437,13 @@ LIMIT_BUSY_GRACE = setting("LONGHAUL_LIMIT_BUSY_GRACE", 30, float)
 # The Claude Code versions whose internal files longhaul has been seen to read
 # correctly: 2.1.295 and 2.1.300 by hand, 2.1.301 to 2.1.303 from limit
 # switches in real use, 2.1.310 in the owner's live test (2026-10-26: a weekly
-# limit, the question, a yes, the chat carried on on the other account).
+# limit, the question, a yes, the chat carried on on the other account),
+# 2.1.311 to 2.1.318 in real use (2026-11-04 to 11-06): the terminal's
+# supervisor (2.1.311) saw its limits and asked; the panel's (VS Code's own
+# 2.1.318) carried chats on at their resets and moved one at a session limit.
 # Outside this range longhaul still runs Claude, and says that switching may
 # not work (the files it reads are undocumented).
-TESTED_VERSIONS = ((2, 1, 295), (2, 1, 310))
+TESTED_VERSIONS = ((2, 1, 295), (2, 1, 318))
 # Tests end the loop after this many launches; 0 runs until you stop it.
 MAX_RUNS = setting("LONGHAUL_MAX_RUNS", 0, int)
 # A limit's reset time plus this margin before longhaul tries that account again.

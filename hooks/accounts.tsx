@@ -19,7 +19,7 @@ import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 // forgetting the limits. The pane draws `longhaul.py status --json` and runs
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
-// bin/longhaul does not run, so /longhaul:manage cannot yet. One at a time;
+// /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06). One at a time;
 // the rows are read again when the pane opens and after each.
 //
 // Each line of the list is a Button: the pane is opened with focus and

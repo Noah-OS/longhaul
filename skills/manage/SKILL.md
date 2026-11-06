@@ -26,6 +26,7 @@ Accounts:
 - Add one: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul add NAME EMAIL`, with `--repo PATH` for each repository it alone may be used in (and those inside it) and `--dir DIR` for its folder (default ~/.claude-<name>). It writes Longhaul's accounts list, then signs the account in.
 - Sign one in again: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul setup NAME --relogin`; `${CLAUDE_PLUGIN_ROOT}/bin/longhaul setup NAME` signs in one that is not.
 - Take one off the list: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay.
+- Where one may be used (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME`. Change it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --add PATH` (a folder it may be used in, and those inside it), `--remove PATH`, each PATH starting with / or ~/ and repeatable, or `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --anywhere` (drops its list). A folder on an account's list is kept for the accounts that list it, so say which other accounts that leaves out, as the command's output does.
 
 For add and setup, tell the user first that the sign-in opens in the
 browser and that they sign in there with that account's email: Longhaul

@@ -22,7 +22,8 @@
 # chat") the commands that set Longhaul up run from here too: add, setup,
 # remove, models, switch, vscode, statusline install and uninstall,
 # update, clear and uninstall, each in the forms its case below allows
-# and no other. A user of the VS Code panel may have no terminal open, and
+# and no other; and folders, since the owner's yes of 2026-11-06 ("Yes,
+# add folders"): where an account may be used, read or changed. A user of the VS Code panel may have no terminal open, and
 # the /longhaul:manage skill shows each command and what it changes and
 # runs it only after the user's yes in the chat (the panel can approve
 # Bash by itself, so Claude Code's own prompt is not enough); where a
@@ -48,7 +49,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, models, switch, vscode on|off, statusline install|uninstall, update, clear, uninstall --dry-run|--yes and -h"
+runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, folders NAME [--add|--remove PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear, uninstall --dry-run|--yes and -h"
 # A setup command, $1, in a form its case does not allow: the forms that
 # do run, $2, and why the rest does not, $3, when that needs saying.
 only() {
@@ -57,6 +58,16 @@ only() {
 }
 # A word that is a value, not empty and not a flag.
 plain() { case "$1" in ""|-*) return 1 ;; esac; }
+# folders' arguments after NAME: --add or --remove, each with its PATH,
+# at least one pair; --anywhere alone is its own form. longhaul.py refuses
+# a PATH that is not absolute itself, writing nothing, as add's --repo.
+folders_rest() {
+  shift 2
+  [ $# -gt 0 ] || return 1
+  while [ $# -gt 0 ]; do
+    case "$1" in --add|--remove) [ $# -ge 2 ] && plain "$2" || return 1; shift 2 ;; *) return 1 ;; esac
+  done
+}
 # add's arguments after NAME EMAIL: --dir and --repo, each with its value.
 add_rest() {
   shift 3
@@ -99,6 +110,12 @@ case "$1" in
   remove)
     plain "$2" && [ $# -eq 2 ] && exec python3 "$here/longhaul.py" "$@"
     only remove "\`remove NAME\`" ;;
+  folders)
+    # Reads with NAME alone; changes with --add/--remove PATH pairs, or --anywhere alone.
+    if plain "$2" && { [ $# -eq 2 ] || [ "$#:$3" = "3:--anywhere" ] || folders_rest "$@"; }; then
+      exec python3 "$here/longhaul.py" "$@"
+    fi
+    only folders "\`folders NAME\`, \`folders NAME --add PATH\` or \`--remove PATH\` (repeated), or \`folders NAME --anywhere\`" ;;
   switch)
     case "$#:$2" in 1:|2:ask|2:auto|2:never) exec python3 "$here/longhaul.py" "$@" ;; esac
     only switch "\`switch [ask|auto|never]\`" ;;
