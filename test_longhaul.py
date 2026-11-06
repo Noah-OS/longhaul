@@ -4959,10 +4959,11 @@ class CodexPackaging(unittest.TestCase):
                 self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
                 self.assertFalse((root / "imported").exists(), "longhaul was imported")
         big = self.post("x" * longhaul.FILTER_SMALL)
-        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root), LONGHAUL_FILTERS="off")
-        self.assertEqual((out.returncode, out.stdout), (0, b""))
-        self.assertFalse((root / "imported").exists(), "LONGHAUL_FILTERS=off stops it first, as on Claude Code")
-        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root))
+        for off in ({"LONGHAUL_FILTERS": "off"}, {}, {"LONGHAUL_FILTERS": "bogus"}):  # off by default (2026-11-06)
+            out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root), **off)
+            self.assertEqual((out.returncode, out.stdout), (0, b""))
+            self.assertFalse((root / "imported").exists(), f"{off} stops it first, as on Claude Code")
+        out = self.shell(self.prelude(), big, PLUGIN_ROOT=str(root), LONGHAUL_FILTERS="shadow")
         self.assertEqual((out.returncode, out.stdout, out.stderr), (0, b"", b""))
         self.assertEqual(json.loads((root / "ran.json").read_text()),
                          {"argv": ["filter", "--agent", "codex"], "stdin": big.decode()}, "the input as it came")
@@ -6701,8 +6702,9 @@ class Filter(unittest.TestCase):
         self.assertIsNone(self.check(self.data("grep x y", "a:1:b\n" * 20), "lossless"), "small")
 
     def test_shadow_changes_nothing_and_logs_what_each_level_would_cut(self):
-        self.assertEqual(longhaul.filter_mode(), "shadow", "the default until a week of it is measured")
-        for value, mode in (("off", "off"), ("lossless", "lossless"), ("on", "on"), ("bogus", "shadow")):
+        self.assertEqual(longhaul.filter_mode(), "off", "the default since the shadow week (2026-11-06)")
+        for value, mode in (("off", "off"), ("shadow", "shadow"), ("lossless", "lossless"), ("on", "on"),
+                            ("bogus", "off")):
             os.environ["LONGHAUL_FILTERS"] = value
             self.assertEqual(longhaul.filter_mode(), mode)
         self.assertIsNone(self.check(self.data("./build.sh", self.build_log(), agent="a1"), "shadow"))
@@ -6896,7 +6898,8 @@ class CodexFilter(unittest.TestCase):
     discovery/2026-10-28-codex-hooks.md). So on Codex the filter stays in
     shadow whatever LONGHAUL_FILTERS says, but off: it measures and logs by
     size, and changes, saves and answers nothing. Decision 4 is the
-    owner's, later, on these numbers."""
+    owner's, later, on these numbers. Off by default since 2026-11-06, as
+    on Claude Code, so these tests name a mode; with none it does nothing."""
 
     SID = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e9f"
     AGENT = "019f9d8f-0000-7000-8000-000000000001"
@@ -6914,7 +6917,12 @@ class CodexFilter(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)  # the user's own settings are not this test's
-        os.environ.pop("LONGHAUL_FILTERS", None)
+        os.environ["LONGHAUL_FILTERS"] = "shadow"  # off by default since 2026-11-06: these tests measure
+
+    def test_with_no_mode_named_it_does_nothing_and_logs_nothing(self):
+        os.environ.pop("LONGHAUL_FILTERS")
+        self.assertEqual(self.hook(self.post("./build.sh", self.build_log())), "")
+        self.assertFalse((self.home / "filters").exists(), "off by default (the owner, 2026-11-06)")
 
     def grep(self):
         """grep's matches: lossless would cut them, on no more."""
@@ -6988,13 +6996,13 @@ class CodexFilter(unittest.TestCase):
 
     def test_lossless_and_on_stay_shadow_under_codex_and_give_no_answer(self):
         # A cut would reach the model as the tool's error, so none is made (decision 4, the owner's).
-        values = ("lossless", "on", "shadow", "bogus", "")
+        values = ("lossless", "on", "shadow", "bogus", "")  # the last two are off since 2026-11-06
         for i, value in enumerate(values):
             with self.subTest(value=value):
                 data = self.post("./build.sh", self.build_log(), tool_use_id=f"call_{i}")
                 self.assertEqual(self.hook(data, value), "")
         self.assertEqual([(n["id"], n["mode"], n["applied"]) for n in self.logged()],
-                         [(f"call_{i}", "shadow", False) for i in range(len(values))])
+                         [(f"call_{i}", "shadow", False) for i in range(3)])
         self.assertTrue(all(n["shown"] == n["chars"] and n["dropped"] > 0 for n in self.logged()))
         data = longhaul.codex_hook_input(self.post("grep -rn compute_value src/service", self.grep()))
         for mode in ("lossless", "on"):

@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import sys, io, json, os\ntry:\n    b = sys.stdin.buffer.read(1000001); raw = b.decode(\"utf-8\", \"replace\")\n    d = json.loads(raw); r = d.get(\"tool_response\") if isinstance(d, dict) else None\n    big = len(b) <= 1000000 and isinstance(r, str) and len(r) >= 1500\nexcept Exception:\n    big = False\nif big and os.environ.get(\"LONGHAUL_FILTERS\") != \"off\":\n    try:\n        sys.stderr = open(os.devnull, \"w\"); sys.path.insert(0, sys.argv[1]); import longhaul\n        sys.stdin = io.StringIO(raw); longhaul.main([\"filter\", \"--agent\", \"codex\"])\n    except BaseException:\n        pass\nsys.exit(0)' \"$PLUGIN_ROOT\"",
+            "command": "python3 -I -c 'import sys, io, json, os\ntry:\n    b = sys.stdin.buffer.read(1000001); raw = b.decode(\"utf-8\", \"replace\")\n    d = json.loads(raw); r = d.get(\"tool_response\") if isinstance(d, dict) else None\n    big = len(b) <= 1000000 and isinstance(r, str) and len(r) >= 1500\nexcept Exception:\n    big = False\nif big and os.environ.get(\"LONGHAUL_FILTERS\") in (\"shadow\", \"lossless\", \"on\"):\n    try:\n        sys.stderr = open(os.devnull, \"w\"); sys.path.insert(0, sys.argv[1]); import longhaul\n        sys.stdin = io.StringIO(raw); longhaul.main([\"filter\", \"--agent\", \"codex\"])\n    except BaseException:\n        pass\nsys.exit(0)' \"$PLUGIN_ROOT\"",
             "timeout": 5,
             "statusMessage": "Measuring this output (longhaul filter, in shadow)"
           }

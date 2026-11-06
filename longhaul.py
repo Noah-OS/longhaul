@@ -292,9 +292,9 @@ Usage:
                           to reopen
   longhaul filter               the plugin's PostToolUse hook on Bash: hands Claude a
                           shorter output where nothing is lost, or with the whole
-                          output saved and named (LONGHAUL_FILTERS: shadow, the
-                          default, changes nothing and logs what it would cut;
-                          lossless; on; off)
+                          output saved and named (LONGHAUL_FILTERS: off, the
+                          default; shadow changes nothing and logs what it
+                          would cut; lossless; on)
   longhaul autocompact-note SID TOKENS
                           what the plugin's hooks module runs once it has run
                           /compact at the end of the turn in which a chat saved
@@ -7041,9 +7041,10 @@ def guard(opts) -> int:
 # a command, before its output reaches the model, and may hand Claude Code
 # a shorter output in the same shape (updatedToolOutput, Claude Code
 # 2.1.310 on): the command itself is never rewritten. LONGHAUL_FILTERS
-# says how far it goes:
-# - shadow, the default until a week of it is measured: it changes
-#   nothing, and logs by size alone what the two levels below would cut;
+# says how far it goes (off by default since 2026-11-06, filter_mode()):
+# - shadow, the default for its measured week (2026-10-27 to 11-06): it
+#   changes nothing, and logs by size alone what the two levels below
+#   would cut;
 # - lossless: only steps after which nothing Claude could need is gone.
 #   Colour codes, carriage-return redraws and trailing blanks go; three or
 #   more identical lines are said once with their count; grep's matches
@@ -7056,7 +7057,7 @@ def guard(opts) -> int:
 #   FILTER_KEEP_DAYS; at FILTER_STORE_MAX nothing more is dropped), and
 #   one line names the file, the lines left out and how many of them
 #   mention an error;
-# - off.
+# - off, the default: hooks.json's prelude exits before loading Longhaul.
 # Left alone: output under FILTER_SMALL characters; a command that prints
 # files (FILTER_PRINTS, git diff, git show), or one the shell could not
 # be split safely; a format the user chose (FILTER_FORMAT); an image, a
@@ -7178,8 +7179,14 @@ FILTER_TABLE = (
 
 
 def filter_mode() -> str:
-    mode = os.environ.get("LONGHAUL_FILTERS") or "shadow"
-    return mode if mode in FILTER_MODES else "shadow"
+    """LONGHAUL_FILTERS, read at call time: off unless it names a mode.
+    Off by default since the owner's decision of 2026-11-06, after the
+    shadow week (docs/live/2026-11-06-token-gates): lossless would have
+    cut 0.35% of Bash output and on 1.24%, with on's cuts used again 12.8%
+    of the time, against a hook that loaded Longhaul on 4 in 10 Bash
+    outputs. hooks.json's prelude loads Longhaul only for a mode named."""
+    mode = os.environ.get("LONGHAUL_FILTERS") or "off"
+    return mode if mode in FILTER_MODES else "off"
 
 
 def filter_commands(command):
