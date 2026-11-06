@@ -16599,6 +16599,21 @@ class Panel(StreamHarness):
         self.assertEqual(p.wait(10), 0)
         self.assertEqual(self.calls()[0]["config"], str(self.pro), "Max is nearly full")
 
+    def test_a_panel_job_is_logged_only_in_debug_and_a_chats_launch_always(self):
+        # Log audit row #18, 2026-11-06: 639 short-job lines in two weeks, read
+        # by nothing. The chat's launch line is not routine.
+        p = self.start(["--version"])
+        self.assertEqual(self.output(), b"fake job done")
+        self.assertEqual(p.wait(10), 0)
+        self.assertNotIn("panel job on", self.log_text())
+        self.plan(["reply"])
+        self.chat_said_hello()
+        self.assertIn("panel chat on ", self.log_text())
+        p = self.start(["--version"], LONGHAUL_LOG="debug")
+        self.assertEqual(self.output(), b"fake job done")
+        self.assertEqual(p.wait(10), 0)
+        self.assertIn("panel job on Max: ", self.log_text())
+
     def chat_said_hello(self, **env):
         """A panel chat that says hello and ends: (its process, claude's launch)."""
         p = self.start(**env)
