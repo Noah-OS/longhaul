@@ -11377,16 +11377,16 @@ class Checkpoint(unittest.TestCase):
                       "facts[2] is 1,300 characters; the cap is 1,000", out.stderr)
         self.assertEqual(json.loads(self.file().read_text())["goal"], "y" * 999 + "…", "a refusal changes nothing")
         # A total a little over 16,000 bytes is saved and says so.
-        short = [f"{'d' * 740} {i:02}" for i in range(20)]
+        short = [f"{'d' * 780} {i:02}" for i in range(20)]
         record = {"schema_version": 1, "session_id": "s1", "written_at": time.time(), "cwd": str(self.work),
-                  **self.state(done=short, decisions=short)}
+                  **self.state(done=short)}
         size = len(json.dumps(record, indent=2)) + 1
         self.assertTrue(16_000 < size < 17_600, size)
-        out = self.save(self.state(done=short, decisions=short), "s1")
+        out = self.save(self.state(done=short), "s1")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("bytes is over the 16,000 cap, saved all the same", out.stdout)
         # Past 10% it is refused with the size against the cap.
-        out = self.save(self.state(done=[f"{'d' * 900} {i:02}" for i in range(20)], decisions=short), "s1")
+        out = self.save(self.state(done=[f"{'d' * 900} {i:02}" for i in range(20)]), "s1")
         self.assertEqual(out.returncode, 2, out.stderr)
         self.assertRegex(out.stderr, r"[\d,]+ bytes in all; the cap is 16,000")
         # A checkpoint read back is held to the cap as it was: no cut there.
