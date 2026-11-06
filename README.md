@@ -192,6 +192,8 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_FILTERS` | `shadow` | `lossless`, `on` or `off` |
 | `LONGHAUL_INDEX` | on | CodeGraph's index only; `all`: CodeGraph's and Trail-Code's; `off`: no code index built |
 | `LONGHAUL_SWITCH` | `ask` | `auto` or `never`; overrides `longhaul switch` |
+| `LONGHAUL_API_RETRY` | on | `off`: no carry-on in the VS Code panel a minute after a turn stopped on an API server error |
+| `LONGHAUL_LOG` | routine lines left out | `debug`: every line, reminder checks below the threshold and short panel jobs included |
 | `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
 
 `longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul -h`, or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).

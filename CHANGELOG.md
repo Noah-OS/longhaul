@@ -2,6 +2,27 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.7 - 2026-11-06
+
+A turn stopped by an API server error is carried on once in the VS Code panel, and the log audit's smaller fixes: short ids for `longhaul -r`, checkpoint saves a little over their caps, a calmer log, no 20 s hold for a rate limit that never stops the turn.
+
+### Added
+
+- **One retry after an API server error, in the panel.** When a turn stops on a `server_error` (72 times in two weeks, each after Claude Code's own retries), the panel waits a minute and, if nothing else happened in the chat, sends "The last turn stopped on an API server error. Carry on where you left off." Once per streak: if the retried turn stops the same way, it says so once and sends nothing more. Not in `longhaul pipe`; `LONGHAUL_API_RETRY=off` turns it off.
+- **A server error is said in a notification elsewhere.** In a terminal chat, and in a panel chat without the retry, the StopFailure hook says "This turn stopped on an API server error; prompt again to carry on." once per stop.
+- **`LONGHAUL_LOG=debug`** writes every line to `~/.longhaul/longhaul.log`. By default the log now leaves out reminder checks below the threshold and short panel jobs, which made up about a third of it. No line's text changed.
+
+### Fixed
+
+- **`longhaul -r 5ca8a797` works with a short id.** A short id (4 or more characters, any case) is expanded to the full one from the transcripts' file names in every account's projects folder, and said. Several matches or none are refused with exit 2, listing the matches. Before, the short id went to Claude Code as typed; Claude Code exited at once, and Longhaul took that for a crash and reopened it. A `--resume` that Claude Code refuses at once is no longer taken for a crash, and its lock file is removed.
+- **A checkpoint a little over its caps is saved.** A text up to 10% over its 1,000-character cap is cut at a word and ends in "…", and a total up to 10% over 16,000 bytes is saved; the save's line says which. Further over, the refusal names every field over its cap, with its size, and keeps the state file, so Claude edits that field and saves again instead of writing the whole checkpoint again (40 refusals in two weeks, each a rewrite). A refusal for a value shaped like a credential still removes the file.
+- **A rate limit Claude Code got past no longer holds your next message for 20 s.** The panel held its lines after any rejected `rate_limit_event`: 18 times with no stop after it. Now nothing is held while the account is already at its limit or a question or carry-on is open, and a hold ends as soon as the main thread replies or the turn ends with no limit stop.
+- **The sign-in check waits 20 s instead of 10.** With no answer by then, a remembered answer under a day old that says the account was signed in as expected is used quietly. The terminal now keeps the same answers the panel does.
+- **`longhaul remove NAME` clears that account's recorded limit and sign-in failure.** The usage ledger, the history and the account's folder are kept.
+- **`longhaul add --repo PATH`** keeps a path that does not exist yet with the same note as `longhaul folders --add`.
+- **An account whose folders include `/` is shown as "everywhere (its folders include /)"** in `longhaul folders`, `longhaul status`, the doctor and `/accounts`, not "only in /".
+- **The panel's relay reads the account a chat runs on whole.** A change to `accounts.json` while a chat ran could, for a moment, name the wrong account to another thread (0.3.6).
+
 ## 0.3.6 - 2026-11-05
 
 Where an account may be used can be changed, in `/accounts` and with `longhaul folders`, and an account used nowhere says why. Running chats see account and setting changes, and a carry-on is no longer cancelled by a line that was no reply. Trail-Code's map is no longer built by default.
