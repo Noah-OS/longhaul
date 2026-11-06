@@ -916,6 +916,66 @@ class Loop(unittest.TestCase):
         self.assertEqual(calls[0]["args"][:2], ["--resume", "557ce21f-c99c-49f0-93e5-22ae7d1d1ae7"])
         self.assertIn("docs · Max", calls[0]["args"])
 
+    def project_file(self, base, project, sid):
+        path = base / "projects" / project / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        return path
+
+    def test_a_short_id_in_capitals_expands_and_is_said_in_one_line(self):
+        self.project_file(self.max, "-tmp-proj", "5ca8a797-1111-4222-8333-444455556666")
+        out, calls = self.run_longhaul(["exit"], "-r", "5CA8a797", runs=1)
+        self.assertEqual(calls[0]["args"][:2], ["--resume", "5ca8a797-1111-4222-8333-444455556666"])
+        self.assertIn("resuming 5ca8a797-1111-4222-8333-444455556666", out.stdout)
+
+    def test_a_short_id_is_found_in_an_accounts_own_projects_folder(self):
+        # Not linked to the default one: Pro keeps a real file of its own.
+        (self.home / "accounts.json").write_text(json.dumps(
+            [{"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(self.pro)}]))
+        self.project_file(self.pro, "-tmp-other", "7d2e0c11-1111-4222-8333-444455556666")
+        _, calls = self.run_longhaul(["exit"], "-r", "7d2e0c11", runs=1)
+        self.assertEqual(calls[0]["args"][:2], ["--resume", "7d2e0c11-1111-4222-8333-444455556666"])
+
+    def test_one_conversation_reached_through_a_linked_projects_folder_counts_once(self):
+        real = self.project_file(self.max, "-tmp-proj", "5ca8a797-1111-4222-8333-444455556666")
+        (self.pro / "projects").symlink_to(self.max / "projects")
+        (self.home / "accounts.json").write_text(json.dumps(
+            [{"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(self.pro)}]))
+        _, calls = self.run_longhaul(["exit"], "-r", "5ca8", runs=1)
+        self.assertEqual(calls[0]["args"][:2], ["--resume", real.stem])
+
+    def test_a_short_id_several_conversations_start_with_is_refused_with_a_list(self):
+        for tail in ("1111", "2222"):
+            self.project_file(self.max, "-tmp-proj", f"5ca8a797-{tail}-4222-8333-444455556666")
+        out, calls = self.run_longhaul(["exit"], "-r", "5ca8", runs=1)
+        self.assertEqual((out.returncode, calls), (2, []))
+        self.assertIn("2 conversations start with 5ca8", out.stdout)
+        for tail in ("1111", "2222"):
+            self.assertIn(f"5ca8a797-{tail}-4222-8333-444455556666", out.stdout)
+        self.assertEqual(list((self.home / "locks").glob("*")) if (self.home / "locks").exists() else [], [])
+
+    def test_a_short_id_no_conversation_starts_with_is_refused(self):
+        self.project_file(self.max, "-tmp-proj", "5ca8a797-1111-4222-8333-444455556666")
+        out, calls = self.run_longhaul(["exit"], "-r", "deadbeef", runs=1)
+        self.assertEqual((out.returncode, calls), (2, []))
+        self.assertIn("no conversation starting with deadbeef", out.stdout)
+
+    def test_a_whole_id_a_name_and_a_very_short_id_go_to_claude_as_typed(self):
+        whole = "00000000-0000-4000-8000-000000000000"
+        for typed in (whole, "my refactor", "5ca"):
+            _, calls = self.run_longhaul(["exit"], "-r", typed, runs=1)
+            self.assertEqual(calls[-1]["args"][:2], ["--resume", typed])
+
+    def test_a_resume_claude_refuses_at_once_is_not_a_crash_to_reopen_and_leaves_no_lock(self):
+        # The log audit of 2026-11-05, #6: claude 2.1.311 exits 1 on an id it
+        # cannot find, writing no session record.
+        out, calls = self.run_longhaul(["refuse", "exit"], "-r", "sid-nothing-here", runs=3)
+        self.assertEqual(len(calls), 1, out.stdout)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("exited with code 1 straight away on `--resume sid-nothing-here`", out.stdout)
+        self.assertNotIn("Reopening", out.stdout + out.stderr)
+        self.assertFalse((self.home / "locks" / "sid-nothing-here.lock").exists())
+
     def test_a_conversation_still_open_elsewhere_is_not_opened_twice(self):
         sessions = self.max / "sessions"
         sessions.mkdir()
@@ -21437,6 +21497,92 @@ class Accounts(unittest.TestCase):
             code = longhaul.main(["remove", name])
         return code, out.getvalue()
 
+    def test_remove_clears_the_accounts_limit_and_sign_in_failure_and_keeps_the_rest(self):
+        # The log audit of 2026-11-05, #15: a removed account's limit and
+        # sign-in failure stayed in Longhaul's files. The ledger, the other
+        # accounts' entries and the account's folder are left as they were.
+        team = self.tmp / "team"
+        team.mkdir()
+        (team / "keep.txt").write_text("x")
+        (self.relay / "accounts.json").write_text(json.dumps(self.accounts() + [
+            {"name": "Team", "config_dir": str(team), "email": "team@example.com"}]))
+        until = time.time() + 3600
+        (self.relay / "state.json").write_text(json.dumps({"limited_until": {"Team": until, "Max": until + 1},
+                                                           "handled_limits": ["u1"]}))
+        (self.relay / longhaul.SIGN_IN_FAILED).write_text(json.dumps({"Team": 100, "Max": 200}))
+        (self.relay / "ledger.jsonl").write_text('{"account": "Team"}\n')
+        out = self.longhaul("remove", "team")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        state = json.loads((self.relay / "state.json").read_text())
+        self.assertEqual(state["limited_until"], {"Max": until + 1})
+        self.assertEqual(state["handled_limits"], ["u1"])
+        self.assertEqual(json.loads((self.relay / longhaul.SIGN_IN_FAILED).read_text()), {"Max": 200})
+        self.assertEqual((self.relay / "ledger.jsonl").read_text(), '{"account": "Team"}\n')
+        self.assertEqual((team / "keep.txt").read_text(), "x")
+
+    def test_remove_writes_no_state_or_sign_in_file_when_it_has_nothing_of_the_account(self):
+        team = self.tmp / "team"
+        (self.relay / "accounts.json").write_text(json.dumps(self.accounts() + [
+            {"name": "Team", "config_dir": str(team), "email": "team@example.com"}]))
+        self.assertEqual(self.longhaul("remove", "Team").returncode, 0)
+        self.assertFalse((self.relay / "state.json").exists())
+        self.assertFalse((self.relay / longhaul.SIGN_IN_FAILED).exists())
+
+    def auth_in_process(self, acct, status, cached=None, fn="signed_in_as_expected"):
+        """`fn` of longhaul in this process, auth_status() answering `status`,
+        AUTH_CACHE holding `cached`: (the answer, the log lines, the cache)."""
+        cache = self.relay / "auth-cache.json"
+        if cached is not None:
+            cache.write_text(json.dumps({str(self.max): cached}))
+        lines = []
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", self.relay), mock.patch.object(longhaul, "AUTH_CACHE", cache), \
+                mock.patch.object(longhaul, "auth_status", return_value=status), \
+                mock.patch.object(longhaul, "log", side_effect=lines.append), \
+                mock.patch.object(longhaul, "say", side_effect=lines.append), \
+                mock.patch.object(longhaul, "notify") as notified:
+            if fn == "signed_in_as_expected":
+                answer = longhaul.signed_in_as_expected(acct)
+            else:
+                answer = longhaul.signed_in_cached(acct, "claude")
+        self.assertFalse(notified.called, "a stand-in answer notifies no one")
+        return answer, lines, json.loads(cache.read_text()) if cache.exists() else {}
+
+    TIMEOUT = {"loggedIn": False, "unknown": True, "why": "no answer in 20s"}
+
+    def test_the_sign_in_check_waits_20_seconds_by_default(self):
+        self.assertEqual(longhaul.AUTH_TIMEOUT, 20)
+
+    def test_a_check_with_no_answer_uses_a_remembered_answer_under_a_day_old_quietly_in_the_terminal_and_the_panel(self):
+        # The log audit of 2026-11-05, #11: "no answer in 10 s, trusting it"
+        # eleven times. The terminal's check now writes and reads the cache
+        # the panel uses.
+        acct = {"name": "Max", "config_dir": str(self.max), "email": "first@example.com"}
+        for fn in ("signed_in_as_expected", "signed_in_cached"):
+            fresh = {"email": "FIRST@example.com", "at": time.time() - 23 * 3600}
+            answer, lines, _ = self.auth_in_process(acct, self.TIMEOUT, fresh, fn)
+            self.assertTrue(answer, fn)
+            self.assertEqual(len(lines), 1, lines)
+            self.assertNotIn("trusting it", lines[0])
+            self.assertIn("signed in as expected", lines[0])
+
+    def test_a_check_with_no_answer_and_no_usable_cache_keeps_trusting_it_with_the_warning(self):
+        acct = {"name": "Max", "config_dir": str(self.max), "email": "first@example.com"}
+        for cached in (None, {"email": "first@example.com", "at": time.time() - 25 * 3600},
+                       {"email": "someone@example.com", "at": time.time() - 3 * 3600},
+                       {"email": "first@example.com", "at": "x"}, ["x"]):
+            for fn in ("signed_in_as_expected", "signed_in_cached"):
+                answer, lines, _ = self.auth_in_process(acct, self.TIMEOUT, cached, fn)
+                self.assertTrue(answer)
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn("trusting it for this launch", lines[0])
+
+    def test_the_terminals_check_writes_the_answer_it_got_to_the_panels_cache(self):
+        acct = {"name": "Max", "config_dir": str(self.max), "email": "first@example.com"}
+        answer, _, cache = self.auth_in_process(acct, {"loggedIn": True, "email": "first@example.com"})
+        self.assertTrue(answer)
+        self.assertEqual(cache[str(self.max)]["email"], "first@example.com")
+        self.assertAlmostEqual(cache[str(self.max)]["at"], time.time(), delta=30)
+
     def test_longhaul_remove_names_the_chats_still_running_on_the_account_and_what_happens(self):
         # The log audit of 2026-11-05 (#1): a chat ran on an account removed
         # hours before, and every prompt was refused.
@@ -21519,7 +21665,8 @@ class Accounts(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(self.accounts()[-1], {"name": "Team", "config_dir": str(team), "email": "team@example.com",
                                                "repositories": [str(work), "~/later"]}, "kept as given, as --dir is")
-        self.assertIn("--repo ~/later does not exist yet; kept for when it does", out.stdout)
+        self.assertIn("~/later does not exist yet; kept for when it does", out.stdout)
+        self.assertNotIn("--repo ~/later does not exist", out.stdout, "folders --add's words (2026-11-06)")
         self.assertIn(f"added Team (team@example.com), folder {team}, only in ~/work, ~/later; signing it in now",
                       out.stdout)
 
@@ -21687,7 +21834,7 @@ class Folders(unittest.TestCase):
             "PATH` (or take / off their lists)."])
         out = self.longhaul("folders", "personal-1")
         self.assertEqual(self.said(out), [
-            "personal-1 may be used only in /.",
+            "personal-1 may be used everywhere (its folders include /).",
             "With / among its folders, personal-1 keeps every folder, so spare is used nowhere until its folders "
             "are set."])
         self.assertEqual(self.said(self.longhaul("folders", "work")), ["work may be used only in ~/work."],
@@ -21897,6 +22044,9 @@ class Folders(unittest.TestCase):
                       "until its folders are set: in /accounts, on spare's page, or with `longhaul folders spare --add "
                       "PATH` (or take / off its list).", lines[at + 1:at + 4], out.stdout)
         self.assertNotIn("       anywhere", lines, "it is used nowhere: not said to be used anywhere")
+        [keeper] = [i for i, line in enumerate(lines) if line.startswith("personal-1 ")]
+        self.assertIn("       everywhere (its folders include /)", lines[keeper + 1:keeper + 3], out.stdout)
+        self.assertNotIn("only in: /", out.stdout, "2026-11-06: a list holding / is not a narrow one")
         # The doctor, in this process, with HOME the scratch folder there too,
         # so `~` is never the machine's.
         for name in ("personal-1", "spare", "work"):
@@ -21908,7 +22058,7 @@ class Folders(unittest.TestCase):
             c = longhaul.doctor_accounts()
         self.assertEqual(c["mark"], "warn", c)
         items = {text: mark for mark, text, *_ in c["items"]}
-        self.assertEqual(items, {"personal-1: ~/.claude-personal-1, only in /": "ok",
+        self.assertEqual(items, {"personal-1: ~/.claude-personal-1, everywhere (its folders include /)": "ok",
                                  "spare: ~/.claude-spare, used nowhere: personal-1 keeps every folder": "warn",
                                  "work: ~/.claude-work, only in ~/work": "ok"})
         self.assertIn("`longhaul folders spare --add PATH`", c["step"])
