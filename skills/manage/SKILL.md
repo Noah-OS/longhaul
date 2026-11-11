@@ -1,6 +1,6 @@
 ---
 name: manage
-description: "Run Longhaul's setup from this chat: add, sign in or remove an account, switching, subagent models, the VS Code panel, the status line, auto-update, clearing limits, uninstalling. Each change runs only after the user's yes."
+description: "Run Longhaul's setup from this chat: accounts (add, sign in, remove, pick a chat's), switching, subagent models, the VS Code panel, the status line, auto-update, clearing limits, uninstalling. Each change runs only after the user's yes."
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul models) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run)
 ---
 
@@ -28,7 +28,7 @@ Accounts:
 - Take one off the list: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay. To delete its folder as well, tell the user first that its sign-in and the chat history kept in that folder go for good; on their yes, run `${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME --delete-folder --yes`. It refuses, nothing changed, a folder it may not delete (the default one, one another account uses, one a chat still runs on: this chat's own account cannot be deleted from this chat), and says why; show that.
 - Where one may be used (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME`. Change it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --add PATH` (a folder it may be used in, and those inside it), `--remove PATH`, each PATH starting with / or ~/ and repeatable, or `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --anywhere` (drops its list). A folder on an account's list is kept for the accounts that list it, so say which other accounts that leaves out, as the command's output does.
 
-Two account actions run in a terminal for now (the plugin's shim does not let them through from a chat yet): give the user the line to type there, `longhaul` in place of the full path, and say what it changes.
+Which account a chat runs on, and which a folder prefers:
 - Run this chat on one account from now on: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul use NAME`. A VS Code panel chat moves the next time Claude is idle in it; any other chat starts there when it is next opened, and the command says which. It refuses an account not allowed in this chat's folder, one at its usage limit (`${CLAUDE_PLUGIN_ROOT}/bin/longhaul clear NAME` forgets a limit that is over), or one not signed in as expected. It is no lock: at a usage limit the switching mode decides, as for any chat.
 - Prefer an account in a folder: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --prefer PATH`; `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --no-prefer PATH` takes it off. A new chat in PATH or a folder inside it, and a chat there that moves at a usage limit, goes to NAME first while it has room; a reopened chat goes back to the account it ran on. A PATH the account may not be used in is refused, with why.
 
