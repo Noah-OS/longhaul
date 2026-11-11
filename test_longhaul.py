@@ -22658,12 +22658,20 @@ class RemoveDeleteFolder(unittest.TestCase):
     def test_the_doctor_lists_leftover_claude_folders_no_account_uses_by_name_and_size(self):
         # Plain remove keeps the folder; the doctor names what is left, in
         # full runs only (not the first-chat line's quick checks).
-        old = self.tmp / ".claude-old"
+        old, empty = self.tmp / ".claude-old", self.tmp / ".claude-empty"
         (old / "projects" / "-work").mkdir(parents=True)
         (old / "projects" / "-work" / "s9.jsonl").write_text("x" * 3000)
         (old / "projects" / "-work" / "s9.jsonl").chmod(0)
-        (self.tmp / ".claude-empty").mkdir()
-        (self.tmp / ".claude-relay").mkdir()
+        empty.mkdir()
+        for folder in (old, empty):
+            (folder / ".claude.json").touch()
+        # Not a Claude config folder (no .claude.json): a former Longhaul home, say.
+        (self.tmp / ".claude-state").mkdir()
+        (self.tmp / ".claude-state" / "accounts.json").write_text("[]")
+        (self.tmp / ".claude-home").mkdir()
+        (self.tmp / ".claude-home" / ".claude.json").touch()
+        self.home = self.tmp / ".claude-home"  # Longhaul's own home, whatever its name
+        self.write_accounts(self.entry("Max"), self.entry("Team"))
         (self.tmp / ".claude-alias").symlink_to(self.team)
         (self.tmp / ".claude-gone").symlink_to(self.tmp / "nowhere")
         (self.tmp / ".claude-notes").write_text("x")

@@ -16698,22 +16698,24 @@ def doctor_accounts(quick: bool = False) -> dict:
 def doctor_leftovers(accounts: list) -> list:
     """The ~/.claude-* folders no listed account uses (2026-11-11), each
     as "~/.claude-x (size)": plain `longhaul remove` keeps a removed
-    account's folder. ~/.claude-relay, links, files, the default folder
-    and the CLAUDE_CONFIG_DIR this runs under are passed over. Only names
-    and sizes are read (folder_size()), never a file."""
+    account's folder. Only a Claude config folder counts, one holding a
+    .claude.json (Claude Code writes it in each folder it signs in to):
+    a folder of another kind with such a name, a former Longhaul home
+    among them, is passed over, as are Longhaul's own home, links, files,
+    the default folder and the CLAUDE_CONFIG_DIR this runs under. Only
+    names and sizes are read (folder_size()), never a file."""
     used = {os.path.realpath(config_of(a)) for a in accounts
             if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)}
-    used.add(os.path.realpath(DEFAULT_CONFIG))
+    used |= {os.path.realpath(DEFAULT_CONFIG), os.path.realpath(LONGHAUL_HOME)}
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         used.add(os.path.realpath(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"])))
     try:
         with os.scandir(HOME) as found:
-            names = sorted(e.name for e in found if e.name.startswith(".claude-") and e.name != ".claude-relay"
-                           and e.is_dir(follow_symlinks=False))
+            names = sorted(e.name for e in found if e.name.startswith(".claude-") and e.is_dir(follow_symlinks=False))
     except OSError:
         return []
     return [f"{home_path(str(HOME / n))} ({size_text(folder_size(str(HOME / n)))})" for n in names
-            if os.path.realpath(HOME / n) not in used]
+            if os.path.realpath(HOME / n) not in used and os.path.lexists(HOME / n / ".claude.json")]
 
 
 def doctor_claude_word(words: list) -> int | None:
