@@ -22864,6 +22864,303 @@ class Fallback(unittest.TestCase):
                                                                "work (fallback): ~/.claude-work, only in ~/work"])
 
 
+class Use(unittest.TestCase):
+    """`longhaul use NAME [--chat ID]` (the owner, 2026-11-11: "I need to be
+    able to manually choose the account I work on, per session"): the
+    account one chat runs on from now on. Its checks, the choice it writes
+    (LONGHAUL_HOME/uses/<chat>.json), what it says by where the chat is,
+    and the next open taking the choice (take_choice()). The relay's side
+    is UseRelay's and PanelUse's. Every path is scratch, HOME too; claude
+    is fake_stream.py, which answers `auth status` from FAKE_EMAILS."""
+
+    SID = "5f0c2a9e-1111-4222-8333-944455556666"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # resolved, so `~` is shown for it (/var is a link on a Mac)
+        self.home, self.claude, self.work = self.tmp / "home", self.tmp / "claude", self.tmp / "work"
+        for d in (self.home, self.claude / "projects" / "-work", self.work / ".git"):
+            d.mkdir(parents=True)
+        self.listed = [{"name": "Max", "config_dir": str(self.tmp / "max"), "email": "first@example.com"},
+                       {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "second@example.com"},
+                       {"name": "zain", "config_dir": str(self.tmp / "zain"), "email": "third@example.com",
+                        "repositories": [str(self.tmp / "zain-repo")]}]
+        (self.home / "accounts.json").write_text(json.dumps(self.listed))
+        self.emails = {a["config_dir"]: a["email"] for a in self.listed}
+        self.transcript(self.SID, self.work)
+        self.record(self.SID, "Max")
+
+    def transcript(self, sid, cwd=None):
+        """A scratch transcript of chat `sid`, its one line naming the folder `cwd` (none: no cwd)."""
+        line = {"type": "user", **({"cwd": str(cwd)} if cwd else {})}
+        (self.claude / "projects" / "-work" / f"{sid}.jsonl").write_text(json.dumps(line) + "\n")
+
+    def record(self, sid, account):
+        (self.home / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+        (self.home / "usage" / "sessions" / f"{sid}.json").write_text(json.dumps({"account": account}))
+
+    def recorded(self, sid=None):
+        return json.loads((self.home / "usage" / "sessions" / f"{sid or self.SID}.json").read_text()).get("account")
+
+    def choice(self, sid=None):
+        path = self.home / "uses" / f"{sid or self.SID}.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def held(self, entrypoint, sid=None):
+        """A live claude holding the chat, as Claude Code records one in its
+        sessions folder: this test's own process, which longhaul's is not."""
+        (self.claude / "sessions").mkdir(exist_ok=True)
+        (self.claude / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": sid or self.SID, "entrypoint": entrypoint}))
+
+    def log_text(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def longhaul(self, *args, cwd=None, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_AUTH_TTL="0",
+                   FAKE_EMAILS=json.dumps(self.emails), LONGHAUL_USE_WAIT_SECONDS="0.5")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env, cwd=str(cwd or self.tmp),
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_a_chat_not_open_starts_on_the_account_at_its_next_open_its_record_moved(self):
+        short = self.SID[:8]
+        out = self.longhaul("use", "pro", "--chat", short)  # any case, as `longhaul folders` takes a name
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {short} is not open: this takes effect when it is next opened, in the "
+                                     f"panel or with `longhaul -r {short}` in a terminal, and it starts on Pro.\n")
+        choice = self.choice()
+        self.assertRegex(choice.pop("id"), r"^u-[0-9a-f]{12}$")
+        self.assertAlmostEqual(choice.pop("at"), time.time(), delta=30)
+        self.assertEqual(choice, {"chat": self.SID, "account": "Pro"}, "the whole id, the account as listed")
+        self.assertEqual((self.home / "uses" / f"{self.SID}.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "uses").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.recorded(), "Pro", "the record too, as the spec's next open in ask and never reads it")
+        self.assertIn(f"use: {self.SID} is to run on Pro (it runs on Max)", self.log_text())
+
+    def test_from_inside_a_chat_it_is_that_chat_and_outside_one_it_asks_for_chat(self):
+        out = self.longhaul("use", "Pro", cwd=self.work)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(out.stderr, "longhaul use: this runs outside a chat, so it cannot tell which chat to move: "
+                                     "name it with --chat ID (the chat's id, or its first characters)\n")
+        self.assertFalse((self.home / "uses").exists())
+        # From the chat itself, open in a terminal: Claude Code's Bash tool
+        # names it, and its account is its config folder's.
+        self.held("cli")
+        inside = {"CLAUDE_CODE_SESSION_ID": self.SID, "CLAUDE_CONFIG_DIR": str(self.tmp / "max")}
+        out = self.longhaul("use", "Pro", cwd=self.work, **inside)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs in a terminal now, where Longhaul does not move it "
+                                     f"while it runs: quit Claude there and run `longhaul -r {self.SID[:8]}`, and it "
+                                     "starts on Pro.\n")
+        self.assertEqual(self.choice()["account"], "Pro")
+        # The chat's own config folder says where it runs, not its record.
+        self.record(self.SID, "Pro")
+        out = self.longhaul("use", "Max", cwd=self.work, **inside)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs on Max already; the earlier choice of Pro is "
+                                     "dropped.\n")
+        self.assertIsNone(self.choice())
+
+    def test_a_panel_chat_no_relay_takes_it_from_is_told_to_reopen(self):
+        self.held("claude-vscode")
+        started = time.time()
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertGreaterEqual(time.time() - started, 0.5, "it waited for a relay first")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} is open in the VS Code panel with no relay of Longhaul's "
+                                     "that could move it while it runs (in the VS Code panel: \"switch_mid_session\" "
+                                     "is false, or the chat was opened before the panel ran Longhaul): this takes "
+                                     "effect when the chat is next opened. Close it and open it again, and it starts "
+                                     "on Pro.\n")
+        self.assertEqual((self.choice()["account"], self.recorded()), ("Pro", "Pro"), "kept for its next open")
+
+    def test_a_relay_that_takes_the_choice_moves_the_chat_when_it_is_next_idle(self):
+        self.held("claude-vscode")
+        path = self.home / "uses" / f"{self.SID}.json"
+        for act in ("mark", "act"):
+            def relay():  # as Relay.tend_use() does: its pid in the file, or the file gone once acted on
+                end = time.time() + 20
+                while time.time() < end and not path.exists():
+                    time.sleep(0.02)
+                if act == "mark":
+                    longhaul.write_private(path, {**json.loads(path.read_text()), "relay_pid": os.getpid()})
+                else:
+                    path.unlink()
+            t = threading.Thread(target=relay, daemon=True)
+            t.start()
+            out = self.longhaul("use", "Pro", "--chat", self.SID, LONGHAUL_USE_WAIT_SECONDS="20")
+            t.join(20)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+            self.assertEqual(out.stdout, f"Chat {self.SID[:8]} moves to Pro the next time Claude is idle in it (when "
+                                         "asked from inside it: once this turn has ended).\n", act)
+            self.assertEqual(self.recorded(), "Max", "the relay moves the record when it moves the chat")
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def test_each_refusal_is_one_sentence_and_writes_nothing(self):
+        long_id = "abcdef01-2222-4333-8444-955566667777"
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        until = longhaul.clock(json.loads((self.home / "state.json").read_text())["limited_until"]["Pro"])
+        self.transcript("0bad1dea-0000-4000-8000-000000000000")  # no line names a folder
+        for args, env, said in (
+                (("Team",), {}, "no account called Team; the accounts are Max, Pro, zain"),
+                (("Max", "--chat", long_id), {}, f"no chat {long_id[:8]} is known: no transcript or record of one"),
+                (("Max", "--chat", "abcd1234"), {}, "no chat starting with abcd1234 is known"),
+                (("Max", "--chat", "0bad1dea"), {}, "no transcript of 0bad1dea names the folder it runs in, so whether "
+                                                    "Max may be used there cannot be checked; a chat that has sent "
+                                                    "nothing has none"),
+                (("zain", "--chat", self.SID), {}, "zain may not be used in ~/work (its repositories: ~/zain-repo), so "
+                                                   "the chat stays where it is"),
+                (("Pro", "--chat", self.SID), {}, f"Pro is at its usage limit until {until}, so the chat stays where it "
+                                                  "is; if that limit is over already, `longhaul clear Pro` forgets it, "
+                                                  "then run this again")):
+            out = self.longhaul("use", *args, **env)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", f"longhaul use: {said}\n"), args)
+        (self.home / "state.json").unlink()
+        self.emails[str(self.tmp / "pro")] = "someone@else.example"
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", "longhaul use: Pro is not signed in as "
+                         "expected, so the chat stays where it is: `longhaul setup Pro --relogin` signs it in again\n"))
+        self.assertFalse((self.home / "uses").exists())
+        self.assertEqual(self.recorded(), "Max")
+
+    def test_a_chat_on_the_account_already_is_said_and_an_earlier_choice_dropped(self):
+        out = self.longhaul("use", "Max", "--chat", self.SID)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, f"Chat {self.SID[:8]} runs on Max already.\n", ""))
+        self.assertFalse((self.home / "uses").exists())
+        (self.home / "uses").mkdir(mode=0o700)
+        (self.home / "uses" / f"{self.SID}.json").write_text(json.dumps(
+            {"id": "u-0123456789ab", "chat": self.SID, "account": "Pro", "at": int(time.time())}))
+        out = self.longhaul("use", "Max", "--chat", self.SID)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs on Max already; the earlier choice of Pro is dropped.\n")
+        self.assertIsNone(self.choice())
+        self.assertIn(f"use: {self.SID} stays on Max; the earlier choice of Pro is dropped", self.log_text())
+
+    def test_old_and_junk_choices_are_swept_when_a_new_one_is_written(self):
+        uses = self.home / "uses"
+        uses.mkdir(mode=0o700)
+        old, junk, fresh = "aaaa0000-0000-4000-8000-000000000001", "aaaa0000-0000-4000-8000-000000000002", \
+            "aaaa0000-0000-4000-8000-000000000003"
+        (uses / f"{old}.json").write_text(json.dumps({"chat": old, "account": "Pro", "at": time.time() - 31 * 86400}))
+        (uses / f"{junk}.json").write_text("{not json")
+        (uses / f"{fresh}.json").write_text(json.dumps({"chat": fresh, "account": "Pro", "at": time.time()}))
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(sorted(p.stem for p in uses.iterdir()), sorted([fresh, self.SID]))
+
+    def test_the_help_says_a_choice_is_no_lock(self):
+        out = self.longhaul("use", "--help")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("Not a lock: at a usage limit the chat follows the switching mode", " ".join(out.stdout.split()))
+
+    # -- the next open (take_choice())
+
+    def opened(self, mode, choice=None, top=None, **kw):
+        """resumed_index() as the panel's wrapper runs it for chat SID, in
+        this process, with `choice` written first: (index, the log)."""
+        if choice is not None:
+            (self.home / "uses").mkdir(mode=0o700, exist_ok=True)
+            (self.home / "uses" / f"{self.SID}.json").write_text(json.dumps(choice))
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), \
+                mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"), \
+                mock.patch.object(longhaul, "signed_in_cached", lambda acct, binary: acct["name"] != "stranger"):
+            before = self.log_text()
+            idx = longhaul.resumed_index(self.SID, self.listed, mode, "panel", "claude", top=str(top or self.work), **kw)
+        return idx, self.log_text()[len(before):]
+
+    def chose(self, account, ago=0):
+        return {"id": "u-0123456789ab", "chat": self.SID, "account": account, "at": int(time.time() - ago)}
+
+    def test_the_next_open_starts_on_the_account_chosen_in_every_mode_and_takes_the_choice(self):
+        short = self.SID[:8]
+        for mode in ("auto", "ask", "never"):
+            idx, logged = self.opened(mode, self.chose("Pro"))
+            self.assertEqual(idx, 1, mode)
+            self.assertIn(f"panel: {short} starts on Pro, as `longhaul use` chose for it", logged)
+            self.assertIsNone(self.choice(), "a choice acts once")
+        self.assertEqual(self.opened("auto"), (None, ""), "no choice: auto picks, as before")
+        self.assertEqual(self.opened("ask")[0], 0, "no choice: the record, as before")
+
+    def test_a_chosen_account_at_its_limit_is_met_by_the_mode_as_any_chats_is(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        self.assertEqual(self.opened("ask", self.chose("Pro"))[0], 1, "in ask the panel asks at once, as for any chat")
+        self.assertEqual(self.opened("never", self.chose("Pro"))[0], 1, "never waits there")
+        idx, logged = self.opened("auto", self.chose("Pro"))
+        self.assertIsNone(idx, "auto picks")
+        self.assertIn(f"was to start on Pro, which is at its limit until ", logged)
+        self.assertIn("and with switching set to auto longhaul picks; the choice is dropped", logged)
+        self.assertIsNone(self.choice())
+
+    def test_a_choice_that_cannot_be_kept_is_dropped_with_its_reason_and_the_old_rules_decide(self):
+        short = self.SID[:8]
+        self.listed.append({"name": "stranger", "config_dir": str(self.tmp / "s"), "email": "s@example.com"})
+        for choice, reason in (
+                (self.chose("Team"), f"{short} was to start on Team, which was removed from Longhaul's accounts since"),
+                (self.chose("zain"), f"{short} was to start on zain, which may not be used in ~/work"),
+                (self.chose("stranger"), f"{short} was to start on stranger, which is not signed in as expected"),
+                (self.chose("Pro", ago=31 * 86400), f"the account chosen for {short} could not be read, or was chosen "
+                                                    "over 30 days ago"),
+                ({"chat": "another", "account": "Pro", "at": int(time.time())}, "could not be read"),
+                ("junk", "could not be read")):
+            idx, logged = self.opened("ask", choice)
+            self.assertEqual(idx, 0, choice)
+            self.assertIn(reason, logged.replace(str(self.tmp), "~"))
+            self.assertIn("the choice is dropped", logged)
+            self.assertIn(f"panel: {short} last ran on Max; with switching set to ask it starts there", logged)
+            self.assertIsNone(self.choice())
+        idx, logged = self.opened("ask", self.chose("Pro"), unmanaged={"Pro"})
+        self.assertIn("which is not managed; the choice is dropped", logged)
+
+
+class UseAtOpen(unittest.TestCase):
+    """`longhaul -r ID` starting a chat on the account `longhaul use` chose
+    for it (take_choice()), against fake_claude.py as Loop runs it."""
+
+    setUp = Loop.setUp
+    run_longhaul = Loop.run_longhaul
+    record = Loop.record
+    transcript = Loop.transcript
+    reading = Loop.reading
+
+    def chose(self, sid, account):
+        (self.home / "uses").mkdir(mode=0o700, exist_ok=True)
+        (self.home / "uses" / f"{sid}.json").write_text(json.dumps(
+            {"id": "u-0123456789ab", "chat": sid, "account": account, "at": int(time.time())}))
+
+    def test_a_resumed_chat_starts_on_the_account_chosen_for_it_in_every_mode(self):
+        self.transcript("sid-old")
+        for mode in ("ask", "never", "auto"):
+            self.record("sid-old", "Max")
+            self.chose("sid-old", "Pro")
+            out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH=mode)
+            self.assertEqual((calls[-1]["config"], calls[-1]["args"][:2]), (str(self.pro), ["--resume", "sid-old"]),
+                             (mode, out.stdout, out.stderr))
+            self.assertIn("sid-old starts on Pro, as `longhaul use` chose for it", out.stdout)
+            self.assertNotIn("last ran on", out.stdout)
+            self.assertFalse((self.home / "uses" / "sid-old.json").exists(), "a choice acts once")
+        # --account is the newer choice: it wins and drops the old one.
+        self.chose("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", "--account", "Max", runs=1, LONGHAUL_SWITCH="ask")
+        self.assertIsNone(calls[-1]["config"])
+        self.assertFalse((self.home / "uses" / "sid-old.json").exists())
+        self.assertIn("terminal: --account Max wins over the choice of Pro for sid-old",
+                      (self.home / "longhaul.log").read_text())
+
+    def test_in_auto_a_chosen_account_at_its_limit_is_left_for_another_as_with_account(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        self.transcript("sid-old")
+        self.record("sid-old", "Pro")
+        self.chose("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="auto")
+        self.assertIsNone(calls[-1]["config"], out.stdout)
+        self.assertIn("Pro is at its limit until ", out.stdout)
+        self.assertIn("picking an account", out.stdout)
+
+
 class StatusJson(unittest.TestCase):
     """`longhaul status --json` (S1 of the accounts screen): what the screen
     in hooks/ reads, one JSON object on stdout and nothing else, and it
