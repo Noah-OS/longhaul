@@ -16639,13 +16639,15 @@ def doctor_default_email():
     return email.strip().casefold() if isinstance(email, str) and email.strip() else None
 
 
-def doctor_accounts() -> dict:
+def doctor_accounts(quick: bool = False) -> dict:
     """7. The accounts: accounts.json readable, each account's folder
     there, the folders each is kept for, "(fallback)" after the name of
     one used only when the others have no room (2026-11-06); and two
     accounts that sign in as one email (the default sign-in among them)
     are one subscription with one allowance, so a switch between them
-    never helps (the owner's Mac, 2026-10-25). Names, never emails."""
+    never helps (the owner's Mac, 2026-10-25). Names, never emails. Not
+    quick, a line said and not judged names the ~/.claude-* folders no
+    account uses (doctor_leftovers())."""
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
     if problem:
@@ -16685,7 +16687,33 @@ def doctor_accounts() -> dict:
                 and a.get("config_dir") and os.path.realpath(config_of(a)) != on_default:
             items.append(("warn", f"{a['name']} and the default sign-in ({home_path(str(DEFAULT_CONFIG))}) are one "
                                   "subscription (same email): a switch between them never helps", same))
+    left = [] if quick else doctor_leftovers(accounts)
+    if left:
+        them = "it" if len(left) == 1 else "them"
+        items.append((None, f"left over, used by no account: {', '.join(left)}; delete {them} by hand if nothing else "
+                            f"uses {them}", None))
     return doctor_result(plural(len(accounts), "account") + f" in {where}", items)
+
+
+def doctor_leftovers(accounts: list) -> list:
+    """The ~/.claude-* folders no listed account uses (2026-11-11), each
+    as "~/.claude-x (size)": plain `longhaul remove` keeps a removed
+    account's folder. ~/.claude-relay, links, files, the default folder
+    and the CLAUDE_CONFIG_DIR this runs under are passed over. Only names
+    and sizes are read (folder_size()), never a file."""
+    used = {os.path.realpath(config_of(a)) for a in accounts
+            if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)}
+    used.add(os.path.realpath(DEFAULT_CONFIG))
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        used.add(os.path.realpath(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"])))
+    try:
+        with os.scandir(HOME) as found:
+            names = sorted(e.name for e in found if e.name.startswith(".claude-") and e.name != ".claude-relay"
+                           and e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+    return [f"{home_path(str(HOME / n))} ({size_text(folder_size(str(HOME / n)))})" for n in names
+            if os.path.realpath(HOME / n) not in used]
 
 
 def doctor_claude_word(words: list) -> int | None:
@@ -17768,7 +17796,7 @@ def doctor_checks(quick: bool = False, processes=None) -> list:
     for name, function in DOCTOR_CHECKS:
         check = globals()[function]
         try:
-            if function in ("doctor_claude", "doctor_updates", "doctor_codex"):
+            if function in ("doctor_claude", "doctor_updates", "doctor_codex", "doctor_accounts"):
                 result = check(quick)
             elif function == "doctor_chats":
                 result = None if quick else check(doctor_processes() if processes is None else processes)

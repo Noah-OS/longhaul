@@ -22655,6 +22655,37 @@ class RemoveDeleteFolder(unittest.TestCase):
         self.assertIn("usage: longhaul remove [-h] [--delete-folder] [--yes] name", out.stdout)
         self.assertIn("longhaul remove NAME [--delete-folder [--yes]]", longhaul.__doc__)
 
+    def test_the_doctor_lists_leftover_claude_folders_no_account_uses_by_name_and_size(self):
+        # Plain remove keeps the folder; the doctor names what is left, in
+        # full runs only (not the first-chat line's quick checks).
+        old = self.tmp / ".claude-old"
+        (old / "projects" / "-work").mkdir(parents=True)
+        (old / "projects" / "-work" / "s9.jsonl").write_text("x" * 3000)
+        (old / "projects" / "-work" / "s9.jsonl").chmod(0)
+        (self.tmp / ".claude-empty").mkdir()
+        (self.tmp / ".claude-relay").mkdir()
+        (self.tmp / ".claude-alias").symlink_to(self.team)
+        (self.tmp / ".claude-gone").symlink_to(self.tmp / "nowhere")
+        (self.tmp / ".claude-notes").write_text("x")
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"HOME": str(self.tmp)}))
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            for name, value in {"HOME": self.tmp, "LONGHAUL_HOME": self.home, "DEFAULT_CONFIG": self.default,
+                                "DEFAULT_GLOBAL_JSON": self.tmp / ".claude.json"}.items():
+                stack.enter_context(mock.patch.object(longhaul, name, value))
+            full, quick = longhaul.doctor_accounts(), longhaul.doctor_accounts(quick=True)
+            self.write_accounts(self.entry("Team"))
+            fewer = longhaul.doctor_accounts()
+        self.assertEqual(full["mark"], "ok", full)
+        said = "left over, used by no account: ~/.claude-empty (0 KB), ~/.claude-old (3 KB); delete them by hand if " \
+               "nothing else uses them"
+        self.assertIn((None, said, None), full["items"])
+        self.assertEqual(full["items"][:2], quick["items"])
+        self.assertIn((None, "left over, used by no account: ~/.claude-empty (0 KB), ~/.claude-max (1 KB), "
+                             "~/.claude-old (3 KB); delete them by hand if nothing else uses them", None), fewer["items"])
+        self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
+        self.assertTrue((old / "projects" / "-work" / "s9.jsonl").exists())
+
 
 class Folders(unittest.TestCase):
     """`longhaul folders NAME` (the owner, 2026-11-05: "I can't edit the
