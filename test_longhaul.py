@@ -16480,6 +16480,132 @@ class Pieces(unittest.TestCase):
         self.assertIn(f"Odd nowhere ({longhaul.REPOSITORIES_JUNK}). ", longhaul.no_account_text("/x", [odd]))
 
 
+class PickPreferred(unittest.TestCase):
+    """A folder's preferred account (the owner, 2026-11-11: "...or tied to a
+    folder"): pick() with the chat's repository takes a free account that
+    prefers it, or a folder above it, before the fallback and expiry rules
+    (preferred_here()). Without a repository, or with no preference there,
+    pick() is as Pieces tests it. Real scratch folders: matching is by real
+    path."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.work, self.client = self.tmp / "work", self.tmp / "work" / "client"
+        for d in (self.client / "repo", self.work / "other", self.tmp / "work2"):
+            d.mkdir(parents=True)
+
+    def seen(self, five, at=500):
+        return {"five_hour": {"used_percentage": five, "resets_at": at}}
+
+    def test_no_repository_or_no_preference_there_leaves_pick_as_it_was(self):
+        accounts = [{"name": "Max"}, {"name": "Pro", "preferred": [str(self.work)]}]
+        seen = {"Max": self.seen(10, 120), "Pro": self.seen(10, 900)}
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, seen=seen), (0, None), "no top: no preference")
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, seen=seen, top=str(self.tmp / "work2")), (0, None),
+                         "~/work2 is not ~/work, nor inside it")
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, seen=seen, top=str(self.tmp)), (0, None),
+                         "a folder above the preferred one is not in it")
+
+    def test_an_account_preferred_in_the_folder_or_above_it_is_taken_first_fallback_or_not(self):
+        accounts = [{"name": "personal-1"}, {"name": "work", "fallback": True, "preferred": [str(self.work)]},
+                    {"name": "personal-2"}]
+        seen = {"personal-1": self.seen(50, 110), "work": self.seen(10, 900)}
+        for top in (self.work, self.client / "repo"):
+            for start in (0, 1, 2):
+                self.assertEqual(longhaul.pick(accounts, {}, start, now=100, seen=seen, top=str(top)), (1, None),
+                                 (top, start))
+        self.assertEqual(longhaul.pick(accounts, {}, 0, now=100, seen=seen, top=str(self.tmp / "work2")), (0, None))
+
+    def test_the_deepest_preferred_folder_wins_and_a_tie_goes_in_the_files_order(self):
+        accounts = [{"name": "A", "preferred": [str(self.work)]}, {"name": "B", "preferred": ["/nowhere", str(self.client)]},
+                    {"name": "C", "preferred": [str(self.work)]}]
+        self.assertEqual(longhaul.pick(accounts, {}, 0, now=100, top=str(self.client / "repo"))[0], 1)
+        for start in (0, 1, 2):
+            self.assertEqual(longhaul.pick(accounts, {}, start, now=100, top=str(self.work / "other"))[0], 0, start)
+        # A preferred folder named through a link is the folder it leads to.
+        link = self.tmp / "link-to-client"
+        link.symlink_to(self.client)
+        accounts[1]["preferred"] = [str(link)]
+        self.assertEqual(longhaul.pick(accounts, {}, 0, now=100, top=str(self.client))[0], 1)
+
+    def test_a_preferred_account_at_its_limit_skipped_or_not_allowed_here_leaves_the_usual_rules(self):
+        accounts = [{"name": "Max"}, {"name": "Pro", "preferred": [str(self.work)]}, {"name": "Team"}]
+        top = str(self.work)
+        self.assertEqual(longhaul.pick(accounts, {"limited_until": {"Pro": 200}}, 1, now=100, top=top), (2, None))
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, skip={"Pro"}, top=top), (2, None),
+                         "skipped: signed in as someone else, say")
+        # One that may not be used here is never preferred, even where a
+        # caller left it out of `skip` (they put denied_in()'s there).
+        accounts[1]["repositories"] = [str(self.tmp / "work2")]
+        self.assertEqual(longhaul.pick(accounts, {}, 2, now=100, top=top), (2, None), "may not be used here")
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, skip=longhaul.denied_in(accounts, top), top=top),
+                         (2, None))
+        accounts[1]["repositories"] = None
+        accounts[0]["repositories"] = [str(self.work)]  # ~/work is kept for Max
+        self.assertEqual(longhaul.pick(accounts, {}, 2, now=100, top=top), (2, None), "~/work is kept for Max")
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, skip=longhaul.denied_in(accounts, top), top=top),
+                         (0, None))
+        # Every account at its limit: the first reset, as ever.
+        state = {"limited_until": {"Max": 300, "Pro": 400, "Team": 200}}
+        self.assertEqual(longhaul.pick(accounts, state, 0, now=100, top=top), (2, 200))
+
+    def test_a_nearly_full_preferred_account_is_passed_over_only_while_another_has_room(self):
+        accounts = [{"name": "Max"}, {"name": "Pro", "preferred": [str(self.work)]}]
+        top = str(self.work)
+        seen = {"Pro": self.seen(96)}
+        self.assertEqual(longhaul.pick(accounts, {}, 1, now=100, seen=seen, top=top), (0, None),
+                         "the early move leaves it: it must not find it again")
+        seen["Max"] = self.seen(97)
+        self.assertEqual(longhaul.pick(accounts, {}, 0, now=100, seen=seen, top=top), (1, None))
+        self.assertEqual(longhaul.pick(accounts, {"limited_until": {"Max": 200}}, 0, now=100, seen={"Pro": self.seen(96)},
+                                       top=top), (1, None))
+
+    def test_a_preferred_field_that_is_not_a_list_of_absolute_paths_prefers_nothing(self):
+        for junk in (str(self.work), ["work"], [str(self.work), 5], {"a": 1}, ""):
+            accounts = [{"name": "Max"}, {"name": "Pro", "preferred": junk}]
+            self.assertIsNone(longhaul.preferred_of(accounts[1]), repr(junk))
+            self.assertEqual(longhaul.pick(accounts, {}, 0, now=100, top=str(self.work)), (0, None), repr(junk))
+        for none in (None, []):
+            self.assertEqual(longhaul.preferred_of({"name": "Pro", "preferred": none}), [])
+        self.assertEqual(longhaul.preferred_of({"name": "Pro", "preferred": ["~/w"]}), [os.path.expanduser("~/w")])
+
+    def test_choose_for_panel_passes_the_folder_on_and_skips_a_preferred_account_signed_in_as_someone_else(self):
+        accounts = [{"name": "Max"}, {"name": "Pro", "preferred": [str(self.work)]}]
+        strangers = set()
+        with mock.patch.object(longhaul, "signed_in_cached", lambda acct, binary: acct["name"] not in strangers), \
+                mock.patch.object(longhaul, "readings", lambda accounts: {}):
+            self.assertEqual(longhaul.choose_for_panel(accounts, "claude", 0, {}, top=str(self.work)), (1, None))
+            self.assertEqual(longhaul.choose_for_panel(accounts, "claude", 0, {}), (0, None), "a short job: no folder")
+            strangers.add("Pro")
+            self.assertEqual(longhaul.choose_for_panel(accounts, "claude", 0, {}, top=str(self.work)), (0, None))
+
+
+class PreferredAtLaunch(unittest.TestCase):
+    """A new chat in a folder an account is preferred in starts on it: in a
+    terminal (run(), fake_claude.py as Loop runs it) and in the VS Code
+    panel (PanelPreferred); a reopened one in ask still returns to the
+    account it ran on."""
+
+    setUp = Loop.setUp
+    run_longhaul = Loop.run_longhaul
+    record = Loop.record
+    transcript = Loop.transcript
+
+    def test_a_new_chat_in_a_preferred_folder_starts_on_that_account_and_a_reopen_in_ask_where_it_ran(self):
+        work = self.tmp / "work"
+        (work / ".git").mkdir(parents=True)
+        (self.home / "accounts.json").write_text(json.dumps(
+            [{"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(self.pro), "preferred": [str(work)]}]))
+        out, calls = self.run_longhaul(["exit"], runs=1, cwd=work, LONGHAUL_SWITCH="ask")
+        self.assertEqual(calls[-1]["config"], str(self.pro), out.stdout + out.stderr)
+        _, calls = self.run_longhaul(["exit"], runs=1, cwd=self.tmp, LONGHAUL_SWITCH="ask")
+        self.assertIsNone(calls[-1]["config"], "elsewhere, the usual rules")
+        self.transcript("sid-old")
+        self.record("sid-old", "Max")
+        _, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, cwd=work, LONGHAUL_SWITCH="ask")
+        self.assertIsNone(calls[-1]["config"], "a reopen in ask returns to where it ran")
+
+
 class Links(unittest.TestCase):
     """A transcript link to nowhere under the projects folder (T6), and
     one into a folder that cannot be read (Sprint 6 review).
@@ -17826,6 +17952,73 @@ class PanelKeepWorking(StreamHarness):
         self.assertEqual(len(self.calls()), 1)
 
 
+class PanelUse(StreamHarness):
+    """`longhaul use NAME` run from inside a panel chat, end to end: the
+    relay takes the choice, the command says the chat moves, and at the
+    chat's next idle moment the relay moves it (a real swap, fake_stream.py
+    as claude) with USE_CHOSEN. The decisions are UseRelay's."""
+
+    def use(self, *args, **extra_env):
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), FAKE_EMAILS=json.dumps(self.emails),
+                   LONGHAUL_AUTH_TTL="0", LONGHAUL_USE_WAIT_SECONDS="15")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "use", *args], env=env, cwd=str(self.tmp),
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_use_from_inside_a_panel_chat_moves_it_to_the_account_chosen_once_it_is_idle(self):
+        self.plan(["reply", "reply"])
+        p = self.start(LONGHAUL_SWITCH="ask")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "hello")))["is_error"])
+        # As the chat's Bash tool runs it: the chat's id and config folder in its environment.
+        out = self.use("Pro", CLAUDE_CODE_SESSION_ID="sid-1", CLAUDE_CONFIG_DIR=str(self.max))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout + self.log_text()[-2000:])
+        self.assertEqual(out.stdout, "Chat sid-1 moves to Pro the next time Claude is idle in it (when asked from "
+                                     "inside it: once this turn has ended).\n")
+        try:
+            line = self.wait_for(lambda m: m.get("type") == "user" and m.get("isReplay") and m["message"]["content"][0][
+                "text"].startswith("The user chose to run this conversation on the Pro account"))
+        except AssertionError as e:
+            self.fail(f"{e}; the log: {self.log_text()[-3000:]}")
+        self.assertEqual(line["message"]["content"][0]["text"], longhaul.USE_CHOSEN.format(old="Max", new="Pro"))
+        self.assertFalse(self.wait_for(self.result_for(line["uuid"]))["is_error"])
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+        self.assertFalse((self.relay / "uses" / "sid-1.json").exists(), "acted on, then gone")
+        self.assertEqual(json.loads((self.relay / "usage" / "sessions" / "sid-1.json").read_text())["account"], "Pro")
+        log = self.log_text()
+        self.assertIn("panel: sid-1 is to run on Pro (longhaul use); it moves the next time it is idle", log)
+        self.assertIn("panel: sid-1 moved, while idle, from Max to Pro (chosen with longhaul use)", log)
+        # The chat runs on Pro now, which the command run there again says.
+        out = self.use("Pro", CLAUDE_CODE_SESSION_ID="sid-1", CLAUDE_CONFIG_DIR=str(self.pro))
+        self.assertEqual(out.stdout, "Chat sid-1 runs on Pro already.\n")
+
+
+class PanelPreferred(StreamHarness):
+    """A new panel chat in a folder an account is preferred in starts on it;
+    a short job, which runs in no repository, is chosen for as before."""
+
+    def test_a_new_panel_chat_in_a_preferred_folder_starts_on_it(self):
+        work, _ = self.repositories()
+        accounts = json.loads((self.relay / "accounts.json").read_text())
+        accounts[1]["preferred"] = [str(work)]
+        self.accounts(accounts)
+        job = self.start(["-p", "title"], cwd=work)
+        self.assertEqual(self.output(), b"fake job done")
+        job.wait(10)
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max)], "a short job: no folder, no preference")
+        self.plan(["reply"])
+        p = self.start(cwd=work)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "hello")))["is_error"])
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+
+
 class KeepWorking(unittest.TestCase):
     """Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2): a
     panel chat's relay at a limit, driven in this process on a clock of the
@@ -19127,6 +19320,157 @@ class KeepWorking(unittest.TestCase):
         r = self.relay()
         r.remember({"type": "control_request", "request": {"subtype": sorted(longhaul.SIGN_IN)[0]}})
         self.assertEqual(self.state()["limited_until"], {"Max": self.clock.at + 3600})
+
+
+class UseRelay(unittest.TestCase):
+    """A panel chat's relay acting on `longhaul use`'s choice (Relay.
+    tend_use()), in this process on KeepWorking's clock and fakes: the
+    swap is stood in for (moves records it); PanelUse runs the real one."""
+
+    Clock, Watch = KeepWorking.Clock, KeepWorking.Watch
+    setUp = KeepWorking.setUp
+    relay = KeepWorking.relay
+    limited = KeepWorking.limited
+    stop = KeepWorking.stop
+    question = KeepWorking.question
+    waiting = KeepWorking.waiting
+    log_text = KeepWorking.log_text
+
+    def choose(self, account, sid="sid-k"):
+        """The file `longhaul use` writes for chat `sid`."""
+        longhaul.write_private(self.home / "uses" / f"{sid}.json",
+                               {"id": "u-0123456789ab", "chat": sid, "account": account, "at": int(self.clock.at)})
+
+    def choice(self):
+        path = self.home / "uses" / "sid-k.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def recorded(self):
+        path = self.home / "usage" / "sessions" / "sid-k.json"
+        return json.loads(path.read_text()).get("account") if path.exists() else None
+
+    def test_the_relay_takes_the_choice_at_once_and_moves_the_chat_only_once_it_is_idle(self):
+        r = self.relay()
+        r.watch.status = "busy"  # Claude is in a turn: the one that ran the command, say
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(self.choice()["relay_pid"], os.getpid(), "its pid tells the command a relay has it")
+        self.assertEqual(r.moves, [])
+        self.assertIn("panel: sid-k is to run on Pro (longhaul use); it moves the next time it is idle",
+                      self.log_text())
+        r.tend()
+        self.assertEqual(self.log_text().count("is to run on Pro"), 1, "taken once")
+        r.watch.status = "idle"
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.USE_CHOSEN.format(old="Max", new="Pro"))])
+        self.assertIsNone(self.choice())
+        self.assertEqual(self.recorded(), "Pro", "the record moves: a reopen starts there")
+        self.assertEqual(self.notes, ["The panel chat moved to Pro, as you chose."])
+        self.assertIn("panel: sid-k moved, while idle, from Max to Pro (chosen with longhaul use)", self.log_text())
+        r.tend()
+        self.assertEqual(len(r.moves), 1, "a choice acts once")
+
+    def test_a_choice_never_moves_a_chat_in_a_turn_a_swap_a_hold_or_with_agents_writing(self):
+        r = self.relay()
+        self.choose("Pro")
+        for attr, value in (("swapping", True), ("paused", True)):
+            setattr(r, attr, value)
+            r.tend()
+            setattr(r, attr, False)
+        r.watch.agents_busy = lambda: True
+        r.tend()
+        self.assertEqual((r.moves, self.choice()["account"]), ([], "Pro"), "still waiting")
+        r.watch.agents_busy = lambda: False
+        r.tend()
+        self.assertEqual([m[0] for m in r.moves], ["Pro"])
+
+    def test_a_choice_of_the_account_the_chat_is_on_or_of_none_listed_is_dropped(self):
+        r = self.relay()
+        self.choose("Max")
+        r.tend()
+        self.assertEqual((r.moves, self.choice()), ([], None))
+        self.assertIn("panel: sid-k runs on Max already; the choice is dropped", self.log_text())
+        for junk in ("Team", None):
+            if junk:
+                self.choose(junk)
+            else:
+                (self.home / "uses" / "sid-k.json").write_text("{not json")
+            r.tend()
+            self.assertEqual((r.moves, self.choice()), ([], None), junk)
+        self.assertEqual(self.log_text().count("the account chosen for sid-k is not one of Longhaul's accounts now; "
+                                               "the choice is dropped"), 2)
+
+    def test_an_account_that_cannot_take_the_chat_now_is_said_and_the_choice_dropped(self):
+        r = self.relay()
+        self.limited(Pro=self.clock.at + 600)
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual((r.moves, self.choice()), ([], None))
+        until = longhaul.clock(self.clock.at + 600)
+        self.assertEqual(self.notes, [f"The chat stays on Max: Pro, which you chose for it, cannot take it now (it is at "
+                                      f"its limit again, until {until})."])
+        self.assertIn(f"panel: sid-k does not move to Pro, as chosen: it is at its limit again, until {until}",
+                      self.log_text())
+        self.limited()
+        self.strangers.add("Pro")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertIn("cannot take it now (it is not signed in as expected)", self.notes[-1])
+
+    def test_a_choice_takes_the_place_of_an_open_question_or_carry_on_with_the_carry_on_message(self):
+        r = self.relay()
+        self.stop(r)  # ask: the question at the limit is open
+        self.assertIsNotNone(self.question())
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))],
+                         "it stopped at a limit: the carry-on, as a move answered sends")
+        self.assertIsNone(self.question())
+        self.assertIn("question: sid-k's question (q-", self.log_text())
+        self.assertIn(") is withdrawn: Pro was chosen", self.log_text())
+        # never: a carry-on at the reset waits, and the choice takes its place.
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Max")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))])
+        self.assertIsNone(self.waiting())
+        self.assertIn("wait: sid-k's carry-on on Max is cancelled: Pro was chosen", self.log_text())
+
+    def test_longhaul_pipe_leaves_the_choice_for_the_sessions_next_open(self):
+        r = self.relay(says=True, swap=True, mode="auto")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertNotIn("relay_pid", self.choice(), "untouched: the next open takes it")
+
+
+class PreferredRelay(unittest.TestCase):
+    """A panel chat's relay at a limit picks the account preferred in the
+    chat's folder first (Relay.top through choose_for_panel()), on
+    KeepWorking's clock and fakes."""
+
+    Clock, Watch = KeepWorking.Clock, KeepWorking.Watch
+    setUp = KeepWorking.setUp
+    relay = KeepWorking.relay
+    stop = KeepWorking.stop
+    question = KeepWorking.question
+
+    def test_at_a_limit_the_chat_moves_to_the_account_preferred_in_its_folder(self):
+        work = self.tmp / "work"
+        work.mkdir()
+        self.accounts.append({"name": "Team", "config_dir": str(self.tmp / "team"), "email": "team@example.com",
+                              "preferred": [str(work)]})
+        r = self.relay(mode="auto")
+        r.top = str(work)
+        self.stop(r)
+        self.assertEqual([m[0] for m in r.moves], ["Team"], "Pro comes first without the preference")
+        r = self.relay(mode="ask")
+        r.top = str(work)
+        self.stop(r)
+        self.assertEqual(self.question()["to"], "Team")
 
 
 class Pipe(StreamHarness):
@@ -23121,7 +23465,8 @@ class Folders(unittest.TestCase):
         self.assertLess(doc.index("longhaul folders NAME"), doc.index("longhaul switch [ask|auto|never]"))
         out = self.longhaul("folders", "-h")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("usage: longhaul folders [-h] [--add PATH] [--remove PATH] [--anywhere] name", out.stdout)
+        self.assertIn("usage: longhaul folders [-h] [--add PATH] [--remove PATH] [--anywhere] [--prefer PATH] "
+                      "[--no-prefer PATH] name", " ".join(out.stdout.split()))
         # bin/longhaul, what a chat's Claude may run, is the owner's boundary:
         # it runs folders since the owner's yes of 2026-11-06, in its forms
         # alone (ShimCommands has the refused ones).
@@ -23226,6 +23571,87 @@ class Folders(unittest.TestCase):
                                  "spare: ~/.claude-spare, used nowhere: personal-1 keeps every folder": "warn",
                                  "work: ~/.claude-work, only in ~/work": "ok"})
         self.assertIn("`longhaul folders spare --add PATH`", c["step"])
+
+
+class FoldersPrefer(unittest.TestCase):
+    """`longhaul folders NAME --prefer PATH` and `--no-prefer PATH` (the
+    owner, 2026-11-11: an account "tied to a folder"): the folders an
+    account is preferred in ("preferred", read by pick()), changed without a
+    hand edit, by `longhaul folders`'s rules. Folders' scratch setup."""
+
+    setUp = Folders.setUp
+    write_accounts = Folders.write_accounts
+    accounts = Folders.accounts
+    log = Folders.log
+    files = Folders.files
+    longhaul = Folders.longhaul
+    said = Folders.said
+
+    def test_prefer_keeps_each_path_as_written_last_and_no_prefer_takes_it_off_by_real_path(self):
+        self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "note": "kept"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": None})
+        out = self.longhaul("folders", "work", "--prefer", "~/work", "--prefer", "~/later")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.accounts(), [
+            {"name": "personal-1", "config_dir": "~/.claude-personal-1", "note": "kept"},
+            {"name": "work", "config_dir": "~/.claude-work", "repositories": None, "preferred": ["~/work", "~/later"]}],
+            "the other keys as they were, repositories: null too")
+        said = self.said(out)
+        for line in ("longhaul work is preferred in ~/work", "longhaul work is preferred in ~/later",
+                     "longhaul ~/later does not exist yet; kept for when it does",
+                     "work may be used anywhere.",
+                     "work is preferred in ~/work, ~/later: a new chat there, or one that moves at a limit, goes to it "
+                     "first while it has room."):
+            self.assertIn(line, said)
+        self.assertEqual([l for l in self.log() if "preferred in" in l],
+                         ["work is preferred in ~/work", "work is preferred in ~/later"])
+        out = self.longhaul("folders", "work", "--prefer", str(self.tmp / "work"))
+        self.assertIn("longhaul work is preferred in ~/work already", self.said(out))
+        self.assertEqual(self.accounts()[1]["preferred"], ["~/work", "~/later"])
+        out = self.longhaul("folders", "work", "--no-prefer", str(self.tmp / "work") + "/", "--no-prefer", "~/later")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertNotIn("preferred", self.accounts()[1], "none left, no key")
+        self.assertIn("longhaul work is no longer preferred in ~/work", self.said(out))
+        self.assertEqual(self.said(out)[-1], "work may be used anywhere.")
+
+    def test_a_folder_the_account_may_not_be_used_in_is_refused_with_why_and_nothing_written(self):
+        self.write_accounts({"name": "personal-1", "repositories": ["~/personal"]},
+                            {"name": "work", "repositories": ["~/work"]}, {"name": "spare"})
+        before = self.path.read_text()
+        for args, said in (
+                (("work", "--prefer", "~/personal"), "work may not be used in ~/personal (its repositories: ~/work), so "
+                                                     "it cannot be preferred there"),
+                (("spare", "--prefer", "~/work/repo"), "spare may not be used in ~/work/repo: ~/work/repo is kept for "
+                                                       "work (its folders include it), so it cannot be preferred there"),
+                (("work", "--prefer", "work"), "--prefer work is not an absolute path; give the folder's full path, "
+                                               "like ~/work/repo"),
+                (("work", "--no-prefer", "~/work"), "~/work is not a folder work is preferred in")):
+            out = self.longhaul("folders", *args)
+            self.assertEqual(out.returncode, 2, args)
+            self.assertIn(said, " ".join(self.said(out)), args)
+        self.assertEqual(self.path.read_text(), before, "nothing written")
+        # With the folder added in the same command, it may be preferred there.
+        out = self.longhaul("folders", "work", "--add", "~/clients", "--prefer", "~/clients/acme")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.accounts()[1], {"name": "work", "repositories": ["~/work", "~/clients"],
+                                              "preferred": ["~/clients/acme"]})
+
+    def test_the_read_form_says_where_it_is_preferred_and_where_it_no_longer_may_be(self):
+        self.write_accounts({"name": "work", "repositories": ["~/work"], "preferred": ["~/work", "~/old"]},
+                            {"name": "odd", "preferred": "~/work"})
+        out = self.longhaul("folders", "work")
+        self.assertEqual(self.said(out), [
+            "work may be used only in ~/work.",
+            "work is preferred in ~/work, ~/old: a new chat there, or one that moves at a limit, goes to it first while "
+            "it has room.",
+            "But work may not be used in ~/old, so it is not preferred there."])
+        out = self.longhaul("folders", "odd")
+        self.assertEqual(self.said(out), ["odd may be used anywhere.",
+                                          f"odd is preferred nowhere: {longhaul.PREFERRED_JUNK}."])
+        out = self.longhaul("folders", "odd", "--prefer", "~/x")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("odd's preferred field is not a list, so no folder can be added to it or taken from it; until it "
+                      "is mended in ~/home/accounts.json, odd is preferred nowhere", " ".join(self.said(out)))
 
 
 class Fallback(unittest.TestCase):
@@ -23404,6 +23830,303 @@ class Fallback(unittest.TestCase):
                                                                "work (fallback): ~/.claude-work, only in ~/work"])
 
 
+class Use(unittest.TestCase):
+    """`longhaul use NAME [--chat ID]` (the owner, 2026-11-11: "I need to be
+    able to manually choose the account I work on, per session"): the
+    account one chat runs on from now on. Its checks, the choice it writes
+    (LONGHAUL_HOME/uses/<chat>.json), what it says by where the chat is,
+    and the next open taking the choice (take_choice()). The relay's side
+    is UseRelay's and PanelUse's. Every path is scratch, HOME too; claude
+    is fake_stream.py, which answers `auth status` from FAKE_EMAILS."""
+
+    SID = "5f0c2a9e-1111-4222-8333-944455556666"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # resolved, so `~` is shown for it (/var is a link on a Mac)
+        self.home, self.claude, self.work = self.tmp / "home", self.tmp / "claude", self.tmp / "work"
+        for d in (self.home, self.claude / "projects" / "-work", self.work / ".git"):
+            d.mkdir(parents=True)
+        self.listed = [{"name": "Max", "config_dir": str(self.tmp / "max"), "email": "first@example.com"},
+                       {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "second@example.com"},
+                       {"name": "zain", "config_dir": str(self.tmp / "zain"), "email": "third@example.com",
+                        "repositories": [str(self.tmp / "zain-repo")]}]
+        (self.home / "accounts.json").write_text(json.dumps(self.listed))
+        self.emails = {a["config_dir"]: a["email"] for a in self.listed}
+        self.transcript(self.SID, self.work)
+        self.record(self.SID, "Max")
+
+    def transcript(self, sid, cwd=None):
+        """A scratch transcript of chat `sid`, its one line naming the folder `cwd` (none: no cwd)."""
+        line = {"type": "user", **({"cwd": str(cwd)} if cwd else {})}
+        (self.claude / "projects" / "-work" / f"{sid}.jsonl").write_text(json.dumps(line) + "\n")
+
+    def record(self, sid, account):
+        (self.home / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+        (self.home / "usage" / "sessions" / f"{sid}.json").write_text(json.dumps({"account": account}))
+
+    def recorded(self, sid=None):
+        return json.loads((self.home / "usage" / "sessions" / f"{sid or self.SID}.json").read_text()).get("account")
+
+    def choice(self, sid=None):
+        path = self.home / "uses" / f"{sid or self.SID}.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def held(self, entrypoint, sid=None):
+        """A live claude holding the chat, as Claude Code records one in its
+        sessions folder: this test's own process, which longhaul's is not."""
+        (self.claude / "sessions").mkdir(exist_ok=True)
+        (self.claude / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": sid or self.SID, "entrypoint": entrypoint}))
+
+    def log_text(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def longhaul(self, *args, cwd=None, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_AUTH_TTL="0",
+                   FAKE_EMAILS=json.dumps(self.emails), LONGHAUL_USE_WAIT_SECONDS="0.5")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env, cwd=str(cwd or self.tmp),
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_a_chat_not_open_starts_on_the_account_at_its_next_open_its_record_moved(self):
+        short = self.SID[:8]
+        out = self.longhaul("use", "pro", "--chat", short)  # any case, as `longhaul folders` takes a name
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {short} is not open: this takes effect when it is next opened, in the "
+                                     f"panel or with `longhaul -r {short}` in a terminal, and it starts on Pro.\n")
+        choice = self.choice()
+        self.assertRegex(choice.pop("id"), r"^u-[0-9a-f]{12}$")
+        self.assertAlmostEqual(choice.pop("at"), time.time(), delta=30)
+        self.assertEqual(choice, {"chat": self.SID, "account": "Pro"}, "the whole id, the account as listed")
+        self.assertEqual((self.home / "uses" / f"{self.SID}.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "uses").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.recorded(), "Pro", "the record too, as the spec's next open in ask and never reads it")
+        self.assertIn(f"use: {self.SID} is to run on Pro (it runs on Max)", self.log_text())
+
+    def test_from_inside_a_chat_it_is_that_chat_and_outside_one_it_asks_for_chat(self):
+        out = self.longhaul("use", "Pro", cwd=self.work)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertEqual(out.stderr, "longhaul use: this runs outside a chat, so it cannot tell which chat to move: "
+                                     "name it with --chat ID (the chat's id, or its first characters)\n")
+        self.assertFalse((self.home / "uses").exists())
+        # From the chat itself, open in a terminal: Claude Code's Bash tool
+        # names it, and its account is its config folder's.
+        self.held("cli")
+        inside = {"CLAUDE_CODE_SESSION_ID": self.SID, "CLAUDE_CONFIG_DIR": str(self.tmp / "max")}
+        out = self.longhaul("use", "Pro", cwd=self.work, **inside)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs in a terminal now, where Longhaul does not move it "
+                                     f"while it runs: quit Claude there and run `longhaul -r {self.SID[:8]}`, and it "
+                                     "starts on Pro.\n")
+        self.assertEqual(self.choice()["account"], "Pro")
+        # The chat's own config folder says where it runs, not its record.
+        self.record(self.SID, "Pro")
+        out = self.longhaul("use", "Max", cwd=self.work, **inside)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs on Max already; the earlier choice of Pro is "
+                                     "dropped.\n")
+        self.assertIsNone(self.choice())
+
+    def test_a_panel_chat_no_relay_takes_it_from_is_told_to_reopen(self):
+        self.held("claude-vscode")
+        started = time.time()
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertGreaterEqual(time.time() - started, 0.5, "it waited for a relay first")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} is open in the VS Code panel with no relay of Longhaul's "
+                                     "that could move it while it runs (in the VS Code panel: \"switch_mid_session\" "
+                                     "is false, or the chat was opened before the panel ran Longhaul): this takes "
+                                     "effect when the chat is next opened. Close it and open it again, and it starts "
+                                     "on Pro.\n")
+        self.assertEqual((self.choice()["account"], self.recorded()), ("Pro", "Pro"), "kept for its next open")
+
+    def test_a_relay_that_takes_the_choice_moves_the_chat_when_it_is_next_idle(self):
+        self.held("claude-vscode")
+        path = self.home / "uses" / f"{self.SID}.json"
+        for act in ("mark", "act"):
+            def relay():  # as Relay.tend_use() does: its pid in the file, or the file gone once acted on
+                end = time.time() + 20
+                while time.time() < end and not path.exists():
+                    time.sleep(0.02)
+                if act == "mark":
+                    longhaul.write_private(path, {**json.loads(path.read_text()), "relay_pid": os.getpid()})
+                else:
+                    path.unlink()
+            t = threading.Thread(target=relay, daemon=True)
+            t.start()
+            out = self.longhaul("use", "Pro", "--chat", self.SID, LONGHAUL_USE_WAIT_SECONDS="20")
+            t.join(20)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+            self.assertEqual(out.stdout, f"Chat {self.SID[:8]} moves to Pro the next time Claude is idle in it (when "
+                                         "asked from inside it: once this turn has ended).\n", act)
+            self.assertEqual(self.recorded(), "Max", "the relay moves the record when it moves the chat")
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+    def test_each_refusal_is_one_sentence_and_writes_nothing(self):
+        long_id = "abcdef01-2222-4333-8444-955566667777"
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        until = longhaul.clock(json.loads((self.home / "state.json").read_text())["limited_until"]["Pro"])
+        self.transcript("0bad1dea-0000-4000-8000-000000000000")  # no line names a folder
+        for args, env, said in (
+                (("Team",), {}, "no account called Team; the accounts are Max, Pro, zain"),
+                (("Max", "--chat", long_id), {}, f"no chat {long_id[:8]} is known: no transcript or record of one"),
+                (("Max", "--chat", "abcd1234"), {}, "no chat starting with abcd1234 is known"),
+                (("Max", "--chat", "0bad1dea"), {}, "no transcript of 0bad1dea names the folder it runs in, so whether "
+                                                    "Max may be used there cannot be checked; a chat that has sent "
+                                                    "nothing has none"),
+                (("zain", "--chat", self.SID), {}, "zain may not be used in ~/work (its repositories: ~/zain-repo), so "
+                                                   "the chat stays where it is"),
+                (("Pro", "--chat", self.SID), {}, f"Pro is at its usage limit until {until}, so the chat stays where it "
+                                                  "is; if that limit is over already, `longhaul clear Pro` forgets it, "
+                                                  "then run this again")):
+            out = self.longhaul("use", *args, **env)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", f"longhaul use: {said}\n"), args)
+        (self.home / "state.json").unlink()
+        self.emails[str(self.tmp / "pro")] = "someone.else@example.com"
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", "longhaul use: Pro is not signed in as "
+                         "expected, so the chat stays where it is: `longhaul setup Pro --relogin` signs it in again\n"))
+        self.assertFalse((self.home / "uses").exists())
+        self.assertEqual(self.recorded(), "Max")
+
+    def test_a_chat_on_the_account_already_is_said_and_an_earlier_choice_dropped(self):
+        out = self.longhaul("use", "Max", "--chat", self.SID)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, f"Chat {self.SID[:8]} runs on Max already.\n", ""))
+        self.assertFalse((self.home / "uses").exists())
+        (self.home / "uses").mkdir(mode=0o700)
+        (self.home / "uses" / f"{self.SID}.json").write_text(json.dumps(
+            {"id": "u-0123456789ab", "chat": self.SID, "account": "Pro", "at": int(time.time())}))
+        out = self.longhaul("use", "Max", "--chat", self.SID)
+        self.assertEqual(out.stdout, f"Chat {self.SID[:8]} runs on Max already; the earlier choice of Pro is dropped.\n")
+        self.assertIsNone(self.choice())
+        self.assertIn(f"use: {self.SID} stays on Max; the earlier choice of Pro is dropped", self.log_text())
+
+    def test_old_and_junk_choices_are_swept_when_a_new_one_is_written(self):
+        uses = self.home / "uses"
+        uses.mkdir(mode=0o700)
+        old, junk, fresh = "aaaa0000-0000-4000-8000-000000000001", "aaaa0000-0000-4000-8000-000000000002", \
+            "aaaa0000-0000-4000-8000-000000000003"
+        (uses / f"{old}.json").write_text(json.dumps({"chat": old, "account": "Pro", "at": time.time() - 31 * 86400}))
+        (uses / f"{junk}.json").write_text("{not json")
+        (uses / f"{fresh}.json").write_text(json.dumps({"chat": fresh, "account": "Pro", "at": time.time()}))
+        out = self.longhaul("use", "Pro", "--chat", self.SID)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(sorted(p.stem for p in uses.iterdir()), sorted([fresh, self.SID]))
+
+    def test_the_help_says_a_choice_is_no_lock(self):
+        out = self.longhaul("use", "--help")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("Not a lock: at a usage limit the chat follows the switching mode", " ".join(out.stdout.split()))
+
+    # -- the next open (take_choice())
+
+    def opened(self, mode, choice=None, top=None, **kw):
+        """resumed_index() as the panel's wrapper runs it for chat SID, in
+        this process, with `choice` written first: (index, the log)."""
+        if choice is not None:
+            (self.home / "uses").mkdir(mode=0o700, exist_ok=True)
+            (self.home / "uses" / f"{self.SID}.json").write_text(json.dumps(choice))
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), \
+                mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"), \
+                mock.patch.object(longhaul, "signed_in_cached", lambda acct, binary: acct["name"] != "stranger"):
+            before = self.log_text()
+            idx = longhaul.resumed_index(self.SID, self.listed, mode, "panel", "claude", top=str(top or self.work), **kw)
+        return idx, self.log_text()[len(before):]
+
+    def chose(self, account, ago=0):
+        return {"id": "u-0123456789ab", "chat": self.SID, "account": account, "at": int(time.time() - ago)}
+
+    def test_the_next_open_starts_on_the_account_chosen_in_every_mode_and_takes_the_choice(self):
+        short = self.SID[:8]
+        for mode in ("auto", "ask", "never"):
+            idx, logged = self.opened(mode, self.chose("Pro"))
+            self.assertEqual(idx, 1, mode)
+            self.assertIn(f"panel: {short} starts on Pro, as `longhaul use` chose for it", logged)
+            self.assertIsNone(self.choice(), "a choice acts once")
+        self.assertEqual(self.opened("auto"), (None, ""), "no choice: auto picks, as before")
+        self.assertEqual(self.opened("ask")[0], 0, "no choice: the record, as before")
+
+    def test_a_chosen_account_at_its_limit_is_met_by_the_mode_as_any_chats_is(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        self.assertEqual(self.opened("ask", self.chose("Pro"))[0], 1, "in ask the panel asks at once, as for any chat")
+        self.assertEqual(self.opened("never", self.chose("Pro"))[0], 1, "never waits there")
+        idx, logged = self.opened("auto", self.chose("Pro"))
+        self.assertIsNone(idx, "auto picks")
+        self.assertIn(f"was to start on Pro, which is at its limit until ", logged)
+        self.assertIn("and with switching set to auto longhaul picks; the choice is dropped", logged)
+        self.assertIsNone(self.choice())
+
+    def test_a_choice_that_cannot_be_kept_is_dropped_with_its_reason_and_the_old_rules_decide(self):
+        short = self.SID[:8]
+        self.listed.append({"name": "stranger", "config_dir": str(self.tmp / "s"), "email": "s@example.com"})
+        for choice, reason in (
+                (self.chose("Team"), f"{short} was to start on Team, which was removed from Longhaul's accounts since"),
+                (self.chose("zain"), f"{short} was to start on zain, which may not be used in ~/work"),
+                (self.chose("stranger"), f"{short} was to start on stranger, which is not signed in as expected"),
+                (self.chose("Pro", ago=31 * 86400), f"the account chosen for {short} could not be read, or was chosen "
+                                                    "over 30 days ago"),
+                ({"chat": "another", "account": "Pro", "at": int(time.time())}, "could not be read"),
+                ("junk", "could not be read")):
+            idx, logged = self.opened("ask", choice)
+            self.assertEqual(idx, 0, choice)
+            self.assertIn(reason, logged.replace(str(self.tmp), "~"))
+            self.assertIn("the choice is dropped", logged)
+            self.assertIn(f"panel: {short} last ran on Max; with switching set to ask it starts there", logged)
+            self.assertIsNone(self.choice())
+        idx, logged = self.opened("ask", self.chose("Pro"), unmanaged={"Pro"})
+        self.assertIn("which is not managed; the choice is dropped", logged)
+
+
+class UseAtOpen(unittest.TestCase):
+    """`longhaul -r ID` starting a chat on the account `longhaul use` chose
+    for it (take_choice()), against fake_claude.py as Loop runs it."""
+
+    setUp = Loop.setUp
+    run_longhaul = Loop.run_longhaul
+    record = Loop.record
+    transcript = Loop.transcript
+    reading = Loop.reading
+
+    def chose(self, sid, account):
+        (self.home / "uses").mkdir(mode=0o700, exist_ok=True)
+        (self.home / "uses" / f"{sid}.json").write_text(json.dumps(
+            {"id": "u-0123456789ab", "chat": sid, "account": account, "at": int(time.time())}))
+
+    def test_a_resumed_chat_starts_on_the_account_chosen_for_it_in_every_mode(self):
+        self.transcript("sid-old")
+        for mode in ("ask", "never", "auto"):
+            self.record("sid-old", "Max")
+            self.chose("sid-old", "Pro")
+            out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH=mode)
+            self.assertEqual((calls[-1]["config"], calls[-1]["args"][:2]), (str(self.pro), ["--resume", "sid-old"]),
+                             (mode, out.stdout, out.stderr))
+            self.assertIn("sid-old starts on Pro, as `longhaul use` chose for it", out.stdout)
+            self.assertNotIn("last ran on", out.stdout)
+            self.assertFalse((self.home / "uses" / "sid-old.json").exists(), "a choice acts once")
+        # --account is the newer choice: it wins and drops the old one.
+        self.chose("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", "--account", "Max", runs=1, LONGHAUL_SWITCH="ask")
+        self.assertIsNone(calls[-1]["config"])
+        self.assertFalse((self.home / "uses" / "sid-old.json").exists())
+        self.assertIn("terminal: --account Max wins over the choice of Pro for sid-old",
+                      (self.home / "longhaul.log").read_text())
+
+    def test_in_auto_a_chosen_account_at_its_limit_is_left_for_another_as_with_account(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        self.transcript("sid-old")
+        self.record("sid-old", "Pro")
+        self.chose("sid-old", "Pro")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="auto")
+        self.assertIsNone(calls[-1]["config"], out.stdout)
+        self.assertIn("Pro is at its limit until ", out.stdout)
+        self.assertIn("picking an account", out.stdout)
+
+
 class StatusJson(unittest.TestCase):
     """`longhaul status --json` (S1 of the accounts screen): what the screen
     in hooks/ reads, one JSON object on stdout and nothing else, and it
@@ -23414,7 +24137,8 @@ class StatusJson(unittest.TestCase):
     config folder to email ("default" for ~/.claude)."""
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
-                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"}
+                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
+                    "preferred", "use_here"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
@@ -23485,11 +24209,12 @@ class StatusJson(unittest.TestCase):
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
-            "this_chat": False})
+            "this_chat": False, "preferred": [], "use_here": "ok"})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"],
-            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it")
+            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here"],
+            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it; "
+            "preferred and use_here last (2026-11-11)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -23668,7 +24393,7 @@ class StatusJson(unittest.TestCase):
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
-                    "folder": "~/claude", "this_chat": False}])
+                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
@@ -23815,6 +24540,55 @@ class StatusJson(unittest.TestCase):
                 self.vscode.write_text(text)
                 self.assertIs(self.read(self.status())["vscode"], want)
                 self.assertEqual(self.vscode.read_text(), text, "only read")
+
+
+class StatusPreferred(unittest.TestCase):
+    """What `longhaul status` and `status --json` say of a folder's preferred
+    account and of `longhaul use` here (2026-11-11): "preferred" and
+    "use_here", additive keys the accounts screen will read in a later
+    pass. StatusJson's scratch setup and stand-in claude."""
+
+    setUp = StatusJson.setUp
+    folder = StatusJson.folder
+    write_accounts = StatusJson.write_accounts
+    status = StatusJson.status
+    longhaul = StatusJson.longhaul
+    read = StatusJson.read
+    by_name = StatusJson.by_name
+    ACCOUNT_KEYS, KEYS = StatusJson.ACCOUNT_KEYS, StatusJson.KEYS
+
+    def test_status_json_gives_each_accounts_preferred_folders_and_what_use_would_do_here(self):
+        work = self.tmp / "work"
+        work.mkdir()
+        self.write_accounts(
+            {"name": "here", "config_dir": str(self.folder("here")), "email": "h@example.com", "preferred": ["~/work"]},
+            {"name": "kept", "config_dir": str(self.folder("kept")), "email": "k@example.com",
+             "repositories": ["~/elsewhere"], "preferred": "~/work"},
+            {"name": "full", "config_dir": str(self.folder("full")), "email": "f@example.com"},
+            {"name": "stranger", "config_dir": str(self.folder("stranger")), "email": "s@example.com"},
+            {"name": "free", "config_dir": str(self.folder("free")), "email": "free@example.com"})
+        self.emails = {str(self.folder(n)): f"{n[0]}@example.com" for n in ("here", "kept", "full")}
+        self.emails.update({str(self.folder("stranger")): "other@example.com",
+                            str(self.folder("free")): "free@example.com"})
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"full": time.time() + 3600}}))
+        found = self.by_name(self.read(self.status(cwd=work, CLAUDE_CONFIG_DIR=str(self.folder("here")))))
+        self.assertEqual({n: (a["preferred"], a["use_here"]) for n, a in found.items()}, {
+            "here": (["~/work"], "this_chat"), "kept": (None, "not_allowed"), "full": ([], "limited"),
+            "stranger": ([], "not_signed_in"), "free": ([], "ok")})
+        # No list of accounts (the stand-in for no file): nothing to tell.
+        (self.home / "accounts.json").unlink()
+        found = self.read(self.status())
+        self.assertEqual([(a["preferred"], a["use_here"]) for a in found["accounts"]], [([], None)])
+
+    def test_status_says_where_an_account_is_preferred_and_a_field_that_prefers_nothing(self):
+        self.write_accounts({"name": "work", "config_dir": str(self.folder("work")), "preferred": ["~/work", "/srv/x"]},
+                            {"name": "odd", "config_dir": str(self.folder("odd")), "preferred": ["work"]},
+                            {"name": "plain", "config_dir": str(self.folder("plain"))})
+        out = self.longhaul("status")
+        lines = out.stdout.splitlines()
+        self.assertIn("       preferred in: ~/work, /srv/x", lines)
+        self.assertIn(f"       {longhaul.PREFERRED_JUNK}; it is preferred nowhere", lines)
+        self.assertEqual(sum("preferred" in line for line in lines), 2, "nothing for an account with none")
 
 
 class Switch(unittest.TestCase):
