@@ -16076,6 +16076,11 @@ def status(opts) -> int:
             print("       anywhere")
         if is_fallback(acct):  # the owner, 2026-11-06: the work account, only when the others have no room
             print(f"       fallback: {FALLBACK_RULE.format(where='here')}")
+        liked = preferred_of(acct)  # the owner, 2026-11-11: an account tied to a folder
+        if liked is None:
+            print(f"       {PREFERRED_JUNK}; it is preferred nowhere")
+        elif liked:
+            print(f"       preferred in: {', '.join(home_path(p) for p in liked)}")
         if acct.get("config_dir"):
             broken = [i for i in SHARED if (DEFAULT_CONFIG / i).exists() and not (config_of(acct) / i).is_symlink()]
             if broken:
@@ -16195,7 +16200,7 @@ def status_checks(accounts: list[dict]) -> list:
 
 
 def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, failed: dict,
-                   accounts: list[dict]) -> dict:
+                   accounts: list[dict], allowed_here: list | None = None) -> dict:
     """One account's entry in the screen's object, from its auth_status()
     answer `a`. A check that could not say leaves signed_in and as_expected
     null, never false: that is not "signed out". As expected is what
@@ -16204,7 +16209,16 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at()).
     kept_out_by names the accounts that keep it out of every folder
     (kept_out_by(), among `accounts`), for one with no list; else [].
-    fallback is is_fallback(): true for "fallback": true alone (2026-11-06)."""
+    fallback is is_fallback(): true for "fallback": true alone (2026-11-06).
+    preferred (2026-11-11) is the folders it is preferred in, as only_in
+    shows its folders ([] for none, null for a field that is not a list of
+    absolute paths: preferred nowhere). use_here is what `longhaul use
+    NAME`, run from this chat in this folder, would do, for the pane's
+    button: "ok"; "this_chat", on it already; or its refusal, in its
+    order: "not_allowed" here (`allowed_here`, eligible()'s), "limited",
+    "not_signed_in" (as_expected false; a check that could not say is
+    trusted, as the command trusts it). Null with no list of accounts or
+    no folder to tell (`allowed_here` None)."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -16214,16 +16228,21 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     plan = a.get("subscriptionType")
     until = as_number(state["limited_until"].get(acct["name"]))
     reading = read_json(USAGE_DIR / f"{acct['name']}.json")
-    allowed = repositories_of(acct)
+    allowed, liked = repositories_of(acct), preferred_of(acct)
+    as_expected = None if signed_in is None else signed_in and (want is None or got.lower() == want.lower())
+    limited = until is not None and until > now
+    use_here = (None if allowed_here is None else "this_chat" if this_chat
+                else "not_allowed" if acct["name"] not in allowed_here else "limited" if limited
+                else "not_signed_in" if as_expected is False else "ok")
     return {
         "name": acct["name"],
         "email": masked_email(acct.get("email")),
         "signed_in": signed_in,
-        "as_expected": None if signed_in is None else signed_in and (want is None or got.lower() == want.lower()),
+        "as_expected": as_expected,
         "check_failed": str(a.get("why")) if unknown else None,
         "sign_in_failed_at": sign_in_failed_at(failed.get(acct["name"]), reading),
         "plan": plan if signed_in and isinstance(plan, str) else None,
-        "limited_until": until if until is not None and until > now else None,
+        "limited_until": until if limited else None,
         "five_hour": status_window(reading, "five_hour", now),
         "week": status_window(reading, "seven_day", now),
         "only_in": None if allowed is None else [home_path(p) for p in allowed],
@@ -16231,6 +16250,8 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "fallback": is_fallback(acct),
         "folder": home_path(str(config_of(acct))) if has_folder(acct) else "",
         "this_chat": this_chat,
+        "preferred": None if liked is None else [home_path(p) for p in liked],
+        "use_here": use_here,
     }
 
 
@@ -16249,15 +16270,16 @@ def status_json() -> int:
     ours = next((i for i, a in enumerate(accounts)
                  if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
     failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
-    rows = [status_account(acct, a, state, now, i == ours, failed, accounts)
-            for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
-    here = None
+    here = allowed_here = None
     if listed:
         try:
             top = repository_of(os.getcwd())
-            here = {"folder": home_path(top), "may_use": eligible(accounts, top)}
+            allowed_here = eligible(accounts, top)
+            here = {"folder": home_path(top), "may_use": allowed_here}
         except OSError:  # the folder it runs in was removed: no "here" to say
             pass
+    rows = [status_account(acct, a, state, now, i == ours, failed, accounts, allowed_here)
+            for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
     try:
         mode, mode_problem = switch_mode(), None
     except ValueError as e:

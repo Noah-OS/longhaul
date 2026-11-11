@@ -28,6 +28,10 @@ Accounts:
 - Take one off the list: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay.
 - Where one may be used (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME`. Change it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --add PATH` (a folder it may be used in, and those inside it), `--remove PATH`, each PATH starting with / or ~/ and repeatable, or `${CLAUDE_PLUGIN_ROOT}/bin/longhaul folders NAME --anywhere` (drops its list). A folder on an account's list is kept for the accounts that list it, so say which other accounts that leaves out, as the command's output does.
 
+Two account actions run in a terminal for now (the plugin's shim does not let them through from a chat yet): give the user the line to type there, `longhaul` in place of the full path, and say what it changes.
+- Run this chat on one account from now on: `longhaul use NAME --chat ${CLAUDE_SESSION_ID}`. A VS Code panel chat moves the next time Claude is idle in it; any other chat starts there when it is next opened, and the command says which. It refuses an account not allowed in this chat's folder, one at its usage limit (`longhaul clear NAME` forgets a limit that is over), or one not signed in as expected. It is no lock: at a usage limit the switching mode decides, as for any chat.
+- Prefer an account in a folder: `longhaul folders NAME --prefer PATH`; `longhaul folders NAME --no-prefer PATH` takes it off. A new chat in PATH or a folder inside it, and a chat there that moves at a usage limit, goes to NAME first while it has room; a reopened chat goes back to the account it ran on. A PATH the account may not be used in is refused, with why.
+
 For add and setup, tell the user first that the sign-in opens in the
 browser and that they sign in there with that account's email: Longhaul
 accepts no other. A browser signed in to claude.ai as someone else: copy

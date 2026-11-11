@@ -23597,7 +23597,8 @@ class StatusJson(unittest.TestCase):
     config folder to email ("default" for ~/.claude)."""
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
-                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"}
+                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
+                    "preferred", "use_here"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
@@ -23668,11 +23669,12 @@ class StatusJson(unittest.TestCase):
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
-            "this_chat": False})
+            "this_chat": False, "preferred": [], "use_here": "ok"})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat"],
-            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it")
+            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here"],
+            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it; "
+            "preferred and use_here last (2026-11-11)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -23851,7 +23853,7 @@ class StatusJson(unittest.TestCase):
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
-                    "folder": "~/claude", "this_chat": False}])
+                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
@@ -23998,6 +24000,55 @@ class StatusJson(unittest.TestCase):
                 self.vscode.write_text(text)
                 self.assertIs(self.read(self.status())["vscode"], want)
                 self.assertEqual(self.vscode.read_text(), text, "only read")
+
+
+class StatusPreferred(unittest.TestCase):
+    """What `longhaul status` and `status --json` say of a folder's preferred
+    account and of `longhaul use` here (2026-11-11): "preferred" and
+    "use_here", additive keys the accounts screen will read in a later
+    pass. StatusJson's scratch setup and stand-in claude."""
+
+    setUp = StatusJson.setUp
+    folder = StatusJson.folder
+    write_accounts = StatusJson.write_accounts
+    status = StatusJson.status
+    longhaul = StatusJson.longhaul
+    read = StatusJson.read
+    by_name = StatusJson.by_name
+    ACCOUNT_KEYS, KEYS = StatusJson.ACCOUNT_KEYS, StatusJson.KEYS
+
+    def test_status_json_gives_each_accounts_preferred_folders_and_what_use_would_do_here(self):
+        work = self.tmp / "work"
+        work.mkdir()
+        self.write_accounts(
+            {"name": "here", "config_dir": str(self.folder("here")), "email": "h@example.com", "preferred": ["~/work"]},
+            {"name": "kept", "config_dir": str(self.folder("kept")), "email": "k@example.com",
+             "repositories": ["~/elsewhere"], "preferred": "~/work"},
+            {"name": "full", "config_dir": str(self.folder("full")), "email": "f@example.com"},
+            {"name": "stranger", "config_dir": str(self.folder("stranger")), "email": "s@example.com"},
+            {"name": "free", "config_dir": str(self.folder("free")), "email": "free@example.com"})
+        self.emails = {str(self.folder(n)): f"{n[0]}@example.com" for n in ("here", "kept", "full")}
+        self.emails.update({str(self.folder("stranger")): "other@example.com",
+                            str(self.folder("free")): "free@example.com"})
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"full": time.time() + 3600}}))
+        found = self.by_name(self.read(self.status(cwd=work, CLAUDE_CONFIG_DIR=str(self.folder("here")))))
+        self.assertEqual({n: (a["preferred"], a["use_here"]) for n, a in found.items()}, {
+            "here": (["~/work"], "this_chat"), "kept": (None, "not_allowed"), "full": ([], "limited"),
+            "stranger": ([], "not_signed_in"), "free": ([], "ok")})
+        # No list of accounts (the stand-in for no file): nothing to tell.
+        (self.home / "accounts.json").unlink()
+        found = self.read(self.status())
+        self.assertEqual([(a["preferred"], a["use_here"]) for a in found["accounts"]], [([], None)])
+
+    def test_status_says_where_an_account_is_preferred_and_a_field_that_prefers_nothing(self):
+        self.write_accounts({"name": "work", "config_dir": str(self.folder("work")), "preferred": ["~/work", "/srv/x"]},
+                            {"name": "odd", "config_dir": str(self.folder("odd")), "preferred": ["work"]},
+                            {"name": "plain", "config_dir": str(self.folder("plain"))})
+        out = self.longhaul("status")
+        lines = out.stdout.splitlines()
+        self.assertIn("       preferred in: ~/work, /srv/x", lines)
+        self.assertIn(f"       {longhaul.PREFERRED_JUNK}; it is preferred nowhere", lines)
+        self.assertEqual(sum("preferred" in line for line in lines), 2, "nothing for an account with none")
 
 
 class Switch(unittest.TestCase):
