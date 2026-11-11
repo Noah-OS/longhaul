@@ -1773,6 +1773,19 @@ class Loop(unittest.TestCase):
             longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro")[:60]), "the carry-on names the move")
         self.assertIn("the wait ends early", (self.home / "longhaul.log").read_text())
 
+    def test_a_limit_forgotten_during_a_wait_ends_the_wait(self):
+        # The owner, 2026-11-11: an account reset before its time was waited
+        # for until the recorded time, and `longhaul clear` changed nothing.
+        (self.home / "config.json").write_text(json.dumps({"switch": "never"}))
+        cleared = threading.Timer(2, lambda: (self.home / "state.json").write_text(json.dumps({"limited_until": {}})))
+        cleared.start()
+        self.addCleanup(cleared.cancel)
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], LONGHAUL_SWITCH="")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")[:60]), "it carries on on Max")
+        self.assertIn("the wait ends early", (self.home / "longhaul.log").read_text())
+
     def test_the_account_waited_for_removed_meanwhile_is_not_reopened_on(self):
         (self.home / "config.json").write_text(json.dumps({"switch": "never"}))
         only_pro = json.dumps([{"name": "Pro", "config_dir": str(self.pro)}])
@@ -18937,6 +18950,183 @@ class KeepWorking(unittest.TestCase):
         self.assertFalse((self.home / "questions" / "sid-k.answer.json").exists(), "a refusal writes nothing")
         for said in (s for _, s in [self.answer("../x", "q-1", "move")]):
             self.assertEqual(said.count("."), 1, "one plain sentence")
+
+    # -- a recorded limit forgotten or lifted while the chat waits (the owner,
+    # 2026-11-11: an account was reset early and `longhaul clear` moved nothing)
+
+    def forget(self, *names):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = longhaul.main(["clear", *names])
+        return code, (out.getvalue() + err.getvalue()).strip()
+
+    def test_clear_with_a_name_forgets_that_account_alone_and_says_until_when(self):
+        self.limited(Max=self.clock.at + 3600, Pro=self.clock.at + 7200)
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
+        code, said = self.forget("max")
+        self.assertEqual(code, 0, said)
+        self.assertIn("forgot Max's recorded limit (it was until ", said)
+        self.assertEqual(self.state()["limited_until"], {"Pro": self.clock.at + 7200})
+        self.assertIn("clear: Max's recorded limit forgotten", self.log_text())
+
+    def test_clear_with_a_name_not_listed_changes_nothing(self):
+        self.limited(Max=self.clock.at + 3600)
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
+        code, said = self.forget("Team")
+        self.assertEqual(code, 2)
+        self.assertIn("no account called Team; the accounts are Max, Pro", said)
+        self.assertEqual(self.state()["limited_until"], {"Max": self.clock.at + 3600})
+
+    def test_clear_with_a_name_at_no_limit_says_so(self):
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
+        code, said = self.forget("Pro")
+        self.assertEqual(code, 0)
+        self.assertTrue(said.endswith("Pro has no recorded limit"), said)
+
+    def test_clear_says_which_limits_it_forgot_or_that_there_were_none(self):
+        self.limited(Max=self.clock.at + 3600, Pro=self.clock.at - 5)
+        code, said = self.forget()
+        self.assertEqual(code, 0)
+        self.assertIn("forgot the recorded limits: Max (it was until ", said)
+        self.assertNotIn("Pro", said, "a limit already past is not one to name")
+        self.assertEqual(self.state()["limited_until"], {})
+        self.assertTrue(self.forget()[1].endswith("forgot the recorded limits: none was recorded"))
+
+    def test_a_wait_answered_carries_on_at_once_when_the_limit_is_forgotten(self):
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "wait")
+        r.tend()
+        self.assertIsNotNone(self.waiting())
+        self.later(120)
+        self.forget("Max")
+        r.tend()
+        self.assertIsNone(self.waiting())
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertEqual(r.moves, [])
+        self.assertIn("Max's recorded limit is gone", self.log_text())
+
+    def test_in_never_the_wait_ends_when_the_limit_is_forgotten(self):
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.assertIsNotNone(self.waiting())
+        self.later(120)
+        self.forget()
+        r.tend()
+        self.assertIsNone(self.waiting())
+        self.assertEqual(len(self.said(r)), 1)
+
+    def test_a_wait_stays_while_its_limit_is_still_recorded(self):
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.later(120)
+        self.forget("Pro")  # state.json is written, Max's limit stands
+        self.limited(Max=self.clock.at + 3480, Pro=self.clock.at + 60)
+        r.tend()
+        self.assertIsNotNone(self.waiting())
+        self.assertEqual(self.said(r), [])
+
+    def test_an_open_move_question_gives_way_when_this_accounts_limit_is_forgotten(self):
+        r = self.relay()
+        self.stop(r)
+        self.assertEqual(self.question()["kind"], "move")
+        self.later(120)
+        self.forget("Max")
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertEqual(r.moves, [], "nothing moves: the chat's own account has room")
+        self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
+        self.assertIn("is withdrawn: Max's recorded limit is gone", self.log_text())
+
+    def test_a_first_reset_question_gives_way_when_this_accounts_limit_is_forgotten(self):
+        self.limited(Pro=self.clock.at + 7200)
+        r = self.relay()
+        self.stop(r)
+        self.assertEqual(self.question()["kind"], "first_reset")
+        self.later(120)
+        self.forget("Max")
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertEqual((r.moves, len(self.said(r))), ([], 1))
+
+    def test_in_ask_another_accounts_limit_forgotten_asks_the_move_and_moves_nothing(self):
+        self.limited(Pro=self.clock.at + 7200)
+        r = self.relay()
+        self.stop(r)
+        first = self.question()
+        self.assertEqual(first["kind"], "first_reset")
+        self.later(120)
+        self.forget("Pro")
+        r.tend()
+        q = self.question()
+        self.assertEqual((q["kind"], q["to"]), ("move", "Pro"))
+        self.assertNotEqual(q["id"], first["id"])
+        self.assertEqual((r.moves, self.said(r)), ([], []), "no answer, no move")
+
+    def test_in_auto_a_carry_on_goes_to_the_account_whose_limit_was_forgotten(self):
+        self.limited(Pro=self.clock.at + 7200)
+        r = self.relay(mode="auto", swap=True)
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Max")
+        self.later(120)
+        self.forget("Pro")
+        r.tend()
+        self.assertIsNone(self.waiting())
+        self.assertEqual([name for name, _ in r.moves], ["Pro"])
+
+    def test_a_chat_that_carried_on_since_is_sent_nothing_when_the_limit_is_forgotten(self):
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.later(120)
+        r.replied_at = self.clock.at
+        self.forget()
+        r.tend()
+        self.assertEqual(self.said(r), [])
+
+    def test_a_reply_after_the_limit_forgets_the_recorded_limit(self):
+        r = self.relay()
+        self.stop(r)
+        self.later(5)
+        r.replied_at = self.clock.at
+        r.tend()
+        self.assertEqual(self.state()["limited_until"], {})
+        self.assertIn("limit: Max's recorded limit (until ", self.log_text())
+        self.assertIn("is forgotten: sid-k had a reply on Max after it", self.log_text())
+
+    def test_a_reply_after_the_limit_leaves_a_later_limit_recorded_since(self):
+        r = self.relay()
+        self.stop(r)
+        self.later(5)
+        self.limited(Max=self.clock.at + 5 * 86400)  # another chat met the weekly limit since
+        r.replied_at = self.clock.at
+        r.tend()
+        self.assertEqual(self.state()["limited_until"], {"Max": self.clock.at + 5 * 86400})
+
+    def test_a_reply_before_a_due_carry_on_forgets_the_recorded_limit(self):
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.later(1800)
+        r.replied_at = self.clock.at
+        self.later(1800 + 61)
+        self.limited(Max=self.clock.at + 60)  # kept past its time by hand, to see it go
+        r.carry_for["limit"]["resets_at"] = self.clock.at + 60
+        r.tend()
+        self.assertEqual(self.said(r), [])
+        self.assertEqual(self.state()["limited_until"], {})
+
+    def test_a_sign_in_in_a_chat_on_an_account_with_no_email_forgets_its_limit(self):
+        self.accounts = [{"name": "Max", "config_dir": None}]
+        self.limited(Max=self.clock.at + 3600)
+        r = self.relay()
+        r.remember({"type": "control_request", "request": {"subtype": sorted(longhaul.SIGN_IN)[0]}})
+        self.assertEqual(self.state()["limited_until"], {})
+        self.assertIn("is forgotten: a sign-in started in a chat on it", self.log_text())
+
+    def test_a_sign_in_in_a_chat_on_an_account_with_an_email_keeps_its_limit(self):
+        self.limited(Max=self.clock.at + 3600)
+        r = self.relay()
+        r.remember({"type": "control_request", "request": {"subtype": sorted(longhaul.SIGN_IN)[0]}})
+        self.assertEqual(self.state()["limited_until"], {"Max": self.clock.at + 3600})
 
 
 class Pipe(StreamHarness):

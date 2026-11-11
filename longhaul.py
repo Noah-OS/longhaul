@@ -342,7 +342,8 @@ Usage:
   longhaul trial rate [CHAIN N]
                           the finished chains to rate, without their arms; with
                           CHAIN N, records a rating from 1 to 5
-  longhaul clear                forget the recorded limits
+  longhaul clear [NAME]         forget the recorded limits, or NAME's alone; a chat
+                          waiting for one carries on within a few seconds
   (log)                         LONGHAUL_HOME/longhaul.log leaves out its routine
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
@@ -1848,6 +1849,25 @@ def ask_here(question: str, keys: str, then: str, until: float, about: str, noti
             termios.tcsetattr(fd, termios.TCSANOW, old)
 
 
+def limit_gone(names) -> "callable":
+    """For a wait (wait_until()'s `changed`): whether the recorded limit of
+    any of `names` is gone before its time, forgotten by `longhaul clear`
+    or lifted (forget_limit()); the terminal waited for the recorded time
+    whatever became of the record (the owner, 2026-11-11). state.json is
+    read only when it has changed (file_mark())."""
+    path, names = LONGHAUL_HOME / "state.json", list(names)
+    seen = [file_mark(path)]
+
+    def gone() -> bool:
+        mark = file_mark(path)
+        if mark == seen[0]:
+            return False
+        seen[0] = mark
+        limited, now = load_state()["limited_until"], time.time()
+        return any((as_number(limited.get(n)) or 0) <= now for n in names)
+    return gone
+
+
 def wait_until(until: float, what: str, changed=lambda: False) -> bool:
     """Wait until `until`: True to carry on, False on Ctrl+C. `changed` is
     asked every few seconds, and True from it ends the wait early, for the
@@ -1860,7 +1880,8 @@ def wait_until(until: float, what: str, changed=lambda: False) -> bool:
         while time.time() < until:
             time.sleep(min(5, max(0.1, until - time.time())))
             if changed():
-                log("the wait ends early: accounts.json or the switching mode changed, so longhaul decides again")
+                log("the wait ends early: accounts.json, the switching mode or a recorded limit changed, so longhaul "
+                    "decides again")
                 return True
         return True
     except KeyboardInterrupt:
@@ -2534,7 +2555,8 @@ def run(opts) -> int:
             elif resets + RESET_MARGIN > time.time():
                 what, waiting = waiting or (f"{stay} is at its limit, and with switching set to {mode} "
                                             "the conversation stays on it (or start it with --account NAME)"), None
-                if not wait_until(resets + RESET_MARGIN, what, refresh):
+                lifted = limit_gone([stay])
+                if not wait_until(resets + RESET_MARGIN, what, lambda: bool(refresh()) or lifted()):
                     return 0
                 continue
             elif not signed_in_as_expected(accounts[names.index(stay)]):
@@ -2570,7 +2592,9 @@ def run(opts) -> int:
                 return stopped()
             if elsewhere is None:
                 which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
-                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit", refresh):
+                lifted = limit_gone(n for n in names if n not in wrong)
+                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit",
+                                  lambda: bool(refresh()) or lifted()):
                     return 0
                 continue
             idx, forced, stay = elsewhere, None, (names[elsewhere] if mode != "auto" else None)
@@ -13155,6 +13179,7 @@ class Relay:
         self.gone: set = set()
         self.off_done: set = set()
         self.to_reconsider = False  # refresh() saw a change: reconsider() at the next round
+        self.state_mark = file_mark(LONGHAUL_HOME / "state.json")  # tend_lifted(): state.json as last looked at
         # self.accounts and self.idx change together under pair_lock, and a
         # reader on another thread reads them through running_on() (2026-11-06).
         self.pair_lock = threading.Lock()
@@ -13255,6 +13280,11 @@ class Relay:
             forget_auth(acct)
             log(f"panel: a sign-in started in a chat on {acct['name']}; longhaul checks who {acct['name']} is "
                 "before its next launch")
+            if not acct.get("email"):
+                # No email to hold it to (the stand-in for no accounts.json):
+                # the folder may now be another subscription's, and the limit
+                # recorded was the one before's (the owner, 2026-11-11).
+                forget_limit(acct["name"], "a sign-in started in a chat on it, and it has no email to be held to")
             return
         if sub in LATEST:
             key = (sub,)
@@ -14030,12 +14060,14 @@ class Relay:
         if self.to_reconsider:
             self.to_reconsider = False
             self.reconsider()
+        self.tend_lifted()
         if self.question:
             if self.replied_at > self.question_for["since"]:
-                q = self.question
+                q, limit = self.question, self.question_for["limit"]
                 log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: the chat carried on on "
                     f"{q['from']} (a reply came after the limit)")
                 self.drop_question()
+                self.lifted_by_reply(q["chat"], limit)
             else:
                 self.read_answer()
                 if self.holds() and time.time() >= self.question["carries_on_at"]:
@@ -14049,6 +14081,87 @@ class Relay:
         if self.carry and time.time() >= self.carry["until"]:
             self.carry_on()
         self.tend_retry()
+
+    def lifted_by_reply(self, sid: str, limit: dict) -> None:
+        """A reply came on this chat's account after its limit: the account
+        works, so the limit recorded at that stop is forgotten
+        (forget_limit(), never one recorded until later since) and the
+        other chats waiting for it carry on too. On 2026-11-11 three chats
+        were asked to carry on at 16:30, had their replies at 16:26, and
+        the record still said 16:30."""
+        name = self.accounts[self.idx]["name"]
+        forget_limit(name, f"{sid} had a reply on {name} after it", as_number(limit.get("resets_at")) or 0)
+
+    def tend_lifted(self) -> None:
+        """A recorded limit this chat waits for is gone from state.json
+        before its time: `longhaul clear` forgot it, or a reply or a
+        sign-in lifted it (forget_limit()). Until 0.3.8 the relay kept its
+        own schedule and never looked: an account reset early by Anthropic
+        was waited for until the recorded time, and `longhaul clear`
+        changed nothing in an open chat (the owner, 2026-11-11). Looked at
+        only when state.json changed (file_mark()), and only while a
+        question is open or a carry-on waits more than RESET_MARGIN away.
+
+        This chat's own account with room: it carries on there, in every
+        mode, since nothing moves (a reopen's question only lets its held
+        messages go). Else the account the carry-on was scheduled for: it
+        goes now, as it was going to. Else another account has room:
+        again() decides as at any reset, so ask asks the move and auto
+        moves. A chat that has carried on since its limit is left to
+        tend() and carry_on(), which see that."""
+        mark = file_mark(LONGHAUL_HOME / "state.json")
+        if mark == self.state_mark:
+            return
+        self.state_mark = mark
+        q, c = self.question, self.carry
+        if not (q or c):
+            return
+        about = self.question_for if q else self.carry_for
+        now = time.time()
+        if (q["carries_on_at"] if q else c["until"]) - now <= RESET_MARGIN or self.replied_at > about["since"]:
+            return
+        limited = load_state()["limited_until"]
+
+        def room(i) -> bool:
+            return i is not None and (as_number(limited.get(self.accounts[i]["name"])) or 0) <= now
+
+        here, to = self.idx, about.get("to")
+        usable = [i for i in range(len(self.accounts)) if self.accounts[i]["name"] not in self.bad]
+        # What was full when the question was asked or the carry-on set: a
+        # move question's own account; a first reset's every account; a
+        # carry-on's own and the one it goes to, and in auto every account.
+        others = (q["kind"] == "first_reset") if q else (c["why"] == "auto")
+        if not (room(here) or (not q and room(to)) or (others and any(room(i) for i in usable))):
+            return
+        limit, since, sid = about["limit"], about["since"], (q or c)["chat"]
+        if room(here):
+            name = self.accounts[here]["name"]
+            if q:
+                log(f"question: {sid}'s question ({q['id']}) is withdrawn: {name}'s recorded limit is gone")
+                self.drop_question()
+                if about.get("reopened"):
+                    self.settle_hold()
+                    return
+            else:
+                log(f"wait: {sid}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {name}'s recorded "
+                    "limit is gone")
+                self.drop_carry()
+            self.carry_on_now(here, limit, since, "its recorded limit is gone")
+        elif c and not q and room(to):
+            log(f"wait: {sid}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {c['account']}'s "
+                "recorded limit is gone")
+            self.carry_on()
+        else:
+            if q:
+                log(f"question: {sid}'s question ({q['id']}) is withdrawn: a recorded limit is gone, so an "
+                    "account has room")
+                self.drop_question()
+            else:
+                log(f"wait: {sid}'s carry-on on {c['account']} at {clock(c['until'])} is looked at again: a "
+                    "recorded limit is gone, so an account has room")
+                self.drop_carry()
+            self.again(limit, since)
+        self.settle_hold()
 
     def tend_retry(self) -> None:
         """One retry after a server error (API_RETRY_WAIT's comment), at
@@ -14178,6 +14291,8 @@ class Relay:
         if self.replied_at > about["since"] or quota_continued(c["chat"], about["since"]):
             log(f"wait: {c['chat']} carried on without longhaul (a turn ran after the limit), so nothing was sent "
                 f"at {clock(c['until'])}")
+            if self.replied_at > about["since"]:
+                self.lifted_by_reply(c["chat"], about["limit"])
             return
         self.carry_on_now(about["to"], about["limit"], about["since"], c["why"])
 
@@ -15591,6 +15706,8 @@ def status(opts) -> int:
         who = (f"{a.get('email')} ({a.get('subscriptionType')})" if a.get("loggedIn")
                else f"could not check ({a.get('why')})" if a.get("unknown") else "NOT signed in")
         print(f"{acct['name']:<6} {who:<44} {limit}   [{config_of(acct)}]")
+        if until > now:
+            print(f"       reset before then? `longhaul clear {acct['name']}` forgets the recorded limit")
         want = acct.get("email")
         if want and (a.get("email") or "").lower() != want.lower():
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
@@ -15809,9 +15926,62 @@ def status_json() -> int:
     return 2 if problem else 0
 
 
-def clear(_opts) -> int:
+def forget_limit(name: str, why: str, upto: float | None = None):
+    """Forget `name`'s recorded limit in state.json, with one log line
+    saying `why` and until when it had been recorded; that time, or None
+    when nothing was forgotten: none recorded, one already past, or, with
+    `upto`, one recorded until later than that (another chat met a later
+    limit since, the weekly one after the five-hour one: not this caller's
+    to forget). The chats waiting for it see state.json change and carry
+    on (Relay.tend_lifted())."""
+    found = []
+
+    def forget(state):
+        until = as_number(state["limited_until"].get(name))
+        if until is None or until <= time.time() or (upto is not None and until > upto):
+            return
+        del state["limited_until"][name]
+        found.append(until)
+    try:
+        update_state(forget)
+    except OSError as e:
+        log(f"limit: {name}'s recorded limit was not forgotten: {e.strerror or e}")
+        return None
+    if found:
+        log(f"limit: {name}'s recorded limit (until {clock(found[0])}) is forgotten: {why}")
+    return found[0] if found else None
+
+
+def clear(opts) -> int:
+    """`longhaul clear [NAME]`: forget the recorded limits, or NAME's alone
+    (the owner, 2026-11-11: an account was reset before its time and
+    Longhaul went on waiting for it). It says which it forgot and until
+    when each had been recorded; a chat waiting for one carries on within
+    a few seconds (Relay.tend_lifted())."""
+    name, now = getattr(opts, "name", None), time.time()
+    recorded = {n: u for n, u in load_state()["limited_until"].items() if (as_number(u) or 0) > now}
+    if name:
+        accounts, _problem = load_accounts()
+        names = [a["name"] for a in accounts or []] + [n for n in recorded]
+        match = next((n for n in names if n.lower() == name.lower()), None)
+        if match is None:
+            say(f"no account called {name}; the accounts are {', '.join(dict.fromkeys(names))}")
+            return 2
+        if match not in recorded:
+            say(f"{match} has no recorded limit")
+            return 0
+        update_state(lambda state: state["limited_until"].pop(match, None))
+        log(f"clear: {match}'s recorded limit forgotten (it was until {clock(recorded[match])})")
+        say(f"forgot {match}'s recorded limit (it was until {clock(recorded[match])}); a chat waiting for it "
+            "carries on within a few seconds")
+        return 0
     update_state(lambda state: state.update(limited_until={}))
-    say("forgot the recorded limits")
+    if not recorded:
+        say("forgot the recorded limits: none was recorded")
+        return 0
+    each = ", ".join(f"{n} (it was until {clock(u)})" for n, u in recorded.items())
+    log(f"clear: the recorded limits forgotten: {each}")
+    say(f"forgot the recorded limits: {each}; a chat waiting for one carries on within a few seconds")
     return 0
 
 
@@ -17652,6 +17822,9 @@ def main(argv: list[str]) -> int:
                            help="a fallback: used only when no other account allowed there has room")
         if cmd == "remove":
             p.add_argument("name")
+        if cmd == "clear":
+            p.add_argument("name", nargs="?", metavar="NAME",
+                           help="only this account's recorded limit (default: every account's)")
         if cmd == "fallback":
             p.add_argument("name", help="the account")
             p.add_argument("action", nargs="?", choices=["on", "off"],

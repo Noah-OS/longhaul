@@ -41,7 +41,7 @@ Settings:
 - The VS Code panel on Longhaul's accounts: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul vscode on --yes` (it replaces any other program the panel was set to run); back to its own sign-in: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul vscode off`. Each edits VS Code's settings, a copy kept. After either, tell the user to reload VS Code: Cmd+Shift+P, then Developer: Reload Window.
 - The status line: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline install --yes` sets Claude Code's to Longhaul's, replacing one of the user's own (say so; a copy is kept); `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline uninstall` puts the one before back.
 - Claude Code's auto-update for Longhaul (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status`. Set it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update on --yes` or `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update off --yes`.
-- Forget the recorded usage limits: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul clear`.
+- Forget the recorded usage limits (an account was reset before its time and Longhaul still waits for it): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul clear`. The chats waiting for one carry on within a few seconds. One account's alone is terminal only: `longhaul clear NAME`.
 
 Uninstall:
 - What it would remove (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run`; with ~/.longhaul too: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run --purge`. Show it before asking.
