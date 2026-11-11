@@ -22694,6 +22694,23 @@ class RemoveDeleteFolder(unittest.TestCase):
         self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
         self.assertTrue((old / "projects" / "-work" / "s9.jsonl").exists())
 
+    def test_the_manage_skill_and_the_readme_offer_it_and_say_first_that_the_history_goes_for_good(self):
+        # The shim (bin/longhaul, the owner's to change) runs `remove NAME`
+        # alone, so until it lets --delete-folder through the skill gives
+        # the user the terminal line; every command it names by the shim's
+        # path is one the shim runs (Manage tests that).
+        text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
+        [line] = [l for l in text.splitlines() if l.startswith("- Take one off the list:")]
+        flat = " ".join(line.split())
+        self.assertIn("`${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay.", flat)
+        self.assertIn("tell the user first that its sign-in and the chat history kept in that folder go for good", flat)
+        self.assertIn("`longhaul remove NAME --delete-folder`", flat)
+        self.assertLess(flat.index("tell the user first"), flat.index("--delete-folder"))
+        readme = (HERE / "README.md").read_text()
+        [line] = [l for l in readme.splitlines() if l.startswith("**Sign in again, or remove an account.**")]
+        self.assertIn("`longhaul remove work --delete-folder` deletes its folder too", line)
+        self.assertIn("for good", line)
+
 
 class Folders(unittest.TestCase):
     """`longhaul folders NAME` (the owner, 2026-11-05: "I can't edit the

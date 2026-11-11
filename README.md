@@ -114,7 +114,7 @@ longhaul add work you@example.com
 
 Either way, the browser sign-in opens at once: sign in with that same email. What you type in `/accounts` goes to Longhaul's own command, not to Claude, and a password or a code is typed only in the browser.
 
-**Sign in again, or remove an account.** In `/accounts`, open the account's line: **Sign in again** (or **Sign in**), or **Remove**, which asks first. In a terminal: `longhaul setup work --relogin` signs it in again; `longhaul remove work` takes it off the list. Its folder and sign-in stay.
+**Sign in again, or remove an account.** In `/accounts`, open the account's line: **Sign in again** (or **Sign in**), or **Remove**, which asks first. In a terminal: `longhaul setup work --relogin` signs it in again; `longhaul remove work` takes it off the list. Its folder and sign-in stay. `longhaul remove work --delete-folder` deletes its folder too, with the sign-in and any chat history kept in it, for good: it says what goes and asks first, and refuses `~/.claude`, a folder another account uses and one a chat still runs on. On a Mac the sign-in Claude Code keeps in the Keychain may remain. `longhaul doctor` names the `~/.claude-*` folders no account uses.
 
 **A failed sign-in.** When a chat stops because its sign-in failed, Longhaul marks that account. `/accounts` shows "sign-in failed" on its line, and its page offers **Sign in**. `longhaul status` gives the line to run: `longhaul setup NAME --relogin`. The mark goes at the account's next reply, or after a sign-in that works.
 
