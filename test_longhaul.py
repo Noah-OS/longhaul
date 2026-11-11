@@ -17813,6 +17813,52 @@ class PanelKeepWorking(StreamHarness):
         self.assertEqual(len(self.calls()), 1)
 
 
+class PanelUse(StreamHarness):
+    """`longhaul use NAME` run from inside a panel chat, end to end: the
+    relay takes the choice, the command says the chat moves, and at the
+    chat's next idle moment the relay moves it (a real swap, fake_stream.py
+    as claude) with USE_CHOSEN. The decisions are UseRelay's."""
+
+    def use(self, *args, **extra_env):
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), FAKE_EMAILS=json.dumps(self.emails),
+                   LONGHAUL_AUTH_TTL="0", LONGHAUL_USE_WAIT_SECONDS="15")
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "use", *args], env=env, cwd=str(self.tmp),
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_use_from_inside_a_panel_chat_moves_it_to_the_account_chosen_once_it_is_idle(self):
+        self.plan(["reply", "reply"])
+        p = self.start(LONGHAUL_SWITCH="ask")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "hello")))["is_error"])
+        # As the chat's Bash tool runs it: the chat's id and config folder in its environment.
+        out = self.use("Pro", CLAUDE_CODE_SESSION_ID="sid-1", CLAUDE_CONFIG_DIR=str(self.max))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout + self.log_text()[-2000:])
+        self.assertEqual(out.stdout, "Chat sid-1 moves to Pro the next time Claude is idle in it (when asked from "
+                                     "inside it: once this turn has ended).\n")
+        try:
+            line = self.wait_for(lambda m: m.get("type") == "user" and m.get("isReplay") and m["message"]["content"][0][
+                "text"].startswith("The user chose to run this conversation on the Pro account"))
+        except AssertionError as e:
+            self.fail(f"{e}; the log: {self.log_text()[-3000:]}")
+        self.assertEqual(line["message"]["content"][0]["text"], longhaul.USE_CHOSEN.format(old="Max", new="Pro"))
+        self.assertFalse(self.wait_for(self.result_for(line["uuid"]))["is_error"])
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+        self.assertFalse((self.relay / "uses" / "sid-1.json").exists(), "acted on, then gone")
+        self.assertEqual(json.loads((self.relay / "usage" / "sessions" / "sid-1.json").read_text())["account"], "Pro")
+        log = self.log_text()
+        self.assertIn("panel: sid-1 is to run on Pro (longhaul use); it moves the next time it is idle", log)
+        self.assertIn("panel: sid-1 moved, while idle, from Max to Pro (chosen with longhaul use)", log)
+        # The chat runs on Pro now, which the command run there again says.
+        out = self.use("Pro", CLAUDE_CODE_SESSION_ID="sid-1", CLAUDE_CONFIG_DIR=str(self.pro))
+        self.assertEqual(out.stdout, "Chat sid-1 runs on Pro already.\n")
+
+
 class KeepWorking(unittest.TestCase):
     """Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2): a
     panel chat's relay at a limit, driven in this process on a clock of the
@@ -18937,6 +18983,131 @@ class KeepWorking(unittest.TestCase):
         self.assertFalse((self.home / "questions" / "sid-k.answer.json").exists(), "a refusal writes nothing")
         for said in (s for _, s in [self.answer("../x", "q-1", "move")]):
             self.assertEqual(said.count("."), 1, "one plain sentence")
+
+
+class UseRelay(unittest.TestCase):
+    """A panel chat's relay acting on `longhaul use`'s choice (Relay.
+    tend_use()), in this process on KeepWorking's clock and fakes: the
+    swap is stood in for (moves records it); PanelUse runs the real one."""
+
+    Clock, Watch = KeepWorking.Clock, KeepWorking.Watch
+    setUp = KeepWorking.setUp
+    relay = KeepWorking.relay
+    limited = KeepWorking.limited
+    stop = KeepWorking.stop
+    question = KeepWorking.question
+    waiting = KeepWorking.waiting
+    log_text = KeepWorking.log_text
+
+    def choose(self, account, sid="sid-k"):
+        """The file `longhaul use` writes for chat `sid`."""
+        longhaul.write_private(self.home / "uses" / f"{sid}.json",
+                               {"id": "u-0123456789ab", "chat": sid, "account": account, "at": int(self.clock.at)})
+
+    def choice(self):
+        path = self.home / "uses" / "sid-k.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def recorded(self):
+        path = self.home / "usage" / "sessions" / "sid-k.json"
+        return json.loads(path.read_text()).get("account") if path.exists() else None
+
+    def test_the_relay_takes_the_choice_at_once_and_moves_the_chat_only_once_it_is_idle(self):
+        r = self.relay()
+        r.watch.status = "busy"  # Claude is in a turn: the one that ran the command, say
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(self.choice()["relay_pid"], os.getpid(), "its pid tells the command a relay has it")
+        self.assertEqual(r.moves, [])
+        self.assertIn("panel: sid-k is to run on Pro (longhaul use); it moves the next time it is idle",
+                      self.log_text())
+        r.tend()
+        self.assertEqual(self.log_text().count("is to run on Pro"), 1, "taken once")
+        r.watch.status = "idle"
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.USE_CHOSEN.format(old="Max", new="Pro"))])
+        self.assertIsNone(self.choice())
+        self.assertEqual(self.recorded(), "Pro", "the record moves: a reopen starts there")
+        self.assertEqual(self.notes, ["The panel chat moved to Pro, as you chose."])
+        self.assertIn("panel: sid-k moved, while idle, from Max to Pro (chosen with longhaul use)", self.log_text())
+        r.tend()
+        self.assertEqual(len(r.moves), 1, "a choice acts once")
+
+    def test_a_choice_never_moves_a_chat_in_a_turn_a_swap_a_hold_or_with_agents_writing(self):
+        r = self.relay()
+        self.choose("Pro")
+        for attr, value in (("swapping", True), ("paused", True)):
+            setattr(r, attr, value)
+            r.tend()
+            setattr(r, attr, False)
+        r.watch.agents_busy = lambda: True
+        r.tend()
+        self.assertEqual((r.moves, self.choice()["account"]), ([], "Pro"), "still waiting")
+        r.watch.agents_busy = lambda: False
+        r.tend()
+        self.assertEqual([m[0] for m in r.moves], ["Pro"])
+
+    def test_a_choice_of_the_account_the_chat_is_on_or_of_none_listed_is_dropped(self):
+        r = self.relay()
+        self.choose("Max")
+        r.tend()
+        self.assertEqual((r.moves, self.choice()), ([], None))
+        self.assertIn("panel: sid-k runs on Max already; the choice is dropped", self.log_text())
+        for junk in ("Team", None):
+            if junk:
+                self.choose(junk)
+            else:
+                (self.home / "uses" / "sid-k.json").write_text("{not json")
+            r.tend()
+            self.assertEqual((r.moves, self.choice()), ([], None), junk)
+        self.assertEqual(self.log_text().count("the account chosen for sid-k is not one of Longhaul's accounts now; "
+                                               "the choice is dropped"), 2)
+
+    def test_an_account_that_cannot_take_the_chat_now_is_said_and_the_choice_dropped(self):
+        r = self.relay()
+        self.limited(Pro=self.clock.at + 600)
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual((r.moves, self.choice()), ([], None))
+        until = longhaul.clock(self.clock.at + 600)
+        self.assertEqual(self.notes, [f"The chat stays on Max: Pro, which you chose for it, cannot take it now (it is at "
+                                      f"its limit again, until {until})."])
+        self.assertIn(f"panel: sid-k does not move to Pro, as chosen: it is at its limit again, until {until}",
+                      self.log_text())
+        self.limited()
+        self.strangers.add("Pro")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertIn("cannot take it now (it is not signed in as expected)", self.notes[-1])
+
+    def test_a_choice_takes_the_place_of_an_open_question_or_carry_on_with_the_carry_on_message(self):
+        r = self.relay()
+        self.stop(r)  # ask: the question at the limit is open
+        self.assertIsNotNone(self.question())
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))],
+                         "it stopped at a limit: the carry-on, as a move answered sends")
+        self.assertIsNone(self.question())
+        self.assertIn("question: sid-k's question (q-", self.log_text())
+        self.assertIn(") is withdrawn: Pro was chosen", self.log_text())
+        # never: a carry-on at the reset waits, and the choice takes its place.
+        r = self.relay(mode="never")
+        self.stop(r)
+        self.assertEqual(self.waiting()["account"], "Max")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", longhaul.CARRY_ON.format(old="Max", kind="session", new="Pro"))])
+        self.assertIsNone(self.waiting())
+        self.assertIn("wait: sid-k's carry-on on Max is cancelled: Pro was chosen", self.log_text())
+
+    def test_longhaul_pipe_leaves_the_choice_for_the_sessions_next_open(self):
+        r = self.relay(says=True, swap=True, mode="auto")
+        self.choose("Pro")
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertNotIn("relay_pid", self.choice(), "untouched: the next open takes it")
 
 
 class Pipe(StreamHarness):

@@ -14111,6 +14111,66 @@ class Relay:
         if self.carry and time.time() >= self.carry["until"]:
             self.carry_on()
         self.tend_retry()
+        self.tend_use()
+
+    def tend_use(self) -> None:
+        """`longhaul use`'s choice of account for this chat (USES), each
+        round: marked as taken with this relay's pid, which the command
+        waits for, then acted on the next time the chat is idle, never in
+        a turn, a swap or a hold: the chat moves there (move_to()) with
+        USE_CHOSEN, or CARRY_ON when it stopped at a limit and a question
+        or carry-on was open (not a reopen's question: there nothing was
+        cut off), which the user's choice takes the place of, held
+        messages going on there;
+        the record moves too, so a reopen starts there. One the chat runs
+        on already is dropped; one that cannot take it now (unready()) is
+        dropped and said. longhaul pipe leaves it for the session's next
+        open: its driver's consent is for moves at a limit."""
+        sid = self.watch.sid if self.watch else None
+        path = chat_file(USES, sid)
+        if self.says or path is None or not path.exists():
+            return
+        found = read_json(path)
+        name = choice_of(found, sid)
+        listed = [a["name"] for a in self.accounts]
+        if name is None or name in self.gone or name not in listed:
+            log(f"{self.who}: the account chosen for {sid} is not one of Longhaul's accounts now; the choice is dropped")
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return
+        here = self.accounts[self.idx]["name"]
+        if found.get("relay_pid") != os.getpid():
+            with contextlib.suppress(OSError):
+                write_private(path, {**found, "relay_pid": os.getpid()})
+            log(f"{self.who}: {sid} is to run on {name} (longhaul use); it moves the next time it is idle")
+        if self.swapping or self.paused or self.watch.status != "idle" or self.watch.agents_busy() or name == here:
+            if name == here:
+                log(f"{self.who}: {sid} runs on {name} already; the choice is dropped")
+                with contextlib.suppress(OSError):
+                    path.unlink()
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
+        nxt = listed.index(name)
+        problem = self.unready(nxt)
+        if problem:
+            log(f"{self.who}: {sid} does not move to {name}, as chosen: {problem}")
+            notify(f"The chat stays on {here}: {name}, which you chose for it, cannot take it now ({problem}).")
+            return
+        about = self.question_for if self.question else self.carry_for if self.carry else {}
+        if self.question:
+            log(f"question: {self.question['chat']}'s question ({self.question['id']}) is withdrawn: {name} was chosen")
+            self.drop_question()
+        if self.carry:
+            log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} is cancelled: {name} was chosen")
+            self.drop_carry()
+        limit = None if about.get("reopened") else about.get("limit")  # a reopen's question: nothing was cut off
+        text = (CARRY_ON.format(old=here, kind=limit["kind"], new=name) if limit
+                else USE_CHOSEN.format(old=here, new=name))
+        if self.move_to(nxt, text):
+            note_session_account(sid, name)
+            log(f"{self.who}: {sid} moved, while idle, from {here} to {name} (chosen with longhaul use)")
+            notify(f"The panel chat moved to {name}, as you chose.")
 
     def tend_retry(self) -> None:
         """One retry after a server error (API_RETRY_WAIT's comment), at
