@@ -23447,7 +23447,7 @@ class Use(unittest.TestCase):
             out = self.longhaul("use", *args, **env)
             self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", f"longhaul use: {said}\n"), args)
         (self.home / "state.json").unlink()
-        self.emails[str(self.tmp / "pro")] = "someone@else.example"
+        self.emails[str(self.tmp / "pro")] = "someone.else@example.com"
         out = self.longhaul("use", "Pro", "--chat", self.SID)
         self.assertEqual((out.returncode, out.stdout, out.stderr), (2, "", "longhaul use: Pro is not signed in as "
                          "expected, so the chat stays where it is: `longhaul setup Pro --relogin` signs it in again\n"))
