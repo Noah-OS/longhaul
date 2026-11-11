@@ -121,6 +121,14 @@ Usage:
                           that name it, so one with no list is used where no
                           list does: beside one whose folders include /, nowhere,
                           which this says. /accounts does it with buttons
+  longhaul folders NAME [--prefer PATH]... [--no-prefer PATH]...
+                          the folders NAME is preferred in: a new chat in one
+                          (or in a folder inside it), or one that moves at a
+                          limit there, goes to NAME first while it has room
+                          (the deepest preferred folder wins); --no-prefer
+                          takes one off. A folder NAME may not be used in is
+                          refused. A reopened chat goes back to the account it
+                          ran on (`longhaul use` moves it)
   longhaul fallback NAME [on|off]
                           whether NAME is a fallback, used only when no other
                           account allowed there has room (with neither word
@@ -130,6 +138,14 @@ Usage:
                           to a fallback, and a chat on one is not moved off it
                           when a normal account has room again. /accounts does
                           it with a button
+  longhaul use NAME [--chat ID] the chat this runs in, or chat ID (a short id
+                          works), runs on NAME from now on: a VS Code panel
+                          chat moves the next time Claude is idle in it, any
+                          other starts there when it is next opened, which it
+                          says. Refused for an account not allowed in the
+                          chat's folder, at its limit or not signed in as
+                          expected. Not a lock: at a usage limit the chat
+                          follows the switching mode, as any chat does
   longhaul switch [ask|auto|never]
                           the switching mode at a usage limit (see --switch):
                           with none, the one in force and where it comes from
@@ -1091,8 +1107,61 @@ def is_fallback(acct: dict) -> bool:
     return acct.get("fallback") is True
 
 
+# A folder's preferred account (the owner, 2026-11-11: "...or tied to a
+# folder"): an optional "preferred": ["~/work/client", ...] on an account in
+# accounts.json, kept as written as "repositories" is; absent, null or []
+# is none, as every account had before. pick() takes a free account that
+# prefers the chat's folder, or one above it, first (preferred_here()). A
+# field that is not a list of absolute paths prefers nothing: a typo never
+# sends a chat anywhere, and `longhaul status` says so.
+PREFERRED_JUNK = "its preferred field is not a list of absolute paths"
+
+
+def preferred_of(acct: dict):
+    """The folders an account is preferred in, `~` expanded: [] for none
+    (absent, null or an empty list), None for a value that is not a list
+    of absolute paths, which prefers nothing."""
+    found = acct.get("preferred")
+    if found is None or found == []:
+        return []
+    if not isinstance(found, list):
+        return None
+    paths = [os.path.expanduser(p) if isinstance(p, str) else "" for p in found]
+    return paths if all(os.path.isabs(p) for p in paths) else None
+
+
+def preference_depth(acct: dict, top: str) -> int:
+    """How deep the deepest of `acct`'s preferred folders that is the
+    repository `top` or a folder above it lies, by real path on both
+    sides, as account_allowed() compares them: the length of its real
+    path; 0 when none is."""
+    real, depth = os.path.realpath(top), 0
+    for entry in map(os.path.realpath, preferred_of(acct) or ()):
+        if real == entry or inside(real, entry):
+            depth = max(depth, len(entry))
+    return depth
+
+
+def preferred_here(accounts: list[dict], free: list[int], top: str, seen: dict, now: float):
+    """Of the indices `free` (not at a limit, not skipped), the account
+    preferred most deeply in `top` (preference_depth()), a tie going in
+    the file's order, when it may be used there (eligible()); else None.
+    One nearly full is passed over while another of `free` has room: the
+    early move leaves such an account, and would find it again."""
+    depths = [(preference_depth(accounts[i], top), i) for i in sorted(free)]
+    if not any(d for d, _ in depths):  # no preference here: nothing more is read
+        return None
+    allowed = set(eligible(accounts, top))
+    roomy = any(not near_full(seen.get(accounts[i]["name"]), now) for i in free)
+    best, depth = None, 0
+    for d, i in depths:
+        if d > depth and accounts[i]["name"] in allowed and not (roomy and near_full(seen.get(accounts[i]["name"]), now)):
+            best, depth = i, d
+    return best
+
+
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
-         seen: dict | None = None):
+         seen: dict | None = None, top: str | None = None):
     """The account to launch on.
 
     Among accounts not at a limit, a fallback account (is_fallback()) is
@@ -1112,6 +1181,15 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     normal account has room again: nothing calls this for that, since it
     would be a move nobody asked for. A limit, the early move off a nearly
     full account, or a reopen in auto picks again, and then this rule.
+
+    With `top`, the chat's repository: before all that, among the accounts
+    not at a limit, one preferred in `top` or a folder above it
+    (preferred_here(): the deepest folder wins, a tie in the file's order)
+    is taken, fallback or not; at its limit, signed in as someone else (the
+    callers then skip it), or nearly full while another has room, these
+    rules decide. Without `top`, or with no preference there, nothing else
+    changes. A reopened chat in ask and never does not come here: it
+    returns to the account it ran on.
     """
     now = time.time() if now is None else now
     seen = seen or {}
@@ -1121,6 +1199,9 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     if not usable:
         return None, None
     free = [i for i in usable if limited.get(accounts[i]["name"], 0) <= now]
+    liked = preferred_here(accounts, free, top, seen, now) if free and top is not None else None
+    if liked is not None:
+        return liked, None
     if free:
         group = [i for i in free if not is_fallback(accounts[i])] or free
         roomy = [i for i in group if not near_full(seen.get(accounts[i]["name"]), now)]
@@ -2423,7 +2504,7 @@ def run(opts) -> int:
             return None
         skip = {a["name"] for a in accounts if a["name"] in kept_here or not account_allowed(a, top)}
         while True:
-            i, until = pick(accounts, state, 0, skip=skip, seen=seen)
+            i, until = pick(accounts, state, 0, skip=skip, seen=seen, top=top)
             if i is None or until:
                 return None
             if signed_in_as_expected(accounts[i]):
@@ -2476,7 +2557,7 @@ def run(opts) -> int:
         nonlocal prompt
         skip = wrong | {stay}
         while True:
-            i, until = pick(accounts, state, (names.index(stay) + 1) % len(names), skip=skip, seen=seen)
+            i, until = pick(accounts, state, (names.index(stay) + 1) % len(names), skip=skip, seen=seen, top=top)
             if i is None or until:
                 return None
             if signed_in_as_expected(accounts[i]):
@@ -2598,7 +2679,7 @@ def run(opts) -> int:
             elif signed_in_as_expected(accounts[i]):
                 idx, until, chosen = i, None, True
         while not chosen:
-            idx, until = pick(accounts, state, idx, skip=wrong, seen=seen)
+            idx, until = pick(accounts, state, idx, skip=wrong, seen=seen, top=top)
             if idx is None or until or signed_in_as_expected(accounts[idx]):
                 break
             wrong.add(accounts[idx]["name"])
@@ -2782,7 +2863,7 @@ def run(opts) -> int:
                     state["handled_limits"] = (state.get("handled_limits", []) + [limit["uuid"]])[-50:]
             state = update_state(mark)
             nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong,
-                             seen=readings(accounts))
+                             seen=readings(accounts), top=top)
             new = accounts[nxt]["name"]
             every = "every account allowed here" if denied else "every account"
             msg = f"{acct['name']} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])})."
@@ -2831,7 +2912,7 @@ def run(opts) -> int:
             prompt = None
             used = max((u for u, _ in windows(readings(accounts).get(acct["name"]), time.time())), default=0)
             nxt, _ = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
-                          seen=readings(accounts))
+                          seen=readings(accounts), top=top)
             msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
                    f"longhaul moved it to {accounts[nxt]['name']}.")
             say(msg)
@@ -2841,7 +2922,7 @@ def run(opts) -> int:
             # leave()'s move in auto, off an account removed or no longer
             # allowed here: as the early move, no carry-on message.
             prompt = None
-            nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts))
+            nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts), top=top)
             msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul "
             msg += f"moved it to {accounts[nxt]['name']}." if nxt is not None else "moved it."
             say(msg)
@@ -12839,16 +12920,18 @@ def signed_in_cached(acct: dict, binary: str) -> bool:
 
 
 def choose_for_panel(accounts: list[dict], binary: str, start: int = 0, state: dict | None = None,
-                     wrong: set | None = None):
+                     wrong: set | None = None, top: str | None = None):
     """The account a panel claude runs on: pick()'s rules and the email
     check, also when every account is at a limit (an account signed in as
     someone else is never used, limited or not). (index, until) as pick()
-    returns; (None, None) when no account is signed in as it should be."""
+    returns; (None, None) when no account is signed in as it should be.
+    `top`: the chat's repository, for pick()'s preferred accounts (none
+    for a short job)."""
     state = load_state() if state is None else state
     wrong = set() if wrong is None else wrong
     seen = readings(accounts)
     while True:
-        i, until = pick(accounts, state, start, skip=wrong, seen=seen)
+        i, until = pick(accounts, state, start, skip=wrong, seen=seen, top=top)
         if i is None:
             return None, None
         if signed_in_cached(accounts[i], binary):
@@ -12960,7 +13043,7 @@ def wrap(argv: list[str]) -> int:
                 notify(f"{accounts[idx]['name']} is at its limit until {clock(until)}; the chat stays on it "
                        f"(switching is {mode})")
         if idx is None:
-            idx, _ = choose_for_panel(accounts, binary, wrong=set(denied))
+            idx, _ = choose_for_panel(accounts, binary, wrong=set(denied), top=top)
         if idx is None and denied:
             # Not run unchanged: ~/.claude can be the denied account, or signed in
             # as it, so the chat would run outside the policy (final review,
@@ -13121,7 +13204,7 @@ def pipe(argv: list[str]) -> int:
             # one longhaul manages. A new session (--session-id) is picked.
             idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged, top)
         if idx is None:
-            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied)
+            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied, top=top)
         if idx is None:  # "allowed here" with any account denied, as run() says (final review, Sprint 7, G5)
             which = "no account allowed here" if denied else "no account"
             log(f"pipe: {which} is signed in as expected, so longhaul did not start Claude")
@@ -13800,7 +13883,7 @@ class Relay:
         if self.replied_at > about["since"]:
             return  # tend() and carry_on() see that it carried on
         nxt, until = choose_for_panel(self.accounts, self.binary, (self.idx + 1) % len(self.accounts), load_state(),
-                                      wrong=set(self.bad))
+                                      wrong=set(self.bad), top=self.top)
         if nxt is None or nxt == self.idx or (until and not (q and auto and not about.get("reopened"))):
             return
         limit, since, reopened = about["limit"], about["since"], about.get("reopened")
@@ -13915,7 +13998,7 @@ class Relay:
         here_idx, sid, text, why = self.idx, self.watch.sid, self.off_text(), self.off()
         here = self.accounts[here_idx]
         nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), load_state(),
-                                      wrong=set(self.bad))
+                                      wrong=set(self.bad), top=self.top)
         if nxt is None or until or nxt == here_idx:
             none = ("no account allowed here is signed in as expected" if nxt is None
                     else "every account allowed here is at its limit")
@@ -14034,7 +14117,7 @@ class Relay:
         state = load_state() if state is None else state
         path = chat_file(QUESTIONS, sid)
         nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
-                                      wrong=set(self.bad))
+                                      wrong=set(self.bad), top=self.top)
         if path is None or nxt is None or (nxt == here_idx and not until):
             why = ("the chat has no id yet" if path is None
                    else "no account allowed here is signed in as expected" if nxt is None
@@ -14353,7 +14436,7 @@ class Relay:
         here_idx = self.idx
         state = load_state()
         nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
-                                      wrong=set(self.bad))
+                                      wrong=set(self.bad), top=self.top)
         if self.mode == "never":
             own = state["limited_until"].get(self.accounts[here_idx]["name"], 0)
             if own > time.time():
@@ -14530,7 +14613,7 @@ class Relay:
             self.drop_carry()
         if to is None:
             nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
-                                          wrong=set(self.bad))
+                                          wrong=set(self.bad), top=self.top)
         else:
             nxt, until = to, None
         if self.says and self.init_request is None:
@@ -15706,8 +15789,17 @@ def folders(opts) -> int:
     --repo has none, and so does a remove that leaves it empty.
     accounts.json is written as add and remove write it, whole, the other
     keys and the accounts' order kept, one log line per change; an
-    unknown NAME or a bad path writes nothing, exit 2."""
+    unknown NAME or a bad path writes nothing, exit 2.
+
+    --prefer PATH and --no-prefer PATH (the owner, 2026-11-11: an account
+    "tied to a folder") change the folders the account is preferred in
+    ("preferred", which pick() reads: preferred_here()) by the same rules,
+    after the folders it may be used in, which they may come with: PATH
+    kept as written, a remove matched by real path, the key dropped when
+    none is left. A PATH the account may not be used in (eligible(), with
+    its folders as they are now) is refused with why (may_not_text())."""
     adds, drops = opts.add or [], opts.remove or []
+    prefers, unprefers = getattr(opts, "prefer", None) or [], getattr(opts, "no_prefer", None) or []
     if opts.anywhere and (adds or drops):
         say("--anywhere drops every folder: give it alone, not with --add or --remove")
         return 2
@@ -15715,7 +15807,11 @@ def folders(opts) -> int:
         if not os.path.isabs(os.path.expanduser(p)):
             say(f"--add {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
             return 2
-    if not (adds or drops or opts.anywhere):  # it only reads: no lock, nothing written
+    for p in prefers:
+        if not os.path.isabs(os.path.expanduser(p)):
+            say(f"--prefer {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
+            return 2
+    if not (adds or drops or opts.anywhere or prefers or unprefers):  # it only reads: no lock, nothing written
         accounts, problem = read_accounts_file()
         acct = folders_account(opts.name, accounts, problem, tell=print)
         if acct is None:
@@ -15729,7 +15825,8 @@ def folders(opts) -> int:
         if acct is None:
             return 2
         name, found = acct["name"], acct.get("repositories")
-        entry = {k: v for k, v in acct.items() if k != "repositories"}  # the other keys, in their order
+        # the other keys, in their order; all of them when only the preferred folders change
+        entry = {k: v for k, v in acct.items() if k != "repositories"} if opts.anywhere or adds or drops else acct
         if opts.anywhere:
             listed = repositories_of(acct)
             if listed == []:
@@ -15737,7 +15834,7 @@ def folders(opts) -> int:
             else:
                 changes.append(f"dropped {name}'s folders ({', '.join(map(home_path, listed))})" if listed
                                else f"dropped {name}'s folders: {REPOSITORIES_JUNK}")
-        else:
+        elif adds or drops:
             if found is not None and not isinstance(found, list):
                 say(f"{name}'s repositories field is not a list, so no folder can be added to it or taken from it: "
                     f"`longhaul folders {name} --anywhere` drops it, then --add sets its folders")
@@ -15760,6 +15857,11 @@ def folders(opts) -> int:
                     notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
             if paths:  # in its place when it was there, else last; none left, none kept
                 entry = {**acct, "repositories": paths}
+        if prefers or unprefers:
+            entry = folders_preferred(entry, [entry if a is acct else a for a in accounts], prefers, unprefers,
+                                      changes, notes)
+            if entry is None:
+                return 2
         if changes:
             accounts[accounts.index(acct)] = entry
             write_json(LONGHAUL_HOME / "accounts.json", accounts)
@@ -15830,6 +15932,44 @@ def fallback_cmd(opts) -> int:
     return 0
 
 
+def folders_preferred(entry: dict, accounts: list[dict], prefers: list, unprefers: list, changes: list,
+                      notes: list):
+    """`entry` with --no-prefer's folders taken off its "preferred", then
+    --prefer's added (folders()'s rules), each change and note added to
+    `changes` and `notes`; `accounts` holds `entry` in its place, for
+    eligible(). None once the refusal is said: a field that is not a list,
+    a folder to take off it is not preferred in, or one to add that it may
+    not be used in."""
+    name, found = entry["name"], entry.get("preferred")
+    if found is not None and not isinstance(found, list):
+        say(f"{name}'s preferred field is not a list, so no folder can be added to it or taken from it; until it is "
+            f"mended in {home_path(str(LONGHAUL_HOME / 'accounts.json'))}, {name} is preferred nowhere")
+        return None
+    liked = list(found or [])
+    for p in unprefers:
+        hits = [e for e in liked if same_folder(e, p)]
+        if not hits:
+            say(f"{folder_shown(p)} is not a folder {name} is preferred in")
+            return None
+        liked = [e for e in liked if e not in hits]
+        changes += [f"{name} is no longer preferred in {folder_shown(e)}" for e in hits]
+    for p in prefers:
+        if any(same_folder(e, p) for e in liked):
+            notes.append(f"{name} is preferred in {folder_shown(p)} already")
+            continue
+        where = os.path.normpath(os.path.expanduser(p))
+        if name not in eligible(accounts, where):
+            say(f"{may_not_text(entry, where, accounts)}, so it cannot be preferred there")
+            return None
+        liked.append(p)  # kept as given, `~` included, as "repositories" is
+        changes.append(f"{name} is preferred in {folder_shown(p)}")
+        if not os.path.exists(where):
+            notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
+    if liked:  # in its place when it was there, else last; none left, none kept
+        return {**entry, "preferred": liked}
+    return {k: v for k, v in entry.items() if k != "preferred"}
+
+
 def folders_account(name: str, accounts, problem, tell=say):
     """`longhaul folders`'s account, and `longhaul fallback`'s, by NAME in
     any case, as remove finds it; None once the reason is told (`tell`:
@@ -15879,6 +16019,24 @@ def folders_lines(acct: dict, accounts: list[dict]) -> list[str]:
             lines.append(f"With / among its folders, {acct['name']} keeps every folder, so {', '.join(out)} "
                          f"{'are' if len(out) > 1 else 'is'} used nowhere until {'their' if len(out) > 1 else 'its'} "
                          "folders are set.")
+    return lines + preferred_lines(acct, accounts)
+
+
+def preferred_lines(acct: dict, accounts: list[dict]) -> list[str]:
+    """The folders `acct` is preferred in, as `longhaul folders` and status
+    say them: none, nothing; a field that is not a list of absolute paths,
+    that it is preferred nowhere; else the folders, and those of them it
+    may not be used in, where it is not preferred."""
+    liked, name = preferred_of(acct), acct["name"]
+    if liked is None:
+        return [f"{name} is preferred nowhere: {PREFERRED_JUNK}."]
+    if not liked:
+        return []
+    lines = [f"{name} is preferred in {', '.join(map(folder_shown, liked))}: a new chat there, or one that moves at "
+             "a limit, goes to it first while it has room."]
+    out = [p for p in liked if name not in eligible(accounts, os.path.normpath(p))]
+    if out:
+        lines.append(f"But {name} may not be used in {', '.join(map(folder_shown, out))}, so it is not preferred there.")
     return lines
 
 
@@ -17974,6 +18132,12 @@ def main(argv: list[str]) -> int:
                            help="one of its folders to take off, matched by real path; repeat for more")
             p.add_argument("--anywhere", action="store_true",
                            help="drop its list: it may be used wherever no other account's folders keep the folder")
+            p.add_argument("--prefer", action="append", metavar="PATH",
+                           help="a folder it is preferred in: a new chat there (and in the folders inside it), or "
+                                "one that moves at a limit, goes to it first while it has room; kept as written (~ "
+                                "allowed); repeat for more")
+            p.add_argument("--no-prefer", action="append", metavar="PATH",
+                           help="a folder it is preferred in, taken off, matched by real path; repeat for more")
         if cmd == "allow":
             p.add_argument("chat", metavar="ID",
                            help="the chat: its id, or its first 8 characters or more (the account check's refusal "
