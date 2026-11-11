@@ -16703,15 +16703,16 @@ def forget_limit(name: str, why: str, upto: float | None = None):
     """Forget `name`'s recorded limit in state.json, with one log line
     saying `why` and until when it had been recorded; that time, or None
     when nothing was forgotten: none recorded, one already past, or, with
-    `upto`, one recorded until later than that (another chat met a later
-    limit since, the weekly one after the five-hour one: not this caller's
-    to forget). The chats waiting for it see state.json change and carry
+    `upto`, one recorded until later than that by more than KIND_SLACK
+    (another chat met a later limit since, the weekly one after the
+    five-hour one: not this caller's to forget; the same window as another
+    chat recorded it, a moment apart, is). The chats waiting for it see state.json change and carry
     on (Relay.tend_lifted())."""
     found = []
 
     def forget(state):
         until = as_number(state["limited_until"].get(name))
-        if until is None or until <= time.time() or (upto is not None and until > upto):
+        if until is None or until <= time.time() or (upto is not None and until > upto + KIND_SLACK):
             return
         del state["limited_until"][name]
         found.append(until)

@@ -17849,6 +17849,116 @@ class PanelKeepWorking(StreamHarness):
         self.assertIn("wait: sid-1 carries on on Max at ", self.log_text())
         self.assertIn("wait: sid-1 carried on on Max (answered)", self.log_text())
 
+    def forget(self, *names):
+        """`longhaul clear [NAME]` as a terminal, the skill or the pane runs it: what it said."""
+        env = dict(os.environ, LONGHAUL_HOME=str(self.relay), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "global.json"), LONGHAUL_NO_NOTIFY="1")
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "clear", *names], env=env,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout + out.stderr
+
+    def limits(self):
+        return json.loads((self.relay / "state.json").read_text())["limited_until"]
+
+    def test_clear_ends_an_answered_wait_an_hour_from_its_reset(self):
+        # The owner, 2026-11-11: "even forget limits did not work". The
+        # reset is an hour away; only the forgotten record can carry on.
+        p, q = self.limit_and_question()
+        self.answer(q, "wait")
+        self.wait_file("waits/sid-1.json")
+        self.assertIn("forgot Max's recorded limit", self.forget("Max"))
+        self.carry_on("The Max account hit its session limit, so longhaul waited for it to reset")
+        self.assertEqual(len(self.calls()), 1, "the same claude carries on")
+        self.assertFalse((self.relay / "waits" / "sid-1.json").exists())
+        self.assertIn("goes now: Max's recorded limit is gone", self.log_text())
+
+    def test_clear_ends_the_wait_in_never(self):
+        self.plan(["limit", "reply"])
+        p = self.start(LONGHAUL_SWITCH="never")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        self.wait_file("waits/sid-1.json")
+        self.forget()
+        self.carry_on("The Max account hit its session limit, so longhaul waited for it to reset")
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_clear_withdraws_an_open_question_and_carries_on_on_the_same_account(self):
+        p, q = self.limit_and_question()
+        self.forget("Max")
+        self.carry_on("The Max account hit its session limit, so longhaul waited for it to reset")
+        self.assertEqual(len(self.calls()), 1, "nothing moved: no answer was given")
+        self.assertEqual(sorted(os.listdir(self.relay / "questions")), [])
+
+    def second_chat(self, mode):
+        """A second panel chat, sid-2, on the same accounts and the same
+        account's limit; the first's process stays running, followed no
+        more (its part is read from the log and its files)."""
+        (self.relay / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+        (self.relay / "usage" / "sessions" / "sid-2.json").write_text(json.dumps({"account": "Max"}))  # it ran on Max
+        p = self.start(self.EXT_ARGS + ["--resume=sid-2"], LONGHAUL_SWITCH=mode)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        return p
+
+    def log_count(self, text, timeout=10, want=1):
+        end = time.time() + timeout
+        while self.log_text().count(text) < want and time.time() < end:
+            time.sleep(0.05)
+        return self.log_text().count(text)
+
+    def test_clear_carries_two_waiting_chats_on_once_each_and_no_more(self):
+        # Two chats wait for the same account. One clear: each carries on
+        # once; the forgotten record does not come round again as a loop.
+        self.plan(["limit", "limit", "reply", "reply"])
+        p1 = self.start(LONGHAUL_SWITCH="never")
+        self.initialize(p1)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p1, "build it")))["is_error"])
+        self.wait_file("waits/sid-1.json")
+        p2 = self.second_chat("never")
+        self.user(p2, "build the other")
+        self.wait_file("waits/sid-2.json")
+        self.forget()
+        self.assertEqual(self.log_count("wait: sid-1 carried on on Max"), 1, self.log_text()[-3000:])
+        self.assertEqual(self.log_count("wait: sid-2 carried on on Max"), 1, self.log_text()[-3000:])
+        time.sleep(3)  # thirty rounds of each relay's tend()
+        log = self.log_text()
+        self.assertEqual((log.count("wait: sid-1 carried on on Max"), log.count("wait: sid-2 carried on on Max")), (1, 1))
+        self.assertEqual(log.count("goes now"), 2)
+        self.assertEqual(self.limits(), {})
+        self.assertEqual(len(self.calls()), 2, "each chat's own claude carried on; none was started")
+        for p in (p1, p2):
+            self.assertIsNone(p.poll(), "both relays still run")
+
+    def test_a_reply_in_one_chat_carries_on_the_other_chat_waiting_for_the_same_account(self):
+        p1, q = self.limit_and_question()
+        self.plan(["limit", "reply", "reply"])  # the second chat meets the limit too; then Claude answers again
+        p2 = self.second_chat("never")
+        self.user(p2, "build the other")
+        self.wait_file("waits/sid-2.json")
+        self.user(p1, "go on")  # the account works again: Claude answers
+        self.assertEqual(self.log_count("is forgotten: sid-1 had a reply on Max after it"), 1, self.log_text()[-3000:])
+        self.assertEqual(self.log_count("wait: sid-2 carried on on Max"), 1, self.log_text()[-3000:])
+        time.sleep(3)
+        log = self.log_text()
+        self.assertEqual(log.count("wait: sid-2 carried on on Max"), 1)
+        self.assertEqual(log.count("is forgotten"), 1)
+        self.assertEqual(self.limits(), {})
+
+    def test_a_reply_after_the_limit_forgets_the_recorded_limit(self):
+        # 2026-11-11: asked to carry on at 16:30, replies at 16:26, and the
+        # record still said 16:30 for every other chat.
+        p, q = self.limit_and_question()
+        self.assertIn("Max", self.limits())
+        self.assertFalse(self.wait_for(self.result_for(self.user(p, "go on")))["is_error"])
+        end = time.time() + 10
+        while "Max" in self.limits() and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(self.limits(), {}, self.log_text()[-2000:])
+        self.assertIn("is forgotten: sid-1 had a reply on Max after it", self.log_text())
+
     def test_a_subagents_line_after_the_limit_does_not_cancel_the_carry_on(self):
         # The log audit of 2026-11-05 (#3): a subagent's assistant line, or
         # a <synthetic> one, after the stop was "a reply after the limit".
