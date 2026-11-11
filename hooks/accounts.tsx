@@ -177,6 +177,7 @@ function clean(s: any): LonghaulStatus {
       check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
+      ...(typeof a.use_here === 'string' ? { use_here: a.use_here } : {}),
       folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
@@ -280,6 +281,42 @@ async function remove($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
   await act($, { label: `Remove: ${name}`, doing: `Removing ${name}…`, argv: ['remove', name], timeoutMs: STATUS_TIMEOUT,
     then: 'list' })
+}
+
+// With its folder (0.3.9; the owner, 2026-11-11: "when I delete an account
+// it does not delete its files"): `remove NAME --delete-folder --yes`, after
+// the pane's own second yes. longhaul.py checks first and refuses, nothing
+// changed, a folder it may not delete (the default one, another account's,
+// one a chat runs on); its words show in the result.
+async function removeWithFolder($: any, name: string): Promise<void> {
+  if (busy || !(await known($, name))) return
+  await act($, { label: `Remove with its folder: ${name}`, doing: `Removing ${name} and deleting its folder…`,
+    argv: ['remove', name, '--delete-folder', '--yes'], timeoutMs: STATUS_TIMEOUT, then: 'list' })
+}
+
+// This chat on the account (`use NAME --chat ID`): the relay moves it the
+// next time Claude is idle in it; longhaul.py says when it cannot.
+async function useHere($: any, name: string): Promise<void> {
+  if (busy || !(await known($, name))) return
+  let sid = ''
+  try { sid = String(await $.session.id()) } catch {}
+  if (!sid) return
+  await act($, { label: `Use for this chat: ${name}`, doing: `Choosing ${name} for this chat…`,
+    argv: ['use', name, '--chat', sid], timeoutMs: STATUS_TIMEOUT })
+}
+
+// One account's recorded limit forgotten (`clear NAME`): it was reset
+// before its time. The chats waiting for it carry on within a few seconds.
+async function clearOne($: any, name: string): Promise<void> {
+  if (busy || !(await known($, name))) return
+  await act($, { label: `Forget its limit: ${name}`, doing: `Forgetting ${name}'s recorded limit…`,
+    argv: ['clear', name], timeoutMs: STATUS_TIMEOUT })
+}
+
+// Whether a yes is being asked for on this account's page: its Remove, or
+// its Remove with the folder.
+function asking(c: Ctx, name: string): boolean {
+  return c.confirm === name || c.confirm === `delete:${name}`
 }
 
 // The Folders part's three: a folder typed on this account's page added,
@@ -694,7 +731,7 @@ function where(a: LonghaulAccount): string {
 function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
   const { Box, Text, Button, Input } = c.E
   const name = String(a.name)
-  const offered = c.idle && c.confirm !== name
+  const offered = c.idle && !asking(c, name)
   const kept = (a.kept_out_by ?? []).map(String)
   const typed = c.folder.account === name ? c.folder : NO_FOLDER
   return (
@@ -739,7 +776,7 @@ function fallbackPart($: any, c: Ctx, a: LonghaulAccount): any {
   return (
     <Box flexDirection="column">
       <Text>{on ? `Fallback: ${FALLBACK}` : 'Normal account'}</Text>
-      {c.idle && c.confirm !== name && <Button key="fallback" label={on ? 'Use as a normal account' : 'Use as fallback'}
+      {c.idle && !asking(c, name) && <Button key="fallback" label={on ? 'Use as a normal account' : 'Use as fallback'}
         onPress={() => void setFallback($, name, !on)} />}
     </Box>
   )
@@ -773,8 +810,11 @@ function accountPage($: any, c: Ctx): any {
       <Text dimColor>{where(a)}</Text>
       {a.email && <Text dimColor>{mask(String(a.email))}</Text>}
       {a.folder && <Text dimColor>{mask(`folder ${a.folder}`)}</Text>}
-      {c.idle && c.confirm !== name && (
+      {c.idle && !asking(c, name) && (
         <Box flexDirection="row" gap={1}>
+          {a.use_here === 'ok' && <Button key={`use-${name}`} label="Use for this chat" onPress={() => void useHere($, name)} />}
+          {typeof a.limited_until === 'number'
+            && <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />}
           <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />
           <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void update($, confirming, () => name)} />
         </Box>
@@ -784,6 +824,19 @@ function accountPage($: any, c: Ctx): any {
           <Text color="warning">{`Remove ${name} from Longhaul's list? Its folder and sign-in stay.`}</Text>
           <Box flexDirection="row" gap={1}>
             <Button key="remove-yes" label="Remove" variant="primary" onPress={() => void remove($, name)} />
+            <Button key="remove-folder" label="Remove and delete its folder…" dimColor
+              onPress={() => void update($, confirming, () => `delete:${name}`)} />
+            <Button key="remove-no" label="Cancel" onPress={() => void update($, confirming, () => null)} />
+          </Box>
+        </Box>
+      )}
+      {c.idle && c.confirm === `delete:${name}` && (
+        <Box flexDirection="column">
+          <Text color="warning">{mask(`Remove ${name} and delete its folder ${a.folder}? Its sign-in and the chat history `
+            + 'kept in that folder go for good.')}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Button key="remove-folder-yes" label="Delete the folder" variant="primary"
+              onPress={() => void removeWithFolder($, name)} />
             <Button key="remove-no" label="Cancel" onPress={() => void update($, confirming, () => null)} />
           </Box>
         </Box>

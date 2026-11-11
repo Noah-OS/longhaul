@@ -302,6 +302,54 @@ both('Sign in again for a signed-in account, Sign in for one that is not, the no
   await ui.unmount()
 })
 
+both('Remove with its folder asks twice and runs remove --delete-folder --yes; Cancel runs nothing', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'remove-work-2' })
+  await ui.press({ key: 'remove-folder' })
+  expect(after(w)).toEqual([])
+  expect(await texts(ui)).toContain('Remove work-2 and delete its folder ~/.claude-work-2? Its sign-in and the chat '
+    + 'history kept in that folder go for good.')
+  expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
+  await ui.press({ key: 'remove-no' })
+  expect(after(w)).toEqual([])
+  expect(await ui.find({ key: 'remove-folder-yes' })).toBeUndefined()
+  await ui.press({ key: 'remove-work-2' })
+  await ui.press({ key: 'remove-folder' })
+  w.status = done(JSON.stringify({ ...STATUS, accounts: ACCOUNTS.filter(a => a.name !== 'work-2') }))
+  await ui.press({ key: 'remove-folder-yes' })
+  expect(after(w)).toEqual([['remove', 'work-2', '--delete-folder', '--yes'], ['status', '--json']])
+  expect(await buttons(ui)).toEqual(ROWS.filter(k => k !== 'row-work-2'))
+  await ui.unmount()
+})
+
+both('an account at its limit offers Forget its limit, which runs clear NAME', async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-personal-1')
+  expect(await ui.find({ key: 'clear-personal-1' })).toBeUndefined()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'clear-work-2' })
+  expect(after(w)).toEqual([['clear', 'work-2'], ['status', '--json']])
+  await ui.unmount()
+})
+
+both('Use for this chat shows only where use would take the chat, and runs use NAME --chat ID', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, accounts: ACCOUNTS.map(a => ({ ...a,
+    use_here: a.name === 'team-4' ? 'ok' : a.name === 'personal-1' ? 'this_chat' : 'not_allowed' })) }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  expect(await ui.find({ key: 'use-work-2' })).toBeUndefined()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-team-4')
+  await ui.press({ key: 'use-team-4' })
+  expect(after(w)).toEqual([['use', 'team-4', '--chat', SID], ['status', '--json']])
+  await ui.unmount()
+})
+
 both('Remove runs only after its confirmation, Cancel runs nothing, and its result shows on the list', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
@@ -596,7 +644,7 @@ both("an account's Folders: each folder with Remove, a field to add one, and Any
   await open(ui, 'row-work-2')
   const all = await texts(ui)
   for (const t of ['Folders:', '  ~/work', '  ~/clients']) expect(all).toContain(t)
-  expect(await buttons(ui)).toEqual(['signin-work-2', 'remove-work-2', 'folder-remove-0', 'folder-remove-1', 'folder-add',
+  expect(await buttons(ui)).toEqual(['clear-work-2', 'signin-work-2', 'remove-work-2', 'folder-remove-0', 'folder-remove-1', 'folder-add',
     'folder-anywhere', 'fallback', 'back'])
   expect((await ui.find({ key: 'folder-remove-1' }))?.text).toBe('Remove')
   expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Anywhere')

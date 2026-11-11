@@ -31,6 +31,14 @@ export type LonghaulAccount = {
   // room (the owner, 2026-11-06). Optional: an older longhaul.py does not
   // give it, and the pane then offers no button for it.
   fallback?: boolean
+  // Whether `longhaul use NAME` would take this chat here (0.3.9): "ok",
+  // "this_chat", "not_allowed", "limited" or "not_signed_in"; null with no
+  // accounts list or folder. Optional: an older longhaul.py does not give
+  // it, and the pane then offers no button for it.
+  use_here?: string | null
+  // The folders the account is preferred in (0.3.9); null for a value that
+  // is not a list of paths.
+  preferred?: string[] | null
   folder: string
   this_chat: boolean
 }
