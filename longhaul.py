@@ -111,7 +111,13 @@ Usage:
                           sign-in; with --repo, used only in those
                           repositories and those inside them (repeat it);
                           --fallback marks it a fallback (see below)
-  longhaul remove NAME          off the list (its folder and sign-in are kept)
+  longhaul remove NAME [--delete-folder [--yes]]
+                          off the list (its folder and sign-in are kept);
+                          --delete-folder deletes its folder too, with the
+                          sign-in and any chat history kept in it, after
+                          saying what goes and a yes in a terminal (--yes:
+                          without asking); never ~/.claude, a folder another
+                          account uses, a link, or one a chat runs on
   longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]
                           where NAME may be used (with no option it only
                           reads); --add a folder it may be used in, and those
@@ -15290,7 +15296,14 @@ def guided_vscode() -> None:
 
 
 def remove(opts) -> int:
-    """longhaul remove NAME: off longhaul's list. Its folder and sign-in are kept."""
+    """longhaul remove NAME: off longhaul's list. Its folder and sign-in are
+    kept. With --delete-folder its folder goes too (remove_with_folder());
+    --yes alone answers nothing, so it is refused, nothing changed."""
+    if getattr(opts, "delete_folder", False):
+        return remove_with_folder(opts.name, opts.yes)
+    if getattr(opts, "yes", False):
+        say(f"--yes answers --delete-folder's question; plain `longhaul remove {opts.name}` asks nothing")
+        return 2
     with locked("accounts"):
         accounts, problem = read_accounts_file()
         if problem:
@@ -15382,6 +15395,278 @@ def say_still_running(acct: dict) -> None:
         f"chat moves to an account allowed in its folder the next time it is idle; in ask or never it stays on {name} "
         "and is told so once, and closing and opening it again moves it. A chat started with --switch or "
         "LONGHAUL_SWITCH keeps that mode.")
+
+
+# How every refusal of `remove NAME --delete-folder` ends: the account is
+# still listed and its folder kept, and plain remove still works.
+REMOVE_KEPT = "`longhaul remove {name}` still takes {name} off the list and keeps its folder."
+
+
+def remove_with_folder(name: str, assume_yes: bool) -> int:
+    """`longhaul remove NAME --delete-folder [--yes]` (the owner, 2026-11-11:
+    "when I delete an account it does not delete its files"; plain remove
+    stays as it was). Everything is checked first, delete_refusal() and
+    then the chats on it (chats_refusal()): a folder it may not delete
+    changes nothing, exit 2, and says why. Then what goes is said
+    (delete_lines(): the folder, its size, the sign-in, the conversations
+    its own projects/ keeps) and asked in a terminal; --yes is the yes of
+    the /longhaul:manage skill, which asks in the chat first. No terminal
+    and no --yes changes nothing, exit 2, and any answer but yes nothing,
+    exit 1. On a yes the list is read again under its lock and checked
+    again (the chats too, when time went by in the question), the account
+    goes off it, Longhaul's own records of it go (forget_auth(),
+    forget_removed(), forget_usage()), and the folder is deleted, each link
+    in it removed and never followed: the shared items are links into
+    ~/.claude. A folder that is not there leaves nothing to delete or ask.
+    Longhaul does not sign the account out: Claude Code keys the Keychain
+    entry to the folder (the note at the top), Longhaul has no sign-out of
+    its own (setup --relogin signs in over the old sign-in), and it never
+    runs one blind, so it says the entry may remain. One log line per
+    outcome, paths and sizes only."""
+    accounts, problem = read_accounts_file()
+    if problem:
+        say(unreadable_text(problem))
+        return 2
+    acct = next((a for a in accounts if a["name"].lower() == name.lower()), None)
+    if acct is None:
+        say(f"no account called {name}; the accounts are {', '.join(a['name'] for a in accounts)}")
+        return 2
+    if len(accounts) == 1:
+        say("that is the only account; longhaul needs at least one")
+        return 2
+    name = acct["name"]
+    why = delete_refusal(acct, accounts)
+    folder = os.path.realpath(config_of(acct)) if why is None else ""
+    there = bool(folder) and os.path.isdir(folder)
+    why = why or (chats_refusal(acct) if there else None)
+    if why:
+        return refuse_delete(acct, why)
+    shown_folder = home_path(folder)
+    size = folder_size(folder) if there else 0
+    if there:
+        for line in delete_lines(acct, folder, size):
+            show(line)
+    if there and not assume_yes:
+        if not terminal():
+            show(f"Not deleted, nothing changed: `longhaul remove {name} --delete-folder` asks first, in a terminal; "
+                 "run it in one, or add --yes to do it without asking.")
+            log(f"remove: {name}'s folder {shown_folder} not deleted, nothing changed: no terminal to ask in")
+            return 2
+        try:
+            agreed = yes(f"Delete {shown_folder} and take {name} off the list?")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            agreed = False
+        if not agreed:
+            show(f"Not deleted, nothing changed: {name} is still on the list. `longhaul remove {name}` takes it off "
+                 "the list and keeps its folder.")
+            log(f"remove: {name}'s folder {shown_folder} not deleted, nothing changed: not confirmed")
+            return 1
+    with locked("accounts"):
+        fresh, problem = read_accounts_file()
+        if problem or acct not in fresh or len(fresh) == 1:
+            show("Not deleted, nothing changed: accounts.json changed meanwhile; run it again.")
+            log(f"remove: {name}'s folder {shown_folder} not deleted, nothing changed: accounts.json changed meanwhile")
+            return 2
+        why = delete_refusal(acct, fresh) or (chats_refusal(acct) if there and not assume_yes else None)
+        if why:
+            return refuse_delete(acct, why)
+        write_json(LONGHAUL_HOME / "accounts.json", [a for a in fresh if a != acct])
+    log(f"remove: {name} taken off the list")
+    forget_auth(acct)
+    forget_removed(name)
+    forget_usage(name)
+    if not there:
+        show(f"removed {name} from longhaul's accounts; its folder {shown_folder} is not there, so nothing was deleted.")
+        log(f"remove: {name}'s folder {shown_folder} was not there; nothing deleted")
+        return 0
+    try:
+        shutil.rmtree(folder)  # links are removed, never followed (and the folder itself is none)
+    except OSError as e:
+        where = f" ({home_path(e.filename)})" if isinstance(e.filename, str) else ""
+        show(f"removed {name} from longhaul's accounts, but its folder {shown_folder} could not all be deleted: "
+             f"{e.strerror or e}{where}. Delete what is left yourself.")
+        log(f"remove: {name}'s folder {shown_folder} not wholly deleted: {e.strerror or e}{where}")
+        return 1
+    show(f"removed {name} from longhaul's accounts and deleted its folder {shown_folder} ({size_text(size)}).")
+    log(f"remove: {name}'s folder {shown_folder} deleted ({size_text(size)})")
+    return 0
+
+
+def delete_refusal(acct: dict, accounts: list):
+    """Why `remove NAME --delete-folder` may not delete `acct`'s folder, in
+    words that follow "Not deleted, nothing changed: ", or None. Never the
+    default folder (~/.claude: the VS Code panel's sign-in, and what every
+    account links into), a link (neither it nor what it points to), the
+    home folder or one above it, a folder outside home, something not a
+    folder, a folder another listed account uses (it would lose its
+    sign-in) or one holding another's, the default one or Longhaul's own
+    files, each by real path; nor one that does not look like a Claude
+    config folder, as a mistyped --dir (~/Documents) would not: a name not
+    starting with .claude, no .claude.json in it, and not empty. Only
+    names and links are looked at, never a file's content."""
+    name, value = acct["name"], acct.get("config_dir")
+    if value is not None and not isinstance(value, str):
+        return f"{name}'s config_dir in accounts.json is not a folder's path"
+    default = os.path.realpath(DEFAULT_CONFIG)
+    folder = config_of(acct)
+    real = os.path.realpath(folder)
+    if not value or real in (default, os.path.realpath(HOME / ".claude")):
+        return (f"{name} uses the default folder {home_path(str(DEFAULT_CONFIG))}, which the VS Code panel signs in "
+                "to and every account links into")
+    shown_path = home_path(str(folder))
+    if folder.is_symlink():
+        return f"{shown_path} is a link (to {home_path(real)}); Longhaul deletes neither a link nor what it points to"
+    if home_or_above(real):
+        return f"{home_path(real)} is your home folder or above it"
+    if not inside(real, os.path.realpath(HOME)):
+        return f"{home_path(real)} is not inside your home folder; Longhaul deletes only a folder inside it"
+    if os.path.lexists(real) and not os.path.isdir(real):
+        return f"{shown_path} is not a folder"
+    for a in accounts:
+        if a == acct or not (a.get("config_dir") is None or isinstance(a.get("config_dir"), str)):
+            continue
+        theirs = os.path.realpath(config_of(a))
+        if theirs == real:
+            return f"{a['name']} uses the same folder, {home_path(real)}, and would lose its sign-in"
+        if inside(theirs, real):
+            return f"{shown_path} holds {a['name']}'s folder"
+    if inside(default, real):
+        return f"{shown_path} holds the default folder {home_path(str(DEFAULT_CONFIG))}"
+    own = os.path.realpath(LONGHAUL_HOME)
+    if own == real or inside(own, real):
+        return f"{shown_path} holds Longhaul's own files ({home_path(own)})"
+    if os.path.isdir(real) and not os.path.basename(real).startswith(".claude") \
+            and not os.path.lexists(os.path.join(real, ".claude.json")) and not folder_is_empty(real):
+        return (f"{shown_path} does not look like a Claude config folder (no .claude.json in it); delete it yourself "
+                "if you are sure")
+    return None
+
+
+def folder_is_empty(folder: str) -> bool:
+    """Whether `folder` holds nothing; one that cannot be listed is not."""
+    try:
+        return not os.listdir(folder)
+    except OSError:
+        return False
+
+
+def chats_refusal(acct: dict):
+    """Why the account's folder may not go while chats run on it
+    (chats_on(), each named as say_still_running() names it), or None: a
+    claude whose folder went from under it fails at its next write. When
+    the chats cannot be listed, none is known not to run."""
+    running, name = chats_on(acct), acct["name"]
+    if running is None:
+        return (f"the chats running now could not be listed (ps did not answer), so whether one still runs on {name} "
+                "is not known")
+    if not running:
+        return None
+    each = ", ".join(f"pid {c['pid']} ({'a VS Code tab' if c.get('panel') else 'a terminal chat'}) in "
+                     f"{home_path(c['cwd']) if isinstance(c.get('cwd'), str) else 'a folder not known'}"
+                     for c in running)
+    one = len(running) == 1
+    return (f"{plural(len(running), 'chat')} still run{'s' if one else ''} on {name}: {each}; close "
+            f"{'it' if one else 'them'} first")
+
+
+def refuse_delete(acct: dict, why: str) -> int:
+    """A refusal of `remove NAME --delete-folder`: said, one log line, exit 2."""
+    name, value = acct["name"], acct.get("config_dir")
+    folder = home_path(str(config_of(acct))) if value is None or isinstance(value, str) else "(not a path)"
+    show(f"Not deleted, nothing changed: {why}. " + REMOVE_KEPT.format(name=name))
+    log(f"remove: {name}'s folder {folder} not deleted, nothing changed: {why}")
+    return 2
+
+
+def delete_lines(acct: dict, folder: str, size: int) -> list:
+    """What `remove NAME --delete-folder` deletes, said before it asks: the
+    folder and its size, the sign-in, and the chat history its own
+    projects/ keeps (conversations_in()); a projects/ that links to the
+    shared one stays, and so does all it reaches. Then that Longhaul does
+    not sign the account out (remove_with_folder() says why)."""
+    name = acct["name"]
+    head = f"{name}'s folder {home_path(folder)} ({size_text(size)}) goes for good: {name}'s sign-in"
+    count, link = conversations_in(folder)
+    if link:
+        head += f". Its chat history is in {home_path(link)}, which it only links to, and stays."
+    elif count:
+        head += f", and the chat history kept in it, {plural(count, 'conversation')} (its projects/ folder)."
+    else:
+        head += ". It keeps no chat history of its own."
+    return [head, f"Longhaul does not sign {name} out: on a Mac, the sign-in Claude Code keeps for this folder in the "
+                  "Keychain may remain."]
+
+
+def conversations_in(folder: str) -> tuple:
+    """(how many conversations `folder`'s own projects/ keeps, None), or
+    (0, the real path it links to) when projects/ is a link, which
+    deleting the folder removes and never follows. A conversation is a
+    <project>/<id>.jsonl file (a subagent's, deeper, is not one), counted
+    by its name, never opened; a project folder that is a link is not
+    counted, as it is not deleted either."""
+    projects = os.path.join(folder, "projects")
+    if os.path.islink(projects):
+        return 0, os.path.realpath(projects)
+    try:
+        with os.scandir(projects) as found:
+            each = [e.path for e in found if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return 0, None
+    count = 0
+    for project in each:
+        try:
+            with os.scandir(project) as found:
+                count += sum(1 for e in found if e.name.endswith(".jsonl") and e.is_file(follow_symlinks=False))
+        except OSError:
+            continue
+    return count, None
+
+
+def folder_size(folder: str) -> int:
+    """The bytes of the files under `folder`, links not followed (what a
+    link reaches is not this folder's) and none opened; what cannot be
+    looked at counts nothing."""
+    total, todo = 0, [folder]
+    while todo:
+        try:
+            with os.scandir(todo.pop()) as found:
+                for e in found:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            todo.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def size_text(n: int) -> str:
+    """A folder's size as remove and the doctor give it."""
+    return trial_size(n) if n else "0 KB"
+
+
+def forget_usage(name: str) -> None:
+    """After `remove NAME --delete-folder`: the account's status-line
+    reading (USAGE_DIR/<name>.json) goes, as its recorded limit does
+    (forget_removed()): a later account added under the same name would
+    start with it. The conversations' records under USAGE_DIR/sessions
+    stay: last_account() passes over an account no longer listed. A name
+    that is not a plain file name is never made a path."""
+    path = USAGE_DIR / f"{name}.json"
+    if os.sep in name or "\0" in name or path.parent != USAGE_DIR:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        log(f"remove: {name}'s usage reading was not cleared: {e.strerror or e}")
+        return
+    log(f"remove: {name}'s usage reading cleared")
 
 
 def folders(opts) -> int:
@@ -17652,6 +17937,10 @@ def main(argv: list[str]) -> int:
                            help="a fallback: used only when no other account allowed there has room")
         if cmd == "remove":
             p.add_argument("name")
+            p.add_argument("--delete-folder", action="store_true",
+                           help="delete its config folder too, with the sign-in and any chat history kept in it, "
+                                "after saying what goes and a yes in a terminal")
+            p.add_argument("--yes", action="store_true", help="with --delete-folder: delete without asking")
         if cmd == "fallback":
             p.add_argument("name", help="the account")
             p.add_argument("action", nargs="?", choices=["on", "off"],
