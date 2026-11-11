@@ -12053,7 +12053,13 @@ class Shim(unittest.TestCase):
                 ("add", "A", "a@b", "--dir=x")),
             ("setup", "`setup NAME [--relogin]`"): (("setup",), ("setup", "--relogin"), ("setup", "Max", "-h"),
                                          ("setup", "Max", "Pro"), ("setup", "Max", "--relogin", "x")),
-            ("remove", "`remove NAME`"): (("remove",), ("remove", "-h"), ("remove", "A", "B")),
+            ("remove", "`remove NAME` or `remove NAME --delete-folder --yes`"): (
+                ("remove",), ("remove", "-h"), ("remove", "A", "B"), ("remove", "A", "--delete-folder"),
+                ("remove", "A", "--yes"), ("remove", "A", "--yes", "--delete-folder"),
+                ("remove", "A", "--delete-folder", "--yes", "x")),
+            ("use", "`use NAME` or `use NAME --chat ID`"): (
+                ("use",), ("use", "-h"), ("use", "A", "B"), ("use", "A", "--chat"), ("use", "A", "--chat", "x", "y"),
+                ("use", "--chat", "x", "A")),
             ("switch", "`switch [ask|auto|never]`"): (("switch", "sometimes"), ("switch", "-h"), ("switch", "auto", "never")),
             ("vscode", "`vscode on --yes` or `vscode off`"): (("vscode",), ("vscode", "on"), ("vscode", "--yes", "on"),
                                                    ("vscode", "off", "x"), ("vscode", "--yes")),
@@ -12063,7 +12069,7 @@ class Shim(unittest.TestCase):
             ("update", "`update [status]`, `update on --yes` or `update off --yes`"): (
                 ("update", "on"), ("update", "off"), ("update", "--yes"), ("update", "status", "--yes"),
                 ("update", "on", "--yes", "x"), ("update", "-h")),
-            ("clear", "`clear` with nothing after it"): (("clear", "x"), ("clear", "-h")),
+            ("clear", "`clear` or `clear NAME`"): (("clear", "-h"), ("clear", "A", "B")),
             ("uninstall", "`uninstall --dry-run [--purge]` or `uninstall --yes [--purge]`"): (
                 ("uninstall",), ("uninstall", "--purge"), ("uninstall", "--purge", "--yes"),
                 ("uninstall", "--dry-run", "--yes"), ("uninstall", "--yes", "--purge", "x"), ("uninstall", "-h")),
@@ -12083,6 +12089,9 @@ class Shim(unittest.TestCase):
                             "does not look like an email"),
                            (("setup", "Max"), "no account called Max"), (("setup", "Max", "--relogin"), "no account called Max"),
                            (("remove", "Max"), "no account called Max"), (("switch",), "Switching: ask (the default)"),
+                           (("remove", "Max", "--delete-folder", "--yes"), "no account called Max"),
+                           (("use", "Team"), "Team"), (("use", "Team", "--chat", "abc"), "Team"),
+                           (("clear", "Team"), "no account called Team"),
                            (("models",), "Where it applies:"), (("update",), "Running here:"),
                            (("update", "status"), "Running here:"),
                            (("vscode", "on", "--yes"), "VS Code's user settings are not at ~/vscode/settings.json"),
@@ -23229,16 +23238,16 @@ class RemoveDeleteFolder(unittest.TestCase):
         self.assertTrue((old / "projects" / "-work" / "s9.jsonl").exists())
 
     def test_the_manage_skill_and_the_readme_offer_it_and_say_first_that_the_history_goes_for_good(self):
-        # The shim (bin/longhaul, the owner's to change) runs `remove NAME`
-        # alone, so until it lets --delete-folder through the skill gives
-        # the user the terminal line; every command it names by the shim's
-        # path is one the shim runs (Manage tests that).
+        # The shim runs `remove NAME --delete-folder --yes` since the
+        # owner's yes of 2026-11-11: the skill's yes in the chat is its
+        # --yes; every command it names by the shim's path is one the shim
+        # runs (Manage tests that).
         text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
         [line] = [l for l in text.splitlines() if l.startswith("- Take one off the list:")]
         flat = " ".join(line.split())
         self.assertIn("`${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay.", flat)
         self.assertIn("tell the user first that its sign-in and the chat history kept in that folder go for good", flat)
-        self.assertIn("`longhaul remove NAME --delete-folder`", flat)
+        self.assertIn("`${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME --delete-folder --yes`", flat)
         self.assertLess(flat.index("tell the user first"), flat.index("--delete-folder"))
         readme = (HERE / "README.md").read_text()
         [line] = [l for l in readme.splitlines() if l.startswith("**Sign in again, or remove an account.**")]

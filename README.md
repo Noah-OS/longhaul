@@ -164,14 +164,14 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 
 **In words:** ask in your own words, for example "add my work account", "turn on the panel" or "set switching to ask". `/longhaul:manage` shows the exact command and what it changes, and runs it only after your yes in the chat. From a chat it can:
 
-- add, sign in again or remove an account (the sign-in opens in your browser; never type a password or code into the chat);
-- change where an account may be used (`longhaul folders`);
+- add, sign in again or remove an account, with its folder too if you say so (the sign-in opens in your browser; never type a password or code into the chat);
+- change where an account may be used or is preferred (`longhaul folders`), and choose the account this chat runs on (`longhaul use`);
 - set the switching mode and the subagent models;
 - turn the VS Code panel's use of your accounts on or off;
 - install or remove the status line, and turn Claude Code's auto-update for Longhaul on or off;
-- forget the recorded limits, allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
+- forget the recorded limits, or one account's (`longhaul clear NAME`), allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
 
-What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record; for now also choosing a chat's account (`longhaul use`) and a folder's preferred account (`longhaul folders NAME --prefer`), for which `/longhaul:manage` gives you the line to type. The fallback mark changes with the button in `/accounts` or `longhaul fallback` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
+What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The fallback mark changes with the button in `/accounts` or `longhaul fallback` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
 
 ## 6. Codex
 

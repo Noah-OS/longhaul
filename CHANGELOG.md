@@ -2,6 +2,25 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.9 - 2026-11-11
+
+You choose the account a chat runs on, a recorded limit that is over is forgotten and the chats waiting for it carry on, and an account can be removed with its folder.
+
+### Added
+
+- **`longhaul use NAME [--chat ID]`** runs a chat on the account you name. A VS Code panel chat moves the next time Claude is idle in it; any other chat starts there when it is next opened. It refuses an account not allowed in the chat's folder, at its recorded limit or not signed in as expected. It is no lock: at a usage limit the switching mode decides, as for any chat.
+- **A folder's preferred account.** `longhaul folders NAME --prefer PATH` makes NAME the first choice for a new chat in PATH or a folder inside it, and for a chat there that moves at a limit, while NAME has room; `--no-prefer PATH` takes it off. `longhaul status` and `longhaul folders NAME` show it.
+- **`longhaul remove NAME --delete-folder`** takes the account off the list and deletes its folder, with the chat history kept in it, after saying what goes and a yes (`--yes` without asking). It checks first and changes nothing when the folder is `~/.claude`, is used by another account, is a link, is outside your home folder, or a chat still runs on it. Plain `longhaul remove NAME` keeps the folder, as before. Longhaul does not sign the account out: on a Mac the Keychain entry for that folder may remain.
+- **`longhaul clear NAME`** forgets one account's recorded limit. `longhaul clear` says which limits it forgot and until when each had been recorded.
+- **`/accounts`** has three more buttons on an account's page: **Use for this chat**, **Forget its limit** and, under Remove, **Remove and delete its folder**, which asks a second time.
+- **`longhaul doctor`** names the `~/.claude-*` folders no account uses, with their sizes.
+- **`/longhaul:manage`** runs `use NAME`, `clear NAME`, `folders NAME --prefer PATH` and `remove NAME --delete-folder --yes`, each after your yes in the chat.
+
+### Fixed
+
+- **A chat waiting at a limit went on waiting after the limit was forgotten.** `longhaul clear` emptied the record, but an open panel chat kept its own schedule and a terminal kept its wait, so nothing happened until the recorded time. Both now see the record go and carry on within a few seconds: on the chat's own account in every mode; to another account as the switching mode says, so `ask` still asks first.
+- **A recorded limit outlived the limit.** When an account was reset before its time, Longhaul waited until the recorded time all the same. A reply on the account after the limit now forgets the record, and so does a sign-in started in a chat on an account with no email on Longhaul's list. A limit reset early that no chat has replied on since is still not noticed by itself: `longhaul clear NAME` forgets it.
+
 ## 0.3.8 - 2026-11-06
 
 An account can be a fallback, used only when no other account has room. `/longhaul:manage` can change where an account may be used. The output filter is off by default, and Claude Code is checked up to 2.1.318.
