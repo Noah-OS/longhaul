@@ -233,7 +233,12 @@ To remove it: `longhaul uninstall --dry-run` lists what Longhaul put outside the
 ## Measured
 
 > [!NOTE]
-> **So far, no saving shown.** On a task where the guard had nothing to catch, block mode saved nothing; on a task where it denied reads the task needed, it cost 3.5 times the baseline's prompt tokens and four times its requests. `warn` stays the default until a week of real use is counted. The method and every number: [Measurements](https://github.com/Noah-OS/longhaul/wiki/Measurements).
+> Measured on one person's work, the author's.
+> - **Helped:** on 8 real compactions, Claude recalled 72% of tested facts with the checkpoint and 66% without (+5.9 points, p = 0.007). That is recall, not yet a better result on the task after.
+> - **Did not help:** the guard's block mode (3.5 times the baseline's prompt tokens where it denied reads the task needed), the output filter (0.35% to 1.24% of Bash output) and the code index (no fewer tokens). Block mode and the filter are off by default.
+> - **Costs:** about 90 ms on every `Read` and `Bash` call, and about 509 tokens in every session.
+>
+> The method and every number: [Measurements](https://github.com/Noah-OS/longhaul/wiki/Measurements).
 
 Longhaul was built from patterns in real use: in one person's 964 transcripts over five weeks, 515 whole-file reads over 20,000 characters, 17.4 million characters in all. Every number it reports names where it came from and how sure it is, and no saving is claimed that has not been measured.
 
