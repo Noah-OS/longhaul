@@ -19314,6 +19314,52 @@ class KeepWorking(unittest.TestCase):
         self.assertEqual(self.state()["limited_until"], {})
         self.assertTrue(self.forget()[1].endswith("forgot the recorded limits: none was recorded"))
 
+    def test_clear_names_the_chat_whose_question_it_ends_or_says_no_panel_chat_carries_on(self):
+        # UX review Q7: the result names the chats that carry on because of
+        # it, by short id and folder, and never a word of the chat.
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
+        r = self.relay()
+        self.stop(r)
+        self.assertEqual((self.question()["kind"], self.question()["from"]), ("move", "Max"))
+        transcript = self.tmp / "sid-k.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "cwd": str(self.tmp / "work")}) + "\n")
+        (self.home / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+        (self.home / "usage" / "sessions" / "sid-k.json").write_text(json.dumps({"transcript": str(transcript)}))
+        # A question whose relay has closed, and junk, wait for nothing.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (self.home / "questions" / "sid-gone.json").write_text(json.dumps(
+            {**self.question(), "chat": "sid-gone", "relay_pid": dead.pid}))
+        (self.home / "questions" / "sid-odd.json").write_text(json.dumps({**self.question(), "chat": "sid-other"}))
+        (self.home / "questions" / "sid-zero.json").write_text(json.dumps(
+            {**self.question(), "chat": "sid-zero", "relay_pid": 0}))
+        (self.home / "questions" / "sid-junk.json").write_text("[1]")
+        self.limited(Max=self.clock.at + 3600, Pro=self.clock.at + 7200)
+        code, said = self.forget("Pro")
+        self.assertEqual(code, 0, said)
+        self.assertTrue(said.endswith("no chat in the panel carries on because of it; a terminal that waits for it "
+                                      "carries on within a few seconds"), said)
+        code, said = self.forget("Max")
+        self.assertEqual(code, 0, said)
+        self.assertTrue(said.endswith(f"; chat sid-k ({longhaul.home_path(str(self.tmp / 'work'))}) waits for it and "
+                                      "carries on within a few seconds"), said)
+        for other in ("sid-gone", "sid-odd", "sid-other", "sid-zero", "sid-junk"):
+            self.assertNotIn(other, said)
+
+    def test_clear_names_a_chat_whose_carry_on_waits_for_a_limit_it_forgot(self):
+        r = self.relay()
+        self.stop(r)
+        self.answer("sid-k", self.question()["id"], "wait")
+        r.tend()
+        self.assertEqual(self.waiting()["account"], "Max")
+        (self.home / "waits" / "sid-old.json").write_text(json.dumps(
+            {**self.waiting(), "chat": "sid-old", "until": self.clock.at - 1}))
+        code, said = self.forget()
+        self.assertEqual(code, 0, said)
+        self.assertIn("forgot the recorded limits: Max (it was until ", said)
+        self.assertTrue(said.endswith("; chat sid-k waits for it and carries on within a few seconds"), said)
+        self.assertNotIn("sid-old", said, "a carry-on whose time has passed waits no more")
+
     def test_a_wait_answered_carries_on_at_once_when_the_limit_is_forgotten(self):
         r = self.relay()
         self.stop(r)

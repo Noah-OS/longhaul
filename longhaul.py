@@ -365,7 +365,8 @@ Usage:
                           the finished chains to rate, without their arms; with
                           CHAIN N, records a rating from 1 to 5
   longhaul clear [NAME]         forget the recorded limits, or NAME's alone; a chat
-                          waiting for one carries on within a few seconds
+                          waiting for one carries on within a few seconds, and
+                          the panel chats that do are named
   (log)                         LONGHAUL_HOME/longhaul.log leaves out its routine
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
@@ -16731,12 +16732,56 @@ def forget_limit(name: str, why: str, upto: float | None = None):
     return found[0] if found else None
 
 
+def waiting_for(names, now: float) -> list[str]:
+    """The ids of the panel chats that carry on when the recorded limits of
+    `names` are forgotten (Relay.tend_lifted()), by their records, in id
+    order: a carry-on waiting for one of them (WAITS, its "until" ahead),
+    or a question asked at one's limit ("from" in QUESTIONS) whose relay
+    still runs. A record not in its shape, or under a name that is not a
+    plain id (an answer's), is none. A terminal's wait has no record, so
+    it is never among them."""
+    found = []
+    for folder in (WAITS, QUESTIONS):
+        for path in sorted((LONGHAUL_HOME / folder).glob("*.json")):
+            sid, rec = path.stem, read_json(path)
+            if not (re.fullmatch(GUARD_ID, sid) and isinstance(rec, dict) and rec.get("chat") == sid):
+                continue
+            if folder == WAITS:
+                hit = rec.get("account") in names and (as_number(rec.get("until")) or 0) > now
+            else:
+                pid = rec.get("relay_pid")
+                hit = (rec.get("from") in names and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                       and pid_alive(pid))
+            if hit and sid not in found:
+                found.append(sid)
+    return sorted(found)
+
+
+def carry_text(names, now: float, what: str) -> str:
+    """What clear() says of the chats it lets carry on (waiting_for()): each
+    by its short id and the folder its transcript last ran in, when one
+    says it, and never a word of the chat; or that none in the panel does.
+    A terminal waiting for one is said in general: it has no record."""
+    chats = []
+    for sid in waiting_for(names, now):
+        hits = transcript_hits(sid)
+        cwd = last_cwd(hits[0]) if hits else None
+        chats.append(f"{shown(sid[:8])} ({home_path(cwd)})" if cwd else shown(sid[:8]))
+    if not chats:
+        return (f"no chat in the panel carries on because of {what}; a terminal that waits for {what} carries on "
+                "within a few seconds")
+    one = len(chats) == 1
+    return (f"{'chat' if one else 'chats'} {', '.join(chats)} {'waits' if one else 'wait'} for {what} and "
+            f"{'carries' if one else 'carry'} on within a few seconds")
+
+
 def clear(opts) -> int:
     """`longhaul clear [NAME]`: forget the recorded limits, or NAME's alone
     (the owner, 2026-11-11: an account was reset before its time and
     Longhaul went on waiting for it). It says which it forgot and until
-    when each had been recorded; a chat waiting for one carries on within
-    a few seconds (Relay.tend_lifted())."""
+    when each had been recorded, and names the panel chats that carry on
+    within a few seconds because of it (carry_text(); Relay.tend_lifted()),
+    or says none does (UX review Q7)."""
     name, now = getattr(opts, "name", None), time.time()
     recorded = {n: u for n, u in load_state()["limited_until"].items() if (as_number(u) or 0) > now}
     if name:
@@ -16751,8 +16796,8 @@ def clear(opts) -> int:
             return 0
         update_state(lambda state: state["limited_until"].pop(match, None))
         log(f"clear: {match}'s recorded limit forgotten (it was until {clock(recorded[match])})")
-        say(f"forgot {match}'s recorded limit (it was until {clock(recorded[match])}); a chat waiting for it "
-            "carries on within a few seconds")
+        say(f"forgot {match}'s recorded limit (it was until {clock(recorded[match])}); "
+            + carry_text([match], now, "it"))
         return 0
     update_state(lambda state: state.update(limited_until={}))
     if not recorded:
@@ -16760,7 +16805,7 @@ def clear(opts) -> int:
         return 0
     each = ", ".join(f"{n} (it was until {clock(u)})" for n, u in recorded.items())
     log(f"clear: the recorded limits forgotten: {each}")
-    say(f"forgot the recorded limits: {each}; a chat waiting for one carries on within a few seconds")
+    say(f"forgot the recorded limits: {each}; " + carry_text(list(recorded), now, "it" if len(recorded) == 1 else "one"))
     return 0
 
 
