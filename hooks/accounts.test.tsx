@@ -624,7 +624,7 @@ both('an account with no folder and times in decimals, and an odd record, are dr
   expect(all).toContain("could not check: its config_dir is not a folder's path")
   expect(all).toContain(`5-hour 100%, resets ${clock(AT + 3600.5)}`)
   expect(all).toContain(`at its limit until ${clock(AT + 3600.5)}`)
-  expect(all).not.toMatch(/folder |NaN|undefined/)
+  expect(all).not.toMatch(/sign-in folder|NaN|undefined/)
   expect(await ui.find({ key: 'signin-odd-5' })).toBeDefined()
   await ui.press({ key: 'back' })
   await open(ui, 'row-odd-6')
@@ -704,16 +704,16 @@ both('a sign-in that failed in a chat: the line says so, the page says when, and
 // the Folders part of its page runs `longhaul.py folders NAME ...`, one
 // action at a time, and reads the rows again after each.
 
-both("an account's Folders: each folder with Remove, a field to add one, and Anywhere, each running folders", async ($, on, surface) => {
+both("an account's Folders: each folder with Remove, a field to add one, and Remove all folder limits, each running folders", async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-work-2')
   const all = await texts(ui)
-  for (const t of ['Folders:', '  ~/work', '  ~/clients']) expect(all).toContain(t)
+  for (const t of ['Runs only in:', '  ~/work', '  ~/clients']) expect(all).toContain(t)
   expect(await buttons(ui)).toEqual(['clear-work-2', 'signin-work-2', 'remove-work-2', 'folder-remove-0', 'folder-remove-1', 'folder-add',
     'folder-anywhere', 'fallback', 'back'])
   expect((await ui.find({ key: 'folder-remove-1' }))?.text).toBe('Remove')
-  expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Anywhere')
+  expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Remove all folder limits…')
   expect(await ui.find({ key: 'folder-path' })).toBeDefined()
   await ui.press({ key: 'folder-remove-1' })
   expect(after(w)).toEqual([['folders', 'work-2', '--remove', '~/clients'], ['status', '--json']])
@@ -725,8 +725,28 @@ both("an account's Folders: each folder with Remove, a field to add one, and Any
   expect(after(w).slice(2)).toEqual([['folders', 'work-2', '--add', '~/new'], ['status', '--json']])
   expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Add folder ~/new: work-2'))).toBe(true)
   expect((await ui.find({ key: 'folder-path' }))?.text).toBe('')
+  // It asks first, naming the folders it would un-reserve (the read after Add folder still lists two).
   await ui.press({ key: 'folder-anywhere' })
+  expect(after(w).slice(4)).toEqual([])
+  expect(await texts(ui)).toContain('Remove all of work-2\'s folder limits? ~/work, ~/clients would no longer be '
+    + 'reserved for work-2, and it could run in any folder no other account reserves.')
+  expect(await ringed(ui)).toEqual(['anywhere-no'])
+  expect(await ui.find({ key: 'folder-remove-0' })).toBeUndefined() // nothing else while it asks
+  expect(await ui.find({ key: 'signin-work-2' })).toBeUndefined()
+  await ui.press({ key: 'anywhere-no' })
+  expect(after(w).slice(4)).toEqual([])
+  expect(await ui.find({ key: 'anywhere-yes' })).toBeUndefined()
+  // Back cancels it too.
+  await ui.press({ key: 'folder-anywhere' })
+  await ui.press({ key: 'back' })
+  expect(await ui.find({ key: 'anywhere-yes' })).toBeUndefined()
+  expect(await ui.find({ key: 'folder-anywhere' })).toBeDefined()
+  expect(after(w).slice(4)).toEqual([])
+  // Only a yes runs it.
+  await ui.press({ key: 'folder-anywhere' })
+  await ui.press({ key: 'anywhere-yes' })
   expect(after(w).slice(4)).toEqual([['folders', 'work-2', '--anywhere'], ['status', '--json']])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove all folder limits: work-2'))).toBe(true)
   await ui.unmount()
 })
 
@@ -734,7 +754,7 @@ both('Add folder refuses an empty or relative folder and runs nothing; the field
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-personal-1')
-  expect(await texts(ui)).toContain('Folders: anywhere')
+  expect(await texts(ui)).toContain('Runs in: any folder no other account reserves')
   expect(await ui.find({ key: 'folder-anywhere' })).toBeUndefined() // it has no list to drop
   for (const [typed, said] of [['', /Type a folder/], ['work/x', /starts with \/ or ~\//], ['-rf', /starts with/]] as const) {
     await ui.input({ key: 'folder-path', text: typed, kind: 'change' })
@@ -772,7 +792,7 @@ both('an account kept out of every folder: its line says so, its page names who 
   await ui.press({ key: 'signin-spare-5' })
   expect(await texts(ui)).toContain('⚠ personal-1 keeps every folder, so spare-5 is used nowhere until a folder is added '
     + "here (or / is removed from personal-1's).")
-  // The keeper's own page: / with its Remove, and Anywhere.
+  // The keeper's own page: / with its Remove, and Remove all folder limits.
   await ui.press({ key: 'back' })
   await open(ui, 'row-personal-1')
   expect(await texts(ui)).toContain('  /')
@@ -784,15 +804,19 @@ both('an account kept out of every folder: its line says so, its page names who 
   await ui.unmount()
 })
 
-both('a folders field that is not a list: the page says so, offers Anywhere and no field to add to it', async ($, on, surface) => {
+both('a folders field that is not a list: the page says so, offers Remove all folder limits and no field to add to it', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-spare-3')
-  expect(await texts(ui)).toContain('Folders: its repositories field is not a list of absolute paths, so it is used '
-    + 'nowhere. Anywhere drops it.')
+  expect(await texts(ui)).toContain('Runs in: no folder, as its repositories field is not a list of absolute paths. '
+    + 'Remove all folder limits drops it.')
   expect(await buttons(ui)).toEqual(['signin-spare-3', 'remove-spare-3', 'folder-anywhere', 'fallback', 'back'])
   expect(await ui.find({ key: 'folder-path' })).toBeUndefined()
   await ui.press({ key: 'folder-anywhere' })
+  expect(after(w)).toEqual([])
+  expect(await texts(ui)).toContain("Drop spare-3's repositories field? It is not a list of paths; spare-3 could then "
+    + 'run in any folder no other account reserves.')
+  await ui.press({ key: 'anywhere-yes' })
   expect(after(w)).toEqual([['folders', 'spare-3', '--anywhere'], ['status', '--json']])
   await ui.unmount()
 })

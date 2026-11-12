@@ -14,7 +14,8 @@ import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
 // item's page, Escape goes back, and from the list closes the pane. An
 // account's page has its details and its actions (Sign in again or Sign in,
 // Remove), then its folders, each with Remove, a field to add one and
-// Anywhere (the owner, 2026-11-05: "I can't edit the accounts"), then
+// Remove all folder limits… (the owner, 2026-11-05: "I can't edit the
+// accounts"; it asks first since the UX review's Q12), then
 // whether it is a fallback, with the button that turns it (2026-11-06); Add
 // account's page the form; Settings' page switching, the VS Code panel and
 // forgetting the limits. The pane draws `longhaul.py status --json` and runs
@@ -316,10 +317,10 @@ async function clearOne($: any, name: string): Promise<void> {
     argv: ['clear', name], timeoutMs: STATUS_TIMEOUT })
 }
 
-// Whether a yes is being asked for on this account's page: its Remove, or
-// its Remove with the folder.
+// Whether a yes is being asked for on this account's page: its Remove, its
+// Remove with the sign-in folder, or Remove all folder limits.
 function asking(c: Ctx, name: string): boolean {
-  return c.confirm === name || c.confirm === `delete:${name}`
+  return c.confirm === name || c.confirm === `delete:${name}` || c.confirm === `anywhere:${name}`
 }
 
 // The Folders part's three: a folder typed on this account's page added,
@@ -346,7 +347,8 @@ async function removeFolder($: any, name: string, path: string): Promise<void> {
 async function anywhere($: any, name: string): Promise<void> {
   const a = busy ? null : await known($, name)
   if (!a || (a.only_in !== null && !a.only_in.length)) return // no list to drop
-  await act($, { label: `Anywhere: ${name}`, doing: `Dropping ${name}'s folders…`, argv: ['folders', name, '--anywhere'],
+  await act($, { label: `Remove all folder limits: ${name}`, doing: `Removing ${name}'s folder limits…`,
+    argv: ['folders', name, '--anywhere'],
     timeoutMs: STATUS_TIMEOUT })
 }
 
@@ -748,10 +750,14 @@ function where(a: LonghaulAccount): string {
   return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
 }
 
-// Its Folders: "anywhere", or each folder with Remove; a field to add one
-// and Add folder; Anywhere while it has a list to drop. A field that is not
-// a list is said, with Anywhere alone. Who keeps it out of every folder, and
-// the way out. The controls while nothing runs and no Remove waits for a yes.
+// Its Folders: where it runs (any folder no other account reserves), or
+// each folder it runs only in with Remove; a field to add one and Add
+// folder; Remove all folder limits… while it has a list to drop, which asks
+// first and names the folders it would un-reserve (the UX review's Q12: one
+// press dropped a whole list, opening client folders to other accounts). A
+// field that is not a list is said, with Remove all folder limits… alone.
+// Who keeps it out of every folder, and the way out. The controls while
+// nothing runs and no yes is asked for.
 function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
   const { Box, Text, Button, Input } = c.E
   const name = String(a.name)
@@ -760,10 +766,10 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
   const typed = c.folder.account === name ? c.folder : NO_FOLDER
   return (
     <Box flexDirection="column">
-      {a.only_in === null && <Text>{'Folders: its repositories field is not a list of absolute paths, so it is used '
-        + 'nowhere. Anywhere drops it.'}</Text>}
-      {a.only_in !== null && !a.only_in.length && <Text>Folders: anywhere</Text>}
-      {a.only_in !== null && a.only_in.length > 0 && <Text>Folders:</Text>}
+      {a.only_in === null && <Text>{'Runs in: no folder, as its repositories field is not a list of absolute paths. '
+        + 'Remove all folder limits drops it.'}</Text>}
+      {a.only_in !== null && !a.only_in.length && <Text>Runs in: any folder no other account reserves</Text>}
+      {a.only_in !== null && a.only_in.length > 0 && <Text>Runs only in:</Text>}
       {(a.only_in ?? []).map((path, i) => (
         <Box flexDirection="row" gap={1}>
           <Text>{`  ${mask(path)}`}</Text>
@@ -781,8 +787,22 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
       {offered && (
         <Box flexDirection="row" gap={1}>
           {a.only_in !== null && <Button key="folder-add" label="Add folder" onPress={() => void addFolder($, name)} />}
-          {(a.only_in === null || a.only_in.length > 0)
-            && <Button key="folder-anywhere" label="Anywhere" onPress={() => void anywhere($, name)} />}
+          {(a.only_in === null || a.only_in.length > 0) && <Button key="folder-anywhere" label="Remove all folder limits…"
+            onPress={() => void ask($, `anywhere:${name}`, 'anywhere-no')} />}
+        </Box>
+      )}
+      {c.idle && c.confirm === `anywhere:${name}` && (
+        <Box flexDirection="column">
+          <Text color="warning">{mask(a.only_in === null
+            ? `Drop ${name}'s repositories field? It is not a list of paths; ${name} could then run in any folder no other `
+              + 'account reserves.'
+            : `Remove all of ${name}'s folder limits? ${a.only_in.join(', ')} would no longer be reserved for ${name}, `
+              + 'and it could run in any folder no other account reserves.')}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Button key="anywhere-yes" label="Remove all folder limits" variant="primary"
+              onPress={() => void anywhere($, name)} />
+            <Button key="anywhere-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
+          </Box>
         </Box>
       )}
     </Box>
