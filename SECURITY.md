@@ -17,7 +17,7 @@ The latest release only. `longhaul update` says whether you run it.
 Longhaul runs on your own machine, with your own Claude Code sign-ins. These are in scope:
 
 - Longhaul printing, logging or sending message text, tool output, tokens or credentials.
-- Longhaul writing or deleting files outside what [Privacy and security](https://github.com/Noah-OS/longhaul/wiki/Privacy-and-Security) lists.
+- Longhaul writing or deleting files outside what the wiki's Privacy and security page lists.
 - A chat, a repository's files or a tool's output making Longhaul run a command, change an account or delete a folder that the user did not ask for.
 - The shim `bin/longhaul` running a command form it should refuse.
 - A hook that lets a prompt through on an account the folder is not allowed on.
