@@ -234,7 +234,7 @@ To remove it: `longhaul uninstall --dry-run` lists what Longhaul put outside the
 
 > [!NOTE]
 > Measured on one person's work, the author's.
-> - **Helped:** on 8 real compactions, Claude recalled 72% of tested facts with the checkpoint and 66% without (+5.9 points, p = 0.007). That is recall, not yet a better result on the task after.
+> - **Helped a little:** on 8 real compactions, Claude recalled 72% of tested facts with the checkpoint and 66% without (+5.9 points, p = 0.007); a second run with new questions gave +2.8, not significant. That is recall, not a better result on the task after, and the checkpoint is not shown to add to a summary written under compact instructions.
 > - **Did not help:** the guard's block mode (3.5 times the baseline's prompt tokens where it denied reads the task needed), the output filter (0.35% to 1.24% of Bash output) and the code index (no fewer tokens). Block mode and the filter are off by default.
 > - **Costs:** about 90 ms on every `Read` and `Bash` call, and about 509 tokens in every session.
 >
