@@ -830,7 +830,7 @@ function where(a: LonghaulAccount): string {
   if (a.only_in === null) return 'may be used nowhere'
   if (a.kept_out_by?.length) return 'may be used nowhere for now'
   if (a.only_in.includes('/')) return `may be used ${EVERYWHERE}`
-  return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used anywhere'
+  return a.only_in.length ? `may be used only in ${mask(a.only_in.join(', '))}` : 'may be used in any folder no other account reserves'
 }
 
 // Its Folders: where it runs (any folder no other account reserves), or

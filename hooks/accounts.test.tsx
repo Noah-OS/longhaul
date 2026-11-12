@@ -237,7 +237,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   await open(ui, 'row-personal-1')
   let all = await texts(ui)
   for (const t of ['personal-1 (this chat)', 'max · signed in', `5-hour 40%, resets ${clock(AT + 2 * HOUR)}`,
-                   `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used anywhere', 'a•••@example.com',
+                   `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used in any folder no other account reserves', 'a•••@example.com',
                    'sign-in folder ~/.claude-personal-1'])
     expect(all).toContain(t)
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'fallback', 'back'])
