@@ -841,6 +841,47 @@ both('a folders run that is refused shows why; a typed email is masked, and pass
   await ui.unmount()
 })
 
+// First choice (0.3.9's "preferred"): the folders an account is used first
+// in while it has room. Its page shows them, each with Remove, which runs
+// `longhaul.py folders NAME --no-prefer PATH`.
+
+both("an account's first choices: each with Remove, which runs folders NAME --no-prefer PATH", async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], preferred: ['~/code/client'] },
+    { ...ACCOUNTS[1], preferred: ['~/work/a', '~/work/b'] }, { ...ACCOUNTS[2], preferred: [] },
+    { ...ACCOUNTS[3], preferred: 'everywhere' }] }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain('First choice in: ~/code/client')
+  expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'prefer-remove-0', 'folder-add', 'fallback',
+    'back'])
+  expect((await ui.find({ key: 'prefer-remove-0' }))?.text).toBe('Remove')
+  await ui.press({ key: 'prefer-remove-0' })
+  expect(after(w)).toEqual([['folders', 'personal-1', '--no-prefer', '~/code/client'], ['status', '--json']])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove first choice ~/code/client: personal-1')))
+    .toBe(true)
+  await ui.press({ key: 'back' })
+  // Several: one line each.
+  await open(ui, 'row-work-2')
+  const all = await texts(ui)
+  for (const t of ['First choice in:', '  ~/work/a', '  ~/work/b']) expect(all).toContain(t)
+  await ui.press({ key: 'prefer-remove-1' })
+  expect(after(w).slice(2)).toEqual([['folders', 'work-2', '--no-prefer', '~/work/b'], ['status', '--json']])
+  // No Remove while a yes is asked for.
+  await ui.press({ key: 'remove-work-2' })
+  expect(await ui.find({ key: 'prefer-remove-0' })).toBeUndefined()
+  expect(await texts(ui)).toContain('  ~/work/a')
+  await ui.press({ key: 'remove-no' })
+  await ui.press({ key: 'back' })
+  // First choice nowhere, or a field that is not a list: no line.
+  for (const name of ['spare-3', 'team-4']) {
+    await open(ui, `row-${name}`)
+    expect((await texts(ui)).some(t => /First choice/.test(t))).toBe(false)
+    await ui.press({ key: 'back' })
+  }
+  await ui.unmount()
+})
+
 // A fallback account (the owner, 2026-11-06: "A fallback mark"): used only
 // when no other account allowed here has room. Its line says so, its page
 // says what it is, and a button runs `longhaul.py fallback NAME on|off`.

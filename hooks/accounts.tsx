@@ -179,6 +179,7 @@ function clean(s: any): LonghaulStatus {
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
       ...(typeof a.use_here === 'string' ? { use_here: a.use_here } : {}),
+      ...(Array.isArray(a.preferred) ? { preferred: strs(a.preferred) } : a.preferred === null ? { preferred: null } : {}),
       folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
@@ -342,6 +343,15 @@ async function removeFolder($: any, name: string, path: string): Promise<void> {
   if (!a?.only_in?.includes(path)) return
   await act($, { label: mask(`Remove folder ${path}: ${name}`), doing: mask(`Taking ${path} off ${name}'s folders…`),
     argv: ['folders', name, '--remove', path], timeoutMs: STATUS_TIMEOUT })
+}
+
+// One of the folders it is first choice in taken off (`folders NAME
+// --no-prefer PATH`, 0.3.9), only one the last read listed.
+async function unprefer($: any, name: string, path: string): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a?.preferred?.includes(path)) return
+  await act($, { label: mask(`Remove first choice ${path}: ${name}`), doing: mask(`Taking ${path} off ${name}'s first choices…`),
+    argv: ['folders', name, '--no-prefer', path], timeoutMs: STATUS_TIMEOUT })
 }
 
 async function anywhere($: any, name: string): Promise<void> {
@@ -809,6 +819,28 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
   )
 }
 
+// The folders it is first choice in (0.3.9's "preferred", the UX review's
+// Q3: used there while it has room), each with Remove, while nothing runs
+// and no yes is asked for. Nothing where it is first choice nowhere, or the
+// record does not say (an older longhaul.py, or a field that is not a list).
+function preferredPart($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button } = c.E
+  const liked = a.preferred ?? []
+  if (!liked.length) return null
+  const name = String(a.name)
+  const offered = c.idle && !asking(c, name)
+  const drop = (path: string, i: number) => offered
+    && <Button key={`prefer-remove-${i}`} label="Remove" dimColor onPress={() => void unprefer($, name, path)} />
+  if (liked.length === 1)
+    return <Box flexDirection="row" gap={1}><Text>{mask(`First choice in: ${liked[0]}`)}</Text>{drop(liked[0]!, 0)}</Box>
+  return (
+    <Box flexDirection="column">
+      <Text>First choice in:</Text>
+      {liked.map((path, i) => <Box flexDirection="row" gap={1}><Text>{`  ${mask(path)}`}</Text>{drop(path, i)}</Box>)}
+    </Box>
+  )
+}
+
 // Whether it is a fallback (the owner, 2026-11-06), and the button that
 // turns it the other way, while nothing runs and no Remove waits for a yes.
 // Nothing for a record that does not say: an older longhaul.py has no
@@ -886,6 +918,7 @@ function accountPage($: any, c: Ctx): any {
           </Box>
         </Box>
       )}
+      {preferredPart($, c, a)}
       {foldersPart($, c, a)}
       {fallbackPart($, c, a)}
     </Box>
