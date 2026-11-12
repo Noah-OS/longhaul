@@ -14,7 +14,7 @@ You choose the account a chat runs on, a recorded limit that is over is forgotte
 - **`longhaul clear NAME`** forgets one account's recorded limit. `longhaul clear` says which limits it forgot and until when each had been recorded.
 - **`/accounts`** has three more buttons on an account's page: **Use for this chat**, **Forget its limit** and, under Remove, **Remove and delete its folder**, which asks a second time.
 - **`longhaul doctor`** names the `~/.claude-*` folders no account uses, with their sizes.
-- **`/longhaul:manage`** runs `use NAME`, `clear NAME`, `folders NAME --prefer PATH` and `remove NAME --delete-folder --yes`, each after your yes in the chat.
+- **`/longhaul:manage`** runs `use NAME`, `clear NAME` and `folders NAME --prefer PATH`, each after your yes in the chat. Deleting an account's folder stays yours: the `/accounts` button or a terminal.
 
 ### Fixed
 

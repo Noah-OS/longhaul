@@ -26,10 +26,10 @@
 # add folders"): where an account may be used, read or changed; and,
 # since the owner's yes of 2026-11-11, `use NAME` (the account this chat
 # runs on), `clear NAME` (one account's recorded limit), the folders
-# options --prefer and --no-prefer, and `remove NAME --delete-folder
-# --yes`, which deletes the account's folder after the user's yes in the
-# chat (longhaul.py checks first and refuses, nothing changed, a folder
-# it may not delete). A user of the VS Code panel may have no terminal open, and
+# options --prefer and --no-prefer. `remove NAME --delete-folder` does
+# not run from here (the lead, 2026-11-12: a deletion that cannot be
+# undone takes the user's own hand, in a terminal or on the /accounts
+# button, never a chat's --yes). A user of the VS Code panel may have no terminal open, and
 # the /longhaul:manage skill shows each command and what it changes and
 # runs it only after the user's yes in the chat (the panel can approve
 # Bash by itself, so Claude Code's own prompt is not enough); where a
@@ -55,7 +55,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME [--delete-folder --yes], use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes and -h"
+runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes and -h"
 # A setup command, $1, in a form its case does not allow: the forms that
 # do run, $2, and why the rest does not, $3, when that needs saying.
 only() {
@@ -114,9 +114,9 @@ case "$1" in
     if plain "$2" && { [ $# -eq 2 ] || [ "$#:$3" = "3:--relogin" ]; }; then exec python3 "$here/longhaul.py" "$@"; fi
     only setup "\`setup NAME [--relogin]\`" "with no NAME it signs in every account at once" ;;
   remove)
-    # With the folder, only with --yes: bare --delete-folder asks in a terminal.
-    plain "$2" && case "$#:$3:$4" in 2::|4:--delete-folder:--yes) exec python3 "$here/longhaul.py" "$@" ;; esac
-    only remove "\`remove NAME\` or \`remove NAME --delete-folder --yes\`" "--delete-folder asks first in a terminal, and from here the user's yes in the chat is its --yes" ;;
+    # Never with the folder: that deletion is the user's own, in a terminal or /accounts.
+    if plain "$2" && [ $# -eq 2 ]; then exec python3 "$here/longhaul.py" "$@"; fi
+    only remove "\`remove NAME\`" "--delete-folder deletes the account's folder for good: the user runs it in a terminal, or uses Remove and delete its folder in /accounts" ;;
   use)
     # The account this chat, or the chat named, runs on from now on.
     if plain "$2" && { [ $# -eq 2 ] || { [ $# -eq 4 ] && [ "$3" = --chat ] && plain "$4"; }; }; then
