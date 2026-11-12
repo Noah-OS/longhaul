@@ -22527,17 +22527,24 @@ class Accounts(unittest.TestCase):
                      "[~/.claude-team]", "leave it open to use it anywhere", "Add Team (team@example.com), sign-in in "
                      "~/.claude-team, anywhere? [Y/n]", "A browser window opens: sign in as team@example.com.",
                      "Add another account? [y/N]", "Your accounts:",
-                     "move the conversation to another allowed account by itself? [Y/n]", "Saved: it moves by itself (auto)"):
+                     "move the conversation to another allowed account by itself (auto)? The default, ask, asks you "
+                     "first. [y/N]", "Saved: it asks first (ask)"):
             self.assertIn(said, out.stdout, said)
         self.assertRegex(out.stdout, r"Team\s+team@example\.com\s+~/\.claude-team\s+anywhere")
         # The owner, 2026-10-23: Longhaul keeps the answer itself, no shell profile to edit.
-        self.assertEqual(json.loads((self.relay / "config.json").read_text()), {"switch": "auto"})
+        # UX review Q10: Enter is the documented default, ask; it saved auto before.
+        self.assertEqual(json.loads((self.relay / "config.json").read_text()), {"switch": "ask"})
         self.assertNotIn("export LONGHAUL_SWITCH", out.stdout)
         quiet = self.guided(["Pro", "pro@example.com", "", "n", "", "n"], LONGHAUL_SWITCH="never")
         self.assertIn("Switching at a usage limit: never, from LONGHAUL_SWITCH in this shell.", quiet.stdout)
-        self.assertNotIn("[Y/n]\n", quiet.stdout.split("Your accounts:")[-1], "not asked when the shell says")
+        self.assertNotIn("[y/N]\n", quiet.stdout.split("Your accounts:")[-1], "not asked when the shell says")
         again = self.guided(["Max2", "max2@example.com", "", "n", "", "n"])
-        self.assertIn("Switching at a usage limit: auto (in ", again.stdout, "asked once, then said")
+        self.assertIn("Switching at a usage limit: ask (in ", again.stdout, "asked once, then said")
+        # A yes is auto.
+        (self.relay / "config.json").unlink()
+        auto = self.guided(["Max3", "max3@example.com", "", "n", "", "n", "y"])
+        self.assertIn("Saved: it moves by itself (auto)", auto.stdout)
+        self.assertEqual(json.loads((self.relay / "config.json").read_text()), {"switch": "auto"})
 
     def test_guided_add_asks_again_for_a_bad_or_taken_name_or_email_and_takes_folder_limits(self):
         (self.tmp / "orbit").mkdir()

@@ -15562,7 +15562,9 @@ def guided_switching() -> None:
     """Asks once whether to move a conversation to another allowed account by
     itself at a usage limit, and keeps the answer in config.json, read by the
     terminal and the panel alike (the owner, 2026-10-23: Longhaul does it,
-    not a shell profile to edit). --switch and LONGHAUL_SWITCH still win."""
+    not a shell profile to edit). --switch and LONGHAUL_SWITCH still win.
+    The question names the default, ask, and Enter keeps it (UX review Q10:
+    Enter saved auto, against the documented default)."""
     accounts, problem = read_accounts_file()
     if problem or len(accounts or []) < 2:
         return
@@ -15572,8 +15574,8 @@ def guided_switching() -> None:
     if config_switch():
         say(f"Switching at a usage limit: {config_switch()} (in {home_path(str(CONFIG))}).")
         return
-    auto = yes("When an account reaches its usage limit, move the conversation to another allowed account by itself?",
-               default=True)
+    auto = yes("When an account reaches its usage limit, move the conversation to another allowed account by itself "
+               "(auto)? The default, ask, asks you first.")
     found = read_json(CONFIG)
     write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": "auto" if auto else "ask"})
     # The panel asks too since keep working (K1): "stays put in the panel" was true only with its relay off.
