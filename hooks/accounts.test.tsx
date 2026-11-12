@@ -824,7 +824,8 @@ both('a move question at the top of the list, its two answers, and Move runs ans
   const { ui } = await opened($, w, surface)
   expect((await texts(ui))[0]).toBe(MOVE_SAYS)
   expect((await ui.find({ key: 'answer-move' }))?.text).toBe('Move and carry on')
-  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe('Wait for the reset')
+  // Wait names the minute it carries on: the reset, from a relay with no carries_on_at.
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe(`Wait, carry on at ${clock(AT + 38 * HOUR)}`)
   expect((await buttons(ui)).slice(0, 2)).toEqual(['answer-move', 'answer-wait'])
   // The focus starts on nothing while a question is open: a stray Enter answers nothing.
   expect((await ui.findAll({ type: 'Button' })).filter((b: any) => b.props.autoFocus)).toEqual([])
@@ -855,6 +856,17 @@ both('the question shows on every page, and Wait runs answer wait', async ($, on
   await ui.unmount()
 })
 
+both("Wait names the relay's carry-on minute; a question with no time waits for the reset", async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, { ...QUESTION, carries_on_at: AT + 38 * HOUR + 60 })
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe(`Wait, carry on at ${clock(AT + 38 * HOUR + 60)}`)
+  write(w, QUESTION_FILE, { ...QUESTION, id: 'q-dddddddddddd', resets_at: 0 })
+  await w.clock.advance(3000)
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe('Wait for the reset')
+  await ui.unmount()
+})
+
 both('every account at its limit: the first reset, and the same account worded as its own reset', async ($, on, surface) => {
   const w = world(on)
   write(w, QUESTION_FILE, FIRST)
@@ -866,7 +878,7 @@ both('every account at its limit: the first reset, and the same account worded a
   const later = clock(AT + 2 * HOUR + 60)
   expect(later).not.toBe(at)
   expect((await ui.find({ key: 'answer-yes' }))?.text).toBe(`Yes, carry on at ${later}`)
-  expect((await ui.find({ key: 'answer-no' }))?.text).toBe("No, I'll come back")
+  expect((await ui.find({ key: 'answer-no' }))?.text).toBe('No, leave this chat stopped')
   await ui.press({ key: 'answer-no' })
   expect(after(w)).toEqual([['answer', SID, 'q-ba9876543210', 'no']])
   // A new question, for the account this chat is on: it resets first itself.

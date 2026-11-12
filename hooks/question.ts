@@ -128,19 +128,24 @@ export function clock(seconds: number, nowMs: number): string {
 }
 
 // What the question says, and each choice's button, in the relay's words.
-// The question names the reset; Yes names when the carry-on goes, a
-// minute later (the relay's carries_on_at), which is the minute the status
-// entry and the pane show once it waits. A relay older than that field:
-// the reset, as before.
+// The question names the reset; the answer that waits (Wait, or Yes) names
+// when the carry-on goes, a minute later (the relay's carries_on_at), which
+// is the minute the status entry and the pane show once it waits. A relay
+// older than that field: the reset, as before; a question with no time
+// (none above 0) waits "for the reset". The UX review's §4.7 row 11: each
+// label says what it does.
 export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels: Record<string, string> } {
-  if (q.kind === 'move')
+  if (q.kind === 'move') {
+    const goes = q.carries_on_at ?? q.resets_at
     return { says: `${q.from} hit its ${q.limit} limit (resets ${clock(q.resets_at, nowMs)}). `
-      + `Move this chat to ${q.to} and carry on?`, labels: { move: 'Move and carry on', wait: 'Wait for the reset' } }
+      + `Move this chat to ${q.to} and carry on?`, labels: { move: 'Move and carry on',
+      wait: goes > 0 ? `Wait, carry on at ${clock(goes, nowMs)}` : 'Wait for the reset' } }
+  }
   const reset = q.to_resets_at ?? q.resets_at
   const at = clock(reset, nowMs)
   return { says: q.to === q.from ? `${q.from} resets at ${at}. Carry on then?`
     : `Every account is at its limit. ${q.to} resets first, at ${at}. Carry on there then?`,
-  labels: { yes: `Yes, carry on at ${clock(q.carries_on_at ?? reset, nowMs)}`, no: "No, I'll come back" } }
+  labels: { yes: `Yes, carry on at ${clock(q.carries_on_at ?? reset, nowMs)}`, no: 'No, leave this chat stopped' } }
 }
 
 // The pop-up that says a question waits, for a pane that may not have opened.
