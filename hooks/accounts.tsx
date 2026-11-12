@@ -338,6 +338,17 @@ async function addFolder($: any, name: string): Promise<void> {
     done: async () => { await update($, folder, () => NO_FOLDER) } })
 }
 
+// This chat's folder added to the folders an account runs only in, the fix
+// its Use row offers where that list alone keeps it out (`folders NAME
+// --add HERE`). Only from the last read: its list, and where this chat is.
+async function addHere($: any, name: string): Promise<void> {
+  const a = busy ? null : await known($, name)
+  const here = (await read($, lastRead))?.status?.here
+  if (!a || !here || a.use_here !== 'not_allowed' || !a.only_in?.length || folderProblem(here.folder)) return
+  await act($, { label: mask(`Add folder ${here.folder}: ${name}`), doing: mask(`Adding ${here.folder} to ${name}'s folders…`),
+    argv: ['folders', name, '--add', here.folder], timeoutMs: STATUS_TIMEOUT })
+}
+
 async function removeFolder($: any, name: string, path: string): Promise<void> {
   const a = busy ? null : await known($, name)
   if (!a?.only_in?.includes(path)) return
@@ -863,6 +874,60 @@ function keepFolder($: any, name: string): (value: string) => void {
   return value => void update($, folder, () => ({ account: name, path: value, problem: null }))
 }
 
+// Why Use for this chat is not offered (`use_here`, the UX review's Q2: the
+// button used to vanish without a word): "" where it is, or for a record
+// that does not say. Not allowed here is told by its own rule's words.
+function notHere(a: LonghaulAccount, here: LonghaulStatus['here']): string {
+  const at = here ? mask(here.folder) : 'this folder'
+  switch (a.use_here) {
+    case 'this_chat': return 'Use for this chat: this chat runs on it already.'
+    case 'limited': return 'Use for this chat: not offered while it is at its limit.'
+    case 'not_signed_in': return 'Use for this chat: not offered until it is signed in with its email.'
+    case 'not_allowed': {
+      const kept = (a.kept_out_by ?? []).map(String)
+      if (a.only_in === null) return 'Use for this chat: not offered, as its repositories field is not a list of paths.'
+      if (kept.length)
+        return mask(`Use for this chat: not offered, as ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} every folder.`)
+      if (a.only_in.length)
+        return mask(`Use for this chat: not offered here, as it runs only in ${a.only_in.join(', ')}, and this chat is in ${at}.`)
+      if (here?.may_use.length)
+        return mask(`Use for this chat: not offered here, as ${at} is reserved for ${here.may_use.join(', ')}.`)
+      return `Use for this chat: not offered in ${at}.`
+    }
+    default: return a.use_here === 'ok' || a.use_here == null ? '' : 'Use for this chat: not offered here.'
+  }
+}
+
+// The Use row, on every page whose record says (`use_here` not null): the
+// button, or why there is none with the action that fixes it where there is
+// one: its limit forgotten, its sign-in, this folder added to its folders.
+// Each fix lives here alone, not again among the actions.
+function useRow($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button } = c.E
+  if (typeof a.use_here !== 'string') return null
+  const name = String(a.name)
+  const offered = c.idle && !asking(c, name)
+  if (a.use_here === 'ok')
+    return offered ? <Button key={`use-${name}`} label="Use for this chat" onPress={() => void useHere($, name)} /> : null
+  const here = c.status?.here ?? null
+  const fix = !offered ? null
+    : a.use_here === 'limited'
+      ? <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />
+    : a.use_here === 'not_signed_in'
+      ? <Button key={`signin-${name}`} label={signInOf(a).label} onPress={() => void signIn($, name)} />
+    : a.use_here === 'not_allowed' && here && a.only_in?.length && !(a.kept_out_by ?? []).length
+      && folderProblem(here.folder) === null
+      ? <Button key={`use-add-${name}`} label={mask(`Add ${here.folder} to its folders`)}
+        onPress={() => void addHere($, name)} />
+    : null
+  return (
+    <Box flexDirection="row" gap={1}>
+      <Text>{notHere(a, here)}</Text>
+      {fix}
+    </Box>
+  )
+}
+
 // An account's page: what is known of it, then its actions, offered while
 // nothing runs. Remove asks first, in place of the actions.
 function accountPage($: any, c: Ctx): any {
@@ -886,12 +951,13 @@ function accountPage($: any, c: Ctx): any {
       <Text dimColor>{where(a)}</Text>
       {a.email && <Text dimColor>{mask(String(a.email))}</Text>}
       {a.folder && <Text dimColor>{mask(`sign-in folder ${a.folder}`)}</Text>}
+      {useRow($, c, a)}
       {c.idle && !asking(c, name) && (
         <Box flexDirection="row" gap={1}>
-          {a.use_here === 'ok' && <Button key={`use-${name}`} label="Use for this chat" onPress={() => void useHere($, name)} />}
-          {typeof a.limited_until === 'number'
+          {typeof a.limited_until === 'number' && a.use_here !== 'limited'
             && <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />}
-          <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />
+          {a.use_here !== 'not_signed_in'
+            && <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />}
           <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void ask($, name, 'remove-no')} />
         </Box>
       )}

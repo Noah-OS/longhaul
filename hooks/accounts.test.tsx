@@ -416,6 +416,66 @@ both('Use for this chat shows only where use would take the chat, and runs use N
   await ui.unmount()
 })
 
+// Q2: every page whose record says has a Use row: the button, or why not,
+// with the action that fixes it where there is one.
+both('the Use row says why Use for this chat is not offered, with its fix', async ($, on, surface) => {
+  const w = world(on)
+  const keeper = { ...ACCOUNTS[0], name: 'keeper-5', this_chat: false, only_in: ['/'], use_here: 'ok' }
+  const accounts = [{ ...ACCOUNTS[0], use_here: 'this_chat' },
+    { ...ACCOUNTS[1], use_here: 'not_allowed' }, // only in ~/work, ~/clients, and limited
+    { ...ACCOUNTS[2], use_here: 'not_allowed' }, // its folders field is not a list
+    { ...ACCOUNTS[3], use_here: 'not_allowed' }, // no list: ~/code/x is reserved for others
+    { ...ACCOUNTS[3], name: 'kept-6', kept_out_by: ['keeper-5'], use_here: 'not_allowed' },
+    { ...ACCOUNTS[0], name: 'full-7', this_chat: false, limited_until: AT + 2 * HOUR, use_here: 'limited' },
+    { ...ACCOUNTS[0], name: 'out-8', this_chat: false, signed_in: false, as_expected: null, use_here: 'not_signed_in' },
+    keeper, { ...ACCOUNTS[0], name: 'old-9', this_chat: false }]
+  w.status = done(JSON.stringify({ ...STATUS, here: { folder: '~/code/x', may_use: ['personal-1', 'keeper-5'] }, accounts }))
+  const { ui } = await opened($, w, surface)
+  const row = async (name: string) => {
+    await open(ui, `row-${name}`)
+    const said = (await texts(ui)).filter(t => t.startsWith('Use for this chat'))
+    const keys = await buttons(ui)
+    await ui.press({ key: 'back' })
+    return { said, keys }
+  }
+  expect((await row('personal-1')).said).toEqual(['Use for this chat: this chat runs on it already.'])
+  let r = await row('work-2')
+  expect(r.said).toEqual(['Use for this chat: not offered here, as it runs only in ~/work, ~/clients, and this chat is in '
+    + '~/code/x.'])
+  expect(r.keys.slice(0, 4)).toEqual(['use-add-work-2', 'clear-work-2', 'signin-work-2', 'remove-work-2'])
+  expect((await row('spare-3')).said).toEqual(['Use for this chat: not offered, as its repositories field is not a list of '
+    + 'paths.'])
+  expect((await row('team-4')).said).toEqual(['Use for this chat: not offered here, as ~/code/x is reserved for personal-1, '
+    + 'keeper-5.'])
+  expect((await row('kept-6')).said).toEqual(['Use for this chat: not offered, as keeper-5 keeps every folder.'])
+  // At its limit: the fix is Forget its limit, here and not again among the actions.
+  r = await row('full-7')
+  expect(r.said).toEqual(['Use for this chat: not offered while it is at its limit.'])
+  expect(r.keys.filter(k => k.startsWith('clear-'))).toEqual(['clear-full-7'])
+  expect(r.keys.slice(0, 3)).toEqual(['clear-full-7', 'signin-full-7', 'remove-full-7'])
+  // Not signed in: the fix is its Sign in, once.
+  r = await row('out-8')
+  expect(r.said).toEqual(['Use for this chat: not offered until it is signed in with its email.'])
+  expect(r.keys.slice(0, 2)).toEqual(['signin-out-8', 'remove-out-8'])
+  expect((await row('keeper-5')).keys[0]).toBe('use-keeper-5')
+  // An older Longhaul that does not say: no Use row.
+  expect((await row('old-9')).said).toEqual([])
+  // The fixes run their commands.
+  await open(ui, 'row-work-2')
+  expect((await ui.find({ key: 'use-add-work-2' }))?.text).toBe('Add ~/code/x to its folders')
+  await ui.press({ key: 'use-add-work-2' })
+  expect(after(w)).toEqual([['folders', 'work-2', '--add', '~/code/x'], ['status', '--json']])
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-full-7')
+  await ui.press({ key: 'clear-full-7' })
+  expect(after(w).slice(2)).toEqual([['clear', 'full-7'], ['status', '--json']])
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-out-8')
+  await ui.press({ key: 'signin-out-8' })
+  expect(after(w).slice(4)).toEqual([['setup', 'out-8'], ['status', '--json']])
+  await ui.unmount()
+})
+
 both('Remove runs only after its confirmation, Cancel runs nothing, and its result shows on the list', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
