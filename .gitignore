@@ -13,6 +13,7 @@
 !fake_claude.py
 !fake_stream.py
 !LICENSE
+!SECURITY.md
 !.claude-plugin/
 !.claude-plugin/plugin.json
 !.claude-plugin/marketplace.json

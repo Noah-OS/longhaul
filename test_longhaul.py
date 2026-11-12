@@ -5245,7 +5245,7 @@ class Plugin(unittest.TestCase):
         # so each is looked for in the index too.
         tracked = subprocess.run(["git", "ls-files"], cwd=HERE, capture_output=True, text=True, timeout=10).stdout.split()
         for path in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "LICENSE", "README.md",
-                     "CHANGELOG.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
+                     "CHANGELOG.md", "SECURITY.md", "hooks/hooks.json", "hooks/codex_hook.py", "bin/longhaul", ".github/workflows/tests.yml",
                      # Claude Code's skills.
                      "skills/checkpoint/SKILL.md", "skills/doctor/SKILL.md", "skills/inspect/SKILL.md",
                      "skills/manage/SKILL.md",
