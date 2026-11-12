@@ -2,6 +2,22 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+UX quick wins from the review of 2026-11-11: Longhaul's words say what it did, when a limit was seen, and which chats carry on.
+
+### Added
+
+- **`status --json` says when each account's usage was last read**: `reading_at`, in epoch seconds, or null when there is no reading. It stays after the windows it read have reset, so the screen can tell a limit seen a minute ago from one seen two days ago, and "room now" from "not known".
+- **`longhaul clear` names the chats that carry on.** `clear` and `clear NAME` name each panel chat waiting for a limit they forgot, by its short id and its folder, or say that no chat in the panel carries on because of it. A terminal waiting for it carries on as before; it keeps no record, so it is not named.
+
+### Changed
+
+- **Mac notifications are titled "Longhaul"**, not "Claude", so a Longhaul action no longer reads as Claude's.
+- **The guided `longhaul add` keeps the default switching mode, `ask`, on Enter.** Enter at "move the conversation to another allowed account by itself?" saved `auto`; the question now names the default, and only a y saves `auto`.
+- **The terminal's limit question is shorter**: "Max hit its weekly limit (resets Fri 02:00, in 2 d). Move this chat to Pro now?  y move · n wait for Max · q quit Longhaul. No answer means wait, then carry on with Max." The terminal's other questions at a limit take the same keys line.
+- **The `/accounts` pane**: see the UX quick wins Q2–Q8, Q12, Q14.
+
 ## 0.3.9 - 2026-11-11
 
 You choose the account a chat runs on, a recorded limit that is over is forgotten and the chats waiting for it carry on, and an account can be removed with its folder.

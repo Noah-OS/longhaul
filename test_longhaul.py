@@ -5233,8 +5233,10 @@ class Plugin(unittest.TestCase):
     def test_the_changelog_top_entry_is_the_manifests_version(self):
         # Review, Sprint 5 (G2): the newest entry is the version a user
         # installs, so a bump that touched the manifests and not the
-        # CHANGELOG (or the other way round) fails here.
-        heading = re.search(r"^## (\S+)", (HERE / "CHANGELOG.md").read_text(), re.M)
+        # CHANGELOG (or the other way round) fails here. An "Unreleased"
+        # section above it (Keep a Changelog's) collects what the next
+        # release will carry, and is no version.
+        heading = re.search(r"^## (?!Unreleased$)(\S+)", (HERE / "CHANGELOG.md").read_text(), re.M)
         self.assertIsNotNone(heading, "a version heading")
         self.assertEqual(heading.group(1), self.manifest()["version"], "the CHANGELOG's first ## heading")
 
