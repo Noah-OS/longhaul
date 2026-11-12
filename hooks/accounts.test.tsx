@@ -617,6 +617,10 @@ both("the last action's output: its last ten lines, stdout and stderr, every ema
     'should be second@example.com, not <other+tag@example.com>\n')
   await open(ui, 'row-personal-1')
   await ui.press({ key: 'signin-personal-1' })
+  // The reason, its last line, shows at once; the rest behind Details.
+  expect(await texts(ui)).toContain('should be s•••@example.com, not <o•••@example.com>')
+  expect(await texts(ui)).not.toContain('line 7')
+  await ui.press({ key: 'details' })
   const shown = await texts(ui)
   expect(shown.some(t => t.startsWith('✘') && /personal-1/.test(t))).toBe(true)
   expect(shown).toContain('signed in as f•••@example.com')
@@ -685,6 +689,89 @@ both('a status read that fails, or is not JSON, says so with Retry', async ($, o
   await ui.press({ key: 'retry' })
   expect(await buttons(ui)).toEqual(ROWS)
   expect(w.runs.filter(r => r[0] !== 'status')).toEqual([])
+  await ui.unmount()
+})
+
+// Q14: a failure's reason in normal weight, the raw output behind Details,
+// and no "rows" or "exit code" in what the pane says.
+
+// The Texts drawn with exactly this text.
+async function line(ui: any, text: string): Promise<any[]> {
+  return (await ui.findAll({ type: 'Text' })).filter((t: any) => t.text === text)
+}
+both("a failed action's reason is not dim, and its raw output waits behind Details", async ($, on, surface) => {
+  const w = world(on)
+  w.answer.fallback = done('Traceback (most recent call last):\n  File "longhaul.py", line 1\n', 1,
+    'longhaul no account called work-2; the accounts are personal-1\n')
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'fallback' })
+  const head = (await ui.findAll({ type: 'Text' })).find((t: any) => t.text.startsWith('✘'))
+  expect(head?.text).toBe('✘ Use as fallback: work-2')
+  expect(head?.props.dimColor).toBeFalsy()
+  const reason = await line(ui, 'longhaul no account called work-2; the accounts are personal-1')
+  expect(reason.length).toBe(1)
+  expect(reason[0].props.dimColor).toBeFalsy()
+  expect(await texts(ui)).not.toContain('Traceback (most recent call last):')
+  expect((await ui.find({ key: 'details' }))?.text).toBe('Details')
+  await ui.press({ key: 'details' })
+  const raw = (await ui.findAll({ type: 'Text' })).filter((t: any) => t.text === 'Traceback (most recent call last):')
+  expect(raw.length).toBe(1)
+  expect(raw[0].props.dimColor).toBe(true)
+  expect((await ui.find({ key: 'details' }))?.text).toBe('Hide details')
+  await ui.press({ key: 'details' })
+  expect(await texts(ui)).not.toContain('Traceback (most recent call last):')
+  // A next result opens closed; one line has no Details.
+  await ui.press({ key: 'details' })
+  w.answer.fallback = done('', 2, 'longhaul fallback: refused\n')
+  await ui.press({ key: 'fallback' })
+  expect(await ui.find({ key: 'details' })).toBeUndefined()
+  expect((await line(ui, 'longhaul fallback: refused')).length).toBe(1)
+  await ui.unmount()
+})
+
+both('a read that fails says why in normal weight, that chats still run, with Retry and Details', async ($, on, surface) => {
+  const w = world(on)
+  const PAUSED = 'Your chats still run; account switching is paused until this is fixed.'
+  w.status = done('', 1, 'Traceback (most recent call last):\nValueError: something broke\n')
+  const { ui } = await opened($, w, surface)
+  const first = (await ui.findAll({ type: 'Text' }))[1] // after the title
+  expect(first?.text).toBe(`Longhaul could not read your accounts: ValueError: something broke. ${PAUSED}`)
+  expect(first?.props.dimColor).toBeFalsy()
+  expect(await buttons(ui)).toEqual(['retry', 'read-details'])
+  await ui.press({ key: 'read-details' })
+  expect(await texts(ui)).toContain('Traceback (most recent call last):')
+  // accounts.json that cannot be read: status ends with 2, its record still said, the problem in it.
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [], listed: false, here: null,
+    problem: 'accounts.json is not readable: not JSON (Expecting value at line 1 column 1); fix or remove it' }), 2)
+  await ui.press({ key: 'retry' })
+  const all = await texts(ui)
+  expect(all).toContain('Longhaul could not read your accounts: accounts.json is not readable: not JSON (Expecting value '
+    + `at line 1 column 1); fix or remove it. ${PAUSED}`)
+  expect(all.some(t => /no list of accounts|Traceback/.test(t))).toBe(false)
+  expect((await buttons(ui)).slice(0, 1)).toEqual(['retry'])
+  await ui.unmount()
+})
+
+both('no "rows" and no "exit code" in what the pane says', async ($, on, surface) => {
+  const w = world(on)
+  const seen: string[] = []
+  w.status = done('', 2, 'longhaul: error: something\n')
+  const { ui } = await opened($, w, surface)
+  seen.push(...(await texts(ui)))
+  w.status = done('not json')
+  await ui.press({ key: 'retry' })
+  seen.push(...(await texts(ui)))
+  w.status = done(JSON.stringify(STATUS))
+  await ui.press({ key: 'retry' })
+  w.answer.setup = done('one\ntwo\n', 3, 'it broke\n')
+  await open(ui, 'row-personal-1')
+  await ui.press({ key: 'signin-personal-1' })
+  await ui.press({ key: 'details' })
+  seen.push(...(await texts(ui)).filter(t => !['one', 'two', 'it broke'].includes(t)))
+  for (const t of seen) expect(t).not.toMatch(/\brows?\b|exit code/i)
+  expect(seen.some(t => t.startsWith('Longhaul could not read your accounts: longhaul: error: something.'))).toBe(true)
+  expect(seen.some(t => t.startsWith('Longhaul could not read your accounts: its answer was not JSON.'))).toBe(true)
   await ui.unmount()
 })
 

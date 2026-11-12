@@ -65,7 +65,7 @@ const UPDATE = 'To update Longhaul: claude plugin marketplace update longhaul, t
 
 // Change a tag when its value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
-const lastRead = atom({ plugin: 'longhaul', key: 'accountsRead' } as const, null, { shape: 'accounts-read-1' })
+const lastRead = atom({ plugin: 'longhaul', key: 'accountsRead' } as const, null, { shape: 'accounts-read-2' })
 const running = atom({ plugin: 'longhaul', key: 'accountsRunning' } as const, null, { shape: 'accounts-running-2' })
 const result = atom({ plugin: 'longhaul', key: 'accountsResult' } as const, null, { shape: 'accounts-result-2' })
 const confirming = atom({ plugin: 'longhaul', key: 'accountsConfirm' } as const, null, { shape: 'accounts-confirm-1' })
@@ -80,6 +80,8 @@ const answered = atom({ plugin: 'longhaul', key: 'accountsAnswer' } as const, nu
 // What the last look found (question.ts), for the drawing to follow.
 const question = atom({ plugin: 'longhaul', key: 'accountsQuestion' } as const, null, { shape: 'accounts-question-1' })
 const wait = atom({ plugin: 'longhaul', key: 'accountsWait' } as const, null, { shape: 'accounts-wait-1' })
+// Whose raw output shows, behind Details: the last result's, the failed read's, or none.
+const details = atom({ plugin: 'longhaul', key: 'accountsDetails' } as const, null, { shape: 'accounts-details-1' })
 
 // This module's own mark on what it runs: a reload loads a new module, with
 // a new mark, so an action marked by another one was cut off by the reload.
@@ -140,27 +142,29 @@ function folderProblem(path: string): string | null {
   return path.startsWith('/') || path.startsWith('~/') ? null : `A folder starts with / or ~/ (not ${path}).`
 }
 
-// `status --json` read into what the pane draws: the record, or why there is none.
+// `status --json` read into what the pane draws: the record, or why there
+// is none in a few words, with the command's last lines for Details. The
+// record is taken whatever the exit code: an accounts.json it cannot read
+// ends status with 2 and the record still said, its problem in it.
 async function readStatus($: any): Promise<LonghaulAccountsRead> {
   let ran: { exitCode: number; stdout: string; stderr: string }
   try {
     ran = await $.process.run([...base($), 'status', '--json'], { timeoutMs: STATUS_TIMEOUT })
   } catch (err: any) {
-    return { status: null, problem: mask(`Longhaul did not answer: ${err?.message || err}`), update: false }
+    return { status: null, problem: mask(`it did not answer (${err?.message || err})`), update: false, lines: [] }
   }
   const said = tail(ran.stdout, ran.stderr)
   // An older longhaul.py has no --json: argparse refuses it by name.
   if (/unrecognized arguments:.*--json|--json.*(unknown|not recognized)/.test(`${ran.stdout}\n${ran.stderr}`))
-    return { status: null, problem: 'This Longhaul is older than this pane: it has no status --json.', update: true }
-  if (ran.exitCode !== 0)
-    return { status: null, problem: `longhaul.py status ended with exit code ${ran.exitCode}: ${said.at(-1) ?? 'no output'}`, update: false }
-  let status: any
-  try { status = JSON.parse(ran.stdout) } catch {
-    return { status: null, problem: 'Its answer was not JSON.', update: false }
-  }
-  if (!status || typeof status !== 'object' || !Array.isArray(status.accounts))
-    return { status: null, problem: 'Its answer has no list of accounts.', update: false }
-  return { status: clean(status), problem: null, update: false }
+    return { status: null, problem: 'This Longhaul is older than this pane: it has no status --json.', update: true,
+      lines: said }
+  let status: any = null
+  try { status = JSON.parse(ran.stdout) } catch {}
+  if (status && typeof status === 'object' && Array.isArray(status.accounts))
+    return { status: clean(status), problem: null, update: false, lines: [] }
+  const problem = ran.exitCode !== 0 ? said.at(-1) ?? 'it stopped and said nothing'
+    : status === null ? 'its answer was not JSON' : 'its answer has no list of accounts'
+  return { status: null, problem, update: false, lines: said }
 }
 
 // The record as the pane draws it: each field of its type, or "not known",
@@ -227,6 +231,7 @@ async function act($: any, a: Action): Promise<void> {
     } catch (err: any) { // it could not start, or ran past its time and was stopped
       end = { ok: false, label: a.label, lines: [mask(`It did not finish: ${err?.message || err}`)], after: null, page: from }
     }
+    await update($, details, () => null) // a new result opens with its Details closed
     if (end.ok && a.done) await a.done()
     if (end.ok && a.then) {
       const to = a.then
@@ -256,7 +261,7 @@ function firstLook($: any, before: LonghaulAccountsRunning | null, have: Longhau
         if (stale) {
           await update($, running, r => (r && r.by !== SELF ? null : r))
           await update($, result, () => ({ ok: null, label: before.label, after: null, page: before.page ?? 'list',
-            lines: ['Longhaul was reloaded while this ran, so how it ended is not known. The rows were read again.'] }))
+            lines: ["Longhaul was reloaded while this ran, so how it ended is not known. Longhaul's accounts were read again."] }))
         }
         if (!readOnce) await refresh($)
       })().catch(() => {})
@@ -427,7 +432,15 @@ async function clear($: any): Promise<void> {
 async function retry($: any): Promise<void> {
   if (busy) return
   busy = true
-  try { await refresh($) } finally { busy = false }
+  try {
+    await update($, details, d => (d === 'read' ? null : d))
+    await refresh($)
+  } finally { busy = false }
+}
+
+// Details opened or closed: `which` is "result" or "read".
+async function toggle($: any, which: string): Promise<void> {
+  await update($, details, d => (d === which ? null : which))
 }
 
 // The page the pane can show of the one asked for: an account's page only
@@ -574,6 +587,7 @@ type Ctx = {
   question: LonghaulQuestion | null
   wait: LonghaulWait | null
   answer: LonghaulAccountsAnswer | null
+  details: string | null // whose Details are open
   nowMs: number // the clock, for times shown as longhaul.py shows them
 }
 
@@ -648,16 +662,36 @@ function waitPart($: any, c: Ctx): any {
   return c.wait ? <Text>{mask(`This chat ${carries(c.wait, c.nowMs)}.`)}</Text> : null
 }
 
-// Before the rows: still reading, or why they could not be read, with Retry.
+// What the pane says when Longhaul cannot read the accounts (the UX
+// review's §4.7 row 13): the reason in its words, and what still works.
+function unread(reason: string): string {
+  return `Longhaul could not read your accounts: ${mask(reason).replace(/[.\s]+$/, '')}. Your chats still run; account `
+    + 'switching is paused until this is fixed.'
+}
+
+// Before the rows: still reading, or why they could not be read (the
+// record's own problem, or the read's), with Retry, the raw output behind
+// Details. A reason is drawn in normal weight, never dim (Q14).
 function readPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   if (c.have === null) return <Text dimColor>Reading Longhaul's accounts…</Text>
-  if (c.status) return c.status.problem ? <Text color="warning">{`⚠ ${mask(c.status.problem)}`}</Text> : null
+  if (c.status && !c.status.problem) return null
+  const raw = c.status ? [] : c.have.lines ?? []
+  const open = c.details === 'read'
   return (
     <Box flexDirection="column">
-      <Text color="error">{`Could not read Longhaul's accounts. ${c.have.problem ?? ''}`}</Text>
+      {c.have.update
+        ? <Text color="error">{c.have.problem ?? ''}</Text>
+        : <Text color="error">{unread(c.status?.problem ?? c.have.problem ?? '')}</Text>}
       {c.have.update && <Text>{UPDATE}</Text>}
-      {c.idle && <Button key="retry" label="Retry" onPress={() => void retry($)} />}
+      {c.idle && (
+        <Box flexDirection="row" gap={1}>
+          <Button key="retry" label="Retry" onPress={() => void retry($)} />
+          {raw.length > 1 && <Button key="read-details" label={open ? 'Hide details' : 'Details'} dimColor
+            onPress={() => void toggle($, 'read')} />}
+        </Box>
+      )}
+      {open && raw.map(line => <Text dimColor>{line}</Text>)}
     </Box>
   )
 }
@@ -755,7 +789,7 @@ function itemsPart($: any, c: Ctx): any {
   return (
     <Box flexDirection="column">
       {!s.accounts.length && (
-        <Text>{s.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
+        !s.problem && <Text>{s.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
       )}
       {items.map(i => {
         const parts = [`${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`, i.text ? '  ' : '']
@@ -1092,17 +1126,23 @@ function runningPart($: any, c: Ctx): any {
 }
 
 // The last action's end, on the page it ran from: ✔ or ✘ (? when not
-// known), its output's last lines, what next.
+// known), then its output's last line, the command's own word (a failure's
+// reason, or what a forget let carry on), in normal weight, never dim (the
+// UX review's Q14); the rest of its output behind Details; what next.
 function resultPart($: any, c: Ctx): any {
-  const { Box, Text } = c.E
+  const { Box, Text, Button } = c.E
   if (!c.last || !c.canType || !c.idle || c.last.page !== c.page) return null
   const { ok, label, lines, after } = c.last
+  const open = c.details === 'result'
   return (
     <Box flexDirection="column">
       <Text color={ok ? 'success' : ok === false ? 'error' : 'warning'}>
         {`${ok ? '✔' : ok === false ? '✘' : '?'} ${label}${ok === null ? ': not known' : ''}`}
       </Text>
-      {lines.map(line => <Text dimColor>{line}</Text>)}
+      {lines.length > 0 && <Text>{lines.at(-1)}</Text>}
+      {lines.length > 1 && <Button key="details" label={open ? 'Hide details' : 'Details'} dimColor
+        onPress={() => void toggle($, 'result')} />}
+      {open && lines.map(line => <Text dimColor>{line}</Text>)}
       {after && <Text>{after}</Text>}
     </Box>
   )
@@ -1194,9 +1234,9 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir] = await Promise.all([read($, lastRead),
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open] = await Promise.all([read($, lastRead),
       read($, running), read($, result), read($, confirming), read($, form), read($, shown), read($, marked),
-      read($, question), read($, wait), read($, answered), read($, folder)])
+      read($, question), read($, wait), read($, answered), read($, folder), read($, details)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
@@ -1204,7 +1244,8 @@ export const register: Register = on => {
     const canType = TYPING.includes(String(e.surface))
     const status = have?.status ?? null
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
-      form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans, nowMs }
+      form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans,
+      details: open, nowMs }
     return drawPane($, c)
   })
 }

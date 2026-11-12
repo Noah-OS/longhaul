@@ -63,8 +63,11 @@ export type LonghaulStatus = {
 }
 
 // The pane's last read: the answer, or why there is none (update: this
-// Longhaul is older than the pane and has no `status --json`).
-export type LonghaulAccountsRead = { status: LonghaulStatus | null; problem: string | null; update: boolean }
+// Longhaul is older than the pane and has no `status --json`), with the
+// command's last lines, masked, for its Details.
+export type LonghaulAccountsRead = {
+  status: LonghaulStatus | null; problem: string | null; update: boolean; lines: string[]
+}
 
 // Which page the pane shows: the list, or one item's page.
 export type LonghaulAccountsPage = 'list' | 'add' | 'settings' | `account:${string}`
@@ -128,6 +131,7 @@ declare module 'claude-code' {
       accountsWait: Shaped<LonghaulWait | null> // this chat's carry-on at a reset
       accountsAsked: Shaped<string | null> // the last question id the pane was opened for
       accountsAnswer: Shaped<LonghaulAccountsAnswer | null>
+      accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", or none
     }
   }
 }
