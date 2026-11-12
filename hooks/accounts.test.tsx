@@ -390,15 +390,24 @@ both('the pane says "sign-in folder" for an account\'s own folder, never a bare 
   await ui.unmount()
 })
 
-both('an account at its limit offers Forget its limit, which runs clear NAME', async ($, on, surface) => {
+both('an account at its limit offers It has room: forget this limit, which runs clear NAME and shows what it said', async ($, on, surface) => {
   const w = world(on)
+  const NOTE_ONE = 'If it is still full, the next reply meets the limit and Longhaul records it again.'
+  const SAID = 'longhaul forgot work-2\'s recorded limit (it was until 15:00); a chat waiting for it carries on within a few seconds'
+  w.answer.clear = done(`${SAID}\n`)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-personal-1')
   expect(await ui.find({ key: 'clear-personal-1' })).toBeUndefined()
+  expect(await texts(ui)).not.toContain(NOTE_ONE)
   await ui.press({ key: 'back' })
   await open(ui, 'row-work-2')
+  expect((await ui.find({ key: 'clear-work-2' }))?.text).toBe('It has room: forget this limit')
+  expect(await texts(ui)).toContain(NOTE_ONE)
   await ui.press({ key: 'clear-work-2' })
   expect(after(w)).toEqual([['clear', 'work-2'], ['status', '--json']])
+  const all = await texts(ui)
+  expect(all.some(t => t.startsWith('✔') && t.includes('Forget this limit: work-2'))).toBe(true)
+  expect(all).toContain(SAID)
   await ui.unmount()
 })
 
@@ -547,6 +556,9 @@ both("Settings' page: switching, the VS Code panel and forgetting the limits run
   await open(ui, 'row-settings')
   const all = (await texts(ui)).join('\n')
   for (const line of [/ask: asks first/, /auto: moves by itself/, /never: waits for the reset/]) expect(all).toMatch(line)
+  // Forget all recorded limits, with when to use it.
+  expect((await ui.find({ key: 'clear' }))?.text).toBe('Forget all recorded limits')
+  expect(await texts(ui)).toContain('Use this when claude.ai shows room but Longhaul still waits.')
   expect((await ui.find({ key: 'switch' }))?.props.value).toBe('ask')
   expect(await ui.find({ key: 'vscode-off' })).toBeUndefined() // it is off: only Turn on
   await ui.select({ key: 'switch', value: 'auto' })
@@ -555,9 +567,14 @@ both("Settings' page: switching, the VS Code panel and forgetting the limits run
   await ui.press({ key: 'vscode-on' })
   expect(after(w).slice(2)).toEqual([['vscode', 'on', '--yes'], ['status', '--json']])
   expect(await texts(ui)).toContain(RELOAD)
+  // Its result as longhaul.py prints it, the chats that carry on named.
+  const CARRIED = 'longhaul forgot the recorded limits: work-2 (it was until 15:00); carrying on: the chat in ~/code/x'
+  w.answer.clear = done(`${CARRIED}\n`)
   await ui.press({ key: 'clear' })
   expect(after(w).slice(4)).toEqual([['clear'], ['status', '--json']])
   expect(await texts(ui)).not.toContain(RELOAD)
+  expect(await texts(ui)).toContain(CARRIED)
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Forget all recorded limits'))).toBe(true)
   await ui.press({ key: 'vscode-off' })
   expect(after(w).slice(6)).toEqual([['vscode', 'off'], ['status', '--json']])
   expect(await texts(ui)).toContain(RELOAD)
@@ -577,7 +594,7 @@ both("Settings' page names the VS Code panel's own mode when vscode.json sets it
   expect((await ui.find({ key: 'switch' }))?.props.value).toBe('ask') // the Select is still the saved mode
   // The same mode, none (an older longhaul.py), one that is not a mode, or
   // no "switch" to differ from (its problem is said instead): no line.
-  // Each read again after Forget recorded limits, which reads the rows again.
+  // Each read again after Forget all recorded limits, which reads the rows again.
   const cases = [{ panel_switch: 'ask' }, {}, { panel_switch: 'sometimes' },
     { switch: 'sometimes', switch_problem: 'LONGHAUL_SWITCH is not a mode', panel_switch: 'never' }]
   for (const more of cases) {
@@ -638,13 +655,13 @@ both('while an action runs no other is offered, a press then runs nothing, and t
   expect(await buttons(ui)).toEqual(['back'])
   expect(await ui.find({ type: 'Input' })).toBeUndefined()
   expect(await ui.find({ type: 'Select' })).toBeUndefined()
-  expect(await texts(ui)).toContain('Forgetting the recorded limits…')
+  expect(await texts(ui)).toContain('Forgetting all recorded limits…')
   await expect(ui.press({ key: 'clear' })).rejects.toBeDefined()
   // Elsewhere too: an account's page shows its details, and no action.
   await ui.press({ key: 'back' })
   await open(ui, 'row-work-2')
   expect(await buttons(ui)).toEqual(['back'])
-  expect(await texts(ui)).toContain('Forgetting the recorded limits…')
+  expect(await texts(ui)).toContain('Forgetting all recorded limits…')
   await expect(ui.press({ key: 'signin-work-2' })).rejects.toBeDefined()
   await ui.press({ key: 'back' })
   await open(ui, 'row-add')

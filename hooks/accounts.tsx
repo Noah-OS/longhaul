@@ -312,9 +312,16 @@ async function useHere($: any, name: string): Promise<void> {
 
 // One account's recorded limit forgotten (`clear NAME`): it was reset
 // before its time. The chats waiting for it carry on within a few seconds.
+// The button says when to press it, and its line what happens if the
+// account is still full (the UX review's Q7, §4.7 row 3).
+const FORGET_ONE = 'It has room: forget this limit'
+const FORGET_ONE_NOTE = 'If it is still full, the next reply meets the limit and Longhaul records it again.'
+const FORGET_ALL = 'Forget all recorded limits'
+const FORGET_ALL_NOTE = 'Use this when claude.ai shows room but Longhaul still waits.'
+
 async function clearOne($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
-  await act($, { label: `Forget its limit: ${name}`, doing: `Forgetting ${name}'s recorded limit…`,
+  await act($, { label: `Forget this limit: ${name}`, doing: `Forgetting ${name}'s recorded limit…`,
     argv: ['clear', name], timeoutMs: STATUS_TIMEOUT })
 }
 
@@ -410,8 +417,10 @@ async function vscode($: any, on: boolean): Promise<void> {
     timeoutMs: STATUS_TIMEOUT, after: RELOAD })
 }
 
+// Every recorded limit forgotten (`clear`): its result, as longhaul.py
+// prints it, names the chats that carry on.
 async function clear($: any): Promise<void> {
-  await act($, { label: 'Forget recorded limits', doing: 'Forgetting the recorded limits…', argv: ['clear'],
+  await act($, { label: FORGET_ALL, doing: 'Forgetting all recorded limits…', argv: ['clear'],
     timeoutMs: STATUS_TIMEOUT })
 }
 
@@ -912,7 +921,7 @@ function useRow($: any, c: Ctx, a: LonghaulAccount): any {
   const here = c.status?.here ?? null
   const fix = !offered ? null
     : a.use_here === 'limited'
-      ? <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />
+      ? <Button key={`clear-${name}`} label={FORGET_ONE} onPress={() => void clearOne($, name)} />
     : a.use_here === 'not_signed_in'
       ? <Button key={`signin-${name}`} label={signInOf(a).label} onPress={() => void signIn($, name)} />
     : a.use_here === 'not_allowed' && here && a.only_in?.length && !(a.kept_out_by ?? []).length
@@ -955,12 +964,14 @@ function accountPage($: any, c: Ctx): any {
       {c.idle && !asking(c, name) && (
         <Box flexDirection="row" gap={1}>
           {typeof a.limited_until === 'number' && a.use_here !== 'limited'
-            && <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />}
+            && <Button key={`clear-${name}`} label={FORGET_ONE} onPress={() => void clearOne($, name)} />}
           {a.use_here !== 'not_signed_in'
             && <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />}
           <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void ask($, name, 'remove-no')} />
         </Box>
       )}
+      {c.idle && !asking(c, name) && (typeof a.limited_until === 'number' || a.use_here === 'limited')
+        && <Text dimColor>{FORGET_ONE_NOTE}</Text>}
       {c.idle && c.confirm === name && (
         <Box flexDirection="column">
           <Text color="warning">{mask(`Remove ${name} from Longhaul's list? Its sign-in folder${a.folder ? ` ${a.folder}` : ''} `
@@ -1047,7 +1058,12 @@ function settingsPage($: any, c: Ctx): any {
           </Box>
         )}
       </Box>
-      {c.idle && <Button key="clear" label="Forget recorded limits" onPress={() => void clear($)} />}
+      {c.idle && (
+        <Box flexDirection="column">
+          <Text>{FORGET_ALL_NOTE}</Text>
+          <Button key="clear" label={FORGET_ALL} onPress={() => void clear($)} />
+        </Box>
+      )}
     </Box>
   )
 }
