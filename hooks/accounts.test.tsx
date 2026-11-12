@@ -260,6 +260,39 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   await ui.unmount()
 })
 
+// The ring a control draws itself to: its autoFocus. (The plugin's own
+// $.ui.focus is the engine's to grant, to a pane holding the keys, and this
+// test's pane holds none, so the drawing is what is checked.)
+async function ringed(ui: any): Promise<string[]> {
+  return [...(await ui.findAll({ type: 'Button' })), ...(await ui.findAll({ type: 'Input' }))]
+    .filter((b: any) => b.props.autoFocus).map((b: any) => b.key)
+}
+
+both("an account's page opens with the focus on its first harmless control, never Sign in", async ($, on, surface) => {
+  const w = world(on)
+  const { ui } = await opened($, w, surface)
+  // A double Enter on the list: the second lands on the folder field, where Enter only keeps what is typed.
+  await open(ui, 'row-personal-1')
+  expect(await ringed(ui)).toEqual(['folder-path'])
+  await ui.input({ key: 'folder-path', text: '', kind: 'submit' })
+  expect(after(w)).toEqual([])
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  expect(await ringed(ui)).toEqual(['folder-path'])
+  await ui.press({ key: 'back' })
+  // No folder field (its folders field is not a list): Back.
+  await open(ui, 'row-spare-3')
+  expect(await ringed(ui)).toEqual(['back'])
+  // Remove asks with the ring on Cancel, so another Enter cancels.
+  await ui.press({ key: 'remove-spare-3' })
+  expect(await ringed(ui)).toEqual(['remove-no'])
+  await ui.press({ key: 'remove-folder' })
+  expect(await ringed(ui)).toEqual(['remove-no'])
+  await ui.press({ key: 'remove-no' })
+  expect(after(w)).toEqual([])
+  await ui.unmount()
+})
+
 both('Back cancels a Remove waiting for its yes before it leaves the page', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)

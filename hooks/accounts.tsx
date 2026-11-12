@@ -407,6 +407,16 @@ function pageOf(asked: LonghaulAccountsPage, status: LonghaulStatus | null, canT
   return asked === 'add' || asked === 'settings' ? asked : 'list'
 }
 
+// The control an account's page opens with the focus on (the UX review's
+// Q5): the first one a press changes nothing with, so a double Enter on the
+// list never starts a browser sign-in, which holds the pane for up to ten
+// minutes. Its folder field, where it has one (Enter there only keeps what
+// is typed), else Back. Never an action: Use, Sign in, a limit forgotten or
+// a folder changed all run at once, and Remove asks with its yes in reach.
+function harmless(a: LonghaulAccount): string {
+  return a.only_in !== null ? 'folder-path' : 'back'
+}
+
 // The list line each page is opened from, so going back puts the focus there.
 function rowKey(p: LonghaulAccountsPage): string {
   return p.startsWith('account:') ? `row-${p.slice('account:'.length)}` : p === 'list' ? 'row-first' : `row-${p}`
@@ -416,6 +426,13 @@ function rowKey(p: LonghaulAccountsPage): string {
 // pane holds the keys; anywhere else it stays as it is.
 function focusOn($: any, key: string): void {
   try { void Promise.resolve($.ui.focus({ requestId: PANE, key })).catch(() => {}) } catch {}
+}
+
+// A yes asked for (a Remove's), with the focus on its Cancel: a second
+// Enter after the press that asked cancels, and never says yes.
+async function ask($: any, what: string, cancel: string): Promise<void> {
+  await update($, confirming, () => what)
+  focusOn($, cancel)
 }
 
 // Opens an item's page from the list: Enter on its line, or a click.
@@ -666,7 +683,7 @@ function itemsPart($: any, c: Ctx): any {
     if (key) keys.add(key)
     const { text, warn } = summary(a, c.nowMs)
     items.push({ key, head: mask(name).padEnd(width), text, warn, extra: extras(a),
-      open: key ? () => void go($, `account:${name}`, `signin-${name}`) : undefined })
+      open: key ? () => void go($, `account:${name}`, harmless(a)) : undefined })
   }
   if (c.canType) {
     items.push({ key: 'row-add', head: '+ Add account', text: '', warn: false, extra: '',
@@ -752,7 +769,7 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
           + `used nowhere until a folder is added here (or / is removed from ${kept.length > 1 ? 'theirs' : `${kept[0]}'s`}).`)}</Text>
       )}
       {offered && a.only_in !== null && <Input key="folder-path" label="Add a folder: " placeholder="~/work"
-        value={typed.path} onInput={keepFolder($, name)} onSubmit={keepFolder($, name)} />}
+        value={typed.path} onInput={keepFolder($, name)} onSubmit={keepFolder($, name)} autoFocus />}
       {offered && typed.problem && <Text color="error">{`✘ ${typed.problem}`}</Text>}
       {offered && (
         <Box flexDirection="row" gap={1}>
@@ -816,7 +833,7 @@ function accountPage($: any, c: Ctx): any {
           {typeof a.limited_until === 'number'
             && <Button key={`clear-${name}`} label="Forget its limit" onPress={() => void clearOne($, name)} />}
           <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />
-          <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void update($, confirming, () => name)} />
+          <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void ask($, name, 'remove-no')} />
         </Box>
       )}
       {c.idle && c.confirm === name && (
@@ -825,8 +842,8 @@ function accountPage($: any, c: Ctx): any {
           <Box flexDirection="row" gap={1}>
             <Button key="remove-yes" label="Remove" variant="primary" onPress={() => void remove($, name)} />
             <Button key="remove-folder" label="Remove and delete its folder…" dimColor
-              onPress={() => void update($, confirming, () => `delete:${name}`)} />
-            <Button key="remove-no" label="Cancel" onPress={() => void update($, confirming, () => null)} />
+              onPress={() => void ask($, `delete:${name}`, 'remove-no')} />
+            <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
         </Box>
       )}
@@ -837,7 +854,7 @@ function accountPage($: any, c: Ctx): any {
           <Box flexDirection="row" gap={1}>
             <Button key="remove-folder-yes" label="Delete the folder" variant="primary"
               onPress={() => void removeWithFolder($, name)} />
-            <Button key="remove-no" label="Cancel" onPress={() => void update($, confirming, () => null)} />
+            <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
         </Box>
       )}
@@ -938,9 +955,12 @@ function footPart($: any, c: Ctx): any {
   const keys = c.surface === 'terminal'
     ? <Text dimColor>{c.page === 'list' ? '↑ ↓ to move · Enter to open · Esc to close' : 'Esc to go back'}</Text> : null
   if (c.page === 'list') return keys
+  // Back holds the ring on an account's page with nothing harmless above it (harmless()).
+  const a = c.page.startsWith('account:') ? c.status?.accounts.find(x => `account:${x.name}` === c.page) : undefined
+  const ring = a !== undefined && harmless(a) === 'back' && c.idle && !asking(c, String(a.name))
   return (
     <Box flexDirection="column">
-      <Button key="back" label="Back" dimColor onPress={() => void back($)} />
+      <Button key="back" label="Back" dimColor onPress={() => void back($)} {...(ring ? { autoFocus: true } : {})} />
       {keys}
     </Box>
   )
