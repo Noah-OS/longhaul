@@ -34,6 +34,11 @@ const ACCOUNTS = [
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, problem: null }
 const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-settings']
+// What Remove asks, and Remove and delete its sign-in folder… asks then.
+const REMOVE_WORK_2 = "Remove work-2 from Longhaul's list? Its sign-in folder ~/.claude-work-2 stays, and its sign-in "
+  + 'with it. Your project folders are never touched.'
+const DELETE_WORK_2 = 'Remove work-2 and delete its sign-in folder ~/.claude-work-2? Its sign-in and the chat history '
+  + 'kept in it go for good. Your project folders are never touched.'
 
 // A question as longhaul.py's Relay.ask() writes it, and a wait as Relay.schedule() does.
 const RELAY = 4242
@@ -233,7 +238,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   let all = await texts(ui)
   for (const t of ['personal-1 (this chat)', 'max · signed in', `5-hour 40%, resets ${clock(AT + 2 * HOUR)}`,
                    `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used anywhere', 'a•••@example.com',
-                   'folder ~/.claude-personal-1'])
+                   'sign-in folder ~/.claude-personal-1'])
     expect(all).toContain(t)
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'fallback', 'back'])
   expect(all.includes('Esc to go back')).toBe(surface === 'terminal')
@@ -298,7 +303,7 @@ both('Back cancels a Remove waiting for its yes before it leaves the page', asyn
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-work-2')
   await ui.press({ key: 'remove-work-2' })
-  expect(await texts(ui)).toContain("Remove work-2 from Longhaul's list? Its folder and sign-in stay.")
+  expect(await texts(ui)).toContain(REMOVE_WORK_2)
   await ui.press({ key: 'back' })
   expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
   expect(await ui.find({ key: 'signin-work-2' })).toBeDefined()
@@ -335,15 +340,14 @@ both('Sign in again for a signed-in account, Sign in for one that is not, the no
   await ui.unmount()
 })
 
-both('Remove with its folder asks twice and runs remove --delete-folder --yes; Cancel runs nothing', async ($, on, surface) => {
+both('Remove with its sign-in folder asks twice and runs remove --delete-folder --yes; Cancel runs nothing', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-work-2')
   await ui.press({ key: 'remove-work-2' })
   await ui.press({ key: 'remove-folder' })
   expect(after(w)).toEqual([])
-  expect(await texts(ui)).toContain('Remove work-2 and delete its folder ~/.claude-work-2? Its sign-in and the chat '
-    + 'history kept in that folder go for good.')
+  expect(await texts(ui)).toContain(DELETE_WORK_2)
   expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
   await ui.press({ key: 'remove-no' })
   expect(after(w)).toEqual([])
@@ -354,6 +358,35 @@ both('Remove with its folder asks twice and runs remove --delete-folder --yes; C
   await ui.press({ key: 'remove-folder-yes' })
   expect(after(w)).toEqual([['remove', 'work-2', '--delete-folder', '--yes'], ['status', '--json']])
   expect(await buttons(ui)).toEqual(ROWS.filter(k => k !== 'row-work-2'))
+  await ui.unmount()
+})
+
+both('the pane says "sign-in folder" for an account\'s own folder, never a bare "folder"', async ($, on, surface) => {
+  const w = world(on)
+  w.answer.remove = done('', 2, 'Not deleted, nothing changed: a chat runs on it.\n')
+  const { ui } = await opened($, w, surface)
+  const seen: string[] = []
+  for (const name of ['personal-1', 'work-2', 'spare-3', 'team-4']) {
+    await open(ui, `row-${name}`)
+    seen.push(...(await texts(ui)))
+    await ui.press({ key: `remove-${name}` })
+    seen.push(...(await texts(ui)))
+    expect((await ui.find({ key: 'remove-folder' }))?.text).toBe('Remove and delete its sign-in folder…')
+    await ui.press({ key: 'remove-folder' })
+    seen.push(...(await texts(ui)))
+    expect((await ui.find({ key: 'remove-folder-yes' }))?.text).toBe('Delete the sign-in folder')
+    await ui.press({ key: 'remove-folder-yes' }) // refused: the page, its result and its buttons stay
+    seen.push(...(await texts(ui)))
+    await ui.press({ key: 'back' })
+  }
+  expect(seen).toContain(REMOVE_WORK_2)
+  expect(seen).toContain(DELETE_WORK_2)
+  expect(seen.some(t => t.includes('Remove and delete its sign-in folder: work-2'))).toBe(true)
+  // Every place the account's folder is named, or "its folder" or "the folder" said, it is the sign-in folder.
+  for (const t of seen) {
+    for (const m of t.matchAll(/(\S+) folder (~\/\.claude|\/)/g)) expect(m[1]).toBe('sign-in')
+    expect(t).not.toMatch(/\b(its|the|that) folder\b/i)
+  }
   await ui.unmount()
 })
 
@@ -389,7 +422,7 @@ both('Remove runs only after its confirmation, Cancel runs nothing, and its resu
   await open(ui, 'row-work-2')
   await ui.press({ key: 'remove-work-2' })
   expect(after(w)).toEqual([])
-  expect(await texts(ui)).toContain("Remove work-2 from Longhaul's list? Its folder and sign-in stay.")
+  expect(await texts(ui)).toContain(REMOVE_WORK_2)
   await ui.press({ key: 'remove-no' })
   expect(after(w)).toEqual([])
   expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()

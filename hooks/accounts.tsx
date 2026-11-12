@@ -283,14 +283,17 @@ async function remove($: any, name: string): Promise<void> {
     then: 'list' })
 }
 
-// With its folder (0.3.9; the owner, 2026-11-11: "when I delete an account
-// it does not delete its files"): `remove NAME --delete-folder --yes`, after
-// the pane's own second yes. longhaul.py checks first and refuses, nothing
-// changed, a folder it may not delete (the default one, another account's,
-// one a chat runs on); its words show in the result.
+// With its sign-in folder, the account's own Claude Code folder (0.3.9; the
+// owner, 2026-11-11: "when I delete an account it does not delete its
+// files"): `remove NAME --delete-folder --yes`, after the pane's own second
+// yes. longhaul.py checks first and refuses, nothing changed, a folder it
+// may not delete (the default one, another account's, one a chat runs on);
+// its words show in the result. The pane says "sign-in folder" wherever it
+// means that folder (the UX review's Q4): "folder" alone is a project's.
 async function removeWithFolder($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
-  await act($, { label: `Remove with its folder: ${name}`, doing: `Removing ${name} and deleting its folder…`,
+  await act($, { label: `Remove and delete its sign-in folder: ${name}`,
+    doing: `Removing ${name} and deleting its sign-in folder…`,
     argv: ['remove', name, '--delete-folder', '--yes'], timeoutMs: STATUS_TIMEOUT, then: 'list' })
 }
 
@@ -662,6 +665,10 @@ function extras(a: LonghaulAccount): string {
   return said.length ? mask(`   (${said.join(' · ')})`) : ''
 }
 
+// What both Remove confirmations end with: the account's sign-in folder is
+// all that a delete takes, never a folder the user works in.
+const UNTOUCHED = 'Your project folders are never touched.'
+
 // What a fallback is, on its page: longhaul.py's FALLBACK_RULE, "here".
 const FALLBACK = 'used only when no other account allowed here has room'
 
@@ -826,7 +833,7 @@ function accountPage($: any, c: Ctx): any {
       )}
       <Text dimColor>{where(a)}</Text>
       {a.email && <Text dimColor>{mask(String(a.email))}</Text>}
-      {a.folder && <Text dimColor>{mask(`folder ${a.folder}`)}</Text>}
+      {a.folder && <Text dimColor>{mask(`sign-in folder ${a.folder}`)}</Text>}
       {c.idle && !asking(c, name) && (
         <Box flexDirection="row" gap={1}>
           {a.use_here === 'ok' && <Button key={`use-${name}`} label="Use for this chat" onPress={() => void useHere($, name)} />}
@@ -838,10 +845,11 @@ function accountPage($: any, c: Ctx): any {
       )}
       {c.idle && c.confirm === name && (
         <Box flexDirection="column">
-          <Text color="warning">{`Remove ${name} from Longhaul's list? Its folder and sign-in stay.`}</Text>
+          <Text color="warning">{mask(`Remove ${name} from Longhaul's list? Its sign-in folder${a.folder ? ` ${a.folder}` : ''} `
+            + `stays, and its sign-in with it. ${UNTOUCHED}`)}</Text>
           <Box flexDirection="row" gap={1}>
             <Button key="remove-yes" label="Remove" variant="primary" onPress={() => void remove($, name)} />
-            <Button key="remove-folder" label="Remove and delete its folder…" dimColor
+            <Button key="remove-folder" label="Remove and delete its sign-in folder…" dimColor
               onPress={() => void ask($, `delete:${name}`, 'remove-no')} />
             <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
@@ -849,10 +857,10 @@ function accountPage($: any, c: Ctx): any {
       )}
       {c.idle && c.confirm === `delete:${name}` && (
         <Box flexDirection="column">
-          <Text color="warning">{mask(`Remove ${name} and delete its folder ${a.folder}? Its sign-in and the chat history `
-            + 'kept in that folder go for good.')}</Text>
+          <Text color="warning">{mask(`Remove ${name} and delete its sign-in folder${a.folder ? ` ${a.folder}` : ''}? Its `
+            + `sign-in and the chat history kept in it go for good. ${UNTOUCHED}`)}</Text>
           <Box flexDirection="row" gap={1}>
-            <Button key="remove-folder-yes" label="Delete the folder" variant="primary"
+            <Button key="remove-folder-yes" label="Delete the sign-in folder" variant="primary"
               onPress={() => void removeWithFolder($, name)} />
             <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
