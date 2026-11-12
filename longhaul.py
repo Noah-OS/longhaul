@@ -763,6 +763,18 @@ def ago_text(seconds: float) -> str:
     return f"{ago // 86400} day{'s' if ago >= 2 * 86400 else ''} ago"
 
 
+def in_text(seconds: float) -> str:
+    """How long until, in the largest unit that fits, rounded down, as the
+    terminal's limit question says it (UX review 4.7, row 15): in 45 s, in
+    12 min, in 3 h, in 2 d. A time already past is in 0 s."""
+    left = max(0, int(seconds))
+    if left < 60:
+        return f"in {left} s"
+    if left < 3600:
+        return f"in {left // 60} min"
+    return f"in {left // 3600} h" if left < 86400 else f"in {left // 86400} d"
+
+
 # ------------------------------------------------------------- accounts
 
 # load_accounts()'s one account when there is no accounts.json (one
@@ -1823,13 +1835,17 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
     """At a limit in "ask" mode: ask_here()'s answer to moving this
     conversation to `there`, asked until the reset; "no", unasked, for a
     reset already past: no one could answer in time."""
-    if resets_at <= time.time():  # no one could answer in time, so nothing is asked
+    now = time.time()
+    if resets_at <= now:  # no one could answer in time, so nothing is asked
         return "no"
-    return ask_here(f"{here} hit its {kind} limit (resets {clock(resets_at)}). Move this conversation to {there} now?",
-                    f"y: move to {there}, n: wait for {here}, q: stop",
+    # UX review 4.7, row 15: shorter, every fact of the longer text kept.
+    return ask_here(f"{here} hit its {kind} limit (resets {clock(resets_at)}, {in_text(resets_at - now)}). "
+                    f"Move this chat to {there} now?",
+                    f"y move · n wait for {here} · q quit Longhaul",
                     f"longhaul waits and carries on with {here} at {clock(resets_at)}", resets_at,
                     f"move to {there}", f"{here} hit its {kind} limit. Answer in longhaul's terminal: move to {there}?",
-                    f"No answer by the reset, so longhaul carries on with {here}.")
+                    f"No answer by the reset, so longhaul carries on with {here}.",
+                    no_answer=f"No answer means wait, then carry on with {here}.")
 
 
 def ask_to_start(here: str, kind: str | None, resets_at: float, there: str) -> str:
@@ -1844,11 +1860,12 @@ def ask_to_start(here: str, kind: str | None, resets_at: float, there: str) -> s
         return "no"
     limit, at = f"its {kind} limit" if kind else "its limit", clock(resets_at)
     return ask_here(f"{here} is at {limit} until {at}. Start this conversation on {there} instead?",
-                    f"y: start on {there}, n: wait for {here}, q: stop",
+                    f"y start on {there} · n wait for {here} · q quit Longhaul",
                     f"longhaul waits and carries on with {here} at {at}", resets_at,
                     f"start on {there} instead of waiting for {here}",
                     f"{here} is at {limit}. Answer in longhaul's terminal: start this conversation on {there}?",
-                    f"No answer by the reset, so longhaul carries on with {here}.")
+                    f"No answer by the reset, so longhaul carries on with {here}.",
+                    no_answer=f"No answer means wait, then carry on with {here}.")
 
 
 def ask_first_reset(here: str, there: str, resets_at: float, every: str) -> str:
@@ -1862,12 +1879,13 @@ def ask_first_reset(here: str, there: str, resets_at: float, every: str) -> str:
         return "no"
     at = clock(resets_at)
     return ask_here(f"{every.capitalize()} is at its limit. {there} resets first, at {at}. Carry on there then?",
-                    f"y: carry on with {there} at {at}, n: wait for {here}, q: stop",
+                    f"y carry on with {there} at {at} · n wait for {here} · q quit Longhaul",
                     f"longhaul waits for {here} and carries on with it", resets_at,
                     f"carry on with {there} at its reset",
                     f"{every.capitalize()} is at its limit. Answer in longhaul's terminal: carry on with {there} "
                     f"at {at}?",
-                    f"No answer by {there}'s reset, so longhaul waits for {here}.")
+                    f"No answer by {there}'s reset, so longhaul waits for {here}.",
+                    no_answer=f"No answer means wait for {here}, then carry on with it.")
 
 
 def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, there: str) -> str:
@@ -1880,17 +1898,20 @@ def ask_kept_full(where: str, kept: list[str], first: str, resets_at: float, the
     names = " and ".join(kept)
     question = (f"The account{'' if one else 's'} kept for {where} ({names}) {'is' if one else 'are'} at "
                 f"{'its limit' if one else 'their limits'}. Run this conversation on {there} here?")
-    return ask_here(question, f"y: run on {there}, n: wait for {first}, q: stop",
+    return ask_here(question, f"y run on {there} · n wait for {first} · q quit Longhaul",
                     f"longhaul waits and carries on with {first} at {clock(resets_at)}", resets_at,
                     f"run on {there} in {where}",
                     f"{where} is kept for {names}, at {'its limit' if one else 'their limits'}. Answer in longhaul's "
                     f"terminal: run this conversation on {there}?",
-                    f"No answer by the reset, so longhaul carries on with {first}.", auto=False)
+                    f"No answer by the reset, so longhaul carries on with {first}.", auto=False,
+                    no_answer=f"No answer means wait, then carry on with {first} at {clock(resets_at)}.")
 
 
 def ask_here(question: str, keys: str, then: str, until: float, about: str, notice: str, late: str,
-             auto: bool = True) -> str:
-    """Ask `question` in this terminal, `keys` naming the answers: "yes"
+             auto: bool = True, no_answer: str = "") -> str:
+    """Ask `question` in this terminal, `keys` naming the answers ("y move ·
+    n wait for Max · q quit Longhaul") and `no_answer` saying in one short
+    sentence what no answer does (UX review 4.7, row 15): "yes"
     only for a y typed in this terminal once longhaul has asked; "stop" for
     q or Ctrl+C; "no" for n or Enter, no answer by `until` (`late` is said
     then), or no terminal (the question is said, and `then`: what longhaul
@@ -1923,7 +1944,7 @@ def ask_here(question: str, keys: str, then: str, until: float, about: str, noti
         # that wait never ended, and longhaul hung at the limit (Sprint 1).
         termios.tcflush(fd, termios.TCIFLUSH)
         tty.setcbreak(fd, termios.TCSANOW)
-        sys.stdout.write(f"\033[36mlonghaul\033[0m {question} ({keys}). With no answer {then}. ")
+        sys.stdout.write(f"\033[36mlonghaul\033[0m {question}  {keys}. {no_answer or f'With no answer {then}.'} ")
         sys.stdout.flush()
         while time.time() < until:
             ready, _, _ = select.select([fd], [], [], min(1.0, max(0.0, until - time.time())))

@@ -514,7 +514,7 @@ class Loop(unittest.TestCase):
         self.assertGreaterEqual(time.time() - started, 2, "after Max's reset")
         self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
         self.assertTrue(calls[1]["args"][-1].startswith("The Max account hit its session limit, so longhaul waited"))
-        self.assertIn("Move this conversation to Pro now?", out.stdout)
+        self.assertIn("Move this chat to Pro now?", out.stdout)
         self.assertIn("no terminal to answer in, so longhaul waits and carries on with Max at", out.stdout)
 
     def test_in_ask_mode_a_yes_moves_the_conversation_as_before(self):
@@ -553,7 +553,7 @@ class Loop(unittest.TestCase):
         out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y",
                                  FAKE_EMAIL_MAX="first@example.com", FAKE_EMAIL_PRO="stranger@example.com")
         self.assertEqual([c["config"] for c in calls], [None, None], out.stdout)
-        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertNotIn("Move this chat", out.stdout)
         self.assertIn("should be second@example.com but is signed in as stranger@example.com", out.stdout)
 
     def test_in_never_mode_a_reopen_after_a_crash_stays_on_the_same_account(self):
@@ -593,7 +593,7 @@ class Loop(unittest.TestCase):
         out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y")
         self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
         self.assertGreaterEqual(time.time() - started, 2)
-        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertNotIn("Move this chat", out.stdout)
         self.assertNotIn("resets first", out.stdout)
 
     # Keep working (K2): with every account at its limit and another
@@ -606,8 +606,10 @@ class Loop(unittest.TestCase):
         self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
         self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
         self.assertIn("Every account is at its limit. Pro resets first, at ", out.stdout)
-        self.assertIn(". Carry on there then? (y: carry on with Pro at ", out.stdout)
-        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertIn(". Carry on there then?  y carry on with Pro at ", out.stdout)
+        self.assertIn(" · n wait for Max · q quit Longhaul. No answer means wait for Max, then carry on with it.",
+                      out.stdout)
+        self.assertNotIn("Move this chat", out.stdout)
         self.assertTrue(calls[1]["args"][-1].startswith(
             "The Max account hit its session limit while every account was at its limit, so longhaul waited for "
             "the Pro account to reset"), calls[1]["args"][-1])
@@ -627,7 +629,7 @@ class Loop(unittest.TestCase):
     def test_in_never_mode_a_limit_waits_for_the_reset_without_asking(self):
         out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="never", answer=b"y")
         self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
-        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertNotIn("Move this chat", out.stdout)
 
     def test_the_switch_flag_wins_over_the_environment(self):
         _, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], "--switch", "auto", LONGHAUL_SWITCH="never")
@@ -1278,9 +1280,9 @@ class Loop(unittest.TestCase):
     def start_question(self, here, there, until, kind=None):
         """The reopen's question, with its keys and what no answer does."""
         limit, at = f"its {kind} limit" if kind else "its limit", longhaul.clock(until)
-        return (f"{here} is at {limit} until {at}. Start this conversation on {there} instead? "
-                f"(y: start on {there}, n: wait for {here}, q: stop). With no answer longhaul waits and carries on "
-                f"with {here} at {at}.")
+        return (f"{here} is at {limit} until {at}. Start this conversation on {there} instead?  "
+                f"y start on {there} · n wait for {here} · q quit Longhaul. No answer means wait, then carry on with "
+                f"{here}.")
 
     def where_ran(self, sid):
         return json.loads((self.home / "usage" / "sessions" / f"{sid}.json").read_text())["account"]
@@ -1322,7 +1324,7 @@ class Loop(unittest.TestCase):
         # No terminal: the question is said with what longhaul does instead, and nothing waits for a key.
         self.assertIn(f"Pro is at its limit until {longhaul.clock(until)}. Start this conversation on Max instead? "
                       "There is no terminal to answer in, so longhaul waits and carries on with Pro at ", out.stdout)
-        self.assertNotIn("(y: start on Max", out.stdout)
+        self.assertNotIn("y start on Max", out.stdout)
         self.assertIn("asked to start on Max instead of waiting for Pro: no", (self.home / "longhaul.log").read_text())
 
     def test_in_ask_mode_q_at_the_reopens_question_stops_before_any_launch(self):
@@ -1402,7 +1404,7 @@ class Loop(unittest.TestCase):
                 out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="ask",
                                                answer=answer)
                 self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
-                self.assertEqual(out.stdout.count("Move this conversation to Pro now?"), 1, out.stdout)
+                self.assertEqual(out.stdout.count("Move this chat to Pro now?"), 1, out.stdout)
                 self.assertNotIn("Start this conversation on", out.stdout)
 
     def test_a_relaunch_after_a_limit_the_limit_did_not_ask_about_asks_and_carries_on(self):
@@ -1418,7 +1420,7 @@ class Loop(unittest.TestCase):
                                        LONGHAUL_SWITCH="ask", answer=b"y", FAKE_EMAIL_MAX="first@example.com",
                                        FAKE_EMAIL_PRO="second@example.com")
         self.assertEqual([c["config"] for c in calls], [str(self.pro), None], out.stdout + out.stderr)
-        self.assertNotIn("Move this conversation", out.stdout)
+        self.assertNotIn("Move this chat", out.stdout)
         self.assertIn("Start this conversation on Max instead?", out.stdout)
         self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
         self.assertTrue(calls[1]["args"][-1].startswith(
@@ -1640,7 +1642,7 @@ class Loop(unittest.TestCase):
 
     def kept_question(self, work):
         return (f"The account kept for {self.shown(work)} (Pro) is at its limit. Run this conversation on Max here? "
-                "(y: run on Max, n: wait for Pro, q: stop). With no answer longhaul waits and carries on with Pro at ")
+                " y run on Max · n wait for Pro · q quit Longhaul. No answer means wait, then carry on with Pro at ")
 
     def allowed(self):
         path = self.home / "allowed.json"
@@ -15771,7 +15773,7 @@ class Pieces(unittest.TestCase):
 
     def test_the_question_says_what_happens_with_no_answer_and_how_to_stop_asking(self):
         self.ask(typed_after=b"n")
-        self.assertIn("With no answer longhaul waits and carries on with Max at", self.printed)
+        self.assertIn("No answer means wait, then carry on with Max.", self.printed)
         self.assertEqual(len(self.notified), 1)
         self.assertIn("carries on with Max at", self.notified[0])
         self.assertIn("--switch auto", self.notified[0])
@@ -15786,7 +15788,7 @@ class Pieces(unittest.TestCase):
         # Review, Sprint 1: the question was shown and notified though no
         # one could answer it in time.
         self.assertEqual(self.ask(wait=-5), "no")
-        self.assertNotIn("Move this conversation", self.printed)
+        self.assertNotIn("Move this chat", self.printed)
         self.assertEqual(self.notified, [])
 
     # Sprint 2, T2: the crash countdown had the faults Sprint 1 fixed in the question.
@@ -16277,6 +16279,22 @@ class Pieces(unittest.TestCase):
                 with mock.patch.object(longhaul.subprocess, "run", side_effect=failure) as run:
                     longhaul.notify("hello")
                 self.assertIn("timeout", run.call_args.kwargs)
+
+    def test_the_limit_question_is_short_and_keeps_the_reset_and_what_no_answer_does(self):
+        # UX review 4.7, row 15: the row's shape, with each fact the longer
+        # text gave: the reset's time, the keys, and that no answer waits
+        # for the account and carries on with it.
+        resets = time.time() + 2 * 86400 + 600
+        self.at_terminal(lambda: longhaul.ask_to_move("Max", "weekly", resets, "Pro"), typed_after=b"n")
+        self.assertIn(f"Max hit its weekly limit (resets {longhaul.clock(resets)}, in 2 d). Move this chat to Pro now?  "
+                      "y move · n wait for Max · q quit Longhaul. No answer means wait, then carry on with Max. n\n",
+                      self.printed)
+        self.assertNotIn("conversation", self.printed)
+
+    def test_in_text_is_how_long_until_in_the_largest_unit_that_fits(self):
+        for seconds, said in ((-5, "in 0 s"), (0, "in 0 s"), (59.9, "in 59 s"), (60, "in 1 min"), (3599, "in 59 min"),
+                              (3600, "in 1 h"), (86399, "in 23 h"), (86400, "in 1 d"), (2 * 86400 + 4 * 3600, "in 2 d")):
+            self.assertEqual(longhaul.in_text(seconds), said, seconds)
 
     def test_a_mac_notification_is_titled_longhaul_not_claude(self):
         # UX review Q9: titled "Claude", a Longhaul action read as Claude's.
