@@ -24266,7 +24266,7 @@ class StatusJson(unittest.TestCase):
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
-                    "preferred", "use_here"}
+                    "preferred", "use_here", "reading_at"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
 
     def setUp(self):
@@ -24337,12 +24337,13 @@ class StatusJson(unittest.TestCase):
             "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
-            "this_chat": False, "preferred": [], "use_here": "ok"})
+            "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here"],
+            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here",
+            "reading_at"],
             "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it; "
-            "preferred and use_here last (2026-11-11)")
+            "preferred and use_here after them (2026-11-11), reading_at last (2026-11-13)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -24436,6 +24437,35 @@ class StatusJson(unittest.TestCase):
         self.assertEqual((found["max"]["five_hour"], found["max"]["week"], found["max"]["limited_until"]),
                          (None, None, None), "no reading that can be read: no windows")
 
+    def test_reading_at_is_when_the_accounts_usage_was_last_read_or_null(self):
+        # UX review Q6: the screen tells a limit seen a minute ago from one
+        # seen two days ago, and "room now" from "not known".
+        now = time.time()
+        names = ("personal-1", "work", "max", "spare", "odd", "list")
+        self.write_accounts(*({"name": n, "config_dir": str(self.folder(n))} for n in names))
+        usage = self.home / "usage"
+        usage.mkdir()
+        (usage / "personal-1.json").write_text(json.dumps({
+            "at": now - 60.5, "five_hour": {"used_percentage": 40, "resets_at": int(now + 3600)}}))
+        (usage / "work.json").write_text(json.dumps({"at": int(now - 172800)}))
+        (usage / "max.json").write_text("not json")
+        (usage / "odd.json").write_text(json.dumps({"at": "later"}))
+        (usage / "list.json").write_text(json.dumps([{"at": now}]))
+        before = self.files()
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual({n: a["reading_at"] for n, a in found.items()}, {
+            "personal-1": now - 60.5, "work": int(now - 172800), "max": None, "spare": None, "odd": None,
+            "list": None}, "max's reading can't be read, spare has none, odd's at is no number, list's is no object")
+        self.assertEqual(self.files(), before, "only read")
+        # Kept while the windows it read have reset: when it was seen is news still.
+        (usage / "personal-1.json").write_text(json.dumps({
+            "at": now - 7200, "five_hour": {"used_percentage": 100, "resets_at": int(now - 10)}}))
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual((found["personal-1"]["reading_at"], found["personal-1"]["five_hour"]), (now - 7200, None))
+        for junk in (True, None, float("nan")):
+            (usage / "personal-1.json").write_text(json.dumps({"at": junk}))
+            self.assertIsNone(self.by_name(self.read(self.status()))["personal-1"]["reading_at"], junk)
+
     def test_only_in_for_a_list_none_an_empty_list_root_and_junk(self):
         (self.tmp / "work").mkdir()
         self.write_accounts({"name": "personal-1", "repositories": ["~/team", str(self.tmp / "work")]},
@@ -24521,7 +24551,7 @@ class StatusJson(unittest.TestCase):
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
-                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None}])
+                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None, "reading_at": None}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):

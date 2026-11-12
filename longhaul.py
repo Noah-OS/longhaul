@@ -16620,7 +16620,11 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     order: "not_allowed" here (`allowed_here`, eligible()'s), "limited",
     "not_signed_in" (as_expected false; a check that could not say is
     trusted, as the command trusts it). Null with no list of accounts or
-    no folder to tell (`allowed_here` None)."""
+    no folder to tell (`allowed_here` None). reading_at (2026-11-13) is
+    when its last usage reading was taken (the "at" record_usage() writes
+    in USAGE_DIR), in epoch seconds, kept after the windows it read have
+    reset; null for no reading, one that is not an object, or an "at" that
+    is not a number."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -16654,6 +16658,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "this_chat": this_chat,
         "preferred": None if liked is None else [home_path(p) for p in liked],
         "use_here": use_here,
+        "reading_at": as_number(reading.get("at")) if isinstance(reading, dict) else None,
     }
 
 
