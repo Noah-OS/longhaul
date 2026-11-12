@@ -200,8 +200,8 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
   const { ui } = await opened($, w, surface)
   expect(await buttons(ui)).toEqual(ROWS)
   const row = async (key: string) => (await ui.find({ key }))?.text
-  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · week 12%   (this chat)')
-  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · at its limit until ${clock(AT + 3 * HOUR)}   `
+  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · 5h 40% · week 12%   (this chat)')
+  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   `
     + '(only in ~/work, ~/clients)')
   expect(await row('row-spare-3')).toBe('  spare-3     signed in as someone else   (used nowhere)')
   expect(await row('row-team-4')).toBe('  team-4      could not check')
@@ -248,7 +248,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   // The others, each on its own page.
   await open(ui, 'row-work-2')
   all = await texts(ui)
-  for (const t of ['pro · NOT signed in', `at its limit until ${clock(AT + 3 * HOUR)}`,
+  for (const t of ['pro · NOT signed in', `limit until ${clock(AT + 3 * HOUR)} (in 3 h)`,
                    'may be used only in ~/work, ~/clients', 'b•••@example.com'])
     expect(all).toContain(t)
   await ui.press({ key: 'back' })
@@ -627,6 +627,48 @@ both("the last action's output: its last ten lines, stdout and stderr, every ema
   await ui.unmount()
 })
 
+// Q6: a limit with how far off its end is and when Longhaul last read the
+// account (reading_at); with no limit and a reading, "room now".
+both('a limit says how far off it ends and when it was seen; a reading with no limit says room now', async ($, on, surface) => {
+  const w = world(on)
+  const seen = AT - 25 * 60 // 11:35, today
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [
+    { ...ACCOUNTS[0], reading_at: seen },
+    { ...ACCOUNTS[1], limited_until: AT + 40 * 60, reading_at: seen },
+    { ...ACCOUNTS[1], name: 'week-5', signed_in: true, as_expected: true, limited_until: AT + 52 * HOUR, reading_at: null },
+    { ...ACCOUNTS[0], name: 'full-6', this_chat: false, five_hour: { used: 100, resets_at: AT + HOUR }, reading_at: seen },
+    { ...ACCOUNTS[0], name: 'odd-7', this_chat: false, reading_at: 'yesterday' },
+    { ...ACCOUNTS[0], name: 'old-8', this_chat: false }] }))
+  const { ui } = await opened($, w, surface)
+  const row = async (key: string) => (await ui.find({ key }))?.text
+  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · room now · 5h 40% · week 12%   (this chat)')
+  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · limit until ${clock(AT + 40 * 60)} (in 40 min), `
+    + `seen ${clock(seen)}   (only in ~/work, ~/clients)`)
+  expect(await row('row-week-5')).toMatch(new RegExp(`pro · limit until ${clock(AT + 52 * HOUR)} \\(in 2 d 4 h\\)   `))
+  expect(await row('row-full-6')).toMatch(/max · signed in · 5h 100% · week 12%$/) // a full window: no room now
+  expect(await row('row-odd-7')).toMatch(/max · signed in · 5h 40% · week 12%$/) // not a time: not known
+  expect(await row('row-old-8')).toMatch(/max · signed in · 5h 40% · week 12%$/) // an older Longhaul
+  // The pages say the same.
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain(`room now, seen ${clock(seen)}`)
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  expect(await texts(ui)).toContain(`limit until ${clock(AT + 40 * 60)} (in 40 min), seen ${clock(seen)}`)
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-week-5')
+  expect(await texts(ui)).toContain(`limit until ${clock(AT + 52 * HOUR)} (in 2 d 4 h)`)
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-odd-7')
+  expect((await texts(ui)).some(t => /room now|seen/.test(t))).toBe(false)
+  // Two hours off, to the hour.
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[1], limited_until: AT + 2 * HOUR + 10 * 60 }] }))
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'clear-work-2' })
+  expect(await texts(ui)).toContain(`limit until ${clock(AT + 2 * HOUR + 10 * 60)} (in 2 h)`)
+  await ui.unmount()
+})
+
 both('a status read that fails, or is not JSON, says so with Retry', async ($, on, surface) => {
   const w = world(on)
   w.status = done('', 1, 'Traceback: something broke')
@@ -700,7 +742,7 @@ both('an account with no folder and times in decimals, and an odd record, are dr
   let all = (await texts(ui)).join('\n')
   expect(all).toContain("could not check: its config_dir is not a folder's path")
   expect(all).toContain(`5-hour 100%, resets ${clock(AT + 3600.5)}`)
-  expect(all).toContain(`at its limit until ${clock(AT + 3600.5)}`)
+  expect(all).toContain(`limit until ${clock(AT + 3600.5)} (in 1 h)`)
   expect(all).not.toMatch(/sign-in folder|NaN|undefined/)
   expect(await ui.find({ key: 'signin-odd-5' })).toBeDefined()
   await ui.press({ key: 'back' })
@@ -730,7 +772,7 @@ test('on the phone: the list as text, no page, and to manage accounts from the c
   await $.command.run(TYPED)
   const ui = await $.ui.mount(pane('mobile'))
   const all = (await texts(ui)).join('\n')
-  expect(all).toMatch(/personal-1\s+max · signed in · week 12%/)
+  expect(all).toMatch(/personal-1\s+max · signed in · 5h 40% · week 12%/)
   expect(all).toMatch(/NOT signed in/)
   expect(all).toMatch(/manage accounts from the computer/i)
   expect(all).not.toMatch(/Add account|Settings/)
@@ -767,7 +809,7 @@ both('a sign-in that failed in a chat: the line says so, the page says when, and
   const failed = AT - 3 * HOUR
   w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], sign_in_failed_at: failed }, ACCOUNTS[1]] }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/max · sign-in failed · week 12%/)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/max · sign-in failed · 5h 40% · week 12%/)
   expect((await ui.find({ key: 'row-work-2' }))?.text).not.toMatch(/failed/) // null, or not there: an older Longhaul
   await open(ui, 'row-personal-1')
   expect(await texts(ui)).toContain(`Its sign-in failed at ${clock(failed)}.`)
@@ -967,7 +1009,7 @@ both('a fallback: its line and page say so, and the button runs fallback NAME of
   const w = world(on)
   w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], fallback: true }, ...ACCOUNTS.slice(1)] }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text).toBe('  personal-1  max · signed in · week 12%   '
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toBe('  personal-1  max · signed in · 5h 40% · week 12%   '
     + '(this chat · fallback)')
   expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/\(only in ~\/work, ~\/clients\)$/) // normal: no word
   await open(ui, 'row-personal-1')
@@ -1011,7 +1053,7 @@ both('an older Longhaul that does not say: no fallback line and no button', asyn
   w.status = done(JSON.stringify({ ...STATUS, accounts: older }))
   const { ui } = await opened($, w, surface)
   expect((await ui.find({ key: 'row-personal-1' }))?.text)
-    .toBe('  personal-1  max · signed in · week 12%   (this chat)')
+    .toBe('  personal-1  max · signed in · 5h 40% · week 12%   (this chat)')
   await open(ui, 'row-personal-1')
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'back'])
   const all = await texts(ui)

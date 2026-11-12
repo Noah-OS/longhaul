@@ -127,6 +127,20 @@ export function clock(seconds: number, nowMs: number): string {
   return `${d.getDate()} ${month} ${hm}`
 }
 
+// How far ahead a time is, in a few words (the UX review's Q6): "in 40
+// min", "in 2 h", "in 2 d 4 h"; "now" for one that is not ahead. Rounded
+// to the minute, then to the hour from an hour on.
+export function inTime(seconds: number, nowMs: number): string {
+  const ahead = seconds - nowMs / 1000
+  if (!Number.isFinite(ahead)) return '?'
+  if (ahead <= 0) return 'now'
+  const min = Math.max(1, Math.round(ahead / 60))
+  if (min < 60) return `in ${min} min`
+  const h = Math.round(min / 60)
+  if (h < 24) return `in ${h} h`
+  return `in ${Math.floor(h / 24)} d${h % 24 ? ` ${h % 24} h` : ''}`
+}
+
 // What the question says, and each choice's button, in the relay's words.
 // The question names the reset; the answer that waits (Wait, or Yes) names
 // when the carry-on goes, a minute later (the relay's carries_on_at), which

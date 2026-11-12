@@ -5,7 +5,7 @@ import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsFolder, L
   LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulQuestion, LonghaulStatus,
   LonghaulWait } from '../types'
 import { status as showStatus } from './display.ts'
-import { answerArgs, asks, carries, clock, look, waits } from './question.ts'
+import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
 
 // Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
 // does (the owner, 2026-10-30: "a model showing up front of us and we can do
@@ -180,7 +180,7 @@ function clean(s: any): LonghaulStatus {
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
       ...(typeof a.use_here === 'string' ? { use_here: a.use_here } : {}),
       ...(Array.isArray(a.preferred) ? { preferred: strs(a.preferred) } : a.preferred === null ? { preferred: null } : {}),
-      folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
+      reading_at: num(a.reading_at), folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   return { accounts, listed: s.listed === true, here,
@@ -670,15 +670,34 @@ function signedIn(a: LonghaulAccount): string {
   return 'signed in'
 }
 
+// Its recorded limit with how far off its end is and, when Longhaul has a
+// reading, when that was (the UX review's Q6, §4.7 row 1): "limit until Fri
+// 02:00 (in 2 d 4 h), seen Tue 23:10". A reading tells "lifted" from "not
+// known": with no limit recorded and no window full, "room now" (row 2).
+function limitText(a: LonghaulAccount, nowMs: number): string {
+  const seen = typeof a.reading_at === 'number' ? `, seen ${clock(a.reading_at, nowMs)}` : ''
+  return `limit until ${clock(a.limited_until!, nowMs)} (${inTime(a.limited_until!, nowMs)})${seen}`
+}
+
+function roomNow(a: LonghaulAccount): boolean {
+  return typeof a.reading_at === 'number' && typeof a.limited_until !== 'number'
+    && !((a.five_hour?.used ?? 0) >= 100 || (a.week?.used ?? 0) >= 100)
+}
+
 // An account's line in the list: its plan, its sign-in unless that is
-// fine and the limit says more, then the limit or the week's use.
+// fine and the limit says more, then the limit, or room now and the use of
+// its open windows.
 function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boolean } {
   const limited = typeof a.limited_until === 'number'
   const sign = typeof a.sign_in_failed_at === 'number' ? 'sign-in failed' : signedIn(a)
   const parts = a.plan ? [mask(a.plan)] : []
   if (!(limited && sign === 'signed in')) parts.push(sign)
-  if (limited) parts.push(`at its limit until ${clock(a.limited_until!, nowMs)}`)
-  else if (a.week) parts.push(`week ${Math.round(a.week.used)}%`)
+  if (limited) parts.push(limitText(a, nowMs))
+  else {
+    if (roomNow(a)) parts.push('room now')
+    if (a.five_hour) parts.push(`5h ${Math.round(a.five_hour.used)}%`)
+    if (a.week) parts.push(`week ${Math.round(a.week.used)}%`)
+  }
   return { text: parts.join(' · '), warn: limited || sign !== 'signed in' }
 }
 
@@ -950,10 +969,9 @@ function accountPage($: any, c: Ctx): any {
     <Box flexDirection="column">
       <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
       <Text>{[a.plan && mask(a.plan), check].filter(Boolean).join(' · ')}</Text>
+      {typeof a.limited_until === 'number' && <Text color="warning">{limitText(a, c.nowMs)}</Text>}
+      {roomNow(a) && <Text>{`room now, seen ${clock(a.reading_at!, c.nowMs)}`}</Text>}
       {lines.map(line => <Text>{line}</Text>)}
-      {typeof a.limited_until === 'number' && (
-        <Text color="warning">{`at its limit until ${clock(a.limited_until, c.nowMs)}`}</Text>
-      )}
       {typeof a.sign_in_failed_at === 'number' && (
         <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`}</Text>
       )}

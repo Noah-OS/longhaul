@@ -39,6 +39,11 @@ export type LonghaulAccount = {
   // The folders the account is preferred in (0.3.9); null for a value that
   // is not a list of paths.
   preferred?: string[] | null
+  // When Longhaul last read the account's usage (epoch seconds; the UX
+  // review's Q6), which the pane shows as "seen 11:52"; null when it has no
+  // reading. The pane's clean() gives null for one absent (an older
+  // longhaul.py) or not a number; optional for a read stored before it.
+  reading_at?: number | null
   folder: string
   this_chat: boolean
 }
