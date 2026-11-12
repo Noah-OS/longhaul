@@ -16278,6 +16278,17 @@ class Pieces(unittest.TestCase):
                     longhaul.notify("hello")
                 self.assertIn("timeout", run.call_args.kwargs)
 
+    def test_a_mac_notification_is_titled_longhaul_not_claude(self):
+        # UX review Q9: titled "Claude", a Longhaul action read as Claude's.
+        with mock.patch.dict(os.environ), mock.patch.object(longhaul.shutil, "which", return_value="/usr/bin/osascript"), \
+                mock.patch.object(longhaul.subprocess, "run") as run:
+            os.environ.pop("LONGHAUL_NO_NOTIFY", None)
+            longhaul.notify('a "quoted" word')
+        script = run.call_args.args[0][-1]
+        self.assertTrue(script.endswith('with title "Longhaul"'), script)
+        self.assertNotIn("Claude", script)
+        self.assertIn("a 'quoted' word", script)
+
     def relink_with(self, main_text, copy_text, copy_newer):
         tmp = Path(tempfile.mkdtemp())
         main, pro = tmp / "main", tmp / "pro"

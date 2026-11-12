@@ -729,7 +729,7 @@ def notify(msg: str) -> None:
         return
     text = msg.replace("\\", "").replace('"', "'")
     try:
-        subprocess.run(["osascript", "-e", f'display notification "{text}" with title "Claude"'],
+        subprocess.run(["osascript", "-e", f'display notification "{text}" with title "Longhaul"'],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except (OSError, subprocess.SubprocessError) as e:
         log(f"notification not shown: {e!r}")
