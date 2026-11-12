@@ -23412,7 +23412,8 @@ class RemoveDeleteFolder(unittest.TestCase):
         self.assertIn("`${CLAUDE_PLUGIN_ROOT}/bin/longhaul remove NAME`; its folder and sign-in stay.", flat)
         self.assertIn("tell the user first that its sign-in and the chat history kept in that folder go for good", flat)
         self.assertNotIn("bin/longhaul remove NAME --delete-folder", flat)
-        self.assertIn("**Remove and delete its folder** in `/accounts` or `longhaul remove NAME --delete-folder` in a terminal", flat)
+        self.assertIn("**Remove and delete its sign-in folder…** in `/accounts` or `longhaul remove NAME --delete-folder` in a "
+                      "terminal", flat)
         self.assertLess(flat.index("tell the user first"), flat.index("--delete-folder"))
         readme = (HERE / "README.md").read_text()
         [line] = [l for l in readme.splitlines() if l.startswith("**Sign in again, or remove an account.**")]
