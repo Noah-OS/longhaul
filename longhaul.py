@@ -18596,7 +18596,7 @@ def doctor_group(check: dict) -> str:
     """The group a line goes in (DOCTOR_GROUPS), by its result and whether
     it is an extra (DOCTOR_OPTIONAL): its own `kind` when it has one; else
     "works" for ✔; "skip" for the code maps' ⚠ (a map saved no tokens in
-    the cw-repo benchmark, so the doctor does not urge one); else "extra"
+    the code-index benchmark, so the doctor does not urge one); else "extra"
     for an extra's ⚠ (not set up, or set up another way); else "fix", a
     core line not ✔ or an extra's ✘."""
     if check.get("kind") in ("fix", "works", "extra", "skip"):
@@ -18604,7 +18604,7 @@ def doctor_group(check: dict) -> str:
     if check["mark"] == "ok":
         return "works"
     if check["name"] == "Code maps" and check["mark"] == "warn":
-        return "skip"  # a map saved no tokens in the cw-repo benchmark: not urged as worth adding
+        return "skip"  # a map saved no tokens in the code-index benchmark: not urged as worth adding
     return "extra" if check["name"] in DOCTOR_OPTIONAL and check["mark"] == "warn" else "fix"
 
 
