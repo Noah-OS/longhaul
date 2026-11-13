@@ -16,7 +16,14 @@ UX quick wins from the review of 2026-11-11: Longhaul's words say what it did, w
 - **Mac notifications are titled "Longhaul"**, not "Claude", so a Longhaul action no longer reads as Claude's.
 - **The guided `longhaul add` keeps the default switching mode, `ask`, on Enter.** Enter at "move the conversation to another allowed account by itself?" saved `auto`; the question now names the default, and only a y saves `auto`.
 - **The terminal's limit question is shorter**: "Max hit its weekly limit (resets Fri 02:00, in 2 d). Move this chat to Pro now?  y move · n wait for Max · q quit Longhaul. No answer means wait, then carry on with Max." The terminal's other questions at a limit take the same keys line.
-- **The `/accounts` pane**: see the UX quick wins Q2–Q8, Q12, Q14.
+- **`/accounts` says why Use for this chat is not offered**, with the action that fixes it where there is one: sign in, forget the limit, or add this folder to the account's folders.
+- **A limit shows how far off it ends and when it was seen**: "limit until 14:00 (in 2 h), seen 11:52". An account with a reading and no limit says "room now".
+- **An account's own folder is its "sign-in folder"** everywhere in the pane; the Remove questions say that your project folders are never touched.
+- **Remove all folder limits…** (before: Anywhere) asks first and names the folders it un-reserves.
+- **An account's first-choice folders show on its page**, each with Remove.
+- **A failed action shows its reason in plain text**, the raw output behind Details. An account page opens on a harmless control, not on Sign in again.
+- **The limit question's buttons say what they do**: "Wait, carry on at 02:01" and "No, leave this chat stopped".
+- **Pop-ups carry no commands**: a refused message says "Nothing was sent. Type /accounts to move it."; a newer release points to `/longhaul:doctor`.
 
 ## 0.3.9 - 2026-11-11
 
