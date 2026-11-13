@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## Unreleased
+## 0.3.12 - 2026-11-13
 
 A first run shows what already works, not a score that reads as failure (the UX review of 2026-11-11, first run, items 1 and 2).
 
@@ -11,6 +11,8 @@ A first run shows what already works, not a score that reads as failure (the UX 
 - **The first chat's pop-up says what works now.** "7 of 9 quick checks pass" read as two failures when the misses were extras such as the status line. It now names only what the quick checks found working, and one thing to try: "Longhaul <version> is on. Working now: checkpoints, auto-compact at 200k tokens and the read guard. Try it: /longhaul:checkpoint, then /clear. Extras: /longhaul:doctor." When a line is a real problem, the end says "1 to fix: /longhaul:doctor." instead. The VS Code panel's pop-up says the same.
 - **`longhaul doctor` leads with what is to fix and groups its checks.** The first line is "Longhaul <version> · nothing to fix" or "· 2 to fix"; then To fix, Working now, Worth adding, and Not for you right now (one subscription, no VS Code, no Codex, the code index turned off). The checks and what they say are the same. The extras (the terminal command, updates, the status line, the VS Code panel, the code maps, the hooks' load, Codex) are worth adding when they are not set up, and to fix only when they are set up and broken. The step that comes first ends the list, in place of "N of M set up. Next: …".
 - **The doctor prints the terminal command's setup line on a line of its own**, so it can be copied whole.
+- **An extra not set up is drawn ⚠ under Worth adding, never ✘**, and code maps that are not built go under Not for you right now: a map saved no tokens in the benchmark, so the doctor does not urge one.
+- **The README starts with "Try it in a minute"**: a checkpoint, `/clear`, "where were we?", then `/longhaul:inspect`. Its folders paragraph names the button **Remove all folder limits…** (before: Anywhere).
 - **With no Codex folder, the doctor's Codex line says so**, under Not for you right now; it used to leave the line out.
 
 ## 0.3.11 - 2026-11-13
