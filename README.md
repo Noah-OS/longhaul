@@ -49,7 +49,14 @@ The plugin loads in the next session, or after `/reload-plugins` in a running on
 
 ## 2. Check it
 
-In any chat:
+**Try it in a minute**, in any chat, right after installing:
+
+1. `/longhaul:checkpoint`. Claude writes down the goal, the next step, the facts it found and the files it changed.
+2. `/clear`. Longhaul says "your checkpoint from before /clear is back" (in the same folder, up to 6 hours after the save). After a compaction it comes back the same way.
+3. Ask "where were we?". Claude answers from the checkpoint.
+4. `/longhaul:inspect` shows where this chat's tokens went.
+
+**What is set up**, in any chat:
 
 ```
 /longhaul:doctor
@@ -148,7 +155,7 @@ A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`
 
 **Keep a folder for one account:** `longhaul add work you@example.com --repo ~/work` uses that account only in `~/work` and the repositories inside it, and keeps the folder for it: a chat there on another account is refused before anything is sent. When the account kept for a folder is at its limit, `longhaul` in a terminal asks whether to run the chat on another one; `longhaul allow <chat id>` lets one refused chat's prompts through on its account for 30 days.
 
-**Change an account's folders.** In `/accounts`, open the account: its Folders part lists them, each with **Remove**; type a folder and press **Add folder**, or press **Anywhere** to drop the list. In a terminal, `longhaul folders work` says where `work` may be used; `longhaul folders work --add ~/clients` adds a folder, `--remove ~/work` takes one off, and `--anywhere` drops the list. An account with no folders of its own is used only where no other account's folders reach: beside an account whose folders include `/`, it is used nowhere until it has folders of its own, and `/accounts`, `longhaul status` and `longhaul folders` say so.
+**Change an account's folders.** In `/accounts`, open the account: its Folders part lists them, each with **Remove**; type a folder and press **Add folder**, or press **Remove all folder limits…** to drop the list (it names the folders first and asks). In a terminal, `longhaul folders work` says where `work` may be used; `longhaul folders work --add ~/clients` adds a folder, `--remove ~/work` takes one off, and `--anywhere` drops the list. An account with no folders of its own is used only where no other account's folders reach: beside an account whose folders include `/`, it is used nowhere until it has folders of its own, and `/accounts`, `longhaul status` and `longhaul folders` say so.
 
 **Choose the account for one chat.** `longhaul use work --chat <chat id>` runs that chat on `work` from now on (a short id works when only one chat starts with it; run from inside a chat, `longhaul use work` needs no `--chat`). A chat in the VS Code panel moves the next time Claude is idle in it, with a line in the chat saying so; any other chat (closed, in a terminal, or with `"switch_mid_session": false`) starts on `work` when it is next opened, and the command says which. It refuses an account not allowed in the chat's folder, one at its usage limit, or one not signed in as expected. A choice is no lock: at a usage limit the switching mode decides, as for any chat.
 
