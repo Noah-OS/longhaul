@@ -732,7 +732,7 @@ both("a failed action's reason is not dim, and its raw output waits behind Detai
 
 both('a read that fails says why in normal weight, that chats still run, with Retry and Details', async ($, on, surface) => {
   const w = world(on)
-  const PAUSED = 'Your chats still run; account switching is paused until this is fixed.'
+  const PAUSED = 'Your chats still run; this screen works again once this is fixed.'
   w.status = done('', 1, 'Traceback (most recent call last):\nValueError: something broke\n')
   const { ui } = await opened($, w, surface)
   const first = (await ui.findAll({ type: 'Text' }))[1] // after the title

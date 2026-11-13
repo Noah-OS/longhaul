@@ -18577,25 +18577,14 @@ def doctor_lines(checks: list) -> list:
     return lines
 
 
-DOCTOR_COMPACT = ("# Compact instructions",
-                  "When compacting, keep: the goal; the next action; the decisions made and why; the files "
-                  "changed; how to verify the work (the commands and tests).")
-
-
-def doctor_compact_instructions() -> list:
-    """What the doctor prints after the checklist (Sprint 11, I6): a block
-    for the user to paste into their CLAUDE.md, which a compaction reads,
-    asking it to keep what a checkpoint keeps; a blank line first sets it
-    apart. The paste is the user's: Longhaul never writes CLAUDE.md."""
-    return ["", "To keep the thread through a compaction, paste these two lines into your CLAUDE.md "
-                "(Longhaul never writes CLAUDE.md):", *DOCTOR_COMPACT]
-
-
 def doctor(_opts) -> int:
-    """`longhaul doctor`: the checklist, read-only; exit 0."""
+    """`longhaul doctor`: the checklist, read-only; exit 0. Until 0.3.10 a
+    "# Compact instructions" block for CLAUDE.md followed it (Sprint 11,
+    I6); the live control of 2026-11-12 found that sentence, given to a
+    real /compact, kept no more than a plain /compact (-1.0 points, -6.7
+    to +4.6, 8 compactions), so the doctor no longer suggests it."""
     for line in doctor_lines(doctor_checks()):
         print(line)
-    print("\n".join(doctor_compact_instructions()))
     return 0
 
 

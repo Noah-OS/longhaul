@@ -92,7 +92,7 @@ Once the plugin is loaded, most of it works by itself.
 | `/accounts` | To see your accounts and manage them with buttons: see [More than one account](#4-more-than-one-account). |
 | `/longhaul:manage` | To set Longhaul up without a terminal, in your own words: see [From the VS Code chat](#5-from-the-vs-code-chat). |
 
-**Keeping a long session on track:** let the reminder ask for the checkpoint, or type `/longhaul:checkpoint` yourself, then `/compact` or `/clear`; the work picks up from the checkpoint. For Claude Code's own compactions, `/longhaul:doctor` prints a "# Compact instructions" block to paste into your CLAUDE.md; Longhaul never writes it.
+**Keeping a long session on track:** let the reminder ask for the checkpoint, or type `/longhaul:checkpoint` yourself, then `/compact` or `/clear`; the work picks up from the checkpoint. Instructions to `/compact` kept no more in a test of 8 real compactions, so Longhaul does not suggest them ([Measurements](https://github.com/Noah-OS/longhaul/wiki/Measurements)).
 
 ## 4. More than one account
 

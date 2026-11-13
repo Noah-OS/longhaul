@@ -663,10 +663,12 @@ function waitPart($: any, c: Ctx): any {
 }
 
 // What the pane says when Longhaul cannot read the accounts (the UX
-// review's §4.7 row 13): the reason in its words, and what still works.
+// review's §4.7 row 13): the reason in its words, and what still works. Not
+// "switching is paused": switching runs in the relay, not here, and a
+// read that only failed in the pane leaves it running.
 function unread(reason: string): string {
-  return `Longhaul could not read your accounts: ${mask(reason).replace(/[.\s]+$/, '')}. Your chats still run; account `
-    + 'switching is paused until this is fixed.'
+  return `Longhaul could not read your accounts: ${mask(reason).replace(/[.\s]+$/, '')}. Your chats still run; this `
+    + 'screen works again once this is fixed.'
 }
 
 // Before the rows: still reading, or why they could not be read (the

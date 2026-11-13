@@ -2,6 +2,16 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+### Removed
+
+- **The doctor no longer suggests a "# Compact instructions" block for CLAUDE.md.** The live control of 2026-11-12 gave that sentence to a real `/compact` on 8 compactions: recall was 1.0 point lower than a plain `/compact` (−6.7 to +4.6), so nothing shows it helps. The README says so instead.
+
+### Changed
+
+- **`/accounts`, when it cannot read the accounts, no longer says that switching is paused.** Switching runs in the chat's relay, not in the pane, so a read that failed only in the pane leaves it running; the pane now says "Your chats still run; this screen works again once this is fixed."
+
 ## 0.3.10 - 2026-11-13
 
 UX quick wins from the review of 2026-11-11: Longhaul's words say what it did, when a limit was seen, and which chats carry on.

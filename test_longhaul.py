@@ -12277,9 +12277,8 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.startswith("Longhaul "), out.stdout)
         self.assertIn("Chats running now: none running", out.stdout)
-        # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
-        self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
-                         r"^\d+ of 11 set up\. Next: ")
+        # The count ends the output (no compact instructions after it since 0.3.10).
+        self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 11 set up\. Next: ")
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
         for args in (("doctor", "--fix"), ("doctor", "-h")):  # nothing after it: the skill's rule names it alone
             out = self.shim(*args, **env)
@@ -22449,14 +22448,9 @@ class PreCompact(unittest.TestCase):
             self.assertIn("run it in a terminal", out.stderr)
         self.assertFalse(self.home.exists(), "nothing was written")
 
-    def test_doctor_prints_the_compact_instructions_last_and_writes_no_claude_md(self):
-        block = longhaul.doctor_compact_instructions()
-        self.assertEqual(block[0], "", "a blank line sets it apart from the checklist")
-        self.assertIn("CLAUDE.md", block[1])
-        self.assertIn("Longhaul never writes CLAUDE.md", block[1])
-        self.assertEqual(block[2:], ["# Compact instructions",
-                                     "When compacting, keep: the goal; the next action; the decisions made and why; "
-                                     "the files changed; how to verify the work (the commands and tests)."])
+    def test_doctor_ends_on_its_count_suggests_no_compact_instructions_and_writes_no_claude_md(self):
+        # 0.3.10: the live control found the block's sentence kept no more than a plain /compact.
+        self.assertFalse(hasattr(longhaul, "doctor_compact_instructions"))
         # The doctor as the terminal runs it, every path scratch, in a project folder.
         fake, user, project = self.tmp / "fakes", self.tmp / "user", self.tmp / "project"
         for folder in (fake, user / ".claude", project):
@@ -22476,9 +22470,8 @@ class PreCompact(unittest.TestCase):
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
-        self.assertEqual(lines[-len(block):], block)
-        self.assertRegex(lines[-len(block) - 1], r"^\d+ of 11 set up\. Next: ", "after the checklist's count")
-        self.assertEqual(out.stdout.count("# Compact instructions"), 1)
+        self.assertRegex(lines[-1], r"^\d+ of 11 set up\. Next: ", "the checklist's count ends it")
+        self.assertNotIn("Compact instructions", out.stdout)
         self.assertEqual(list(self.tmp.rglob("CLAUDE.md")), [], "printed, never written")
         self.assertFalse(self.home.exists(), "the doctor writes nothing")
 
@@ -26725,14 +26718,14 @@ class Doctor(unittest.TestCase):
     # ---------------------------------------------------- the whole checklist
 
     def doctor(self, processes=()):
-        """`longhaul doctor` in this process: its exit code and the checklist's lines. The compact
-        instructions printed after the checklist (Sprint 11, I6) are checked and set aside."""
+        """`longhaul doctor` in this process: its exit code and the checklist's lines, which end
+        the output (the compact instructions after them went in 0.3.10)."""
         with mock.patch.object(longhaul, "doctor_processes", return_value=list(processes)), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             code = longhaul.main(["doctor"])
-        lines, block = out.getvalue().splitlines(), longhaul.doctor_compact_instructions()
-        self.assertEqual(lines[-len(block):], block, "the compact instructions come last")
-        return code, lines[:-len(block)]
+        lines = out.getvalue().splitlines()
+        self.assertNotIn("Compact instructions", out.getvalue())
+        return code, lines
 
     def test_the_last_line_counts_what_is_set_up_and_names_the_first_next_step(self):
         before = sorted(self.home.rglob("*"))
@@ -26788,9 +26781,8 @@ class Doctor(unittest.TestCase):
                                  text=True, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("Chats running now: none running", out.stdout)
-            # The count ends the checklist; the compact instructions follow it (Sprint 11, I6).
-            self.assertRegex(out.stdout.splitlines()[-len(longhaul.doctor_compact_instructions()) - 1],
-                             r"^\d+ of 11 set up\. Next: ")
+            # The count ends the output (no compact instructions after it since 0.3.10).
+            self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 11 set up\. Next: ")
             self.assertFalse(home.exists(), "nothing written")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
                              timeout=60)

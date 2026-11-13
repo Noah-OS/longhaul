@@ -17,8 +17,7 @@ accounts, never their emails. The doctor changes nothing.
 
 Show the checklist to the user as it is, in a code block, without changing
 any line or mark. Then, in a sentence, point to the next step on the line
-that counts what is set up. The "# Compact instructions" block after it is
-the user's to paste into their CLAUDE.md; do not write it there yourself.
+that counts what is set up.
 The steps are the user's to take, most of them in a terminal; take none of
 them yourself.
 
