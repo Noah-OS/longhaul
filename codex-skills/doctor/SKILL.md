@@ -20,9 +20,11 @@ is in. Run `../../bin/longhaul doctor` with nothing after it:
 ```
 
 Show the checklist to the user as it is, in a code block, without changing
-any line or mark. Then, in a sentence, point to the next step on the line
-that counts what is set up. A block of lines to paste is the user's to
-paste; do not write it anywhere yourself. The steps are the user's to
-take, most of them in a terminal; take none of them yourself.
+any line or mark. Then, in a sentence, say what its first line says (how
+many lines are to fix, or nothing to fix), and point to the step on its
+last line, "Next: …", when there is one. A command printed alone under a
+step is for the user to copy whole. A block of lines to paste is the
+user's to paste; do not write it anywhere yourself. The steps are the
+user's to take, most of them in a terminal; take none of them yourself.
 
 A step may name an install command; show it, take no install step.

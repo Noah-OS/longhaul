@@ -16,8 +16,10 @@ accounts, never their emails. The doctor changes nothing.
 !`${CLAUDE_PLUGIN_ROOT}/bin/longhaul doctor`
 
 Show the checklist to the user as it is, in a code block, without changing
-any line or mark. Then, in a sentence, point to the next step on the line
-that counts what is set up.
+any line or mark. Then, in a sentence, say what its first line says (how
+many lines are to fix, or nothing to fix), and point to the step on its
+last line, "Next: …", when there is one. A command printed alone under a
+step is for the user to copy whole.
 The steps are the user's to take, most of them in a terminal; take none of
 them yourself.
 

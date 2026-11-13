@@ -18534,13 +18534,14 @@ def doctor_codex(quick: bool = False):
     Codex range is checked yet (codex_version_said()); each folder's
     config.toml items (codex_config_items()); and a ⚠ for CODEX_HOME's
     compressed chats, a week old and more, that this Python cannot read.
-    None (not shown, not counted) with no Codex folder. Of a folder only
+    With no Codex folder, a line that says so, not for this user ("skip":
+    the review of 2026-11-11, 4.5); nothing is run. Of a folder only
     sessions/ is listed and config.toml read; of the chats only the newest
     one's first record is read, and that only without a version from
     `codex --version`."""
     folders = codex_folders(quick)
     if not folders:
-        return None
+        return doctor_result(f"no Codex folder here ({home_path(str(CODEX_HOME))}): nothing to read", kind="skip")
     items, newest, unread = [], [], 0
     for home in folders:
         try:
@@ -18591,11 +18592,6 @@ def doctor_checks(quick: bool = False, processes=None) -> list:
     return checks
 
 
-def doctor_count(checks: list) -> tuple:
-    """(the lines set up, the lines)."""
-    return sum(c["mark"] == "ok" for c in checks), len(checks)
-
-
 def doctor_group(check: dict) -> str:
     """The group a line goes in (DOCTOR_GROUPS), by its result and whether
     it is an extra (DOCTOR_OPTIONAL): its own `kind` when it has one; else
@@ -18626,29 +18622,55 @@ def doctor_working(checks: list) -> list:
 
 
 def doctor_next(checks: list):
-    """The first broken line's step, else the first half-set-up one's."""
-    return next((c["step"] for want in ("bad", "warn") for c in checks if c["mark"] == want and c["step"]), None)
+    """The check whose step comes first: the first line to fix with a
+    step, else the first extra's; None when there is neither."""
+    return next((c for want in ("fix", "extra") for c in checks if doctor_group(c) == want and c["step"]), None)
+
+
+def doctor_marks() -> tuple:
+    """The marks and the headline's dot, plain for a terminal whose
+    encoding has no ✔ or ·."""
+    try:
+        ("".join(DOCTOR_MARKS.values()) + "·").encode(sys.stdout.encoding or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        return DOCTOR_PLAIN, "-"
+    return DOCTOR_MARKS, "·"
+
+
+def doctor_step_lines(check: dict) -> list:
+    """A step as printed: "Next: ..." and, on a line of its own, the
+    command it points to, so it can be copied whole."""
+    command = check.get("command")
+    return [f"Next: {check['step']}"] + ([f"  {command}"] if command else [])
+
+
+def doctor_check_lines(check: dict, marks=DOCTOR_MARKS) -> list:
+    """One check as printed: its mark, name and what it says, then its
+    items and its step, indented."""
+    lines = [f"{marks[check['mark']]} {check['name']}: {check['said']}"]
+    lines.extend(f"    {marks.get(mark, ' ' * len(marks['ok']))} {text}" for mark, text, _ in check["items"])
+    if check["step"]:
+        lines.extend("    " + line for line in doctor_step_lines(check))
+    return lines
 
 
 def doctor_lines(checks: list) -> list:
-    """The checklist as printed: a heading, a line per check with its
-    items and its step, and the count with the first step."""
-    marks = DOCTOR_MARKS
-    try:
-        "".join(DOCTOR_MARKS.values()).encode(sys.stdout.encoding or "utf-8")
-    except (UnicodeEncodeError, LookupError):
-        marks = DOCTOR_PLAIN
-    lines = [f"Longhaul {plugin_version() or '(version unknown)'}: what is set up, and what to do next. "
-             "The doctor only reads; it changes nothing."]
-    for c in checks:
-        lines.append(f"{marks[c['mark']]} {c['name']}: {c['said']}")
-        lines.extend(f"    {marks.get(mark, ' ' * len(marks['ok']))} {text}" for mark, text, _ in c["items"])
-        if c["step"]:
-            lines.append(f"    Next: {c['step']}")
-    n, m = doctor_count(checks)
-    step = doctor_next(checks)
-    lines.append(f"{n} of {m} set up." + (f" Next: {step}" if step else ""))
-    return lines
+    """The checklist as printed (the review of 2026-11-11, 4.5): a headline
+    with how many lines are to fix, then the groups (DOCTOR_GROUPS) in
+    order, each with its checks in the checklist's order and an empty group
+    left out, so each check is in one group; then the step that comes first
+    (doctor_next()). The same checks and facts as the single list it
+    replaced, whose last line was "N of M set up. Next: ..."."""
+    marks, dot = doctor_marks()
+    fix = doctor_to_fix(checks)
+    lines = [f"Longhaul {plugin_version() or '(version unknown)'} {dot} {fix or 'nothing'} to fix", ""]
+    for group, heading in DOCTOR_GROUPS:
+        members = [c for c in checks if doctor_group(c) == group]
+        if members:
+            lines.append(heading)
+            lines.extend("  " + line for c in members for line in doctor_check_lines(c, marks))
+    first = doctor_next(checks)
+    return lines + (doctor_step_lines(first) if first else [])
 
 
 def doctor(_opts) -> int:

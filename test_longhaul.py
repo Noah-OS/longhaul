@@ -5157,6 +5157,9 @@ class CodexPackaging(unittest.TestCase):
         self.assertIn("changes nothing", " ".join(body.split()))
         self.assertIn("take no install step", body)
         self.assertIn("as it is", body)
+        flat = " ".join(body.split())  # as Claude Code's doctor skill: the headline, then the last line's step
+        self.assertIn('point to the step on its last line, "Next: …", when there is one', flat)
+        self.assertNotIn("counts what is set up", flat)
 
 
 class Plugin(unittest.TestCase):
@@ -12271,14 +12274,14 @@ class Shim(unittest.TestCase):
         env = dict(PATH=os.pathsep.join([str(fake), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
                    HOME=str(self.tmp), LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
                    LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"),
-                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder, so no Codex line (CodexDoctor)
+                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder: Codex is not for this user (CodexDoctor)
         self.env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECPATH")}
         out = self.shim("doctor", **env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertTrue(out.stdout.startswith("Longhaul "), out.stdout)
+        self.assertRegex(out.stdout, r"^Longhaul \S+ · (nothing|\d+) to fix\n")
         self.assertIn("Chats running now: none running", out.stdout)
-        # The count ends the output (no compact instructions after it since 0.3.10).
-        self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 11 set up\. Next: ")
+        # The first step ends the output (no compact instructions after it since 0.3.10).
+        self.assertRegex(out.stdout.splitlines()[-1], r"^Next: ")
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
         for args in (("doctor", "--fix"), ("doctor", "-h")):  # nothing after it: the skill's rule names it alone
             out = self.shim(*args, **env)
@@ -22484,7 +22487,7 @@ class PreCompact(unittest.TestCase):
             self.assertIn("run it in a terminal", out.stderr)
         self.assertFalse(self.home.exists(), "nothing was written")
 
-    def test_doctor_ends_on_its_count_suggests_no_compact_instructions_and_writes_no_claude_md(self):
+    def test_doctor_ends_on_its_first_step_suggests_no_compact_instructions_and_writes_no_claude_md(self):
         # 0.3.10: the live control found the block's sentence kept no more than a plain /compact.
         self.assertFalse(hasattr(longhaul, "doctor_compact_instructions"))
         # The doctor as the terminal runs it, every path scratch, in a project folder.
@@ -22501,12 +22504,12 @@ class PreCompact(unittest.TestCase):
                    LONGHAUL_DEFAULT_GLOBAL_JSON=str(user / ".claude.json"),
                    LONGHAUL_VSCODE_SETTINGS=str(self.tmp / "vscode.json"),
                    LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1", LONGHAUL_INDEX="off",
-                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder, so no Codex line (CodexDoctor)
+                   CODEX_HOME=str(self.tmp / "no-codex"))  # no Codex folder: Codex is not for this user (CodexDoctor)
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "doctor"], env=env, cwd=project,
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
-        self.assertRegex(lines[-1], r"^\d+ of 11 set up\. Next: ", "the checklist's count ends it")
+        self.assertRegex(lines[-1], r"^Next: ", "the checklist's first step ends it")
         self.assertNotIn("Compact instructions", out.stdout)
         self.assertEqual(list(self.tmp.rglob("CLAUDE.md")), [], "printed, never written")
         self.assertFalse(self.home.exists(), "the doctor writes nothing")
@@ -26767,24 +26770,53 @@ class Doctor(unittest.TestCase):
         self.assertNotIn("Compact instructions", out.getvalue())
         return code, lines
 
-    def test_the_last_line_counts_what_is_set_up_and_names_the_first_next_step(self):
+    @staticmethod
+    def groups(lines) -> dict:
+        """The checklist's groups as printed: {heading: [(mark, check's name)]}, in order."""
+        found, heading = {}, None
+        for line in lines[2:]:
+            if line in ("To fix", "Working now", "Worth adding", "Not for you right now"):
+                heading = found.setdefault(line, [])
+            elif line.startswith("  ") and not line.startswith("   "):
+                heading.append((line[2], line[4:].split(":", 1)[0]))
+        return found
+
+    def test_the_headline_says_what_is_to_fix_and_the_groups_hold_each_check_once(self):
+        # The review of 2026-11-11 (4.5, item 2): the same checks, led by what
+        # is to fix, then what works, what is worth adding and what is not
+        # for this user; the step that comes first ends it.
         before = sorted(self.home.rglob("*"))
         with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]):
             code, lines = self.doctor()
         self.assertEqual(code, 0)
-        self.assertEqual(lines[0], f"Longhaul {self.VERSION}: what is set up, and what to do next. "
-                                   "The doctor only reads; it changes nothing.")
-        heads = [l for l in lines[1:-1] if not l.startswith(" ")]
-        self.assertEqual([h.split(":", 1)[0][2:] for h in heads],
-                         ["Plugin", "Terminal command", "Claude Code", "Updates", "Status line", "VS Code panel",
-                          "Accounts", "Chats running now", "Code maps", "Features", "Hooks"])
-        self.assertTrue(all(h[0] in "✔✘⚠" and h[1] == " " for h in heads), heads)
-        n = sum(h.startswith("✔") for h in heads)
-        self.assertEqual(lines[-1], f"{n} of 11 set up. Next: {longhaul.doctor_plugin()['step']}",
-                         "the first ✘'s step: the plugin is not installed")
+        self.assertEqual(lines[:2], [f"Longhaul {self.VERSION} · 1 to fix", ""])
+        self.assertEqual(self.groups(lines), {
+            "To fix": [("✘", "Plugin")],
+            "Working now": [("✔", "Claude Code"), ("✔", "Chats running now"), ("✔", "Features"), ("✔", "Hooks")],
+            "Worth adding": [("✘", "Terminal command"), ("⚠", "Updates"), ("⚠", "Status line"), ("⚠", "Code maps")],
+            "Not for you right now": [("✔", "VS Code panel"), ("✔", "Accounts"), ("✔", "Codex")]})
+        self.assertEqual(lines[-1], f"Next: {longhaul.doctor_plugin()['step']}", "the step to fix comes first")
         self.assertEqual(sorted(self.home.rglob("*")), before, "nothing written")
-        # Every line set up.
+        # Each check, in exactly one group, whatever its result.
+        names = [n for members in self.groups(lines).values() for _, n in members]
+        self.assertEqual(sorted(names), sorted(name for name, _ in longhaul.DOCTOR_CHECKS))
+        # With the plugin installed, nothing is to fix; the first extra's step ends it,
+        # and the terminal command's setup line is printed alone, to be copied whole.
         self.installed()
+        rest = f".claude/plugins/cache/longhaul/longhaul/{self.VERSION}"
+        self.checkout(self.VERSION, name=f"user/{rest}")
+        with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]):
+            code, lines = self.doctor()
+        self.assertEqual(lines[0], f"Longhaul {self.VERSION} · nothing to fix")
+        self.assertNotIn("To fix", lines)
+        self.assertEqual(self.groups(lines)["Working now"][0], ("✔", "Plugin"))
+        self.assertEqual(lines[-2:], ["Next: run the line below in a terminal: it writes ~/.local/bin/longhaul, a "
+                                      "launcher that runs the newest installed Longhaul (~/.local/bin must be on PATH)",
+                                      f"  python3 ~/{rest}/longhaul.py setup"])
+        at = lines.index("  ✘ Terminal command: `longhaul` is not on PATH; accounts, switching, the status line, "
+                         "trials, models and VS Code need it")
+        self.assertEqual(lines[at + 2], f"        python3 ~/{rest}/longhaul.py setup", "under its own Next")
+        # Every line set up: nothing to fix, nothing worth adding, no step.
         self.link(self.checkout(self.VERSION))
         self.settings(statusLine={"type": "command", "command": "~/.local/bin/longhaul statusline"})
         self.program("codegraph")
@@ -26792,16 +26824,63 @@ class Doctor(unittest.TestCase):
         with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]), \
                 mock.patch.object(longhaul, "release_status", return_value=status):
             code, lines = self.doctor()
-        self.assertEqual(lines[-1], "11 of 11 set up.", lines)
+        self.assertEqual(lines[0], f"Longhaul {self.VERSION} · nothing to fix")
+        self.assertEqual(list(self.groups(lines)), ["Working now", "Not for you right now"], lines)
+        self.assertEqual(len(self.groups(lines)["Working now"]), 9)
         self.assertFalse([l for l in lines if "Next:" in l])
+        # Two to fix: an account whose folder is missing, and a status line that names nothing there.
+        self.write(self.home / "accounts.json", [{"name": "work", "config_dir": str(self.tmp / "gone")}])
+        self.settings(statusLine={"type": "command", "command": str(self.tmp / "gone" / "longhaul") + " statusline"})
+        with mock.patch.object(longhaul, "claude_version", return_value=longhaul.TESTED_VERSIONS[1]), \
+                mock.patch.object(longhaul, "release_status", return_value=status):
+            code, lines = self.doctor()
+        self.assertEqual(lines[0], f"Longhaul {self.VERSION} · 2 to fix", lines)
+        self.assertEqual(self.groups(lines)["To fix"], [("✘", "Status line"), ("✘", "Accounts")])
+        self.assertEqual(lines[-1], "Next: link the terminal command (see Terminal command)")
+
+    def test_each_result_goes_in_one_group_by_what_it_means(self):
+        group = longhaul.doctor_group
+
+        def check(name, mark="ok", **keys):
+            return {"name": name, **longhaul.doctor_result("said", mark=mark, step=None if mark == "ok" else "do it",
+                                                           **keys)}
+
+        for name, _ in longhaul.DOCTOR_CHECKS:
+            self.assertEqual(group(check(name)), "works", name)
+            self.assertEqual(group(check(name, "bad")), "fix", f"{name}: set up and broken")
+            self.assertEqual(group(check(name, "ok", kind="skip")), "skip", name)
+            self.assertEqual(group(check(name, "warn")), "extra" if name in longhaul.DOCTOR_OPTIONAL else "fix", name)
+        self.assertEqual(sorted(longhaul.DOCTOR_OPTIONAL), sorted(["Terminal command", "Updates", "Status line",
+                                                                   "VS Code panel", "Code maps", "Hooks", "Codex"]))
+        self.assertEqual(group(check("Terminal command", "bad", kind="extra")), "extra", "not there at all")
+        self.assertEqual(group(check("Status line", "warn", kind="fix")), "fix", "settings that are not JSON")
+        # The checks' own: not for you with one subscription, no VS Code, no Codex or the index off.
+        self.assertEqual(longhaul.doctor_accounts()["kind"], "skip")
+        self.assertEqual(longhaul.doctor_vscode()["kind"], "skip")
+        self.assertEqual(longhaul.doctor_codex()["kind"], "skip")
+        os.environ["LONGHAUL_INDEX"] = "off"
+        self.assertEqual(longhaul.doctor_maps(str(self.tmp))["kind"], "skip")
+        del os.environ["LONGHAUL_INDEX"]
+        self.assertNotIn("kind", longhaul.doctor_maps(str(self.tmp)), "on, with no program: worth adding")
+        # Claude Code newer than checked, or not read, is worth a look; older is to fix.
+        low, high = longhaul.TESTED_VERSIONS
+        for version, kind in ((high[:2] + (high[2] + 1,), "extra"), (None, "extra"), (low[:2] + (low[2] - 1,), "fix")):
+            with mock.patch.object(longhaul, "claude_version", return_value=version):
+                self.assertEqual(group({"name": "Claude Code", **longhaul.doctor_claude()}), kind, version)
+        self.write(self.claude / "settings.json", "{not json")
+        self.assertEqual(group({"name": "Status line", **longhaul.doctor_statusline()}), "fix")
+        # The plain marks keep the headline's dot plain too.
+        with mock.patch.object(sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="ascii")):
+            self.assertEqual(longhaul.doctor_marks(), (longhaul.DOCTOR_PLAIN, "-"))
 
     def test_a_check_that_raises_is_a_warning_and_the_rest_go_on(self):
         with mock.patch.object(longhaul, "doctor_vscode", side_effect=RuntimeError("x")), \
                 mock.patch.object(longhaul, "claude_version", return_value=None):
             code, lines = self.doctor()
         self.assertEqual(code, 0)
-        self.assertIn("⚠ VS Code panel: could not be checked (RuntimeError)", lines)
-        self.assertRegex(lines[-1], r"^\d+ of 11 set up\. Next: ")
+        self.assertIn("  ⚠ VS Code panel: could not be checked (RuntimeError)", lines)
+        self.assertIn(("⚠", "VS Code panel"), self.groups(lines)["Worth adding"], "an extra's ⚠")
+        self.assertRegex(lines[-1], r"^Next: ")
 
     def test_doctor_runs_from_the_terminal_and_writes_nothing(self):
         fake = self.tmp / "fakes"
@@ -26821,8 +26900,9 @@ class Doctor(unittest.TestCase):
                                  text=True, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("Chats running now: none running", out.stdout)
-            # The count ends the output (no compact instructions after it since 0.3.10).
-            self.assertRegex(out.stdout.splitlines()[-1], r"^\d+ of 11 set up\. Next: ")
+            self.assertEqual(out.stdout.splitlines()[0], f"Longhaul {self.VERSION} · 1 to fix")
+            # The first step ends the output (no compact instructions after it since 0.3.10).
+            self.assertRegex(out.stdout.splitlines()[-1], r"^Next: ")
             self.assertFalse(home.exists(), "nothing written")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
                              timeout=60)
@@ -26838,6 +26918,12 @@ class Doctor(unittest.TestCase):
         self.assertIn("as it is", body)
         self.assertIn("changes nothing", " ".join(body.split()))
         self.assertIn("take no install step", body, "the steps are the user's")
+        # It points to what the doctor prints: the headline, then the last line's step.
+        flat = " ".join(body.split())
+        self.assertIn("say what its first line says (how many lines are to fix, or nothing to fix)", flat)
+        self.assertIn('point to the step on its last line, "Next: …", when there is one', flat)
+        self.assertIn("A command printed alone under a step is for the user to copy whole.", flat)
+        self.assertNotIn("counts what is set up", flat, "the count line went with the groups")
         readme = (HERE / "README.md").read_text()
         self.assertIn("`longhaul doctor`", readme)
         self.assertIn("`/longhaul:doctor`", readme)
@@ -26867,10 +26953,10 @@ class Doctor(unittest.TestCase):
         return str(self.tmp / "versions" / ".".join(map(str, longhaul.TESTED_VERSIONS[1])) / "claude")
 
     def test_the_first_chat_after_an_install_or_an_update_says_what_works_once(self):
-        self.assertEqual(len(longhaul.doctor_checks(quick=True)), 7, "without the session's path, no version")
+        self.assertEqual(len(longhaul.doctor_checks(quick=True)), 8, "without the session's path, no version")
         os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
         checks = longhaul.doctor_checks(quick=True)
-        self.assertEqual(len(checks), 8, "the quick checks: no updates (network) and no process list")
+        self.assertEqual(len(checks), 9, "the quick checks: no updates (network), no process list, no hooks")
         self.installed()  # the plugin installed: its checkpoint, auto-compact and guard work
         line = (f"Longhaul {self.VERSION} is on. Working now: checkpoints, auto-compact at 200k tokens and the read "
                 "guard. Try it: /longhaul:checkpoint, then /clear. Extras: /longhaul:doctor.")
@@ -26981,7 +27067,7 @@ class Doctor(unittest.TestCase):
                 if name == "the read guard":
                     self.assertEqual(said_items[f"guard: {'advice' if guard == 'warn' else guard}"], "ok")
         # An account whose folder is missing is a problem (✘), counted in the line.
-        self.write(self.home / "accounts.json", {"accounts": [{"name": "work", "config_dir": str(self.tmp / "gone")}]})
+        self.write(self.home / "accounts.json", [{"name": "work", "config_dir": str(self.tmp / "gone")}])
         os.environ["LONGHAUL_GUARD"] = "warn"
         self.assertTrue(said().endswith(". 1 to fix: /longhaul:doctor."), said())
 
@@ -27221,20 +27307,21 @@ class HookBudget(unittest.TestCase):
                                      capture_output=True, text=True, timeout=60)
                 self.assertEqual(out.returncode, 0, out.stderr)
                 lines = out.stdout.splitlines()
-                at = lines.index("✔ Hooks: 6 hooks on 4 events, from project settings and longhaul")
+                # In its group (Working now), each line two spaces in (the review of 2026-11-11).
+                at = lines.index("  ✔ Hooks: 6 hooks on 4 events, from project settings and longhaul")
                 self.assertEqual(lines[at + 1:at + 9], [
-                    "      SessionStart: 2 (longhaul 2)",
-                    "      UserPromptSubmit: 2 (longhaul 2)",
-                    "      PreToolUse: 1 (longhaul 1)",
-                    "      Stop: 1 (project settings 1)",
-                    "      longhaul also loads a hooks module, which runs inside Claude Code: no process of its own, "
+                    "        SessionStart: 2 (longhaul 2)",
+                    "        UserPromptSubmit: 2 (longhaul 2)",
+                    "        PreToolUse: 1 (longhaul 1)",
+                    "        Stop: 1 (project settings 1)",
+                    "        longhaul also loads a hooks module, which runs inside Claude Code: no process of its own, "
                     "and no time recorded",
-                    "      times: Longhaul's own in the newest chat here, s1, as Claude Code recorded them (a run that "
+                    "        times: Longhaul's own in the newest chat here, s1, as Claude Code recorded them (a run that "
                     "prints nothing has none); `longhaul inspect s1` shows every hook's",
-                    "    ✔ longhaul guard on PreToolUse: median 50 ms, longest 60 ms, of 3 timed runs",
+                    "      ✔ longhaul guard on PreToolUse: median 50 ms, longest 60 ms, of 3 timed runs",
                     lines[at + 8]])
                 self.assertFalse(lines[at + 8].startswith("    "), "the next line")
-                self.assertRegex(out.stdout, r"\n\d+ of 11 set up\.")
+                self.assertRegex(out.stdout, r"^Longhaul \S+ · (nothing|\d+) to fix\n")
                 self.assertNotIn(self.SECRET, out.stdout + out.stderr)
                 self.assertFalse(self.home.exists(), "nothing written")
 
@@ -27316,8 +27403,8 @@ class CodexDoctor(unittest.TestCase):
         return text
 
     def printed(self, check) -> list:
-        """The line as the doctor prints it, with no heading and no count."""
-        return longhaul.doctor_lines([{"name": "Codex", **check}])[1:-1]
+        """The line as the doctor prints it, in no group (Doctor pins the groups)."""
+        return longhaul.doctor_check_lines({"name": "Codex", **check})
 
     @staticmethod
     def zstd_in(python) -> bool:
@@ -27327,18 +27414,23 @@ class CodexDoctor(unittest.TestCase):
 
     # ------------------------------------------------------------ the checks
 
-    def test_with_no_codex_folder_there_is_no_line_and_nothing_runs(self):
+    def test_with_no_codex_folder_the_line_says_so_and_nothing_runs(self):
         self.assertEqual(longhaul.DOCTOR_CHECKS[-1], ("Codex", "doctor_codex"), "the last line")
         self.fake_codex()
-        self.assertIsNone(longhaul.doctor_codex())
-        self.assertIsNone(longhaul.doctor_codex(quick=True))
+        # Not for this user (the review of 2026-11-11, 4.5): a line that says so, never one to fix.
+        none = {"mark": "ok", "said": "no Codex folder here (~/.codex): nothing to read", "items": [], "step": None,
+                "kind": "skip"}
+        self.assertEqual(longhaul.doctor_codex(), none)
+        self.assertEqual(longhaul.doctor_codex(quick=True), none)
+        self.assertEqual(longhaul.doctor_group({"name": "Codex", **none}), "skip")
         self.assertFalse(self.ran.exists(), "no Codex folder: `codex --version` is not run")
         with mock.patch.object(longhaul, "DOCTOR_CHECKS", self.ONLY):
-            self.assertEqual(longhaul.doctor_checks(), [], "not shown")
-            self.assertEqual(longhaul.doctor_count(longhaul.doctor_checks(quick=True)), (0, 0), "not counted")
+            self.assertEqual(longhaul.doctor_lines(longhaul.doctor_checks())[2:],
+                             ["Not for you right now", f"  ✔ Codex: {none['said']}"])
+            self.assertEqual(longhaul.doctor_to_fix(longhaul.doctor_checks(quick=True)), 0)
             self.codex.mkdir()
             self.assertEqual([c["name"] for c in longhaul.doctor_checks(quick=True)], ["Codex"])
-            self.assertEqual(longhaul.doctor_count(longhaul.doctor_checks()), (1, 1))
+            self.assertEqual([longhaul.doctor_group(c) for c in longhaul.doctor_checks()], ["works"])
 
     def test_each_codex_folder_is_an_item_with_its_chats(self):
         self.rollout()
@@ -27362,7 +27454,7 @@ class CodexDoctor(unittest.TestCase):
         # CODEX_HOME names a folder that is not there: ~/.codex alone, which they still do not read.
         with mock.patch.object(longhaul, "CODEX_HOME", self.user / "gone"):
             c = longhaul.doctor_codex()
-            self.assertIsNone(longhaul.doctor_codex(quick=True))
+            self.assertEqual(longhaul.doctor_codex(quick=True)["kind"], "skip")
         self.assertEqual(self.items(c)[0], ("ok", f"~/.codex: 2 chats, {unread} (~/gone)"))
         # ~/.codex by another name, through a link: one folder.
         link = self.tmp / "codex-link"
@@ -27605,7 +27697,8 @@ class CodexDoctor(unittest.TestCase):
                 out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, capture_output=True,
                                      text=True, timeout=60)
                 self.assertEqual(out.returncode, 0, out.stderr)
-                lines = out.stdout.splitlines()
+                # Each check is two spaces in, in its group (Doctor pins the groups).
+                lines = [l[2:] if l.startswith("  ") else l for l in out.stdout.splitlines()]
                 [head] = [l for l in lines if l[2:].startswith("Codex: ")]
                 at = lines.index(head)
                 # No config.toml: Longhaul's plugin is not installed in this Codex, an unmarked line
@@ -27613,9 +27706,10 @@ class CodexDoctor(unittest.TestCase):
                 self.assertEqual(head, f"{'✔' if self.zstd_in(python) else '⚠'} Codex: {self.SAID}")
                 self.assertEqual(lines[at + 1:at + 3], ["    ✔ ~/.codex: 2 chats, 1 of them compressed",
                                                         "      version 0.164.0, from `codex --version`"])
-                self.assertIn("\n      ~/.codex: Longhaul's plugin is not installed there (to use it in Codex", out.stdout)
+                self.assertIn("\n        ~/.codex: Longhaul's plugin is not installed there (to use it in Codex", out.stdout)
                 self.assertEqual("that this Python" in out.stdout, not self.zstd_in(python))
-                self.assertRegex(out.stdout, r"\n\d+ of 12 set up\.")
+                self.assertRegex(out.stdout, r"^Longhaul \S+ · 1 to fix\n", "the plugin: Codex's ⚠ is an extra's")
+                self.assertIn("Worth adding" if "⚠" in head else "Working now", lines[:at])
                 self.assertNotIn("SECRET", out.stdout)
                 self.assertFalse(home.exists(), "nothing written")
                 self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.codex.rglob("*")), before)
@@ -27707,7 +27801,7 @@ class CodexDoctorConfig(unittest.TestCase):
 
     def printed(self) -> str:
         """The doctor's Codex line as printed, every item and the step."""
-        return "\n".join(longhaul.doctor_lines([{"name": "Codex", **longhaul.doctor_codex()}]))
+        return "\n".join(longhaul.doctor_check_lines({"name": "Codex", **longhaul.doctor_codex()}))
 
     # ------------------------------------------------------- the trust hash
 
@@ -28046,7 +28140,8 @@ class CodexDoctorConfig(unittest.TestCase):
                 out = subprocess.run([python, str(HERE / "longhaul.py"), "doctor"], env=env, capture_output=True,
                                      text=True, timeout=60)
                 self.assertEqual(out.returncode, 0, out.stderr)
-                lines = out.stdout.splitlines()
+                # Each check is two spaces in, in its group (Doctor pins the groups).
+                lines = [l[2:] if l.startswith("  ") else l for l in out.stdout.splitlines()]
                 has_toml = subprocess.run([python, "-I", "-c", "import tomllib"], capture_output=True,
                                           timeout=30).returncode == 0
                 if has_toml:
