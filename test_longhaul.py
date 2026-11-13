@@ -21005,8 +21005,7 @@ class Display(unittest.TestCase):
         self.assertIn("/^release: Longhaul (\\S+) is installed; (\\S+) runs (\\S+)$/)) && m[2] === sid)", self.SOURCE)
         self.assertIn("/^release: Longhaul (\\S+) is out \\(this is (\\S+)\\)$/)))\n", self.SOURCE, "no session asked")
         for toast in ("`Longhaul: ${m[1]} is installed; this chat runs ${m[3]}. Type /reload-plugins to use it.`",
-                      "`Longhaul: ${m[1]} is out. To update: claude plugin marketplace update longhaul, then claude "
-                      "plugin update longhaul@longhaul, then /reload-plugins.`"):
+                      "`Longhaul ${m[1]} is out. /longhaul:doctor shows how to update.`"):
             self.assertIn(toast, self.SOURCE)
         setup = patterns[10].replace("\\/", "/")
         self.assertEqual(re.match(setup, lines["setup"]).groups(), ("0.2.4", "7", "8"))
@@ -21019,7 +21018,8 @@ class Display(unittest.TestCase):
                       "the context small.`",
                       "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
                       "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
-                      "`Longhaul: ${m[2]} is kept for ${m[3]}; this chat runs on ${m[4]}. Close it and open it again.`",
+                      "`Longhaul stopped your message: ${m[2]} is reserved for ${m[3]}, and this chat is on ${m[4]}. Nothing "
+                      "was sent. Type /accounts to move it.`",
                       "`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} quick checks pass. Type /longhaul:doctor for the full "
                       "list and what's left.`",
                       "`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out "
