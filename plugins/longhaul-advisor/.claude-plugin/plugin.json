@@ -10,6 +10,6 @@
   "repository": "https://github.com/Noah-OS/longhaul",
   "keywords": ["advisor", "review", "experiment"],
   "dependencies": [
-    {"name": "longhaul", "version": ">=0.3.9"}
+    {"name": "longhaul", "version": ">=0.3.10"}
   ]
 }
