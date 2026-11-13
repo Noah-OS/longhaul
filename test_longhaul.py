@@ -26210,17 +26210,23 @@ class Repair(unittest.TestCase):
         self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
         self.assertFalse(self.home.exists(), "no home made")
 
+    def test_a_limit_whose_time_has_passed_is_no_finding(self):
+        # Every reader already treats it as no limit, and state.json keeps one per account that ever hit a
+        # limit: listing it would say "1 thing to repair" after every reset.
+        self.state(Max=self.now - 60)
+        self.assertEqual(self.found(), [])
+        self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
+
     def test_each_finding_is_one_line_saying_what_is_wrong_and_what_the_fix_does(self):
-        self.state(Max=self.now - 60, Pro="soon")
+        self.state(Max="gone", Pro="soon")
         found = self.found()
         self.assertEqual([sorted(f) for f in found], [["fix", "fixable", "id", "what"]] * 2)
         self.assertEqual([(f["id"], f["fixable"]) for f in found], [("limit:Max", True), ("limit:Pro", True)])
-        self.lists_and_changes_nothing("2 things to repair:", "1. Max: a usage limit is still recorded until",
-                                             "which has passed. Fix: forget the old record",
+        self.lists_and_changes_nothing("2 things to repair:", "1. Max: its recorded usage limit in state.json is not a time",
                                              "2. Pro: its recorded usage limit in state.json is not a time")
 
     def test_yes_fixes_each_and_logs_one_line_for_each(self):
-        self.state(Max=self.now - 60, Pro="soon", Team=self.now + 3600)
+        self.state(Max="gone", Pro="soon", Team=self.now + 3600)
         code, out = self.run_cli("--yes")
         self.assertEqual(code, 0, out)
         self.assertIn("1: fixed.", out)
@@ -26229,18 +26235,18 @@ class Repair(unittest.TestCase):
                          "the limit in force is kept")
         log = self.log()
         self.assertEqual(log.count("repair: "), 2, log)
-        self.assertIn("repair: Max's recorded limit forgotten (it was until", log)
+        self.assertIn("repair: Max's recorded limit forgotten (it was not a time)", log)
         self.assertIn("repair: Pro's recorded limit forgotten (it was not a time)", log)
         self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
 
     def test_in_a_terminal_each_fix_asks_and_a_no_leaves_it(self):
-        self.state(Max=self.now - 60, Pro="soon")
+        self.state(Max="gone", Pro="soon")
         code, out = self.run_cli(terminal=True, answers="n\ny\n")
         self.assertEqual(code, 0, out)
         self.assertIn("Fix 1? [y/N]", out)
         self.assertIn("1: left as it is.", out)
         self.assertIn("2: fixed.", out)
-        self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {"Max": self.now - 60})
+        self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {"Max": "gone"})
         self.assertEqual(self.log().count("repair: "), 1)
         # The input's end stops it: nothing more is fixed.
         code, out = self.run_cli(terminal=True, answers="")
@@ -26248,7 +26254,7 @@ class Repair(unittest.TestCase):
         self.assertEqual([f["id"] for f in self.found()], ["limit:Max"])
 
     def test_a_limit_recorded_meanwhile_is_not_forgotten(self):
-        self.state(Max=self.now - 60)
+        self.state(Max="gone")
         [finding] = longhaul.repair_findings()
         self.state(Max=self.now + 3600)  # a chat met the limit again since
         self.assertIn("changed meanwhile", finding["do"]())
@@ -26275,7 +26281,7 @@ class Repair(unittest.TestCase):
 
     def test_the_doctor_leaves_out_a_limit_whose_time_has_passed(self):
         self.state(Max=self.now - 60)
-        self.assertEqual([f["doctor"] for f in longhaul.repair_findings()], [False])
+        self.assertEqual(longhaul.repair_findings(), [], "no finding at all, so none for the doctor")
 
     def dead_pid(self):
         p = subprocess.Popen(["true"])

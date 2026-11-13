@@ -16875,10 +16875,11 @@ def clear(opts) -> int:
 # LONGHAUL_HOME. It judges nothing new: what it finds is what the code
 # already takes for stuck or broken.
 # - A recorded limit (state.json) that is not a time, which the launch
-#   paths cannot compare, or whose time has passed: every reader takes that
-#   for no limit already (clear, forget_limit(), the status), so it is only
-#   tidied, and the doctor leaves it out. A state.json that is not an
-#   object (load_state()'s empty stand-in).
+#   paths cannot compare. One whose time has passed is no finding: every
+#   reader takes it for no limit already (clear, forget_limit(), the
+#   status), and state.json keeps one per account that ever hit a limit,
+#   so listing it would say "1 thing to repair" after every reset. A
+#   state.json that is not an object (load_state()'s empty stand-in).
 # - A question (QUESTIONS) whose relay has ended (answer_cmd()'s test, and
 #   the pane's), an answer with no question beside it, a wait (WAITS) whose
 #   relay has ended (its relay_pid, which waits carry since repair) or that
@@ -16974,7 +16975,7 @@ def repair_finding(fid: str, what: str, fix: str, do=None, doctor: bool = True) 
 def repair_state(raw: bytes, now: float) -> list:
     """state.json's findings (its bytes, `raw`): the file itself when it is
     not an object, or its limited_until is not one; else each recorded
-    limit that is not a time, or whose time has passed."""
+    limit that is not a time (one whose time has passed is no finding)."""
     path = LONGHAUL_HOME / "state.json"
     state, problem = repair_json(raw)
     if problem or not isinstance(state, dict) or not isinstance(state.get("limited_until", {}), dict):
@@ -16993,10 +16994,10 @@ def repair_state(raw: bytes, now: float) -> list:
     found = []
     for name, until in state.get("limited_until", {}).items():
         number = as_number(until)
-        if number is not None and number > now:
-            continue
+        if number is not None:
+            continue  # in force, or passed: every reader treats a passed one as no limit, so it is no finding
 
-        def forget(name=name, until=until, number=number):
+        def forget(name=name, until=until):
             gone = []
 
             def drop(state):
@@ -17007,16 +17008,11 @@ def repair_state(raw: bytes, now: float) -> list:
             if not gone:
                 return f"{name}'s recorded limit changed meanwhile, so it was left as it is"
             log(f"repair: {name}'s recorded limit forgotten "
-                + (f"(it was until {clock(number)}, which had passed)" if number is not None else "(it was not a time)"))
+                + "(it was not a time)")
             return None
-        if number is None:
-            found.append(repair_finding(f"limit:{name}", f"{name}: its recorded usage limit in state.json is not a time, "
-                                                         "which stops Longhaul deciding where a chat runs",
-                                        "forget it", forget))
-        else:
-            found.append(repair_finding(f"limit:{name}", f"{name}: a usage limit is still recorded until "
-                                                         f"{clock(number)}, which has passed",
-                                        "forget the old record; nothing waits for it", forget, doctor=False))
+        found.append(repair_finding(f"limit:{name}", f"{name}: its recorded usage limit in state.json is not a time, "
+                                                     "which stops Longhaul deciding where a chat runs",
+                                    "forget it", forget))
     return found
 
 
