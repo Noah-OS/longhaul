@@ -17030,9 +17030,10 @@ def uninstall(opts) -> int:
 #
 # The first chat after an install or an update (the plugin's version is
 # not the one LONGHAUL_HOME/seen.json records) is told, by the guard's
-# startup hook, how much is set up and to type /longhaul:doctor; the count
-# is the quick checks' alone (doctor_checks(quick=True)): no process list,
-# no network, no program run, so the hook stays well inside its timeout.
+# startup hook, what works now, what to try, and how many lines are to fix
+# or that /longhaul:doctor has extras; from the quick checks alone
+# (doctor_checks(quick=True)): no process list, no network, no program
+# run, so the hook stays well inside its timeout.
 
 DOCTOR_MARKS = {"ok": "✔", "bad": "✘", "warn": "⚠"}
 DOCTOR_PLAIN = {"ok": "ok", "bad": "XX", "warn": "!!"}  # for a terminal whose encoding has no ✔
@@ -17051,9 +17052,25 @@ DOCTOR_JOBS = ("auth", "mcp", "plugin", "plugins", "update", "upgrade", "doctor"
                "migrate-installer", "--version", "-v", "-h", "--help")
 DOCTOR_PS_TIMEOUT = 10  # seconds each of ps and lsof may take
 SEEN = "seen.json"  # under LONGHAUL_HOME: {"version": the plugin version whose first chat was told, "at": epoch}
-SETUP_LINE = ("Longhaul {version} is on: {n} of {m} quick checks pass. Type /longhaul:doctor for the full list and "
-              "what's left.")  # the quick checks only: the doctor's own count has more lines
-SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"
+# The checks whose lines are extras (the review of 2026-11-11, 4.5): Longhaul's
+# checkpoint, auto-compact and guard work without them, so one not set up
+# is worth adding, not a fault; one set up and broken (✘) is still one to
+# fix. Every other line is a problem when it is not ✔. A line's own `kind`
+# (doctor_result()) overrides both: "skip" for one with nothing to do here
+# (one subscription, no VS Code, no Codex), "extra" or "fix" where its mark
+# alone would say the other.
+DOCTOR_OPTIONAL = ("Terminal command", "Updates", "Status line", "VS Code panel", "Code maps", "Hooks", "Codex")
+DOCTOR_GROUPS = (("fix", "To fix"), ("works", "Working now"), ("extra", "Worth adding"),
+                 ("skip", "Not for you right now"))
+# The first chat's line, from the quick checks: what works now (doctor_working()),
+# the one thing to try, and how many lines are to fix; logged as SETUP_LOGGED,
+# which hooks/display.ts turns into the same words.
+SETUP_LINE = "Longhaul {version} is on. {working}{tail}"
+SETUP_WORKING = "Working now: {working}. Try it: /longhaul:checkpoint, then /clear. "
+SETUP_EXTRAS = "Extras: /longhaul:doctor."
+SETUP_FIX = "{n} to fix: /longhaul:doctor."
+SETUP_LOGGED = "setup: Longhaul {version} is on; working now: {working}; to fix: {n}"
+SETUP_NOTHING = "nothing"  # SETUP_LOGGED's {working} when nothing works yet
 
 
 def plugin_manifest(folder=None) -> dict:
@@ -17076,17 +17093,28 @@ def plugin_repository() -> str:
     return found.group(1) if found else ""
 
 
-def doctor_result(said: str, items=(), mark: str = "ok", step=None) -> dict:
+def doctor_result(said: str, items=(), mark: str = "ok", step=None, command=None, kind=None, works=()) -> dict:
     """One line of the checklist: what it says, its items (mark, text,
     step), its mark, the worst of its own and its items', and its step:
     its own when the line's own mark is the worst, else its first broken
     item's, else its first half-set-up item's. An item marked None is
-    said and not judged (Codex's version): it counts for neither."""
-    items = list(items)
+    said and not judged (Codex's version): it counts for neither.
+    Optional keys, only when given: `command`, a line its own step points
+    to, printed alone so it can be copied whole; `kind`, the group it goes
+    in whatever its mark (doctor_group()); `works`, what it found working,
+    for the first chat's line (doctor_working())."""
+    items, own = list(items), step
     worst = max([mark] + [i[0] for i in items if i[0]], key=DOCTOR_RANK.get)
     if DOCTOR_RANK[mark] < DOCTOR_RANK[worst] or not step:
         step = next((s for want in ("bad", "warn") for m, _, s in items if m == want and s), step)
-    return {"mark": worst, "said": said, "items": items, "step": step if worst != "ok" else None}
+    found = {"mark": worst, "said": said, "items": items, "step": step if worst != "ok" else None}
+    if command and found["step"] and step == own:
+        found["command"] = command
+    if kind:
+        found["kind"] = kind
+    if works:
+        found["works"] = list(works)
+    return found
 
 
 def doctor_expand(path: str) -> str:
@@ -17172,7 +17200,7 @@ def doctor_plugin() -> dict:
     if doctor_in_plugins(__file__) and here and found["version"] and here != found["version"]:
         return doctor_result(f"{version} is installed; this chat runs {here}", mark="warn",
                              step=f"start a new chat, or type /reload-plugins, to run {version}")
-    return doctor_result(f"{version}, enabled ({key})")
+    return doctor_result(f"{version}, enabled ({key})", works=["checkpoints"])
 
 
 def doctor_command() -> dict:
@@ -17181,12 +17209,14 @@ def doctor_command() -> dict:
     the longhaul.py it links to, against the installed plugin's; or the
     launcher setup writes (Sprint 11, I1), and the copy it runs. Accounts,
     switching, the status line, trials, models and VS Code all need it.
-    Its step is the exact line to type, from the newest installed copy;
-    the clone is for a developer, or when no copy is installed."""
+    Its step is the exact line to type, from the newest installed copy,
+    printed on a line of its own (its `command`); the clone is for a
+    developer, or when no copy is installed. Not there at all, it is an
+    extra; there and broken, one to fix."""
     repo = plugin_repository() or "the repository"
     line = setup_line_to_type()
-    link = (f"run `{line}` in a terminal: it writes ~/.local/bin/longhaul, a launcher that runs the newest installed "
-            "Longhaul (~/.local/bin must be on PATH)" if line else
+    link = ("run the line below in a terminal: it writes ~/.local/bin/longhaul, a launcher that runs the newest "
+            "installed Longhaul (~/.local/bin must be on PATH)" if line else
             "install the plugin (see Plugin), then run `longhaul doctor` again for the line that sets it up; or keep "
             f"a checkout of your own: `git clone https://github.com/{repo}.git`, then `python3 longhaul.py setup` in "
             "it (it links ~/.local/bin/longhaul; ~/.local/bin must be on PATH)")
@@ -17195,7 +17225,7 @@ def doctor_command() -> dict:
     if found is None:
         if hits and hits[0][1] is None:
             return doctor_result(f"{home_path(hits[0][0])} links to a file that is gone", mark="bad",
-                                 step=f"remove it, then {link}")
+                                 step=f"remove it, then {link}", command=line)
         if hits:
             return doctor_result(f"{home_path(hits[0][0])} is not executable", mark="bad",
                                  step=f"chmod +x {shlex.quote(hits[0][0])}")
@@ -17204,7 +17234,7 @@ def doctor_command() -> dict:
             return doctor_result("~/.local/bin/longhaul is there, but ~/.local/bin is not on PATH", mark="bad",
                                  step="add ~/.local/bin to PATH in your shell's profile, then open a new terminal")
         return doctor_result("`longhaul` is not on PATH; accounts, switching, the status line, trials, models and "
-                             "VS Code need it", mark="bad", step=link)
+                             "VS Code need it", mark="bad", step=link, command=line, kind="extra")
     real = Path(os.path.realpath(found))
     if launcher_at(real):
         copies = installed_copies()
@@ -17213,16 +17243,17 @@ def doctor_command() -> dict:
                                  mark="bad", step=f"reinstall the plugin: `{install_command()}`")
         if real.read_text(errors="replace") != launcher_text():
             return doctor_result(f"{home_path(found)} is an older launcher than this Longhaul writes", mark="warn",
-                                 step=link)
+                                 step=link, command=line)
         version, script = copies[0]
         return doctor_result(f"{home_path(found)}, Longhaul's launcher: runs {version} "
                              f"({home_path(os.path.dirname(script))})")
     if doctor_in_plugins(str(real)):
         return doctor_result(f"{home_path(found)} links into the plugin's own copy, which moves at every update",
-                             mark="warn", step=link)
+                             mark="warn", step=link, command=line)
     version = plugin_version(real.parent) if real.name == "longhaul.py" else None
     if version is None:
-        return doctor_result(f"{home_path(found)} is not a Longhaul checkout's longhaul.py", mark="warn", step=link)
+        return doctor_result(f"{home_path(found)} is not a Longhaul checkout's longhaul.py", mark="warn", step=link,
+                             command=line)
     plugin = doctor_installed().get("version")
     if plugin and parse_version(plugin) and parse_version(version) != parse_version(plugin):
         where = home_path(str(real.parent))
@@ -17237,7 +17268,9 @@ def doctor_claude(quick: bool = False):
     (TESTED_VERSIONS, version_note()): `claude --version`; quick, the
     version the session's own claude names in its path, a native
     install's .../versions/x.y.z or the VS Code extension's, never a
-    program run, and None (not counted) when the path names none."""
+    program run, and None (not counted) when the path names none. Older
+    than the range is one to fix; newer, or not read, is worth a look
+    (an extra): Claude runs as normal."""
     if quick:
         real = os.path.realpath(os.environ.get("CLAUDE_CODE_EXECPATH") or "")
         named = re.search(r"/versions/(\d+\.\d+\.\d+)(?:/|$)|anthropic\.claude-code-(\d+\.\d+\.\d+)", real)
@@ -17249,14 +17282,14 @@ def doctor_claude(quick: bool = False):
     low, high = (".".join(map(str, v)) for v in TESTED_VERSIONS)
     if version is None:
         return doctor_result("its version could not be read", mark="warn",
-                             step="check that `claude --version` runs in a terminal")
+                             step="check that `claude --version` runs in a terminal", kind="extra")
     shown = ".".join(map(str, version))
     if version_note(version) is None:
         return doctor_result(f"{shown}, in the range Longhaul is checked on ({low} to {high})")
     if version > TESTED_VERSIONS[1]:
         return doctor_result(f"{shown} is newer than Longhaul has been checked on ({low} to {high}): Claude runs as "
                              "normal, and switching accounts at a limit may not", mark="warn",
-                             step=f"a newer Longhaul may cover it: {DOCTOR_UPDATE}")
+                             step=f"a newer Longhaul may cover it: {DOCTOR_UPDATE}", kind="extra")
     return doctor_result(f"{shown} is older than Longhaul has been checked on ({low} to {high})", mark="warn",
                          step="update Claude Code: `claude update`")
 
@@ -17301,7 +17334,8 @@ def doctor_statusline() -> dict:
     found = read_json(path)
     where = home_path(str(path))
     if found is None and path.exists():
-        return doctor_result(f"{where} could not be read", mark="warn", step=f"fix {where}: it is not JSON")
+        return doctor_result(f"{where} could not be read", mark="warn", step=f"fix {where}: it is not JSON",
+                             kind="fix")
     command = dict_at(found, "statusLine").get("command")
     if not isinstance(command, str) or not command.strip():
         return doctor_result("not set, so Claude Code's status line shows no account or allowance", mark="warn",
@@ -17319,7 +17353,7 @@ def doctor_statusline() -> dict:
     if not there:
         return doctor_result(f"runs {home_path(doctor_expand(program))}, which is not there", mark="bad",
                              step="link the terminal command (see Terminal command)")
-    return doctor_result(f"`{home_path(doctor_expand(program))} statusline`")
+    return doctor_result(f"`{home_path(doctor_expand(program))} statusline`", works=["the status line"])
 
 
 def doctor_vscode() -> dict:
@@ -17329,9 +17363,9 @@ def doctor_vscode() -> dict:
     one subscription, or without VS Code."""
     accounts, problem = read_accounts_file()
     if not accounts and not problem:
-        return doctor_result("nothing to set with one subscription (the panel signs in on its own)")
+        return doctor_result("nothing to set with one subscription (the panel signs in on its own)", kind="skip")
     if not VSCODE_SETTINGS.is_file():
-        return doctor_result("VS Code's settings are not on this machine: nothing to set")
+        return doctor_result("VS Code's settings are not on this machine: nothing to set", kind="skip")
     try:
         found = jsonc_load(VSCODE_SETTINGS.read_text(errors="replace"))
     except OSError as e:
@@ -17385,7 +17419,8 @@ def doctor_accounts(quick: bool = False) -> dict:
     if problem:
         return doctor_result(unreadable_text(problem), mark="bad", step=f"fix or remove {where}")
     if not accounts:
-        return doctor_result("one subscription, on ~/.claude (no accounts.json); `longhaul add` adds another")
+        return doctor_result("one subscription, on ~/.claude (no accounts.json); `longhaul add` adds another",
+                             kind="skip")
     items = []
     for a in accounts:
         folder = home_path(str(config_of(a)))
@@ -17693,7 +17728,8 @@ def doctor_maps(cwd=None) -> dict:
             else f"{runnable} of {len(programs)} found; Longhaul builds a map with one in the background")
     return doctor_result(said, items, mark=missing,
                          step=f"install CodeGraph (`{CODEGRAPH_INSTALL['npm']}`)" + (" or Trail-Code" if every else "")
-                         + "; Longhaul installs neither")
+                         + "; Longhaul installs neither",
+                         kind="skip" if off and all(i[0] == "ok" for i in items) else None)  # the user's own choice
 
 
 def doctor_features() -> dict:
@@ -17703,9 +17739,14 @@ def doctor_features() -> dict:
     2026-10-25, with its cap; or the table, and whether it applies
     anywhere: in trial mode, only in a models trial's routed half), and
     the trial. Read from this process's environment, which a
-    chat's Bash tool shares with its hooks."""
-    items = []
+    chat's Bash tool shares with its hooks. Its `works`, for the first
+    chat's line, names only what an ✔ item here says is on: auto-compact
+    (it runs after the context reminder's checkpoint, so at the reminder's
+    threshold), or the reminder alone with auto-compact off, and the read
+    guard unless it is off."""
+    items, works = [], []
     at, why = reminder_threshold()
+    reminded = None if why else at  # the reminder's threshold when its item is ✔ and it is on
     if why:
         items.append(("warn", f"context reminder: LONGHAUL_CHECKPOINT_AT is {why}, so the default ({REMINDER_AT:,} "
                               "tokens) is in force", "set LONGHAUL_CHECKPOINT_AT to a whole number of tokens, or off"))
@@ -17722,12 +17763,16 @@ def doctor_features() -> dict:
                       else f"subagent reminder: at {shown} tokens", None))
     off = (os.environ.get("LONGHAUL_AUTO_COMPACT") or "").strip().lower() == "off"  # as hooks/autocompact.ts reads it
     items.append(("ok", "auto-compact: off (LONGHAUL_AUTO_COMPACT=off)" if off else "auto-compact: on", None))
+    if reminded:
+        at_k = f"{reminded // 1000}k" if reminded % 1000 == 0 else f"{reminded:,}"  # 200k; 120,500
+        works.append(f"a checkpoint reminder at {at_k} tokens" if off else f"auto-compact at {at_k} tokens")
     raw, mode = os.environ.get("LONGHAUL_GUARD"), guard_mode()
     if raw and raw != mode:
         items.append(("warn", "guard: advice (LONGHAUL_GUARD is not warn, block or off)",
                       "set LONGHAUL_GUARD to warn, block or off, or unset it"))
     else:
         items.append(("ok", f"guard: {'advice' if mode == 'warn' else mode}", None))
+        works += [] if mode == "off" else ["the read guard"]
     table, models_mode = models_settings()
     cap = models_cap() or "none"
     trial, problem = trial_read()
@@ -17756,7 +17801,7 @@ def doctor_features() -> dict:
                             f"{(trial_end(trial) - time.time()) / 86_400:.1f} days left", None))
     else:
         items.append(("ok", "trial: off", None))
-    return doctor_result("the switches in force here", items)
+    return doctor_result("the switches in force here", items, works=works)
 
 
 # ---------------------------------------------------------------- hook budget
@@ -18551,6 +18596,35 @@ def doctor_count(checks: list) -> tuple:
     return sum(c["mark"] == "ok" for c in checks), len(checks)
 
 
+def doctor_group(check: dict) -> str:
+    """The group a line goes in (DOCTOR_GROUPS), by its result and whether
+    it is an extra (DOCTOR_OPTIONAL): its own `kind` when it has one; else
+    "works" for ✔; else "extra" for an extra's ⚠ (not set up, or set up
+    another way); else "fix", a core line not ✔ or an extra's ✘."""
+    if check.get("kind") in ("fix", "works", "extra", "skip"):
+        return check["kind"]
+    if check["mark"] == "ok":
+        return "works"
+    return "extra" if check["name"] in DOCTOR_OPTIONAL and check["mark"] == "warn" else "fix"
+
+
+def doctor_to_fix(checks: list) -> int:
+    """How many lines are to fix."""
+    return sum(doctor_group(c) == "fix" for c in checks)
+
+
+def doctor_working(checks: list) -> list:
+    """What works now, as the checks found it: each check's `works`, the
+    plugin's and the features' first, then the others' in order; nothing
+    when the plugin's own line is not ✔, since all of it runs through the
+    plugin's hooks. A check adds to `works` only what passed."""
+    by = {c["name"]: c for c in checks}
+    if by.get("Plugin", {}).get("mark") != "ok":
+        return []
+    first = [by[name] for name in ("Plugin", "Features") if name in by]
+    return [w for c in first + [c for c in checks if c not in first] for w in c.get("works", ())]
+
+
 def doctor_next(checks: list):
     """The first broken line's step, else the first half-set-up one's."""
     return next((c["step"] for want in ("bad", "warn") for c in checks if c["mark"] == want and c["step"]), None)
@@ -18588,14 +18662,25 @@ def doctor(_opts) -> int:
     return 0
 
 
+def setup_said(version: str, working: list, fix: int) -> str:
+    """SETUP_LINE's words: what works now and the one thing to try, then
+    the lines to fix, or the doctor for the extras when there are none.
+    hooks/display.ts says the same from SETUP_LOGGED."""
+    said = SETUP_WORKING.format(working=hook_and(working)) if working else ""
+    return SETUP_LINE.format(version=version, working=said,
+                             tail=SETUP_FIX.format(n=fix) if fix else SETUP_EXTRAS)
+
+
 def setup_line(data: dict):
     """The first-chat line (SETUP_LINE), for the guard's startup hook to
     add to its systemMessage, or None: only in the main conversation of an
     attended session, when this plugin's version is not the one seen.json
-    records (a new install or an update). It counts the quick checks,
-    records the version and logs SETUP_LOGGED, which the display module
-    turns into a pop-up (the VS Code panel shows no systemMessage). Under
-    a lock, so two chats starting at once say it once."""
+    records (a new install or an update). From the quick checks it names
+    what works now (doctor_working()) and counts the lines to fix (a score
+    of all the checks read as failure, the review of 2026-11-11), records
+    the version and logs SETUP_LOGGED, which the display module turns into
+    a pop-up (the VS Code panel shows no systemMessage). Under a lock, so
+    two chats starting at once say it once."""
     if data.get("agent_id") is not None or os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0":
         return None
     version = plugin_version()
@@ -18610,10 +18695,11 @@ def setup_line(data: dict):
     with locked("seen", wait=1):
         if seen():
             return None
-        n, m = doctor_count(doctor_checks(quick=True))
+        checks = doctor_checks(quick=True)
+        working, fix = doctor_working(checks), doctor_to_fix(checks)
         write_json(path, {"version": version, "at": int(time.time())})
-    log(SETUP_LOGGED.format(version=version, n=n, m=m))
-    return SETUP_LINE.format(version=version, n=n, m=m)
+    log(SETUP_LOGGED.format(version=version, working=hook_and(working) if working else SETUP_NOTHING, n=fix))
+    return setup_said(version, working, fix)
 
 
 def main(argv: list[str]) -> int:

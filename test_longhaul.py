@@ -20960,7 +20960,8 @@ class Display(unittest.TestCase):
             "out": "release: Longhaul 0.2.10 is out (this is 0.2.4)",
             "installed": "release: Longhaul 0.2.5 is installed; fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 runs 0.2.4",
             # The first chat after an install or an update (the doctor, 2026-10-25).
-            "setup": "setup: Longhaul 0.2.4 is on: 7 of 8 set up",
+            "setup": "setup: Longhaul 0.2.4 is on; working now: checkpoints, auto-compact at 200k tokens and the read "
+                     "guard; to fix: 0",
             # A checkpoint put back from long ago (review issue 6, 2026-10-25).
             "put back": "checkpoint for fcd7fbcc-bc91-4a30-9dce-e7496a7f4aa6 put back after resume (4214 bytes, written "
                         "98444 s earlier)",
@@ -21007,8 +21008,10 @@ class Display(unittest.TestCase):
                       "`Longhaul ${m[1]} is out. /longhaul:doctor shows how to update.`"):
             self.assertIn(toast, self.SOURCE)
         setup = patterns[10].replace("\\/", "/")
-        self.assertEqual(re.match(setup, lines["setup"]).groups(), ("0.2.4", "7", "8"))
-        self.assertIsNone(re.match(setup, "setup: Longhaul 0.2.4 is on: 7 of 8 set up, and more"), "the whole line")
+        self.assertEqual(re.match(setup, lines["setup"]).groups(),
+                         ("0.2.4", "checkpoints, auto-compact at 200k tokens and the read guard", "0"))
+        self.assertIsNone(re.match(setup, lines["setup"] + ", and more"), "the whole line")
+        self.assertIsNone(re.match(setup, "setup: Longhaul 0.2.4 is on: 7 of 8 set up"), "the old line")
         old = patterns[11].replace("\\/", "/")
         self.assertEqual(re.match(old, lines["put back"]).groups(), (sid, "resume", "4214", "98444"))
         self.assertIn("/^checkpoint for (\\S+) put back after (\\S+) \\((\\d+) bytes, written (\\d+) s earlier\\)$/)) "
@@ -21019,8 +21022,6 @@ class Display(unittest.TestCase):
                       "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
                       "`Longhaul stopped your message: ${m[2]} is reserved for ${m[3]}, and this chat is on ${m[4]}. Nothing "
                       "was sent. Type /accounts to move it.`",
-                      "`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} quick checks pass. Type /longhaul:doctor for the full "
-                      "list and what's left.`",
                       "`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out "
                       "of date. /longhaul:checkpoint saves a fresh one.`"):
             self.assertIn(toast, self.SOURCE)
@@ -21037,7 +21038,9 @@ class Display(unittest.TestCase):
                         'log(f"guard: {verb} a repeat read of {shown} in {sid}{who}")',
                         'log(f"release: Longhaul {latest} is out (this is {running})")',
                         'log(f"release: Longhaul {installed} is installed; {sid} runs {running}")',
-                        'SETUP_LOGGED = "setup: Longhaul {version} is on: {n} of {m} set up"',
+                        'SETUP_LOGGED = "setup: Longhaul {version} is on; working now: {working}; to fix: {n}"',
+                        'log(SETUP_LOGGED.format(version=version, working=hook_and(working) if working else '
+                        'SETUP_NOTHING, n=fix))',
                         'STOP_LOGGED = "stop: {sid} turn ended on an API error ({error})"',
                         '"quota_auto_resume_stale": "quota: {sid} waits for Enter: the usage limit reset while the '
                         'computer slept"',
@@ -21052,6 +21055,39 @@ class Display(unittest.TestCase):
                       "'Longhaul: Claude Code stopped waiting at the usage limit and will not carry on by itself. Send a "
                       "message once it resets.'"):
             self.assertIn(toast, self.SOURCE)
+
+    def test_the_first_chats_pop_up_says_what_the_first_chats_line_says(self):
+        # The review of 2026-11-11 (4.5, item 1): what works now, the one thing
+        # to try, and the lines to fix or the extras. The TS pop-up builds its
+        # words from the log line; each piece is Python's, in JavaScript.
+        version, n, word = "${m[1]}", "${m[3]}", "${m[2]}"
+        head = longhaul.SETUP_LINE.split("{working}")[0].replace("{version}", version)
+        for piece in (f"`{head}`", "`" + longhaul.SETUP_WORKING.replace("{working}", word) + "`",
+                      f"'{longhaul.SETUP_EXTRAS}'", "`" + longhaul.SETUP_FIX.replace("{n}", n) + "`",
+                      f"m[2] === '{longhaul.SETUP_NOTHING}'", "m[3] === '0'"):
+            self.assertIn(piece, self.SOURCE, piece)
+        [pattern] = [p.replace("\\/", "/") for p in re.findall(r"body\.match\(/(.+?)/\)", self.SOURCE)
+                     if p.startswith("^setup: ")]
+
+        def popped(line):  # the toast display.ts shows for a log line, as its code builds it
+            m = re.match(pattern, line)
+            return (f"Longhaul {m[1]} is on. " + ("" if m[2] == longhaul.SETUP_NOTHING else
+                                                  longhaul.SETUP_WORKING.format(working=m[2]))
+                    + (longhaul.SETUP_EXTRAS if m[3] == "0" else longhaul.SETUP_FIX.format(n=m[3])))
+
+        for working, fix in ((["checkpoints", "auto-compact at 200k tokens", "the read guard"], 0),
+                             (["checkpoints", "the read guard", "the status line"], 2), (["checkpoints"], 1), ([], 1)):
+            logged = longhaul.SETUP_LOGGED.format(version="0.3.12", working=longhaul.hook_and(working) if working
+                                                  else longhaul.SETUP_NOTHING, n=fix)
+            self.assertEqual(popped(logged), longhaul.setup_said("0.3.12", working, fix), (working, fix))
+        self.assertEqual(longhaul.setup_said("0.3.12", ["checkpoints", "auto-compact at 200k tokens", "the read guard"], 0),
+                         "Longhaul 0.3.12 is on. Working now: checkpoints, auto-compact at 200k tokens and the read guard. "
+                         "Try it: /longhaul:checkpoint, then /clear. Extras: /longhaul:doctor.")
+        self.assertEqual(longhaul.setup_said("0.3.12", ["checkpoints"], 2),
+                         "Longhaul 0.3.12 is on. Working now: checkpoints. Try it: /longhaul:checkpoint, then /clear. "
+                         "2 to fix: /longhaul:doctor.")
+        self.assertEqual(longhaul.setup_said("0.3.12", [], 1), "Longhaul 0.3.12 is on. 1 to fix: /longhaul:doctor.",
+                         "nothing works: nothing to try")
 
 
 class Release(unittest.TestCase):
@@ -26244,20 +26280,24 @@ class Doctor(unittest.TestCase):
     def test_the_terminal_command_line_knows_the_launcher_and_gives_the_exact_setup_line(self):
         # I1 (Sprint 11): with an installed copy, the step is the one line
         # to type, from that copy; the clone is the developer's way only.
+        # The line is the step's `command`, printed alone so it can be
+        # copied whole (the review of 2026-11-11, 4.5).
         self.installed()
         rest = f".claude/plugins/cache/longhaul/longhaul/{self.VERSION}"
         copy = self.checkout(self.VERSION, name=f"user/{rest}")
-        line = f"`python3 ~/{rest}/longhaul.py setup`"
+        line = f"python3 ~/{rest}/longhaul.py setup"
         c = longhaul.doctor_command()
-        self.assertEqual(c["mark"], "bad")
-        self.assertIn(line, c["step"])
+        self.assertEqual((c["mark"], c["kind"]), ("bad", "extra"), "not there at all: an extra, not a fault")
+        self.assertEqual(c["command"], line)
+        self.assertIn("run the line below in a terminal", c["step"])
         self.assertIn("a launcher that runs the newest installed Longhaul", c["step"])
         self.assertNotIn("git clone", c["step"])
         # A link into the plugin's own copy is moved to the launcher by the same line.
         target = self.link(copy)
         c = longhaul.doctor_command()
         self.assertEqual(c["mark"], "warn")
-        self.assertIn(line, c["step"])
+        self.assertEqual(c["command"], line)
+        self.assertNotIn("kind", c)
         # The launcher: what it runs.
         target.unlink()
         target.write_text(longhaul.launcher_text())
@@ -26269,7 +26309,7 @@ class Doctor(unittest.TestCase):
         c = longhaul.doctor_command()
         self.assertEqual(c["mark"], "warn")
         self.assertIn("an older launcher", c["said"])
-        self.assertIn(line, c["step"])
+        self.assertEqual(c["command"], line)
         # A lost cache: the launcher finds nothing to run.
         shutil.rmtree(copy)
         c = longhaul.doctor_command()
@@ -26826,13 +26866,14 @@ class Doctor(unittest.TestCase):
         """The session's claude, as a native install names it: its version in the path."""
         return str(self.tmp / "versions" / ".".join(map(str, longhaul.TESTED_VERSIONS[1])) / "claude")
 
-    def test_the_first_chat_after_an_install_or_an_update_says_how_much_is_set_up_once(self):
+    def test_the_first_chat_after_an_install_or_an_update_says_what_works_once(self):
         self.assertEqual(len(longhaul.doctor_checks(quick=True)), 7, "without the session's path, no version")
         os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
-        n, m = longhaul.doctor_count(longhaul.doctor_checks(quick=True))
-        self.assertEqual(m, 8, "the quick checks: no updates (network) and no process list")
-        line = (f"Longhaul {self.VERSION} is on: {n} of {m} quick checks pass. Type /longhaul:doctor for the full list "
-                "and what's left.")
+        checks = longhaul.doctor_checks(quick=True)
+        self.assertEqual(len(checks), 8, "the quick checks: no updates (network) and no process list")
+        self.installed()  # the plugin installed: its checkpoint, auto-compact and guard work
+        line = (f"Longhaul {self.VERSION} is on. Working now: checkpoints, auto-compact at 200k tokens and the read "
+                "guard. Try it: /longhaul:checkpoint, then /clear. Extras: /longhaul:doctor.")
         self.assertIsNone(longhaul.guard_check(self.start(agent="a1"), "warn"), "a subagent's start")
         os.environ["CLAUDE_CODE_SESSION_ATTENDED"] = "0"
         self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "a -p run: nobody would read it")
@@ -26842,7 +26883,9 @@ class Doctor(unittest.TestCase):
         self.assertEqual(answer, {"systemMessage": line})
         self.assertEqual(self.seen()["version"], self.VERSION)
         self.assertEqual(oct(os.stat(self.home / "seen.json").st_mode & 0o777), "0o600")
-        self.assertEqual(re.findall(r"setup: .*", self.log()), [f"setup: Longhaul {self.VERSION} is on: {n} of {m} set up"])
+        self.assertEqual(re.findall(r"setup: .*", self.log()),
+                         [f"setup: Longhaul {self.VERSION} is on; working now: checkpoints, auto-compact at 200k tokens "
+                          "and the read guard; to fix: 0"])
         self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "once per version")
         self.write(self.home / "seen.json", {"version": "0.0.1"})  # an update
         self.assertEqual(longhaul.guard_check(self.start(), "warn"), {"systemMessage": line})
@@ -26856,7 +26899,8 @@ class Doctor(unittest.TestCase):
                 mock.patch.object(longhaul, "release_status", side_effect=boom), \
                 mock.patch.object(longhaul, "claude_version", side_effect=boom):
             answer = longhaul.guard_check(self.start(), "warn")
-        self.assertRegex(answer["systemMessage"], rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 quick checks pass\. ")
+        self.assertEqual(answer["systemMessage"], f"Longhaul {self.VERSION} is on. 1 to fix: /longhaul:doctor.",
+                         "no plugin installed here: nothing works through it, and that is the one to fix")
 
     def test_the_first_chat_line_through_the_hook_is_quick_and_joins_the_index_message(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
@@ -26868,8 +26912,8 @@ class Doctor(unittest.TestCase):
         out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
         took = time.time() - started
         self.assertEqual((out.returncode, out.stderr), (0, ""))
-        self.assertRegex(json.loads(out.stdout)["systemMessage"],
-                         rf"^Longhaul {re.escape(self.VERSION)} is on: \d+ of 8 quick checks pass\. Type /longhaul:doctor ")
+        self.assertEqual(json.loads(out.stdout)["systemMessage"], f"Longhaul {self.VERSION} is on. 1 to fix: "
+                                                                  "/longhaul:doctor.")
         self.assertLess(took, 2.0, "well inside the hook's 5 s")
         out = subprocess.run(hook, input=json.dumps(self.start()), env=env, capture_output=True, text=True, timeout=10)
         # Once. Auto Model's guide joins every startup's answer since the
@@ -26882,8 +26926,64 @@ class Doctor(unittest.TestCase):
                 mock.patch.object(longhaul, "index_message", return_value="longhaul: the index's line"):
             said = longhaul.guard_check(self.start(), "warn")["systemMessage"].split("\n")
         self.assertEqual(len(said), 2)
-        self.assertTrue(said[0].startswith(f"Longhaul {self.VERSION} is on: "))
+        self.assertTrue(said[0].startswith(f"Longhaul {self.VERSION} is on. "))
         self.assertEqual(said[1], "longhaul: the index's line")
+
+    def test_the_first_chat_line_names_only_what_passed(self):
+        # The review of 2026-11-11 (4.5, item 1): "Working now" is the checks'
+        # results, never a fixed claim, and a problem is counted, not an extra.
+        os.environ["CLAUDE_CODE_EXECPATH"] = self.execpath()
+
+        def said():
+            self.write(self.home / "seen.json", {"version": "0.0.1"})
+            return longhaul.guard_check(self.start(), "warn")["systemMessage"]
+
+        def working():
+            return longhaul.doctor_working(longhaul.doctor_checks(quick=True))
+
+        self.assertEqual(working(), [], "the plugin not installed: nothing runs through its hooks")
+        self.assertEqual(said(), f"Longhaul {self.VERSION} is on. 1 to fix: /longhaul:doctor.")
+        self.installed(enabled=False)
+        self.assertEqual(working(), [], "turned off")
+        self.installed()
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens", "the read guard"])
+        self.assertTrue(said().endswith("Extras: /longhaul:doctor."), "the terminal command and the status line are "
+                                                                      "extras, not faults")
+        os.environ["LONGHAUL_GUARD"] = "off"
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens"], "the guard turned off")
+        os.environ["LONGHAUL_GUARD"] = "loud"  # not a mode: its item is ⚠, so not named, and one to fix
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens"])
+        self.assertTrue(said().endswith(". 1 to fix: /longhaul:doctor."), said())
+        del os.environ["LONGHAUL_GUARD"]
+        os.environ["LONGHAUL_AUTO_COMPACT"] = "off"
+        self.assertEqual(working(), ["checkpoints", "a checkpoint reminder at 200k tokens", "the read guard"])
+        os.environ["LONGHAUL_CHECKPOINT_AT"] = "off"  # no reminder: auto-compact has nothing to follow either
+        del os.environ["LONGHAUL_AUTO_COMPACT"]
+        self.assertEqual(working(), ["checkpoints", "the read guard"])
+        os.environ["LONGHAUL_CHECKPOINT_AT"] = "120500"
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 120,500 tokens", "the read guard"])
+        del os.environ["LONGHAUL_CHECKPOINT_AT"]
+        self.settings(statusLine={"type": "command", "command": "~/.local/bin/longhaul statusline"})
+        self.assertNotIn("the status line", working(), "it names a program that is not there: ✘")
+        self.link(self.checkout(self.VERSION))
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens", "the read guard", "the status line"])
+        # Whatever the switches, a name in "Working now" is never a line that did not pass.
+        names = {"checkpoints": ["Plugin"], "auto-compact at 200k tokens": ["Plugin", "Features"],
+                 "the read guard": ["Plugin", "Features"], "the status line": ["Plugin", "Status line"]}
+        for guard in ("warn", "off", "loud"):
+            os.environ["LONGHAUL_GUARD"] = guard
+            checks = {c["name"]: c for c in longhaul.doctor_checks(quick=True)}
+            for name in longhaul.doctor_working(list(checks.values())):
+                for check in names[name]:
+                    if check != "Features":
+                        self.assertEqual(checks[check]["mark"], "ok", (name, check))
+                said_items = {text: mark for mark, text, _ in checks["Features"]["items"]}
+                if name == "the read guard":
+                    self.assertEqual(said_items[f"guard: {'advice' if guard == 'warn' else guard}"], "ok")
+        # An account whose folder is missing is a problem (✘), counted in the line.
+        self.write(self.home / "accounts.json", {"accounts": [{"name": "work", "config_dir": str(self.tmp / "gone")}]})
+        os.environ["LONGHAUL_GUARD"] = "warn"
+        self.assertTrue(said().endswith(". 1 to fix: /longhaul:doctor."), said())
 
 
 class HookBudget(unittest.TestCase):

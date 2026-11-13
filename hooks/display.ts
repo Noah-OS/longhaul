@@ -169,9 +169,13 @@ async function popUps($: any, lines: string[]): Promise<void> {
       $.ui.toast(`Longhaul ${m[1]} is out. /longhaul:doctor shows how to update.`, { timeoutMs: 12000 })
     else if ((m = body.match(/^release: Longhaul (\S+) is installed; (\S+) runs (\S+)$/)) && m[2] === sid)
       $.ui.toast(`Longhaul: ${m[1]} is installed; this chat runs ${m[3]}. Type /reload-plugins to use it.`, { timeoutMs: 12000 })
-    // The first chat after an install or an update: the panel shows no systemMessage.
-    else if ((m = body.match(/^setup: Longhaul (\S+) is on: (\d+) of (\d+) set up$/)))
-      $.ui.toast(`Longhaul ${m[1]} is on: ${m[2]} of ${m[3]} quick checks pass. Type /longhaul:doctor for the full list and what's left.`, { timeoutMs: 12000 })
+    // The first chat after an install or an update: the panel shows no
+    // systemMessage. What works now (longhaul.py's quick checks name only
+    // what passed), what to try, and the lines to fix or the extras.
+    else if ((m = body.match(/^setup: Longhaul (\S+) is on; working now: (.+); to fix: (\d+)$/)))
+      $.ui.toast(`Longhaul ${m[1]} is on. `
+                 + (m[2] === 'nothing' ? '' : `Working now: ${m[2]}. Try it: /longhaul:checkpoint, then /clear. `)
+                 + (m[3] === '0' ? 'Extras: /longhaul:doctor.' : `${m[3]} to fix: /longhaul:doctor.`), { timeoutMs: 12000 })
     // A checkpoint put back from six hours ago or more: it may be out of date (review issue 6).
     else if ((m = body.match(/^checkpoint for (\S+) put back after (\S+) \((\d+) bytes, written (\d+) s earlier\)$/)) && m[1] === sid && Number(m[4]) >= 21600)
       $.ui.toast(`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out of date. /longhaul:checkpoint saves a fresh one.`, { timeoutMs: 12000 })
