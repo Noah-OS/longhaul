@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## Unreleased
+## 0.3.10 - 2026-11-13
 
 UX quick wins from the review of 2026-11-11: Longhaul's words say what it did, when a limit was seen, and which chats carry on.
 
