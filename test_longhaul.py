@@ -26319,6 +26319,36 @@ class Repair(unittest.TestCase):
         self.assertIn("changed meanwhile, so it was left as it is", finding["do"]())
         self.assertTrue(path.exists())
 
+    def test_a_use_choice_no_chat_will_take_is_removed(self):
+        (self.home / "accounts.json").write_text(json.dumps([{"name": "Max", "config_dir": str(self.claude)},
+                                                             {"name": "Pro", "config_dir": str(self.user / ".claude-pro")}]))
+        old = self.write("uses/aaaaaaaa-old.json", {"id": "u-1", "chat": "aaaaaaaa-old", "account": "Pro",
+                                                    "at": int(self.now - 31 * 86400)})
+        gone = self.write("uses/bbbbbbbb-gone.json", {"id": "u-2", "chat": "bbbbbbbb-gone", "account": "Team",
+                                                      "at": int(self.now)})
+        junk = self.write("uses/cccccccc-junk.json", {"chat": "someone-else", "account": "Pro", "at": int(self.now)})
+        # A choice for a chat that is closed now waits for its next open, by
+        # design, taken by a relay since ended or not.
+        waits = self.write("uses/dddddddd-waits.json", {"id": "u-3", "chat": "dddddddd-waits", "account": "Pro",
+                                                        "at": int(self.now), "relay_pid": self.dead_pid()})
+        self.assertEqual([f["id"] for f in self.found()],
+                         ["use:aaaaaaaa-old", "use:bbbbbbbb-gone", "use:cccccccc-junk"])
+        self.lists_and_changes_nothing(
+            "uses/aaaaaaaa-old.json is a choice of account that no chat will take: it is not one Longhaul can read, "
+            "or it was made over 30 days ago. Fix: remove the choice; the chat starts as it would without one.",
+            "Chat bbbbbbbb is to start on Team, which is no longer one of Longhaul's accounts")
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p.exists() for p in (old, gone, junk, waits)], [False, False, False, True])
+        log = self.log()
+        self.assertIn("repair: bbbbbbbb-gone's choice of Team, no longer an account, removed", log)
+        self.assertEqual(log.count("repair: "), 3)
+        # With an accounts.json that cannot be read, the names are not judged.
+        self.write("uses/bbbbbbbb-gone.json", {"id": "u-2", "chat": "bbbbbbbb-gone", "account": "Team",
+                                               "at": int(self.now)})
+        (self.home / "accounts.json").write_text("[")
+        self.assertNotIn("use:bbbbbbbb-gone", [f["id"] for f in self.found()])
+
     def test_a_wait_whose_relay_runs_is_no_finding(self):
         # KeepWorking checks that the relay writes its pid in the wait.
         self.write("waits/aaaaaaaa-live.json", {"chat": "aaaaaaaa-live", "until": int(self.now + 60), "account": "Max",

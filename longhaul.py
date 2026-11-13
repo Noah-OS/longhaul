@@ -16859,6 +16859,11 @@ def clear(opts) -> int:
 #   would have carried on and taken it away), and a file in either folder
 #   that is not in its shape. Each is left by a relay that ended without
 #   its way out (Relay.forget_chat()): killed, or the Mac shut down.
+# - A `use` choice (USES) no chat will take: not in its shape, USE_DAYS
+#   old (use_sweep() drops those, but only when `use` runs), or naming an
+#   account no longer on the list (take_choice() drops it at the chat's
+#   next open). A choice for a chat that is closed now is none of it: it
+#   waits for that chat's next open, by design.
 # Longhaul's lock files are none of it: each is an flock, which the OS lets
 # go of when its process ends, however it ends (locked(), hold()), so none
 # is ever stale. Nor is a recorded limit that a reply has lifted: the reply
@@ -17055,6 +17060,39 @@ def repair_waits(now: float) -> list:
     return found
 
 
+def repair_uses(now: float) -> list:
+    """USES' findings: a choice no chat will take (choice_of() finds none
+    in it, or it names an account accounts.json does not list). With an
+    accounts.json that cannot be read, the names are not judged."""
+    folder, found = LONGHAUL_HOME / USES, []
+    try:
+        paths = sorted(folder.glob("*.json"))
+    except OSError:
+        return []
+    accounts, problem = read_accounts_file()
+    names = None if problem else {a["name"] for a in accounts}
+    for path in paths:
+        raw = repair_raw(path)
+        if raw is None:
+            continue
+        sid = path.stem
+        name = choice_of(repair_json(raw)[0], sid, now) if re.fullmatch(GUARD_ID, sid) else None
+        if name is None:
+            what = (f"uses/{shown(path.name, 120)} is a choice of account that no chat will take: it is not one Longhaul "
+                    f"can read, or it was made over {USE_DAYS} days ago")
+            said = f"uses/{path.name}, a choice no chat will take, removed"
+        elif names is not None and name not in names:
+            what = (f"Chat {sid[:8]} is to start on {shown(name, 60)}, which is no longer one of Longhaul's accounts, "
+                    "so the choice will be dropped")
+            said = f"{sid}'s choice of {name}, no longer an account, removed"
+        else:
+            continue
+        found.append(repair_finding(f"use:{shown(sid, 100)}", what,
+                                    "remove the choice; the chat starts as it would without one",
+                                    repair_files([(path, raw)], said)))
+    return found
+
+
 def repair_findings(now: float | None = None) -> list:
     """What `longhaul repair` would fix, in the order it fixes them
     (repair_finding()'s). It only reads: no lock taken, no folder made,
@@ -17064,7 +17102,7 @@ def repair_findings(now: float | None = None) -> list:
     raw = repair_raw(LONGHAUL_HOME / "state.json")
     if raw is not None:
         found += repair_state(raw, now)
-    return found + repair_waits(now) + repair_questions(now)
+    return found + repair_waits(now) + repair_questions(now) + repair_uses(now)
 
 
 def repair(opts) -> int:
