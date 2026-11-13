@@ -2,6 +2,21 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+A middle step between a stuck state and an uninstall (the UX review of 2026-11-11, 2.4, 4.4 and M2): on 2026-11-10 the only way out of a stuck state was `longhaul uninstall --purge`, which took two weeks of trial records with it.
+
+### Added
+
+- **`longhaul repair [--dry-run] [--yes] [--json]`** finds what is stuck or broken in Longhaul's own records and says each in one line, with what its fix does: a carry-on or a question whose relay is gone (the chat closed without taking it away), an answer with no question, a `use` choice no chat will take (over 30 days old, or naming an account no longer on the list), a recorded limit that is not a time or whose time has passed, a broken `accounts.json` (with the JSON error's line and column), and VS Code's wrapper pointing at a Longhaul that is gone. In a terminal each fix asks first; `--yes` makes them all; `--dry-run`, and a run with no terminal and no `--yes`, only list. `--json` gives the list as `[{"id", "what", "fix", "fixable"}]` and changes nothing. Each fix made writes one line to the log. A healthy home says "Nothing to repair."
+- **Each write of the accounts list keeps a last good copy**, `accounts.json.last-good` in Longhaul's home. When a hand edit breaks `accounts.json`, `longhaul repair` puts the copy back after a yes and keeps the broken file as `accounts.json.broken`.
+- **A carry-on's record names its relay's process**, as a question's does, so repair can tell one that still waits from one no relay is left to send.
+
+### Changed
+
+- **`longhaul doctor` names `longhaul repair` where it would fix something**: a new Stuck records line, under To fix, only when a wait, question, `use` choice or recorded limit is stuck; the accounts line when a last good copy can be put back; the VS Code panel's line when its wrapper is gone.
+- **From a chat**, the plugin's command runs `repair --dry-run` and `repair --json`, and refuses a repair that fixes: `/longhaul:manage` shows the list and tells you to run `longhaul repair` in a terminal.
+
 ## 0.3.12 - 2026-11-13
 
 A first run shows what already works, not a score that reads as failure (the UX review of 2026-11-11, first run, items 1 and 2).

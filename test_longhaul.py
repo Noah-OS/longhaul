@@ -26270,6 +26270,9 @@ class Repair(unittest.TestCase):
                 self.assertIn(f"repair: state.json ({why}) replaced", self.log())
                 self.assertEqual(self.found(), [])
 
+    def test_the_usage_block_names_it(self):
+        self.assertIn("longhaul repair [--dry-run] [--yes] [--json]", longhaul.__doc__)
+
     def test_the_doctor_leaves_out_a_limit_whose_time_has_passed(self):
         self.state(Max=self.now - 60)
         self.assertEqual([f["doctor"] for f in longhaul.repair_findings()], [False])

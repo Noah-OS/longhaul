@@ -367,7 +367,18 @@ Usage:
   longhaul clear [NAME]         forget the recorded limits, or NAME's alone; a chat
                           waiting for one carries on within a few seconds, and
                           the panel chats that do are named
-  (log)                         LONGHAUL_HOME/longhaul.log leaves out its routine
+  longhaul repair [--dry-run] [--yes] [--json]
+                          what is stuck or broken in Longhaul's records, one
+                          line each with what its fix does: a wait or question
+                          whose relay is gone, a `use` choice no chat will
+                          take, a recorded limit that is not a time or is
+                          past, a broken accounts.json (put back from the copy
+                          each write keeps), VS Code's wrapper pointing at a
+                          Longhaul that is gone. Each fix after a yes in a
+                          terminal (--yes: all of them); --dry-run, and no
+                          terminal without --yes, only list; --json lists them
+                          as JSON. Try it before an uninstall
+  (log)                       LONGHAUL_HOME/longhaul.log leaves out its routine
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
                           writes everything
