@@ -26793,8 +26793,8 @@ class Doctor(unittest.TestCase):
         self.assertEqual(self.groups(lines), {
             "To fix": [("✘", "Plugin")],
             "Working now": [("✔", "Claude Code"), ("✔", "Chats running now"), ("✔", "Features"), ("✔", "Hooks")],
-            "Worth adding": [("✘", "Terminal command"), ("⚠", "Updates"), ("⚠", "Status line"), ("⚠", "Code maps")],
-            "Not for you right now": [("✔", "VS Code panel"), ("✔", "Accounts"), ("✔", "Codex")]})
+            "Worth adding": [("⚠", "Terminal command"), ("⚠", "Updates"), ("⚠", "Status line")],
+            "Not for you right now": [("✔", "VS Code panel"), ("✔", "Accounts"), ("⚠", "Code maps"), ("✔", "Codex")]})
         self.assertEqual(lines[-1], f"Next: {longhaul.doctor_plugin()['step']}", "the step to fix comes first")
         self.assertEqual(sorted(self.home.rglob("*")), before, "nothing written")
         # Each check, in exactly one group, whatever its result.
@@ -26813,7 +26813,7 @@ class Doctor(unittest.TestCase):
         self.assertEqual(lines[-2:], ["Next: run the line below in a terminal: it writes ~/.local/bin/longhaul, a "
                                       "launcher that runs the newest installed Longhaul (~/.local/bin must be on PATH)",
                                       f"  python3 ~/{rest}/longhaul.py setup"])
-        at = lines.index("  ✘ Terminal command: `longhaul` is not on PATH; accounts, switching, the status line, "
+        at = lines.index("  ⚠ Terminal command: `longhaul` is not on PATH; accounts, switching, the status line, "
                          "trials, models and VS Code need it")
         self.assertEqual(lines[at + 2], f"        python3 ~/{rest}/longhaul.py setup", "under its own Next")
         # Every line set up: nothing to fix, nothing worth adding, no step.
@@ -26849,7 +26849,8 @@ class Doctor(unittest.TestCase):
             self.assertEqual(group(check(name)), "works", name)
             self.assertEqual(group(check(name, "bad")), "fix", f"{name}: set up and broken")
             self.assertEqual(group(check(name, "ok", kind="skip")), "skip", name)
-            self.assertEqual(group(check(name, "warn")), "extra" if name in longhaul.DOCTOR_OPTIONAL else "fix", name)
+            self.assertEqual(group(check(name, "warn")), "skip" if name == "Code maps"  # no saving measured
+                             else "extra" if name in longhaul.DOCTOR_OPTIONAL else "fix", name)
         self.assertEqual(sorted(longhaul.DOCTOR_OPTIONAL), sorted(["Terminal command", "Updates", "Status line",
                                                                    "VS Code panel", "Code maps", "Hooks", "Codex"]))
         self.assertEqual(group(check("Terminal command", "bad", kind="extra")), "extra", "not there at all")

@@ -18595,12 +18595,16 @@ def doctor_checks(quick: bool = False, processes=None) -> list:
 def doctor_group(check: dict) -> str:
     """The group a line goes in (DOCTOR_GROUPS), by its result and whether
     it is an extra (DOCTOR_OPTIONAL): its own `kind` when it has one; else
-    "works" for ✔; else "extra" for an extra's ⚠ (not set up, or set up
-    another way); else "fix", a core line not ✔ or an extra's ✘."""
+    "works" for ✔; "skip" for the code maps' ⚠ (a map saved no tokens in
+    the cw-repo benchmark, so the doctor does not urge one); else "extra"
+    for an extra's ⚠ (not set up, or set up another way); else "fix", a
+    core line not ✔ or an extra's ✘."""
     if check.get("kind") in ("fix", "works", "extra", "skip"):
         return check["kind"]
     if check["mark"] == "ok":
         return "works"
+    if check["name"] == "Code maps" and check["mark"] == "warn":
+        return "skip"  # a map saved no tokens in the cw-repo benchmark: not urged as worth adding
     return "extra" if check["name"] in DOCTOR_OPTIONAL and check["mark"] == "warn" else "fix"
 
 
@@ -18668,7 +18672,9 @@ def doctor_lines(checks: list) -> list:
         members = [c for c in checks if doctor_group(c) == group]
         if members:
             lines.append(heading)
-            lines.extend("  " + line for c in members for line in doctor_check_lines(c, marks))
+            # An extra not set up is drawn ⚠ under Worth adding, never ✘: nothing there is broken.
+            lines.extend("  " + line for c in members for line in doctor_check_lines(
+                {**c, "mark": "warn"} if group == "extra" and c["mark"] == "bad" else c, marks))
     first = doctor_next(checks)
     return lines + (doctor_step_lines(first) if first else [])
 
