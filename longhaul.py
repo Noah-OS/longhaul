@@ -16884,6 +16884,11 @@ def clear(opts) -> int:
 #   with its line and column), put back from ACCOUNTS_LAST_GOOD, which each
 #   write of the list keeps (write_accounts()), the broken file kept beside
 #   it as accounts.json.broken; with no good copy, the fix is the user's.
+# - VS Code's wrapper line naming a longhaul-vscode that is not there (the
+#   doctor's ✘ for the VS Code panel: a copy since updated away), pointed at
+#   this Longhaul by vscode_on(), which edits VS Code's settings as `longhaul
+#   vscode on` does, a copy kept: the one file outside LONGHAUL_HOME a fix
+#   writes. VS Code is reloaded by the user.
 # Longhaul's lock files are none of it: each is an flock, which the OS lets
 # go of when its process ends, however it ends (locked(), hold()), so none
 # is ever stale. Nor is a recorded limit that a reply has lifted: the reply
@@ -17150,12 +17155,49 @@ def repair_accounts() -> list:
                                              "broken file is kept as accounts.json.broken", put_back)]
 
 
+def vscode_wrapper_missing():
+    """The longhaul-vscode VS Code's settings run that is not there to run
+    (doctor_vscode()'s ✘), as a path; else None. Only reads."""
+    try:
+        if not VSCODE_SETTINGS.is_file():
+            return None
+        found = jsonc_load(VSCODE_SETTINGS.read_text(errors="replace"))
+    except OSError:
+        return None
+    value = found.get(VSCODE_WRAPPER_KEY) if isinstance(found, dict) else None
+    if not (isinstance(value, str) and value.endswith("longhaul-vscode")):
+        return None
+    path = doctor_expand(value)
+    return None if os.path.isfile(path) and os.access(path, os.X_OK) else path
+
+
+def repair_vscode() -> list:
+    """The VS Code wrapper's finding: its line names a longhaul-vscode that
+    is not there, so the panel's chats cannot start through Longhaul."""
+    gone = vscode_wrapper_missing()
+    if gone is None:
+        return []
+    here = Path(__file__).resolve().parent / "longhaul-vscode"
+
+    def point():
+        if vscode_on(assume_yes=True) != 0:
+            return "VS Code's settings were not changed (said above)"
+        log(f"repair: VS Code's Claude panel pointed at {home_path(str(here))} (it named {home_path(gone)}, which was "
+            "gone)")
+        return None
+    what = f"VS Code's Claude panel points at {home_path(gone)}, a Longhaul that is not there any more"
+    if not (here.is_file() and os.access(here, os.X_OK)):
+        return [repair_finding("vscode", what, "none here: run `longhaul vscode on` from the terminal command")]
+    return [repair_finding("vscode", what, f"point it at this Longhaul ({home_path(str(here))}), a copy of VS Code's "
+                                           "settings kept; then reload VS Code", point)]
+
+
 def repair_findings(now: float | None = None) -> list:
     """What `longhaul repair` would fix, in the order it fixes them
     (repair_finding()'s). It only reads: no lock taken, no folder made,
     nothing logged."""
     now = time.time() if now is None else now
-    found = repair_accounts()
+    found = repair_accounts() + repair_vscode()
     raw = repair_raw(LONGHAUL_HOME / "state.json")
     if raw is not None:
         found += repair_state(raw, now)

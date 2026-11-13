@@ -26388,6 +26388,27 @@ class Repair(unittest.TestCase):
         (self.home / "accounts.json.last-good").write_text("[")
         self.assertEqual([(f["id"], f["fixable"]) for f in self.found()], [("accounts", False)])
 
+    def test_a_vscode_wrapper_pointing_at_a_copy_that_is_gone_is_pointed_at_this_one(self):
+        gone = self.tmp / "cache" / "0.3.1" / "longhaul-vscode"
+        self.vscode.write_text('{\n    // mine\n    "editor.fontSize": 13,\n'
+                               f'    "claudeCode.claudeProcessWrapper": {json.dumps(str(gone))},\n}}\n')
+        self.lists_and_changes_nothing(
+            f"VS Code's Claude panel points at {gone}, a Longhaul that is not there any more. Fix: point it at this "
+            f"Longhaul ({HERE / 'longhaul-vscode'}), a copy of VS Code's settings kept; then reload VS Code.")
+        self.assertEqual([(f["id"], f["fixable"]) for f in self.found()], [("vscode", True)])
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        found = longhaul.jsonc_load(self.vscode.read_text())
+        self.assertEqual(found[longhaul.VSCODE_WRAPPER_KEY], str(HERE / "longhaul-vscode"))
+        self.assertIn("// mine", self.vscode.read_text(), "VS Code's own format kept")
+        self.assertEqual(len(list(self.vscode.parent.glob("settings.json.before-longhaul-*"))), 1, "a copy kept")
+        self.assertIn(f"repair: VS Code's Claude panel pointed at {HERE / 'longhaul-vscode'}", self.log())
+        self.assertEqual(self.found(), [])
+        # Another wrapper, none, or one that is there: no finding.
+        for value in ("/usr/local/bin/my-wrapper", None, str(HERE / "longhaul-vscode")):
+            self.vscode.write_text(json.dumps({longhaul.VSCODE_WRAPPER_KEY: value} if value else {}))
+            self.assertEqual(self.found(), [], value)
+
     def test_a_wait_whose_relay_runs_is_no_finding(self):
         # KeepWorking checks that the relay writes its pid in the wait.
         self.write("waits/aaaaaaaa-live.json", {"chat": "aaaaaaaa-live", "until": int(self.now + 60), "account": "Max",
