@@ -14504,7 +14504,9 @@ class Relay:
         self.carry = {"chat": sid, "until": carry_time(at), "account": name, "why": why}
         self.carry_for = {"to": to, "limit": limit, "since": since}
         try:
-            write_private(path, self.carry)
+            # With this relay's pid, as a question has it: `longhaul repair`
+            # tells a wait no relay is left to carry on from one that waits.
+            write_private(path, {**self.carry, "relay_pid": os.getpid()})
         except OSError as e:  # the status entry goes without it; the carry-on does not
             log(f"wait: could not write {sid}'s wait ({e!r}); it carries on all the same")
         log(f"wait: {sid} carries on on {name} at {clock(self.carry['until'])} ({why})")
@@ -16850,12 +16852,20 @@ def clear(opts) -> int:
 #   for no limit already (clear, forget_limit(), the status), so it is only
 #   tidied, and the doctor leaves it out. A state.json that is not an
 #   object (load_state()'s empty stand-in).
+# - A question (QUESTIONS) whose relay has ended (answer_cmd()'s test, and
+#   the pane's), an answer with no question beside it, a wait (WAITS) whose
+#   relay has ended (its relay_pid, which waits carry since repair) or that
+#   is WAIT_STALE past its time (the pane's own cut-off: a relay that ran
+#   would have carried on and taken it away), and a file in either folder
+#   that is not in its shape. Each is left by a relay that ended without
+#   its way out (Relay.forget_chat()): killed, or the Mac shut down.
 # Longhaul's lock files are none of it: each is an flock, which the OS lets
 # go of when its process ends, however it ends (locked(), hold()), so none
 # is ever stale. Nor is a recorded limit that a reply has lifted: the reply
 # is known only to the relay of the chat it came in, which forgets the
 # limit itself (Relay.lifted_by_reply()); nothing on disk says when a limit
 # was recorded, to tell a reply after it from one before.
+WAIT_STALE = 600  # seconds past its time a wait is no longer shown: hooks/question.ts's STALE
 
 def repair_raw(path: Path):
     """The bytes at `path`, or None when there are none to read."""
@@ -16876,6 +16886,40 @@ def repair_json(raw: bytes):
         return None, f"not JSON ({e.msg} at line {e.lineno} column {e.colno})"
     except (ValueError, RecursionError):
         return None, "not JSON"
+
+
+def repair_remove(found: list):
+    """Each (path, bytes) of `found` removed, when it still holds those
+    bytes (a relay may have written it again since it was read); why not,
+    else None. One gone already is done."""
+    for path, raw in found:
+        now = repair_raw(path)
+        if now is None and not os.path.lexists(path):
+            continue
+        if now != raw:
+            return f"{home_path(str(path))} changed meanwhile, so it was left as it is"
+        try:
+            path.unlink()
+        except OSError as e:
+            return f"{home_path(str(path))} could not be removed ({e.strerror or e})"
+    return None
+
+
+def repair_files(found: list, said: str):
+    """The fix that removes the files of `found` (repair_remove()) and logs
+    `said`."""
+    def fix():
+        why = repair_remove(found)
+        if why is None:
+            log(f"repair: {said}")
+        return why
+    return fix
+
+
+def relay_ended(pid) -> bool:
+    """Whether a record's relay_pid names no process running now: none, not
+    a pid, or one that has ended."""
+    return not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid))
 
 
 def repair_finding(fid: str, what: str, fix: str, do=None, doctor: bool = True) -> dict:
@@ -16935,6 +16979,82 @@ def repair_state(raw: bytes, now: float) -> list:
     return found
 
 
+def repair_questions(now: float) -> list:
+    """QUESTIONS' findings: a question whose relay has ended, with its
+    answer if there is one; an answer with no question; a file that is
+    not a question for the chat it is named by."""
+    folder, found = LONGHAUL_HOME / QUESTIONS, []
+    try:
+        paths = sorted(folder.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        raw = repair_raw(path)
+        if raw is None:
+            continue
+        name = path.name
+        if name.endswith(".answer.json"):
+            sid = name[:-len(".answer.json")]
+            if not os.path.lexists(folder / f"{sid}.json"):
+                found.append(repair_finding(f"answer:{shown(sid, 100)}", f"questions/{shown(name, 120)} is an answer to a "
+                                                                         "question that is gone",
+                                            "remove it", repair_files([(path, raw)], f"questions/{name}, an answer with "
+                                                                                     "no question, removed")))
+            continue
+        sid, (q, _problem) = path.stem, repair_json(raw)
+        if not (re.fullmatch(GUARD_ID, sid) and isinstance(q, dict) and q.get("chat") == sid):
+            found.append(repair_finding(f"question:{shown(sid, 100)}", f"questions/{shown(name, 120)} is not a question "
+                                                                       "Longhaul can act on",
+                                        "remove it", repair_files([(path, raw)], f"questions/{name}, not a question, "
+                                                                                 "removed")))
+            continue
+        if not relay_ended(q.get("relay_pid")):
+            continue
+        answer = folder / f"{sid}.answer.json"
+        both = [(path, raw)] + ([(answer, repair_raw(answer))] if os.path.lexists(answer) else [])
+        limit = f" at {shown(q['from'], 60)}'s usage limit" if isinstance(q.get("from"), str) and q["from"] else ""
+        found.append(repair_finding(f"question:{sid}", f"Chat {sid[:8]}'s question{limit} waits for an answer, and its "
+                                                       "relay is gone, so no one is left to act on it",
+                                    "remove the question; nothing moves",
+                                    repair_files(both, f"{sid}'s question ({shown(q.get('id'), 40)}) removed: its relay "
+                                                       "was gone")))
+    return found
+
+
+def repair_waits(now: float) -> list:
+    """WAITS' findings: a wait whose relay has ended, one WAIT_STALE past
+    its time, and a file that is not a wait for the chat it is named by."""
+    folder, found = LONGHAUL_HOME / WAITS, []
+    try:
+        paths = sorted(folder.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        raw = repair_raw(path)
+        if raw is None:
+            continue
+        sid, (w, _problem) = path.stem, repair_json(raw)
+        until = as_number(w.get("until")) if isinstance(w, dict) else None
+        account = w.get("account") if isinstance(w, dict) else None
+        if not (re.fullmatch(GUARD_ID, sid) and isinstance(w, dict) and w.get("chat") == sid and until is not None
+                and isinstance(account, str) and account):
+            found.append(repair_finding(f"wait:{shown(sid, 100)}", f"waits/{shown(path.name, 120)} is not a wait "
+                                                                   "Longhaul can act on",
+                                        "remove it", repair_files([(path, raw)], f"waits/{path.name}, not a wait, "
+                                                                                 "removed")))
+            continue
+        on = f"on {shown(account, 60)} at {clock(until)}"
+        if until + WAIT_STALE < now:
+            what, why = f"Chat {sid[:8]}'s carry-on {on} is past, and no relay carried it on", "it was past"
+        elif "relay_pid" in w and relay_ended(w["relay_pid"]):
+            what, why = f"Chat {sid[:8]} waits to carry on {on}, and its relay is gone", "its relay was gone"
+        else:
+            continue
+        found.append(repair_finding(f"wait:{sid}", what, "cancel the wait; nothing is sent",
+                                    repair_files([(path, raw)], f"{sid}'s carry-on {on} cancelled: {why}")))
+    return found
+
+
 def repair_findings(now: float | None = None) -> list:
     """What `longhaul repair` would fix, in the order it fixes them
     (repair_finding()'s). It only reads: no lock taken, no folder made,
@@ -16944,7 +17064,7 @@ def repair_findings(now: float | None = None) -> list:
     raw = repair_raw(LONGHAUL_HOME / "state.json")
     if raw is not None:
         found += repair_state(raw, now)
-    return found
+    return found + repair_waits(now) + repair_questions(now)
 
 
 def repair(opts) -> int:

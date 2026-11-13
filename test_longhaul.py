@@ -18065,8 +18065,10 @@ class PanelKeepWorking(StreamHarness):
         self.answer(q, "wait")
         self.assertTrue(self.wait_for(self.result_for(u))["is_error"], "the limit's answer, from Max")
         self.assertEqual(len(self.calls()), 1)
-        self.assertEqual({k: v for k, v in self.wait_file("waits/sid-c.json").items() if k != "until"},
+        wait = self.wait_file("waits/sid-c.json")
+        self.assertEqual({k: v for k, v in wait.items() if k not in ("until", "relay_pid")},
                          {"chat": "sid-c", "account": "Max", "why": "answered"})
+        self.assertIsInstance(wait["relay_pid"], int, "the relay's own, for `longhaul repair`")
         self.logged("question: sid-c stopped at Max's session limit again; it still carries on on Max at ")
 
     def test_with_no_account_with_room_a_reopen_asks_first_reset_at_once_and_holds_nothing(self):
@@ -18344,7 +18346,8 @@ class KeepWorking(unittest.TestCase):
         self.answer("sid-k", self.question()["id"], "wait")
         r.tend()
         until = int(self.clock.at + 3600 + 60)
-        self.assertEqual(self.waiting(), {"chat": "sid-k", "until": until, "account": "Max", "why": "answered"})
+        self.assertEqual(self.waiting(), {"chat": "sid-k", "until": until, "account": "Max", "why": "answered",
+                                          "relay_pid": os.getpid()})
         self.assertEqual((self.home / "waits" / "sid-k.json").stat().st_mode & 0o777, 0o600)
         self.later(3600 + 30)
         r.tend()
@@ -18423,7 +18426,7 @@ class KeepWorking(unittest.TestCase):
         self.stop(r)
         self.assertIsNone(self.question())
         self.assertEqual(self.waiting(), {"chat": "sid-k", "until": int(self.clock.at + 660), "account": "Pro",
-                                          "why": "auto"})
+                                          "why": "auto", "relay_pid": os.getpid()})
         self.later(660)
         r.tend()
         self.assertEqual([name for name, _ in r.moves], ["Pro"])
@@ -18433,7 +18436,7 @@ class KeepWorking(unittest.TestCase):
         self.stop(r)  # Pro has room
         self.assertIsNone(self.question())
         self.assertEqual(self.waiting(), {"chat": "sid-k", "until": int(self.clock.at + 3660), "account": "Max",
-                                          "why": "never"})
+                                          "why": "never", "relay_pid": os.getpid()})
         self.later(3660)
         r.tend()
         self.assertEqual(self.said(r), [longhaul.CARRY_ON_SAME.format(old="Max", kind="session", new="Max")])
@@ -19215,7 +19218,7 @@ class KeepWorking(unittest.TestCase):
         self.answer("sid-k", self.question()["id"], "wait")
         r.tend()
         self.assertEqual(self.waiting(), {"chat": "sid-k", "until": int(self.clock.at + 3600) + 60, "account": "Max",
-                                          "why": "answered"})
+                                          "why": "answered", "relay_pid": os.getpid()})
         self.assertEqual((self.said(r), r.held, r.moves), (["hello"], None, []), "to this claude: the limit's answer")
         self.later(3660)
         r.tend()
@@ -26242,6 +26245,85 @@ class Repair(unittest.TestCase):
     def test_the_doctor_leaves_out_a_limit_whose_time_has_passed(self):
         self.state(Max=self.now - 60)
         self.assertEqual([f["doctor"] for f in longhaul.repair_findings()], [False])
+
+    def dead_pid(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        return p.pid
+
+    def write(self, rel, data):
+        path = self.home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def question(self, sid, pid):
+        return {"id": "q-0123456789ab", "chat": sid, "relay_pid": pid, "asked_at": int(self.now), "kind": "move",
+                "from": "Max", "limit": "session", "resets_at": int(self.now + 3600), "to": "Pro",
+                "to_resets_at": None, "carries_on_at": int(self.now + 3660), "choices": ["move", "wait"]}
+
+    def test_a_wait_whose_relay_is_gone_or_long_past_is_cancelled(self):
+        dead, until = self.dead_pid(), int(self.now + 3600)
+        gone = self.write("waits/aaaaaaaa-gone.json", {"chat": "aaaaaaaa-gone", "until": until, "account": "Max",
+                                                       "why": "auto", "relay_pid": dead})
+        past = self.write("waits/bbbbbbbb-past.json", {"chat": "bbbbbbbb-past", "until": int(self.now - 601),
+                                                       "account": "Pro", "why": "never"})
+        junk = self.write("waits/cccccccc-junk.json", {"chat": "someone-else", "until": until, "account": "Max"})
+        live = self.write("waits/dddddddd-live.json", {"chat": "dddddddd-live", "until": until, "account": "Max",
+                                                       "why": "auto", "relay_pid": os.getpid()})
+        old = self.write("waits/eeeeeeee-old.json", {"chat": "eeeeeeee-old", "until": until, "account": "Max",
+                                                     "why": "auto"})  # an older relay's, with no pid: its time decides
+        self.assertEqual([(f["id"], f["fixable"]) for f in self.found()],
+                         [("wait:aaaaaaaa-gone", True), ("wait:bbbbbbbb-past", True), ("wait:cccccccc-junk", True)])
+        self.lists_and_changes_nothing(
+            f"Chat aaaaaaaa waits to carry on on Max at {longhaul.clock(until)}, and its relay is gone. Fix: cancel "
+            "the wait; nothing is sent.",
+            "Chat bbbbbbbb's carry-on on Pro at", "is past, and no relay carried it on",
+            "waits/cccccccc-junk.json is not a wait Longhaul can act on. Fix: remove it.")
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p.exists() for p in (gone, past, junk, live, old)], [False, False, False, True, True])
+        log = self.log()
+        self.assertIn("repair: aaaaaaaa-gone's carry-on on Max at", log)
+        self.assertIn("cancelled: its relay was gone", log)
+        self.assertIn("repair: waits/cccccccc-junk.json, not a wait, removed", log)
+        self.assertEqual(log.count("repair: "), 3)
+
+    def test_a_question_whose_relay_is_gone_goes_with_its_answer(self):
+        dead = self.dead_pid()
+        q = self.write("questions/aaaaaaaa-gone.json", self.question("aaaaaaaa-gone", dead))
+        a = self.write("questions/aaaaaaaa-gone.answer.json", {"id": "q-0123456789ab", "choice": "move", "at": 1})
+        lone = self.write("questions/bbbbbbbb-lone.answer.json", {"id": "q-0123456789ab", "choice": "wait", "at": 1})
+        junk = self.write("questions/cccccccc-junk.json", "not json")
+        live = self.write("questions/dddddddd-live.json", self.question("dddddddd-live", os.getpid()))
+        self.assertEqual([f["id"] for f in self.found()],
+                         ["question:aaaaaaaa-gone", "answer:bbbbbbbb-lone", "question:cccccccc-junk"])
+        self.lists_and_changes_nothing(
+            "Chat aaaaaaaa's question at Max's usage limit waits for an answer, and its relay is gone, so no one is "
+            "left to act on it. Fix: remove the question; nothing moves.",
+            "questions/bbbbbbbb-lone.answer.json is an answer to a question that is gone. Fix: remove it.",
+            "questions/cccccccc-junk.json is not a question Longhaul can act on. Fix: remove it.")
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p.exists() for p in (q, a, lone, junk, live)], [False, False, False, False, True])
+        log = self.log()
+        self.assertIn("repair: aaaaaaaa-gone's question (q-0123456789ab) removed: its relay was gone", log)
+        self.assertEqual(log.count("repair: "), 3)
+        self.assertEqual(self.found(), [])
+
+    def test_a_wait_written_again_since_it_was_read_is_left(self):
+        rec = {"chat": "aaaaaaaa-gone", "until": int(self.now + 3600), "account": "Max", "relay_pid": self.dead_pid()}
+        path = self.write("waits/aaaaaaaa-gone.json", rec)
+        [finding] = longhaul.repair_findings()
+        self.write("waits/aaaaaaaa-gone.json", {**rec, "relay_pid": os.getpid()})  # a relay's new carry-on
+        self.assertIn("changed meanwhile, so it was left as it is", finding["do"]())
+        self.assertTrue(path.exists())
+
+    def test_a_wait_whose_relay_runs_is_no_finding(self):
+        # KeepWorking checks that the relay writes its pid in the wait.
+        self.write("waits/aaaaaaaa-live.json", {"chat": "aaaaaaaa-live", "until": int(self.now + 60), "account": "Max",
+                                                "why": "never", "relay_pid": os.getpid()})
+        self.assertEqual(self.found(), [])
 
 
 class Doctor(unittest.TestCase):
