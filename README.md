@@ -226,6 +226,7 @@ To remove it: `longhaul uninstall --dry-run` lists what Longhaul put outside the
 - **A chat stopped because its sign-in failed.** In `/accounts`, open that account and press **Sign in**, or run `longhaul setup NAME --relogin` in a terminal; then send a message.
 - **A pop-up says a question waits, and nothing opened.** Type `/accounts`: the question is at the top.
 - **A chat open twice**, in a terminal and in the panel, writes the same conversation from two places: close one. Longhaul says so when it notices.
+- **Something seems stuck** (a chat that waits for nothing, a question no one can answer, an `accounts.json` that will not read): `longhaul repair --dry-run` lists what is stuck and what each fix does, and changes nothing; `longhaul repair` in a terminal asks before each fix. No need to uninstall to start over. From 0.3.13 on, each change to the account list keeps the last good copy as `~/.longhaul/accounts.json.last-good`, which `repair` can put back.
 - **Anything else:** `/longhaul:doctor`, then the [issue tracker](https://github.com/Noah-OS/longhaul/issues).
 
 ## Know before you use it

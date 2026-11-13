@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "Keep the thread in long Codex chats: Codex saves where it is, and the work picks up after a compaction, a resume or a clear. Shows where the tokens go.",
   "keywords": ["sessions", "usage", "supervisor"],
   "hooks": "./hooks/codex-hooks.json",

@@ -2,9 +2,9 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## Unreleased
+## 0.3.13 - 2026-11-13
 
-A middle step between a stuck state and an uninstall (the UX review of 2026-11-11, 2.4, 4.4 and M2): on 2026-11-10 the only way out of a stuck state was `longhaul uninstall --purge`, which took two weeks of trial records with it.
+A middle step between a stuck state and an uninstall: until now the only sure way out of a stuck state was `longhaul uninstall --purge`, which deletes everything Longhaul kept.
 
 ### Added
 
