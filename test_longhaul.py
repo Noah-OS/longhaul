@@ -26409,6 +26409,34 @@ class Repair(unittest.TestCase):
             self.vscode.write_text(json.dumps({longhaul.VSCODE_WRAPPER_KEY: value} if value else {}))
             self.assertEqual(self.found(), [], value)
 
+    def test_the_doctor_names_repair_where_it_would_fix_something(self):
+        self.assertIsNone(longhaul.doctor_repair(), "nothing stuck: no line")
+        self.state(Max=self.now - 60)
+        self.assertIsNone(longhaul.doctor_repair(), "a limit whose time has passed changes nothing")
+        self.write("waits/aaaaaaaa-gone.json", {"chat": "aaaaaaaa-gone", "until": int(self.now + 3600),
+                                                "account": "Max", "relay_pid": self.dead_pid()})
+        before = self.tree()
+        c = longhaul.doctor_repair()
+        self.assertEqual(self.tree(), before, "the doctor only reads")
+        self.assertEqual(c["mark"], "warn")
+        self.assertIn("1 thing left stuck", c["said"])
+        self.assertEqual([m for m, _, _ in c["items"]], ["warn"])
+        self.assertIn("Chat aaaaaaaa waits to carry on on Max", c["items"][0][1])
+        self.assertTrue(c["step"].startswith("`longhaul repair` in a terminal"), c["step"])
+        self.assertEqual(longhaul.doctor_group({"name": "Stuck records", **c}), "fix")
+        quick = [x["name"] for x in longhaul.doctor_checks(quick=True)]
+        self.assertIn("Stuck records", quick, "quick enough for the first chat's line")
+        # accounts.json and VS Code's wrapper are said on their own lines,
+        # which name repair when it has a fix.
+        (self.home / "accounts.json").write_text("[")
+        self.assertEqual(longhaul.doctor_accounts()["step"], f"fix or remove {longhaul.home_path(str(self.home))}"
+                                                             "/accounts.json", "no good copy: not repair's")
+        (self.home / "accounts.json.last-good").write_text(json.dumps([{"name": "Max"}]))
+        self.assertTrue(longhaul.doctor_accounts()["step"].startswith("`longhaul repair` puts back its last good copy"))
+        self.assertEqual(len(longhaul.doctor_repair()["items"]), 1, "not said twice")
+        self.vscode.write_text(json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(self.tmp / "gone" / "longhaul-vscode")}))
+        self.assertIn("`longhaul repair`", longhaul.doctor_vscode()["step"])
+
     def test_a_wait_whose_relay_runs_is_no_finding(self):
         # KeepWorking checks that the relay writes its pid in the wait.
         self.write("waits/aaaaaaaa-live.json", {"chat": "aaaaaaaa-live", "until": int(self.now + 60), "account": "Max",
@@ -27118,9 +27146,10 @@ class Doctor(unittest.TestCase):
             "Not for you right now": [("✔", "VS Code panel"), ("✔", "Accounts"), ("⚠", "Code maps"), ("✔", "Codex")]})
         self.assertEqual(lines[-1], f"Next: {longhaul.doctor_plugin()['step']}", "the step to fix comes first")
         self.assertEqual(sorted(self.home.rglob("*")), before, "nothing written")
-        # Each check, in exactly one group, whatever its result.
+        # Each check, in exactly one group, whatever its result; Stuck records
+        # has a line only when `longhaul repair` would fix something (Repair).
         names = [n for members in self.groups(lines).values() for _, n in members]
-        self.assertEqual(sorted(names), sorted(name for name, _ in longhaul.DOCTOR_CHECKS))
+        self.assertEqual(sorted(names), sorted(name for name, _ in longhaul.DOCTOR_CHECKS if name != "Stuck records"))
         # With the plugin installed, nothing is to fix; the first extra's step ends it,
         # and the terminal command's setup line is printed alone, to be copied whole.
         self.installed()

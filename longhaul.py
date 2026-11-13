@@ -17468,7 +17468,7 @@ DOCTOR_RANK = {"ok": 0, "warn": 1, "bad": 2}
 # call time, so a test can stand in for one.
 DOCTOR_CHECKS = (("Plugin", "doctor_plugin"), ("Terminal command", "doctor_command"), ("Claude Code", "doctor_claude"),
                  ("Updates", "doctor_updates"), ("Status line", "doctor_statusline"),
-                 ("VS Code panel", "doctor_vscode"), ("Accounts", "doctor_accounts"),
+                 ("VS Code panel", "doctor_vscode"), ("Accounts", "doctor_accounts"), ("Stuck records", "doctor_repair"),
                  ("Chats running now", "doctor_chats"), ("Code maps", "doctor_maps"), ("Features", "doctor_features"),
                  ("Hooks", "doctor_hooks"), ("Codex", "doctor_codex"))
 DOCTOR_UPDATE = "`claude plugin marketplace update longhaul`, then `claude plugin update longhaul@longhaul`"
@@ -17809,7 +17809,7 @@ def doctor_vscode() -> dict:
     path = doctor_expand(value)
     if not (os.path.isfile(path) and os.access(path, os.X_OK)):
         return doctor_result(f"points at {home_path(path)}, which is not there", mark="bad",
-                             step="`longhaul vscode on`, then reload VS Code")
+                             step="`longhaul repair` or `longhaul vscode on`, then reload VS Code")
     if doctor_in_plugins(path):
         return doctor_result(f"points into the plugin's own copy ({home_path(path)}), which moves at every update",
                              mark="warn", step="`longhaul vscode on` from the terminal command")
@@ -17843,7 +17843,10 @@ def doctor_accounts(quick: bool = False) -> dict:
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
     if problem:
-        return doctor_result(unreadable_text(problem), mark="bad", step=f"fix or remove {where}")
+        back = any(f["fixable"] for f in repair_accounts())  # a last good copy to put back
+        return doctor_result(unreadable_text(problem), mark="bad",
+                             step=f"`longhaul repair` puts back its last good copy, or fix or remove {where}" if back
+                             else f"fix or remove {where}")
     if not accounts:
         return doctor_result("one subscription, on ~/.claude (no accounts.json); `longhaul add` adds another",
                              kind="skip")
@@ -17886,6 +17889,22 @@ def doctor_accounts(quick: bool = False) -> dict:
         items.append((None, f"left over, used by no account: {', '.join(left)}; delete {them} by hand if nothing else "
                             f"uses {them}", None))
     return doctor_result(plural(len(accounts), "account") + f" in {where}", items)
+
+
+def doctor_repair():
+    """What `longhaul repair` would fix in Longhaul's records, each an item,
+    with repair as the step (the UX review of 2026-11-11, 4.4); None, and
+    no line, when there is nothing. accounts.json and VS Code's wrapper are
+    said on their own lines, and a limit whose time has passed changes
+    nothing, so none of them is here. Small files and a signal 0 to a pid:
+    quick, and it only reads."""
+    found = [f for f in repair_findings() if f["doctor"] and f["id"] not in ("accounts", "vscode")]
+    if not found:
+        return None
+    return doctor_result(f"{plural(len(found), 'thing')} left stuck, which no running part of Longhaul will clear",
+                         [("warn", f["what"], None) for f in found], mark="warn",
+                         step="`longhaul repair` in a terminal: it asks before each fix (`longhaul repair --dry-run` "
+                              "only lists)")
 
 
 def doctor_leftovers(accounts: list) -> list:
