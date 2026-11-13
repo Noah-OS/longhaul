@@ -802,8 +802,9 @@ def unreadable_text(problem: str) -> str:
     return f"accounts.json is not readable: {problem}; fix or remove it"
 
 
-def read_accounts_file(home: Path | None = None):
-    """accounts.json (LONGHAUL_HOME's, or `home`'s): (the accounts, None);
+def read_accounts_file(home: Path | None = None, name: str = "accounts.json"):
+    """accounts.json (LONGHAUL_HOME's, or `home`'s; or its file `name`, the
+    last good copy, read by the same rules): (the accounts, None);
     ([], None) when there is no file, which is no accounts, as an empty
     list is; or (None, why) when there is a file that is not a list of
     accounts with names (not JSON, not UTF-8, a half-written file, a lone
@@ -811,7 +812,7 @@ def read_accounts_file(home: Path | None = None):
     for "no accounts", said Ready and exited 0, and add would have written
     a one-account list over it (review, Sprint 5)."""
     try:
-        found = json.loads(((home or LONGHAUL_HOME) / "accounts.json").read_text())
+        found = json.loads(((home or LONGHAUL_HOME) / name).read_text())
     except FileNotFoundError:
         return [], None
     except OSError as e:
@@ -824,6 +825,21 @@ def read_accounts_file(home: Path | None = None):
             and all(isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"] for a in found)):
         return None, "not a list of accounts, each with a name"
     return found, None
+
+
+ACCOUNTS_LAST_GOOD = "accounts.json.last-good"  # under LONGHAUL_HOME: the list as Longhaul last wrote it
+
+
+def write_accounts(accounts: list) -> None:
+    """accounts.json written whole, under the caller's "accounts" lock, then
+    the same list kept as ACCOUNTS_LAST_GOOD, for `longhaul repair` to put
+    back when a hand edit breaks the file (the UX review of 2026-11-11,
+    2.4). A copy that cannot be written is logged; the list stands."""
+    write_json(LONGHAUL_HOME / "accounts.json", accounts)
+    try:
+        write_json(LONGHAUL_HOME / ACCOUNTS_LAST_GOOD, accounts)
+    except OSError as e:
+        log(f"accounts: the last good copy was not kept: {e.strerror or e}")
 
 
 def config_of(acct: dict) -> Path:
@@ -15443,7 +15459,7 @@ def add(opts) -> int:
         if getattr(opts, "fallback", False):  # as `longhaul fallback NAME on` marks it (2026-11-06)
             entry["fallback"] = True
         accounts.append(entry)
-        write_json(LONGHAUL_HOME / "accounts.json", accounts)
+        write_accounts(accounts)
     only = f", only in {', '.join(home_path(os.path.expanduser(r)) for r in repos)}" if repos else ""
     if is_fallback(entry):
         only += f", as a fallback ({FALLBACK_RULE.format(where='there')})"
@@ -15848,7 +15864,7 @@ def remove(opts) -> int:
         if len(accounts) == 1:
             say("that is the only account; longhaul needs at least one")
             return 2
-        write_json(LONGHAUL_HOME / "accounts.json", [a for a in accounts if a not in gone])
+        write_accounts([a for a in accounts if a not in gone])
     forget_auth(gone[0])
     forget_removed(gone[0]["name"])
     say(f"removed {gone[0]['name']} from longhaul's accounts. Its folder {config_of(gone[0])} and its sign-in are kept; "
@@ -16003,7 +16019,7 @@ def remove_with_folder(name: str, assume_yes: bool) -> int:
         why = delete_refusal(acct, fresh) or (chats_refusal(acct) if there and not assume_yes else None)
         if why:
             return refuse_delete(acct, why)
-        write_json(LONGHAUL_HOME / "accounts.json", [a for a in fresh if a != acct])
+        write_accounts([a for a in fresh if a != acct])
     log(f"remove: {name} taken off the list")
     forget_auth(acct)
     forget_removed(name)
@@ -16290,7 +16306,7 @@ def folders(opts) -> int:
                 return 2
         if changes:
             accounts[accounts.index(acct)] = entry
-            write_json(LONGHAUL_HOME / "accounts.json", accounts)
+            write_accounts(accounts)
         else:
             entry = acct
     for line in changes:
@@ -16349,7 +16365,7 @@ def fallback_cmd(opts) -> int:
             note = f"{name} is a fallback already" if on else f"{name} is a normal account already"
         if change:
             accounts[accounts.index(acct)] = entry
-            write_json(LONGHAUL_HOME / "accounts.json", accounts)
+            write_accounts(accounts)
     if change:
         say(change)
     else:
@@ -16864,6 +16880,10 @@ def clear(opts) -> int:
 #   account no longer on the list (take_choice() drops it at the chat's
 #   next open). A choice for a chat that is closed now is none of it: it
 #   waits for that chat's next open, by design.
+# - accounts.json that cannot be read (read_accounts_file(): a JSON error
+#   with its line and column), put back from ACCOUNTS_LAST_GOOD, which each
+#   write of the list keeps (write_accounts()), the broken file kept beside
+#   it as accounts.json.broken; with no good copy, the fix is the user's.
 # Longhaul's lock files are none of it: each is an flock, which the OS lets
 # go of when its process ends, however it ends (locked(), hold()), so none
 # is ever stale. Nor is a recorded limit that a reply has lifted: the reply
@@ -17093,12 +17113,49 @@ def repair_uses(now: float) -> list:
     return found
 
 
+def repair_accounts() -> list:
+    """accounts.json's finding, when it cannot be read: put back from the
+    last good copy when that reads as a list of accounts, else for the
+    user to fix."""
+    path, copy = LONGHAUL_HOME / "accounts.json", LONGHAUL_HOME / ACCOUNTS_LAST_GOOD
+    accounts, problem = read_accounts_file()
+    if not problem:
+        return []
+    raw, good = repair_raw(path), repair_raw(copy)
+    kept, kept_problem = read_accounts_file(name=ACCOUNTS_LAST_GOOD) if good is not None else (None, "none")
+    what = f"accounts.json is not readable: {problem}; Longhaul refuses to run chats on your accounts until it is fixed"
+    if kept_problem or not kept:
+        where = " at that line and column" if " at line " in problem else ""
+        return [repair_finding("accounts", what, f"none here, as there is no good copy to put back: fix it by hand{where}, "
+                                                 "or remove it")]
+    try:
+        when = f"from {clock(copy.stat().st_mtime)}, "
+    except OSError:
+        when = ""
+
+    def put_back():
+        with locked("accounts"):
+            if repair_raw(path) != raw or repair_raw(copy) != good:
+                return "accounts.json changed meanwhile, so it was left as it is"
+            try:
+                if raw is not None:
+                    write_whole(path.with_name("accounts.json.broken"), raw)
+                write_whole(path, good)
+            except OSError as e:
+                return f"accounts.json could not be written ({e.strerror or e})"
+        log(f"repair: accounts.json ({problem}) put back from its last good copy ({plural(len(kept), 'account')}); "
+            "the broken one is kept as accounts.json.broken")
+        return None
+    return [repair_finding("accounts", what, f"put back the last good copy ({when}{plural(len(kept), 'account')}); the "
+                                             "broken file is kept as accounts.json.broken", put_back)]
+
+
 def repair_findings(now: float | None = None) -> list:
     """What `longhaul repair` would fix, in the order it fixes them
     (repair_finding()'s). It only reads: no lock taken, no folder made,
     nothing logged."""
     now = time.time() if now is None else now
-    found = []
+    found = repair_accounts()
     raw = repair_raw(LONGHAUL_HOME / "state.json")
     if raw is not None:
         found += repair_state(raw, now)

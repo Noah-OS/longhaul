@@ -26349,6 +26349,45 @@ class Repair(unittest.TestCase):
         (self.home / "accounts.json").write_text("[")
         self.assertNotIn("use:bbbbbbbb-gone", [f["id"] for f in self.found()])
 
+    def test_a_broken_accounts_json_says_its_line_and_column_and_with_no_good_copy_is_the_users_to_fix(self):
+        (self.home / "accounts.json").write_text('[\n  {"name": "Max"},\n  {"name": "Pro"}\n  {"name": "Team"}\n]\n')
+        self.lists_and_changes_nothing(
+            "accounts.json is not readable: not JSON (Expecting ',' delimiter at line 4 column 3); Longhaul refuses "
+            "to run chats on your accounts until it is fixed. Fix: none here, as there is no good copy to put back: "
+            "fix it by hand at that line and column, or remove it.")
+        self.assertEqual([(f["id"], f["fixable"]) for f in self.found()], [("accounts", False)])
+        before = self.tree()
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 1, "something is left to fix")
+        self.assertIn("1: no fix here; none here", out)
+        self.assertEqual(self.tree(), before)
+
+    def test_each_write_of_the_list_keeps_a_good_copy_which_repair_puts_back(self):
+        listed = [{"name": "Max", "config_dir": str(self.claude)}, {"name": "Pro", "config_dir": str(self.user / "p")}]
+        (self.home / "accounts.json").write_text(json.dumps(listed))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.main(["fallback", "Pro", "on"]), 0)
+        good = (self.home / "accounts.json").read_text()
+        self.assertEqual((self.home / "accounts.json.last-good").read_text(), good, "kept at the write")
+        self.assertEqual((self.home / "accounts.json.last-good").stat().st_mode & 0o777, 0o600)
+        broken = good.replace('"Pro"', '"Pro",', 1)
+        (self.home / "accounts.json").write_text(broken)
+        self.lists_and_changes_nothing("accounts.json is not readable: not JSON (",
+                                       "Fix: put back the last good copy (from ", "2 accounts); the broken file is "
+                                       "kept as accounts.json.broken.")
+        code, out = self.run_cli(terminal=True, answers="y\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.home / "accounts.json").read_text(), good)
+        self.assertEqual((self.home / "accounts.json.broken").read_text(), broken, "the hand edit is not lost")
+        self.assertIn("repair: accounts.json (not JSON (", self.log())
+        self.assertIn("put back from its last good copy (2 accounts)", self.log())
+        self.assertEqual(longhaul.read_accounts_file()[1], None)
+        self.assertEqual(self.found(), [])
+        # A copy that does not read as a list of accounts is none to put back.
+        (self.home / "accounts.json").write_text("{}")
+        (self.home / "accounts.json.last-good").write_text("[")
+        self.assertEqual([(f["id"], f["fixable"]) for f in self.found()], [("accounts", False)])
+
     def test_a_wait_whose_relay_runs_is_no_finding(self):
         # KeepWorking checks that the relay writes its pid in the wait.
         self.write("waits/aaaaaaaa-live.json", {"chat": "aaaaaaaa-live", "until": int(self.now + 60), "account": "Max",
