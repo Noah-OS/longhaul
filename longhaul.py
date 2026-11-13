@@ -16832,6 +16832,175 @@ def clear(opts) -> int:
     return 0
 
 
+# --------------------------------------------------------------- repair
+#
+# `longhaul repair [--dry-run] [--yes] [--json]` (the UX review of
+# 2026-11-11, 2.4, 4.4 and M2): on 2026-11-10 the owner, with a stuck state
+# and no middle step, ran `longhaul uninstall --purge`, and a two-week
+# trial's records went with it. Repair is that middle step. It looks
+# through Longhaul's own records, reading only (repair_findings()), says
+# each thing wrong in one line with what its fix does, then makes each fix
+# after a yes in a terminal; --yes makes them all, and --dry-run, --json,
+# or no terminal without --yes make none and write nothing, the log
+# included. Each fix made writes one log line and changes only what is in
+# LONGHAUL_HOME. It judges nothing new: what it finds is what the code
+# already takes for stuck or broken.
+# - A recorded limit (state.json) that is not a time, which the launch
+#   paths cannot compare, or whose time has passed: every reader takes that
+#   for no limit already (clear, forget_limit(), the status), so it is only
+#   tidied, and the doctor leaves it out. A state.json that is not an
+#   object (load_state()'s empty stand-in).
+# Longhaul's lock files are none of it: each is an flock, which the OS lets
+# go of when its process ends, however it ends (locked(), hold()), so none
+# is ever stale. Nor is a recorded limit that a reply has lifted: the reply
+# is known only to the relay of the chat it came in, which forgets the
+# limit itself (Relay.lifted_by_reply()); nothing on disk says when a limit
+# was recorded, to tell a reply after it from one before.
+
+def repair_raw(path: Path):
+    """The bytes at `path`, or None when there are none to read."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def repair_json(raw: bytes):
+    """(the value, None) for JSON bytes, or (None, what is wrong): the kind
+    of problem, with a JSON error's line and column, never the text."""
+    try:
+        return json.loads(raw), None
+    except UnicodeDecodeError:
+        return None, "not UTF-8 text"
+    except json.JSONDecodeError as e:
+        return None, f"not JSON ({e.msg} at line {e.lineno} column {e.colno})"
+    except (ValueError, RecursionError):
+        return None, "not JSON"
+
+
+def repair_finding(fid: str, what: str, fix: str, do=None, doctor: bool = True) -> dict:
+    """One thing to repair: its id, what is wrong and what the fix does, in
+    plain words; `do`, the fix, which returns why it could not be made, or
+    None once made and logged (fixable when there is one); `doctor`, False
+    for one the doctor leaves out (it changes nothing Longhaul does)."""
+    return {"id": fid, "what": what, "fix": fix, "fixable": do is not None, "do": do, "doctor": doctor}
+
+
+def repair_state(raw: bytes, now: float) -> list:
+    """state.json's findings (its bytes, `raw`): the file itself when it is
+    not an object, or its limited_until is not one; else each recorded
+    limit that is not a time, or whose time has passed."""
+    path = LONGHAUL_HOME / "state.json"
+    state, problem = repair_json(raw)
+    if problem or not isinstance(state, dict) or not isinstance(state.get("limited_until", {}), dict):
+        why = problem or ("not an object" if not isinstance(state, dict) else "its limited_until is not an object")
+
+        def fresh():
+            with locked("state"):
+                if repair_raw(path) != raw:
+                    return "state.json changed meanwhile, so it was left as it is"
+                write_json(path, {**state, "limited_until": {}} if isinstance(state, dict) else {"limited_until": {}})
+            log(f"repair: state.json ({why}) replaced by one with no limit recorded")
+            return None
+        return [repair_finding("state", f"state.json, where Longhaul records the usage limits, is not readable "
+                                        f"({why}), so Longhaul takes it for no limit recorded",
+                               "write it again with no limit recorded, as Longhaul reads it now", fresh)]
+    found = []
+    for name, until in state.get("limited_until", {}).items():
+        number = as_number(until)
+        if number is not None and number > now:
+            continue
+
+        def forget(name=name, until=until, number=number):
+            gone = []
+
+            def drop(state):
+                if name in state["limited_until"] and state["limited_until"][name] == until:
+                    del state["limited_until"][name]
+                    gone.append(name)
+            update_state(drop)
+            if not gone:
+                return f"{name}'s recorded limit changed meanwhile, so it was left as it is"
+            log(f"repair: {name}'s recorded limit forgotten "
+                + (f"(it was until {clock(number)}, which had passed)" if number is not None else "(it was not a time)"))
+            return None
+        if number is None:
+            found.append(repair_finding(f"limit:{name}", f"{name}: its recorded usage limit in state.json is not a time, "
+                                                         "which stops Longhaul deciding where a chat runs",
+                                        "forget it", forget))
+        else:
+            found.append(repair_finding(f"limit:{name}", f"{name}: a usage limit is still recorded until "
+                                                         f"{clock(number)}, which has passed",
+                                        "forget the old record; nothing waits for it", forget, doctor=False))
+    return found
+
+
+def repair_findings(now: float | None = None) -> list:
+    """What `longhaul repair` would fix, in the order it fixes them
+    (repair_finding()'s). It only reads: no lock taken, no folder made,
+    nothing logged."""
+    now = time.time() if now is None else now
+    found = []
+    raw = repair_raw(LONGHAUL_HOME / "state.json")
+    if raw is not None:
+        found += repair_state(raw, now)
+    return found
+
+
+def repair(opts) -> int:
+    """`longhaul repair [--dry-run] [--yes] [--json]`: what is stuck or
+    broken in Longhaul's records (repair_findings()), one line each with
+    what its fix does, numbered; then, in a terminal, each fix after its
+    own yes, or every fix with --yes. --dry-run lists them and changes
+    nothing; so does a run with no terminal and no --yes, which says how to
+    fix them. --json prints them alone, as [{"id", "what", "fix",
+    "fixable"}], for a later pane button, and changes nothing. With none:
+    "Nothing to repair.", exit 0. Exit 1 when a fix that was to be made
+    could not be, or a finding has no fix here; else 0."""
+    found = repair_findings()
+    if opts.json:
+        rows = [{key: f[key] for key in ("id", "what", "fix", "fixable")} for f in found]
+        try:
+            print(json.dumps(rows, ensure_ascii=False))
+        except UnicodeEncodeError:  # a stdout that cannot take a name's letters: the same rows, escaped
+            print(json.dumps(rows))
+        return 0
+    if not found:
+        print("Nothing to repair.")
+        return 0
+    asks = not opts.dry_run and not opts.yes and terminal()
+    print(f"{plural(len(found), 'thing')} to repair:")
+    for i, f in enumerate(found, 1):
+        print(f"  {i}. {f['what']}. Fix: {f['fix']}.")
+    if opts.dry_run or not (opts.yes or asks):
+        print("Nothing changed: --dry-run only lists." if opts.dry_run else
+              "Nothing changed: `longhaul repair` asks before each fix, in a terminal; run it in one, or add --yes "
+              "to make every fix (--dry-run only lists).")
+        return 0
+    left = 0
+    for i, f in enumerate(found, 1):
+        if not f["fixable"]:
+            print(f"  {i}: no fix here; {f['fix']}.")
+            left += 1
+            continue
+        if asks:
+            try:
+                agreed = yes(f"Fix {i}?")
+            except (EOFError, KeyboardInterrupt):
+                print("\nStopped: the rest is left as it is.")
+                return 1 if left else 0
+            if not agreed:
+                print(f"  {i}: left as it is.")
+                continue
+        why = f["do"]()
+        if why:
+            print(f"  {i}: not fixed: {why}.")
+            left += 1
+        else:
+            print(f"  {i}: fixed.")
+    return 1 if left else 0
+
+
 # --------------------------------------------------------------- uninstall
 #
 # `longhaul uninstall` (Sprint 11, I7; the install report's item 5): what
@@ -18740,7 +18909,7 @@ def main(argv: list[str]) -> int:
                             "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow", "switch", "answer", "use"):
+                            "models-hook", "allow", "switch", "answer", "use", "repair"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -18870,6 +19039,11 @@ def main(argv: list[str]) -> int:
                            help="remove Longhaul's own records too (LONGHAUL_HOME, ~/.longhaul): the accounts "
                                 "list, the ledger, the log, the checkpoints")
             p.add_argument("--yes", action="store_true", help="remove them without asking (needed without a terminal)")
+        if cmd == "repair":
+            p.add_argument("--dry-run", action="store_true", help="list what is stuck or broken, and change nothing")
+            p.add_argument("--yes", action="store_true", help="make every fix without asking (needed without a terminal)")
+            p.add_argument("--json", action="store_true",
+                           help="the findings alone, as JSON: [{id, what, fix, fixable}]; it changes nothing")
         if cmd == "statusline":
             p.add_argument("action", nargs="?", choices=["install", "uninstall"],
                            help="install: Claude Code's status line set to Longhaul's in settings.json, a copy of "
@@ -18901,7 +19075,7 @@ def main(argv: list[str]) -> int:
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
-                "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd}[cmd](opts)
+                "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd, "repair": repair}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

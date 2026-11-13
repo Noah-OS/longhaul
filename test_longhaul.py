@@ -26095,6 +26095,155 @@ class Uninstall(unittest.TestCase):
         self.assertTrue("longhaul uninstall [--dry-run] [--purge] [--yes]" in longhaul.__doc__)
 
 
+class Repair(unittest.TestCase):
+    """`longhaul repair [--dry-run] [--yes] [--json]` (the UX review of
+    2026-11-11, 2.4, 4.4 and M2): what is stuck or broken in Longhaul's
+    records, one line each with what its fix does, then each fix after a
+    yes in a terminal (--yes: all of them). --dry-run, --json, and no
+    terminal without --yes change nothing, the log included. Every path is
+    scratch: HOME, Longhaul's home, Claude Code's folder and VS Code's
+    settings."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.claude, self.vscode = self.user / ".claude", self.user / "vscode" / "settings.json"
+        for folder in (self.claude, self.home, self.vscode.parent):
+            folder.mkdir(parents=True)
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "DEFAULT_CONFIG": self.claude,
+                            "VSCODE_SETTINGS": self.vscode, "USAGE_DIR": self.home / "usage"}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"LONGHAUL_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = time.time()
+
+    def run_cli(self, *args, terminal=False, answers=""):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(answers)), \
+                mock.patch.dict(os.environ, {"LONGHAUL_TEST_TTY": "1" if terminal else "0"}):
+            code = longhaul.main(["repair", *args])
+        return code, out.getvalue()
+
+    def tree(self):
+        """Every path under the scratch folder, with what it is and holds."""
+        found = {}
+        for root, dirs, files in os.walk(self.tmp):
+            for name in dirs + files:
+                p = Path(root) / name
+                st = os.lstat(p)
+                found[str(p.relative_to(self.tmp))] = (st.st_mode, st.st_mtime_ns, os.readlink(p) if p.is_symlink()
+                                                       else p.read_bytes() if p.is_file() else None)
+        return found
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def found(self):
+        code, out = self.run_cli("--json")
+        self.assertEqual(code, 0, out)
+        return json.loads(out)
+
+    def lists_and_changes_nothing(self, *said):
+        """--dry-run, and a run with no terminal and no --yes, each name
+        `said` and write nothing, the log included; --json too."""
+        before = self.tree()
+        for args in (("--dry-run",), (), ("--json",), ("--dry-run", "--yes")):
+            with self.subTest(args=args):
+                code, out = self.run_cli(*args)
+                self.assertEqual(code, 0, out)
+                for words in said if "--json" not in args else ():
+                    self.assertIn(words, out, args)
+                self.assertEqual(self.tree(), before, f"{args}: nothing written, not even the log")
+        code, out = self.run_cli("--dry-run")
+        self.assertIn("Nothing changed: --dry-run only lists.", out)
+        code, out = self.run_cli()
+        self.assertIn("asks before each fix, in a terminal", out)
+        return out
+
+    def state(self, **limited):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": limited}))
+
+    # ---------------------------------------------------------- the tests
+
+    def test_a_healthy_home_has_nothing_to_repair(self):
+        self.state(Max=self.now + 3600)  # a limit in force is no finding
+        for args in ((), ("--dry-run",), ("--yes",)):
+            code, out = self.run_cli(*args, terminal=True)
+            self.assertEqual((code, out), (0, "Nothing to repair.\n"), args)
+        self.assertEqual(self.found(), [])
+        shutil.rmtree(self.home)
+        self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
+        self.assertFalse(self.home.exists(), "no home made")
+
+    def test_each_finding_is_one_line_saying_what_is_wrong_and_what_the_fix_does(self):
+        self.state(Max=self.now - 60, Pro="soon")
+        found = self.found()
+        self.assertEqual([sorted(f) for f in found], [["fix", "fixable", "id", "what"]] * 2)
+        self.assertEqual([(f["id"], f["fixable"]) for f in found], [("limit:Max", True), ("limit:Pro", True)])
+        self.lists_and_changes_nothing("2 things to repair:", "1. Max: a usage limit is still recorded until",
+                                             "which has passed. Fix: forget the old record",
+                                             "2. Pro: its recorded usage limit in state.json is not a time")
+
+    def test_yes_fixes_each_and_logs_one_line_for_each(self):
+        self.state(Max=self.now - 60, Pro="soon", Team=self.now + 3600)
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1: fixed.", out)
+        self.assertIn("2: fixed.", out)
+        self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {"Team": self.now + 3600},
+                         "the limit in force is kept")
+        log = self.log()
+        self.assertEqual(log.count("repair: "), 2, log)
+        self.assertIn("repair: Max's recorded limit forgotten (it was until", log)
+        self.assertIn("repair: Pro's recorded limit forgotten (it was not a time)", log)
+        self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
+
+    def test_in_a_terminal_each_fix_asks_and_a_no_leaves_it(self):
+        self.state(Max=self.now - 60, Pro="soon")
+        code, out = self.run_cli(terminal=True, answers="n\ny\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Fix 1? [y/N]", out)
+        self.assertIn("1: left as it is.", out)
+        self.assertIn("2: fixed.", out)
+        self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {"Max": self.now - 60})
+        self.assertEqual(self.log().count("repair: "), 1)
+        # The input's end stops it: nothing more is fixed.
+        code, out = self.run_cli(terminal=True, answers="")
+        self.assertIn("Stopped: the rest is left as it is.", out)
+        self.assertEqual([f["id"] for f in self.found()], ["limit:Max"])
+
+    def test_a_limit_recorded_meanwhile_is_not_forgotten(self):
+        self.state(Max=self.now - 60)
+        [finding] = longhaul.repair_findings()
+        self.state(Max=self.now + 3600)  # a chat met the limit again since
+        self.assertIn("changed meanwhile", finding["do"]())
+        self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {"Max": self.now + 3600})
+
+    def test_a_state_json_that_is_not_an_object_is_written_again_with_no_limit(self):
+        for text, why in (("[1, 2", "not JSON (Expecting ',' delimiter at line 1 column 6)"), ("[]", "not an object"),
+                          ('{"limited_until": [], "x": 1}', "its limited_until is not an object")):
+            with self.subTest(text=text):
+                (self.home / "state.json").write_text(text)
+                self.lists_and_changes_nothing(f"state.json, where Longhaul records the usage limits, is not readable "
+                                               f"({why})")
+                self.assertEqual([(f["id"], f["fixable"]) for f in self.found()], [("state", True)])
+                code, out = self.run_cli("--yes")
+                self.assertEqual(code, 0, out)
+                state = json.loads((self.home / "state.json").read_text())
+                self.assertEqual(state["limited_until"], {})
+                self.assertEqual(state.get("x"), 1 if "x" in text else None, "the rest of an object kept")
+                self.assertIn(f"repair: state.json ({why}) replaced", self.log())
+                self.assertEqual(self.found(), [])
+
+    def test_the_doctor_leaves_out_a_limit_whose_time_has_passed(self):
+        self.state(Max=self.now - 60)
+        self.assertEqual([f["doctor"] for f in longhaul.repair_findings()], [False])
+
+
 class Doctor(unittest.TestCase):
     """`longhaul doctor` and /longhaul:doctor (the owner's decision of
     2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
