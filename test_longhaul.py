@@ -12080,6 +12080,9 @@ class Shim(unittest.TestCase):
             ("uninstall", "`uninstall --dry-run [--purge]` or `uninstall --yes [--purge]`"): (
                 ("uninstall",), ("uninstall", "--purge"), ("uninstall", "--purge", "--yes"),
                 ("uninstall", "--dry-run", "--yes"), ("uninstall", "--yes", "--purge", "x"), ("uninstall", "-h")),
+            ("repair", "`repair --dry-run` or `repair --json`"): (
+                ("repair",), ("repair", "--yes"), ("repair", "--dry-run", "--yes"), ("repair", "--json", "--yes"),
+                ("repair", "--dry-run", "x"), ("repair", "-h")),
         }
         for (command, forms), cases in refused.items():
             for args in cases:
@@ -12114,9 +12117,33 @@ class Shim(unittest.TestCase):
             self.assertNotIn("Traceback", out.stderr, args)
             self.assertIn(said, out.stdout + out.stderr, args)
         for runs in ("add NAME EMAIL", "setup NAME", "remove", "models", "switch", "vscode", "statusline install",
-                     "update", "clear", "uninstall"):
+                     "update", "clear", "uninstall", "repair --dry-run|--json"):
             self.assertIn(runs, self.shim().stderr, "the refusal names what does run")
             self.assertIn(runs, self.shim("nope").stderr)
+
+    def test_from_a_chat_repair_lists_and_changes_nothing_and_fixes_only_in_a_terminal(self):
+        home = self.tmp / "home"
+        out = self.chat("repair", "--dry-run")
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "Nothing to repair.\n", ""))
+        self.assertFalse(home.exists(), "nothing was written")
+        (home / "waits").mkdir(parents=True)
+        (home / "waits" / "aaaaaaaa-old.json").write_text(json.dumps({"chat": "aaaaaaaa-old", "until": 1, "account": "Max"}))
+        before = sorted(p.name for p in home.rglob("*"))
+        for args in (("repair", "--dry-run"), ("repair", "--json"), ("repair", "--json", "--dry-run")):
+            out = self.chat(*args)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), args)
+            self.assertIn("aaaaaaaa", out.stdout, args)
+        self.assertEqual([f["id"] for f in json.loads(self.chat("repair", "--json").stdout)], ["wait:aaaaaaaa-old"])
+        out = self.chat("repair", "--yes")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("a repair that fixes asks before each fix, in a terminal", out.stderr)
+        self.assertEqual(sorted(p.name for p in home.rglob("*")), before, "nothing changed, the log included")
+        # The terminal command (longhaul.py itself, never the shim) fixes.
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "repair", "--yes"], capture_output=True,
+                             text=True, env=self.env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("1: fixed.", out.stdout)
+        self.assertFalse((home / "waits" / "aaaaaaaa-old.json").exists())
 
     def test_from_a_chat_the_account_commands_sign_in_through_the_browser_and_write_the_list(self):
         # add NAME EMAIL and setup NAME --relogin run the browser sign-in
@@ -13137,7 +13164,7 @@ class ManageSkill(unittest.TestCase):
 
     ROOT = "${CLAUDE_PLUGIN_ROOT}/bin/longhaul"
     # The forms that only read: the only ones the skill's rule may approve by itself.
-    READS = ("status", "switch", "models", "update status", "uninstall --dry-run")
+    READS = ("status", "switch", "models", "update status", "uninstall --dry-run", "repair --dry-run")
 
     def skill(self):
         text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
@@ -13193,8 +13220,9 @@ class ManageSkill(unittest.TestCase):
                        "switch MODE", "models", "models MODE", "models cap MODEL", "models TYPE MODEL", "vscode on --yes",
                        "vscode off", "statusline install --yes", "statusline uninstall", "update status",
                        "update on --yes", "update off --yes", "clear", "uninstall --dry-run", "uninstall --dry-run --purge",
-                       "uninstall --yes", "uninstall --yes --purge"):
+                       "uninstall --yes", "uninstall --yes --purge", "repair --dry-run"):
             self.assertIn(action, named)
+        self.assertIn("run `longhaul repair` in a terminal, which asks before each fix", flat)
         self.assertNotIn("bin/longhaul trial", body)
         self.assertNotIn("record-probe", " ".join(" ".join(w) for w in self.commands(body)))
 

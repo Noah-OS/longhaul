@@ -29,7 +29,11 @@
 # options --prefer and --no-prefer. `remove NAME --delete-folder` does
 # not run from here (the lead, 2026-11-12: a deletion that cannot be
 # undone takes the user's own hand, in a terminal or on the /accounts
-# button, never a chat's --yes). A user of the VS Code panel may have no terminal open, and
+# button, never a chat's --yes). `repair --dry-run` and `repair --json`
+# list what is stuck and change nothing; a repair that fixes runs only in
+# a terminal, where it asks before each fix (the lead, 2026-11-13: the
+# fixes are the user's middle step before an uninstall, each on its own
+# yes). A user of the VS Code panel may have no terminal open, and
 # the /longhaul:manage skill shows each command and what it changes and
 # runs it only after the user's yes in the chat (the panel can approve
 # Bash by itself, so Claude Code's own prompt is not enough); where a
@@ -55,7 +59,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes and -h"
+runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes, repair --dry-run|--json and -h"
 # A setup command, $1, in a form its case does not allow: the forms that
 # do run, $2, and why the rest does not, $3, when that needs saying.
 only() {
@@ -153,6 +157,10 @@ case "$1" in
     # Bare, uninstall asks in a terminal before it removes anything.
     case "$#:$2:$3" in 2:--dry-run:|3:--dry-run:--purge|2:--yes:|3:--yes:--purge) exec python3 "$here/longhaul.py" "$@" ;; esac
     only uninstall "\`uninstall --dry-run [--purge]\` or \`uninstall --yes [--purge]\`" "bare \`uninstall\` asks first in a terminal" ;;
+  repair)
+    # Listing only: the fixes ask one by one, in a terminal.
+    case "$#:$2:$3" in 2:--dry-run:|2:--json:|3:--dry-run:--json|3:--json:--dry-run) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only repair "\`repair --dry-run\` or \`repair --json\`" "a repair that fixes asks before each fix, in a terminal" ;;
   answer)
     # The user's answer to Longhaul's question at a usage limit: never Claude's (the comment at the top).
     printf '%s\n' "longhaul: \`answer\` does not run from inside a session: it answers the question Longhaul asked the user at a usage limit, which is the user's to answer, with the buttons of Longhaul's pane or in a terminal." >&2

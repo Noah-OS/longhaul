@@ -1,7 +1,7 @@
 ---
 name: manage
 description: "Run Longhaul's setup from this chat: accounts (add, sign in, remove, pick a chat's), switching, subagent models, the VS Code panel, the status line, auto-update, clearing limits, uninstalling. Each change runs only after the user's yes."
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul models) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul models) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run)
 ---
 
 Longhaul's setup actions, which once needed a terminal, run from this chat
@@ -46,6 +46,12 @@ Settings:
 - The status line: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline install --yes` sets Claude Code's to Longhaul's, replacing one of the user's own (say so; a copy is kept); `${CLAUDE_PLUGIN_ROOT}/bin/longhaul statusline uninstall` puts the one before back.
 - Claude Code's auto-update for Longhaul (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status`. Set it: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update on --yes` or `${CLAUDE_PLUGIN_ROOT}/bin/longhaul update off --yes`.
 - Forget the recorded usage limits (an account was reset before its time and Longhaul still waits for it): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul clear`. The chats waiting for one carry on within a few seconds. One account's alone: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul clear NAME`.
+
+Something stuck (a wait or a question that never goes, a limit that is not
+a time, an accounts.json that will not read, the VS Code panel pointing at
+a Longhaul that is gone): offer this before any uninstall.
+- What is stuck, one line each with what its fix does (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run`. Show it as it is.
+- The fixes do not run from here: tell the user to run `longhaul repair` in a terminal, which asks before each fix (`longhaul repair --yes` makes them all).
 
 Uninstall:
 - What it would remove (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run`; with ~/.longhaul too: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run --purge`. Show it before asking.
