@@ -35,6 +35,9 @@ Rules:
   and leave the old one out. The save says how many of the last
   checkpoint's entries are missing.
 - Each decision gives its why on the same line.
+- `next_action` is the work itself, never a wait: if the user paused,
+  put that in `owner_said` and write what to do first when they go on.
+  An open question goes in `blocked` with the answer you would take.
 - Facts the next turn needs, not a narrative. Name files and commands
   rather than copying their contents.
 - Nothing secret: no tokens, keys or passwords. The save refuses a value

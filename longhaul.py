@@ -8073,6 +8073,12 @@ CHECKPOINT_BYTES_MAX = 16_000
 # (log audit, 2026-11-06). Past it the save still refuses.
 CHECKPOINT_OVER_MAX = 1.10
 CHECKPOINT_PUTBACK_MAX = 9_000
+# Said in every put-back, just before what changed since. The task-success
+# test (2026-11-14) gave 8 checkpoints whose next_action was a wait for the
+# user, who had paused; after the user said to carry on, 1 run in 24 stopped
+# on it, and no run without the checkpoint did.
+CHECKPOINT_NEWEST = ("The user's newest message comes before this checkpoint: when it says to carry on, start on "
+                     "next_action; where an open question has a proposed answer, go ahead on it and say so.")
 CHECKPOINT_FILE_MAX = 4 * CHECKPOINT_BYTES_MAX  # what the hook will read of a file: a save never writes more than the cap
 CHECKPOINT_SECRET_SHAPES = ("sk-ant-", "AKIA", "-----BEGIN", "ghp_")  # the start of a known kind of credential
 CHECKPOINT_CLI = ("schema_version", "session_id", "written_at", "cwd")  # set by the CLI, never by the model
@@ -8477,11 +8483,12 @@ def checkpoint_text(kept: dict, now: float) -> str:
         tail = "Changed since the checkpoint: no files were named."
     if not any(kept.get(key) for key in CHECKPOINT_MORE):
         text = "\n".join(lines + [f"{key}: {kept[key]}" for key in CHECKPOINT_TEXTS]
-                         + [listed(key, kept[key]) for key in CHECKPOINT_LISTS] + [tail])
+                         + [listed(key, kept[key]) for key in CHECKPOINT_LISTS] + [CHECKPOINT_NEWEST, tail])
         if len(text) <= CHECKPOINT_PUTBACK_MAX:
             return text
     file = home_path(str(checkpoint_path(kept["session_id"])))
-    room = CHECKPOINT_PUTBACK_MAX - len(tail) - len(file) - 300  # the tail, and the line naming what is left
+    # The newest-message line, the tail, and the line naming what is left.
+    room = CHECKPOINT_PUTBACK_MAX - len(CHECKPOINT_NEWEST) - 1 - len(tail) - len(file) - 300
     size, left = len(lines[0]), {}
     for key in CHECKPOINT_ORDER:
         if key in CHECKPOINT_TEXTS:  # 1,000 characters each at most: always within room
@@ -8499,7 +8506,7 @@ def checkpoint_text(kept: dict, now: float) -> str:
         if taken or (not items and not left and end <= room):
             lines.append(listed(key, taken))
             size += 1 + len(lines[-1])
-    lines.append(tail)
+    lines += [CHECKPOINT_NEWEST, tail]
     if left:
         more = sum(left.values())
         lines.append(f"{more} more entr{'ies' if more != 1 else 'y'} ({', '.join(f'{k} {v}' for k, v in left.items())}) "

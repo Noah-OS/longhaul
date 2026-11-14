@@ -11123,6 +11123,21 @@ class Checkpoint(unittest.TestCase):
                              "tried_failed": [f"a read under 1,024 missed most rebuilds {self.S}"],
                              "working_set": [f"b.py lines 10-40 {self.S}"], **over})
 
+    def test_the_put_back_says_the_users_newest_message_comes_first(self):
+        # The task-success test (docs/live/2026-11-13-task-success): every
+        # one of 8 checkpoints set next_action to waiting for the user, and
+        # one run in 24 stopped on it after the user had said to carry on;
+        # no run without the checkpoint stopped. The line comes once, just
+        # before what changed since, in both forms of the text.
+        line = longhaul.CHECKPOINT_NEWEST
+        self.assertIn("carry on", line)
+        self.assertIn("next_action", line)
+        for state in (self.state(changed_files=[]), self.more(changed_files=[])):
+            self.assertEqual(self.save(state, "s1").returncode, 0)
+            text = self.context(self.check(self.start()))
+            self.assertEqual(text.count(line), 1, text)
+            self.assertTrue(text.endswith(f"\n{line}\nChanged since the checkpoint: no files were named."), text)
+
     def test_the_largest_checkpoint_the_save_takes_comes_back_under_the_hooks_cap_with_the_rest_named(self):
         # Sprint 4 review, A11: the engine caps a hook's additionalContext
         # at 10,000 characters; past it the model gets a file path and a
@@ -11162,7 +11177,8 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual(counts[whole + 1:], [0] * (len(order) - whole - 1), "then nothing after the first cut")
         left = [(key, 20 - shown[key]) for key in order if shown[key] < 20]
         total = sum(n for _, n in left)
-        *_, said, more = text.split("\n")
+        *_, newest, said, more = text.split("\n")
+        self.assertEqual(newest, longhaul.CHECKPOINT_NEWEST, "the newest-message line is kept when entries are cut")
         self.assertTrue(said.startswith("Changed since the checkpoint: f00.py (changed), "), said)
         self.assertEqual(more, f"{total} more entries ({', '.join(f'{k} {n}' for k, n in left)}) are in "
                                f"{longhaul.home_path(str(self.file()))}; read it before relying on memory for them.")
@@ -13153,6 +13169,16 @@ class CheckpointSkill(unittest.TestCase):
         self.assertTrue(all(state[key] for key in longhaul.CHECKPOINT_MORE), "the example shows each new list in use")
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/checkpoint/SKILL.md"], cwd=HERE).returncode, 1)
+
+    def test_both_skills_keep_next_action_the_work_itself_not_a_wait(self):
+        # The task-success test (docs/live/2026-11-13-task-success): all 8
+        # checkpoints made next_action a wait ("Wait for the user's go",
+        # "ask the open questions first") because the user had paused, and
+        # one run in 24 stopped on it after the user said to carry on.
+        for path in ("skills/checkpoint/SKILL.md", "codex-skills/checkpoint/SKILL.md"):
+            body = " ".join((HERE / path).read_text().split())
+            self.assertIn("`next_action` is the work itself, never a wait", body, path)
+            self.assertIn("the answer you would take", body, path)
 
 
 class ManageSkill(unittest.TestCase):
