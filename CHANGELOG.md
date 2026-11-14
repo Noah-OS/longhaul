@@ -2,6 +2,17 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.14 - 2026-11-15
+
+One fix from a measurement. In the task-success test of 2026-11-14 (the wiki's Measurements page), every checkpoint made its next action a wait for the user, who had paused the work, and one run in 24 stopped on it after the user had said to carry on. No run without the checkpoint stopped.
+
+### Changed
+
+- **The checkpoint skill keeps `next_action` the work itself, never a wait**, in Claude Code and in Codex: when the user paused, that goes in `owner_said`; an open question goes in `blocked` with the answer Claude would take.
+- **A checkpoint put back says the user's newest message comes first**, in one line before the files changed since, within the 9,000 characters: when the message says to carry on, Claude starts on the next action, and goes ahead on an open question that has a proposed answer, saying so.
+
+The wording is checked by tests; its effect on the work has not been measured again.
+
 ## 0.3.13 - 2026-11-13
 
 A middle step between a stuck state and an uninstall: until now the only sure way out of a stuck state was `longhaul uninstall --purge`, which deletes everything Longhaul kept.
