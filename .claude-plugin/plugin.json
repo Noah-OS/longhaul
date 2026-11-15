@@ -1,7 +1,7 @@
 {
   "name": "longhaul",
   "version": "0.3.14",
-  "description": "Keep the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or /clear. Shows where the tokens go.",
+  "description": "Long Claude Code sessions and several accounts: a checkpoint, then a compaction at 200k tokens; a chat moved to another of your accounts at a usage limit; where the tokens went. Every feature measured in public, the misses included.",
   "author": {
     "name": "Amr Adel",
     "email": "amra.aadel@gmail.com"

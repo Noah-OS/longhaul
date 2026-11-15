@@ -21,7 +21,7 @@
   <a href="https://github.com/Noah-OS/longhaul/wiki"><b>Wiki</b></a>
 </p>
 
-**Longhaul** keeps the thread in long Claude Code sessions: Claude saves where it is, Longhaul compacts, and the work picks up after a compaction, a resume or `/clear`. It shows where a conversation's tokens went, and flags the tool calls that put a big file into the context whole or a file the context already holds. It is a Claude Code plugin and a terminal command in one Python file, standard library only, and what it keeps stays on your machine.
+**Longhaul** is a Claude Code plugin for long sessions and for more than one account. At 200,000 tokens of context it has Claude save a checkpoint, then compacts the chat, so a long session stops carrying its whole history into every request. With more than one of your own Claude subscriptions, at a usage limit it asks, then moves the chat to another one or carries it on by itself when the limit resets. It shows where a conversation's tokens went. Every measurement of its features is published, the ones that showed no gain included: the checkpoint helps Claude recall a little more after a compaction, and was not shown to make the work after it better ([Measured](#measured)). It is a terminal command too, in one Python file, standard library only, and what it keeps stays on your machine.
 
 This page is the guide: install it, check it, use it day to day, and set up the parts you want. The detail is in the [wiki](https://github.com/Noah-OS/longhaul/wiki).
 
