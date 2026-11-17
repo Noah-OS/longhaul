@@ -1,10 +1,11 @@
 import type { Register } from 'claude-code'
 
-import { carries, found } from './question.ts'
+import { CHAT, clock, found, running } from './question.ts'
 
 // Longhaul's display inside Claude Code (the owner, 2026-10-23): VS Code's
 // panel shows no status line and no hook message, so this shows them. It
-// only reads ~/.longhaul (accounts.json, usage/<account>.json, longhaul.log,
+// only reads ~/.longhaul (accounts.json, usage/<account>.json, this chat's
+// usage/sessions record, state.json, uses/<chat>.json, longhaul.log,
 // release.json), the plugin's own manifest and this chat's question and
 // carry-on as the accounts pane's look found them, and sends nothing
 // anywhere; any failure shows nothing.
@@ -15,6 +16,11 @@ type Reading = { at?: number; five_hour?: Window; seven_day?: Window }
 const TAIL = 65536 // bytes of the log read at most per turn
 let seen = -1 // the log's size when last read: a reload starts afresh
 let context: number | undefined // the last turn's context, input + cache read + cache write
+// This chat's last prompt the account check stopped (its log line, ACCOUNT_LOGGED
+// in longhaul.py): when (epoch seconds), the folder and the accounts that keep it.
+let refused: { sid: string; at: number; where: string; by: string[] } | undefined
+const MOVED_FOR = 3600 // seconds a move shows on the line, as longhaul.py's STATUS_MOVED_FOR
+const USE_DAYS = 30 // a `longhaul use` choice older than this is none, as longhaul.py's
 
 async function home($: any): Promise<string> {
   return (await $.env.get('LONGHAUL_HOME')) || `${await $.env.get('HOME')}/.longhaul`
@@ -24,17 +30,28 @@ async function expand($: any, path: string): Promise<string> {
   return path.startsWith('~/') ? `${await $.env.get('HOME')}${path.slice(1)}` : path
 }
 
-// The account this chat runs on: the one whose folder is CLAUDE_CONFIG_DIR, else main.
-async function account($: any, lh: string): Promise<string> {
+// The account this chat runs on: the one whose folder is CLAUDE_CONFIG_DIR;
+// with none set, the one account with no folder of its own, as longhaul.py's
+// account_for_config() finds it; else main, ~/.claude's own sign-in, which
+// no list names (known: false), and which the line calls DEFAULT_NAME.
+async function account($: any, lh: string): Promise<{ name: string; known: boolean }> {
   const dir = ((await $.env.get('CLAUDE_CONFIG_DIR')) || '').replace(/\/+$/, '')
   try {
     const accounts = JSON.parse(await $.fs.read(`${lh}/accounts.json`))
-    if (Array.isArray(accounts) && dir)
+    if (Array.isArray(accounts) && dir) {
       for (const a of accounts)
         if (a && typeof a.name === 'string' && typeof a.config_dir === 'string'
-            && (await expand($, a.config_dir)).replace(/\/+$/, '') === dir) return a.name
+            && (await expand($, a.config_dir)).replace(/\/+$/, '') === dir) return { name: a.name, known: true }
+    } else if (Array.isArray(accounts)) {
+      const mine = accounts.filter(a => a && typeof a.name === 'string' && !a.config_dir)
+      if (mine.length === 1) return { name: mine[0].name, known: true }
+    }
   } catch {}
-  return 'main'
+  return { name: 'main', known: false }
+}
+
+async function readJson($: any, path: string): Promise<unknown> {
+  try { return JSON.parse(await $.fs.read(path)) } catch { return null }
 }
 
 async function reading($: any, lh: string, name: string): Promise<Reading | undefined> {
@@ -44,8 +61,11 @@ async function reading($: any, lh: string, name: string): Promise<Reading | unde
   } catch { return undefined }
 }
 
-function pct(w: Window | undefined, now: number): string | undefined {
-  return w && typeof w.used_percentage === 'number' && (w.resets_at ?? 0) > now ? `${Math.round(w.used_percentage)}%` : undefined
+// A window of the reading as line() takes it, only while it is open: its
+// share and its reset as clock() shows it.
+function window(w: Window | undefined, nowMs: number): { used: number; resets: string } | null {
+  return w && typeof w.used_percentage === 'number' && (w.resets_at ?? 0) > nowMs / 1000
+    ? { used: w.used_percentage, resets: clock(w.resets_at!, nowMs) } : null
 }
 
 // [0, 3, 10] from "0.3.10" (or a tag's "v0.3.10"), as longhaul.py's
@@ -137,37 +157,60 @@ export function line(state: unknown): string {
   return parts.join(' · ')
 }
 
-// The status entry: the account, its allowance, the context, this chat's
-// question or carry-on, a newer release last. accounts.tsx calls it too,
-// when its look finds the question or the carry-on changed.
+// The one event of this chat's line (line()'s event), the first that holds,
+// in longhaul.py's status_event() order: its question at a limit, open while
+// its relay runs, and its carry-on waiting, as the accounts pane's look last
+// found them (hooks/question.ts, every 3 s); its account's recorded limit in
+// state.json (stopped: neither of those); its last prompt stopped by a
+// folder rule with no reading since (the usage/sessions record's "at"); a
+// `longhaul use` choice of another account, after this turn when a relay
+// took it (its relay_pid runs), else at its next open; a move in the last
+// hour (the record's moved_from and moved_at). Null for none.
+async function event($: any, lh: string, sid: string, name: string, nowMs: number): Promise<Record<string, unknown> | null> {
+  const nowS = nowMs / 1000
+  const { asked, waiting } = found()
+  if (asked) {
+    if (asked.kind === 'move') return { kind: 'question', to: asked.to }
+    return { kind: 'question', to: asked.to, at: clock(asked.carries_on_at ?? asked.to_resets_at ?? asked.resets_at, nowMs) }
+  }
+  if (waiting) return { kind: 'waiting', at: clock(waiting.until, nowMs), on: waiting.account }
+  const limited = num(obj(obj(await readJson($, `${lh}/state.json`)).limited_until)[name])
+  if (limited !== null && limited > nowS) return { kind: 'stopped', until: clock(limited, nowMs) }
+  if (!CHAT.test(sid)) return null
+  const record = obj(await readJson($, `${lh}/usage/sessions/${sid}.json`))
+  const seen = num(record.at)
+  if (refused && refused.sid === sid && (seen === null || refused.at >= Math.floor(seen)))
+    return { kind: 'refused', where: refused.where, by: refused.by }
+  const use = obj(await readJson($, `${lh}/uses/${sid}.json`))
+  const chosen = text(use.account), at = num(use.at)
+  if (use.chat === sid && chosen && chosen !== name && at !== null && nowS - at < USE_DAYS * 86400) {
+    const pid = use.relay_pid
+    const taken = Number.isInteger(pid) && pid > 0 && (await running($, pid))
+    return { kind: 'pending', to: chosen, when: taken ? 'turn' : 'open' }
+  }
+  const movedAt = num(record.moved_at), from = text(record.moved_from)
+  if (movedAt !== null && nowS - movedAt >= 0 && nowS - movedAt < MOVED_FOR && from && record.account === name)
+    return { kind: 'moved', from, at: clock(movedAt, nowMs) }
+  return null
+}
+
+// The status entry: line() of this chat's state, the terminal's status line
+// in the same words (longhaul.py's status_line()): the account, at most one
+// event, its allowance and the context, a newer release last. accounts.tsx
+// calls it too, when its look finds the question or the carry-on changed.
 export async function status($: any): Promise<void> {
   try {
     const lh = await home($)
-    const name = await account($, lh)
+    const { name, known } = await account($, lh)
+    let nowMs = Date.now()
+    try { nowMs = await $.clock.now() } catch {}
+    let sid = ''
+    try { sid = String(await $.session.id()) } catch {}
     const r = await reading($, lh, name)
-    const now = Date.now() / 1000
-    const parts = [name]
-    const five = pct(r?.five_hour, now), week = pct(r?.seven_day, now)
-    if (five) parts.push(`5h ${five}`)
-    if (week) parts.push(`week ${week}`)
-    if (context !== undefined) parts.push(`context ${Math.round(context / 1000)}k`)
-    parts.push(...(await kept($)))
-    const latest = await update($, lh)
-    if (latest) parts.push(`update ${latest}`)
-    $.ui.status(parts.join(' · '))
+    $.ui.status(line({ account: known ? name : DEFAULT_NAME, five: window(r?.five_hour, nowMs),
+      week: window(r?.seven_day, nowMs), ctx: context ?? null, event: await event($, lh, sid, name, nowMs),
+      update: (await update($, lh)) ?? null }))
   } catch {}
-}
-
-// This chat's question and carry-on, as accounts.tsx's look last found them
-// (hooks/question.ts, every 3 s, the question only while its relay runs):
-// "question: /accounts" says where to answer it.
-async function kept($: any): Promise<string[]> {
-  try {
-    const { asked, waiting } = found()
-    let now = Date.now()
-    try { now = await $.clock.now() } catch {}
-    return [...(asked ? ['question: /accounts'] : []), ...(waiting ? [carries(waiting, now)] : [])]
-  } catch { return [] }
 }
 
 // A file's name from the path a log line gives, and "412,345" bytes in KB.
@@ -194,9 +237,18 @@ async function newLines($: any): Promise<string[]> {
   } catch { return [] }
 }
 
+// A log line's stamp, "2026-11-11 14:05:09" in this machine's time, in epoch seconds.
+function stamp(text: string): number | null {
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) /.exec(text)
+  if (!m) return null
+  const [y, mo, d, h, mi, s] = m.slice(1).map(Number) as [number, number, number, number, number, number]
+  const at = new Date(y, mo - 1, d, h, mi, s).getTime() / 1000
+  return Number.isFinite(at) ? at : null
+}
+
 async function popUps($: any, lines: string[]): Promise<void> {
   const sid = await $.session.id()
-  const name = await account($, await home($))
+  const { name } = await account($, await home($))
   for (const line of lines) {
     const body = line.replace(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d /, '')
     let m: RegExpMatchArray | null
@@ -220,8 +272,11 @@ async function popUps($: any, lines: string[]): Promise<void> {
         { timeoutMs: 8000 })
     else if ((m = body.match(/^guard: advised on a repeat read of (.+) in (\S+)( \(a subagent\))?$/)) && m[2] === sid && !m[3])
       $.ui.toast(`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`, { timeoutMs: 8000 })
-    else if ((m = body.match(/^account: refused a prompt in (\S+?): (.+?) is kept for (.+?); the chat runs on (.+)$/)) && m[1] === sid)
+    else if ((m = body.match(/^account: refused a prompt in (\S+?): (.+?) is kept for (.+?); the chat runs on (.+)$/)) && m[1] === sid) {
+      const at = stamp(line)
+      if (at !== null) refused = { sid, at, where: m[2], by: m[3].split(', ') }
       $.ui.toast(`Longhaul stopped your message: ${m[2]} is reserved for ${m[3]}, and this chat is on ${m[4]}. Nothing was sent. Type /accounts to move it.`, { timeoutMs: 12000 })
+    }
     // A newer Longhaul (said at a chat's start, once per version a day): a
     // release names no chat, so any chat shows it; an install names the
     // chat that runs the older version, and that chat alone shows it.

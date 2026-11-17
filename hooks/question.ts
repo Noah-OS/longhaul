@@ -11,7 +11,7 @@ import type { LonghaulQuestion, LonghaulWait } from '../types'
 // program: `kill -0` on the relay's pid, since a relay killed with kill -9
 // leaves its question behind, with no one left to act on an answer.
 
-const CHAT = /^[A-Za-z0-9_-]{1,100}$/ // longhaul.py's GUARD_ID: the chat's id names a file
+export const CHAT = /^[A-Za-z0-9_-]{1,100}$/ // longhaul.py's GUARD_ID: the chat's id names a file
 const ID = /^q-[A-Za-z0-9]{1,64}$/ // longhaul.py writes q-<12 hex>; never an option
 const CHOICES: Record<string, readonly string[]> = { move: ['move', 'wait'], first_reset: ['yes', 'no'] }
 // A wait whose time is this long past is one its relay left (the relay
@@ -75,8 +75,9 @@ export function cleanWait(v: any, chat: string, now: number): LonghaulWait | nul
   return { chat, until, account, why: word(v.why) ?? '' }
 }
 
-// Whether the relay that asked still runs: `kill -0` sends no signal.
-async function running($: any, pid: number): Promise<boolean> {
+// Whether the relay that asked still runs: `kill -0` sends no signal. display.ts
+// asks it of the relay that took a `longhaul use` choice too.
+export async function running($: any, pid: number): Promise<boolean> {
   try {
     const ran = await $.process.run(['kill', '-0', String(pid)], { timeoutMs: 5000 })
     return ran.exitCode === 0
