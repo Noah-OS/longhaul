@@ -15,6 +15,7 @@ Help that fits one screen, and two shorter words.
 ### Changed
 
 - **`longhaul -h` fits one screen**: 49 lines, none wider than 80 columns. It says what Longhaul does, then lists the commands a person types, one line each, grouped: start Claude here, accounts, at a limit, see what happened, fix, set up. Before, it printed all 362 lines of the full list, which opened with an old description and named the commands only the plugin's hooks run.
+- **From a chat**, `longhaul help` in each of its forms, `longhaul login NAME` and `longhaul switch wait` run, as `-h`, `setup NAME --relogin` and `switch never` do.
 
 ## 0.3.17 - 2026-11-17
 

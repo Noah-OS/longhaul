@@ -12279,6 +12279,22 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("Allowance", out.stdout)
 
+    def test_the_shim_lets_help_through_in_each_form_as_it_does_dash_h(self):
+        # The UX review's M6: help only prints, from the Usage block, so a
+        # chat may read any part of it, as it reads -h.
+        for args in (("help",), ("help", "all"), ("help", "hooks"), ("help", "start"), ("help", "folders"),
+                     ("help", "-h"), ("--help",)):
+            out = self.chat(*args)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), args)
+            self.assertEqual(out.stdout, self.usage(*args), args)
+        self.assertEqual(self.chat("help").stdout, self.chat("-h").stdout)
+        for args in (("help", "nope"), ("help", "folders", "x")):  # longhaul's own refusal, never the shim's
+            out = self.chat(*args)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("`longhaul help` lists the commands", out.stderr, args)
+            self.assertNotIn("run it in a terminal", out.stderr, args)
+        self.assertFalse((self.tmp / "home").exists(), "nothing was written")
+
     def test_the_shim_refuses_the_supervisor_and_the_hooks(self):
         # From the Bash tool a plain `longhaul` would start a second claude
         # under a session, with Remote Control and caffeinate; pipe and wrap
@@ -12315,7 +12331,10 @@ class Shim(unittest.TestCase):
             ("use", "`use NAME` or `use NAME --chat ID`"): (
                 ("use",), ("use", "-h"), ("use", "A", "B"), ("use", "A", "--chat"), ("use", "A", "--chat", "x", "y"),
                 ("use", "--chat", "x", "A")),
-            ("switch", "`switch [ask|auto|never]`"): (("switch", "sometimes"), ("switch", "-h"), ("switch", "auto", "never")),
+            ("switch", "`switch [ask|auto|never|wait]`"): (("switch", "sometimes"), ("switch", "-h"),
+                                                       ("switch", "auto", "never"), ("switch", "wait", "x")),
+            ("login", "`login NAME`"): (("login",), ("login", "-h"), ("login", "Max", "Pro"), ("login", "Max", "--relogin"),
+                                        ("login", "--relogin", "Max")),
             ("vscode", "`vscode on --yes` or `vscode off`"): (("vscode",), ("vscode", "on"), ("vscode", "--yes", "on"),
                                                    ("vscode", "off", "x"), ("vscode", "--yes")),
             ("statusline", "`statusline install --yes` or `statusline uninstall`"): (
@@ -12346,6 +12365,7 @@ class Shim(unittest.TestCase):
                            (("add", "A", "not-an-email", "--dir", "/x", "--repo", "/y", "--repo", "/z"),
                             "does not look like an email"),
                            (("setup", "Max"), "no account called Max"), (("setup", "Max", "--relogin"), "no account called Max"),
+                           (("login", "Max"), "no account called Max"),
                            (("remove", "Max"), "no account called Max"), (("switch",), "Switching: ask (the default)"),
                            (("use", "Team"), "Team"), (("use", "Team", "--chat", "abc"), "Team"),
                            (("clear", "Team"), "no account called Team"),
@@ -12364,8 +12384,8 @@ class Shim(unittest.TestCase):
             self.assertNotIn("does not run from inside a session", out.stderr, args)
             self.assertNotIn("Traceback", out.stderr, args)
             self.assertIn(said, out.stdout + out.stderr, args)
-        for runs in ("add NAME EMAIL", "setup NAME", "remove", "models", "switch", "vscode", "statusline install",
-                     "update", "clear", "uninstall", "repair --dry-run|--json"):
+        for runs in ("add NAME EMAIL", "setup NAME", "login NAME", "remove", "models", "switch", "vscode",
+                     "statusline install", "update", "clear", "uninstall", "repair --dry-run|--json", "help"):
             self.assertIn(runs, self.shim().stderr, "the refusal names what does run")
             self.assertIn(runs, self.shim("nope").stderr)
 
@@ -12416,6 +12436,9 @@ class Shim(unittest.TestCase):
         out = self.chat("setup", "Team", "--relogin", FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(len((home / "logins.jsonl").read_text().splitlines()), 2, "signed in again")
+        out = self.chat("login", "Team", FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")  # the same by a shorter name
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(len((home / "logins.jsonl").read_text().splitlines()), 3, "signed in again")
         out = self.chat("add", "Pro", "pro@example.com", "--dir", str(pro), FAKE_EMAILS=emails, FAKE_REQUIRE_LOGIN="1")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         out = self.chat("remove", "Pro")
@@ -12440,6 +12463,10 @@ class Shim(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("forgot the recorded limits", out.stdout)
         self.assertEqual(json.loads((home / "state.json").read_text())["limited_until"], {})
+        # wait is never by another word (the UX review's M6), and saved as never.
+        out = self.chat("switch", "wait")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads((home / "config.json").read_text())["switch"], "never")
 
     def test_from_a_chat_vscode_statusline_and_update_edit_the_scratch_settings_a_copy_kept(self):
         settings = self.tmp / "vscode" / "settings.json"
@@ -12564,7 +12591,7 @@ class Shim(unittest.TestCase):
             self.assertIn("run it in a terminal", out.stderr, args)
         self.assertFalse((self.tmp / "home" / "advisor").exists(), "nothing was written")
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
-        self.assertIn("longhaul advisor status", self.usage(), "the Usage block names it")
+        self.assertIn("longhaul advisor status", self.shim("help", "all").stdout, "the Usage block names it")
 
     def test_the_shim_runs_doctor_which_only_reads(self):
         # The owner, 2026-10-25 ("Doctor + first-chat line"): /longhaul:doctor
@@ -12594,7 +12621,7 @@ class Shim(unittest.TestCase):
             self.assertIn("from here only `doctor` runs, with nothing after it", out.stderr, args)
         self.assertIn("doctor", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("doctor", self.shim().stderr)
-        self.assertIn("longhaul doctor", self.usage(), "the Usage block names it")
+        self.assertIn("longhaul doctor", self.shim("help", "all").stdout, "the Usage block names it")
 
     def test_the_shim_runs_checkpoint_save_which_writes_the_checkpoint_and_its_record_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
@@ -12611,7 +12638,7 @@ class Shim(unittest.TestCase):
         out = self.shim("checkpoint", "save", "s1", input="{not json")
         self.assertEqual(out.returncode, 2, "the refusal's own exit code")
         self.assertIn("longhaul checkpoint: not saved", out.stderr)
-        self.assertIn("longhaul checkpoint", self.usage(), "the Usage block names it")
+        self.assertIn("longhaul checkpoint", self.shim("help", "all").stdout, "the Usage block names it")
         # The skill passes no id: the save takes the session's from the Bash
         # tool's environment (review, A13).
         out = self.shim("checkpoint", "save", input=json.dumps(state), CLAUDE_CODE_SESSION_ID="s9")
