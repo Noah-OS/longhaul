@@ -13272,8 +13272,9 @@ class ManageSkill(unittest.TestCase):
 
 class Reminder(unittest.TestCase):
     """`longhaul reminder` (the owner's decisions of 2026-10-23): once the
-    conversation's context passes LONGHAUL_CHECKPOINT_AT tokens (200,000),
-    and again at each multiple of it, a line for the user and one for the
+    conversation's context passes LONGHAUL_CHECKPOINT_AT tokens (400,000 by
+    default since 2026-11-17; set to 200,000 here, the default before, at
+    which these tests' numbers were taken), and again at each multiple of it, a line for the user and one for the
     model say to save a checkpoint, so that the work can go on in a fresh
     context. The history baseline (98 sessions) found re-reads 1.3% of
     what was read, and long contexts and compactions the cost. The
@@ -13304,6 +13305,9 @@ class Reminder(unittest.TestCase):
         self.env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                         LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
                         LONGHAUL_LOG="debug")  # the check lines below the threshold are routine: kept only in debug (2026-11-06)
+        # The threshold these tests were written at; the default's own tests
+        # unset it (test_the_default_is_400k_on_claude_code_and_a_setting_wins).
+        self.env["LONGHAUL_CHECKPOINT_AT"] = "200000"
 
     def tearDown(self):
         longhaul.LONGHAUL_HOME = self.saved
@@ -13454,7 +13458,7 @@ class Reminder(unittest.TestCase):
         self.grow(205_000)
         self.assertEqual(self.remind(**own), self.reminded(205))
         self.assertEqual(self.record(), {"reminder": {"at": 200_000}})
-        self.assertEqual(self.remind(), "", "at the default, 200k was said too")
+        self.assertEqual(self.remind(), "", "at this class's 200,000, 200k was said too")
         self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=""), "", "empty is unset")
         self.assertEqual(self.remind(self.ask(session_id="s2"), LONGHAUL_CHECKPOINT_AT=" 50000 "), self.reminded(205))
         self.assertEqual(self.record("s2"), {"reminder": {"at": 200_000}}, "four times 50,000")
@@ -13465,16 +13469,16 @@ class Reminder(unittest.TestCase):
                  ("1.5", "not a whole number"), ("+5", "not a whole number"), (self.S, "not a whole number"),
                  ("0", "not above zero"), ("-5", "not above zero")]
         for value, _ in cases:
-            self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=value), "", (value, "150k is under the default"))
-        self.grow(205_000)
+            self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT=value), "", (value, "150k is under the default, 400k"))
+        self.grow(405_000)
         for n, (value, _) in enumerate(cases):
             data = self.ask(session_id=f"j{n}")
-            self.assertEqual(self.remind(data, LONGHAUL_CHECKPOINT_AT=value), self.reminded(205), value)
+            self.assertEqual(self.remind(data, LONGHAUL_CHECKPOINT_AT=value), self.reminded(405), value)
             self.assertEqual(self.remind(data, LONGHAUL_CHECKPOINT_AT=value), "", (value, "once"))
-        self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT="abc"), self.reminded(205), "s1, whose kinds were logged")
+        self.assertEqual(self.remind(LONGHAUL_CHECKPOINT_AT="abc"), self.reminded(405), "s1, whose kinds were logged")
         # Once per session and kind, by the kind alone: s1 met both, each j
         # session one. The lines are whole, so no value is in them.
-        line = "reminder: LONGHAUL_CHECKPOINT_AT is {}, so the default, 200,000 tokens, is used ({})"
+        line = "reminder: LONGHAUL_CHECKPOINT_AT is {}, so the default, 400,000 tokens, is used ({})"
         said = [entry.split(" ", 2)[2] for entry in self.log().splitlines() if "LONGHAUL_CHECKPOINT_AT" in entry]
         self.assertEqual(said, [line.format("not a whole number", "s1"), line.format("not above zero", "s1")]
                          + [line.format(kind, f"j{n}") for n, (_, kind) in enumerate(cases)])
