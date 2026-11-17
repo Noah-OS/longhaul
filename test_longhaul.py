@@ -24042,7 +24042,7 @@ class Folders(unittest.TestCase):
         out = self.longhaul("folders", "-h")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("usage: longhaul folders [-h] [--add PATH] [--remove PATH] [--anywhere] [--prefer PATH] "
-                      "[--no-prefer PATH] name", " ".join(out.stdout.split()))
+                      "[--no-prefer PATH] [--dry-run] [--json] name", " ".join(out.stdout.split()))
         # bin/longhaul, what a chat's Claude may run, is the owner's boundary:
         # it runs folders since the owner's yes of 2026-11-06, in its forms
         # alone (ShimCommands has the refused ones).
@@ -24228,6 +24228,221 @@ class FoldersPrefer(unittest.TestCase):
         self.assertEqual(out.returncode, 2)
         self.assertIn("odd's preferred field is not a list, so no folder can be added to it or taken from it; until it "
                       "is mended in ~/home/accounts.json, odd is preferred nowhere", " ".join(self.said(out)))
+
+
+class FoldersDryRun(unittest.TestCase):
+    """`longhaul folders NAME ... --dry-run [--json]` (the UX review of
+    2026-11-11, M4: "folder rules lock people out"): what a change of an
+    account's folders would do, worked out by the change's own code, and
+    nothing changed. Most of all which folders would then refuse a chat
+    on which account, and which chats running now or started lately
+    (Longhaul's log) it would stop or move, by the account check's rule.
+    It writes nothing: not accounts.json, not the log, not a lock.
+    Folders' scratch setup, HOME too, with a ps that lists no chat; the
+    chats running now are given in process."""
+
+    SID = "5ca8a797-1111-4222-8333-444455556666"
+    OTHER = "1b2c3d4e-1111-4222-8333-444455556666"
+    accounts = Folders.accounts
+    files = Folders.files
+    said = Folders.said
+    write_accounts = Folders.write_accounts
+
+    def setUp(self):
+        Folders.setUp(self)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "ps").write_text("#!/bin/sh\nexit 0\n")  # no chat runs
+        (self.bin / "ps").chmod(0o755)
+        for d in ("clients/api", "other"):
+            (self.tmp / d).mkdir(parents=True)
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "spare", "config_dir": "~/.claude-spare"},
+                            {"name": "work", "config_dir": "~/.claude-work"})
+
+    def longhaul(self, *args):
+        return Folders.longhaul(self, *args, PATH=os.pathsep.join([str(self.bin), "/usr/bin", "/bin"]))
+
+    def started(self, sid, name, where, hhmmss):
+        """A start line in Longhaul's log, today (start_logged()'s words): the
+        time it says, as epoch seconds."""
+        stamp = f"{dt.date.today().isoformat()} {hhmmss}"
+        with open(self.home / "longhaul.log", "a") as f:
+            f.write(f"{stamp} start: {sid} starts on {name} in {where}: it had room, and it comes first in turn\n")
+        return time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+
+    def in_process(self, *args, processes=()):
+        """`longhaul folders ARGS` in this process, `processes` the chats
+        running now (doctor_processes(); None: ps did not answer): (exit
+        code, its lines, colour codes dropped)."""
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.tmp, "DEFAULT_CONFIG": self.tmp / "claude",
+                                "USAGE_DIR": self.home / "usage", "QUIET": False}.items():
+                stack.enter_context(mock.patch.object(longhaul, name, value))
+            stack.enter_context(mock.patch.object(longhaul, "doctor_processes",
+                                                  return_value=None if processes is None else list(processes)))
+            stack.enter_context(mock.patch.dict(os.environ, {"HOME": str(self.tmp)}))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            code = longhaul.main(["folders", *args])
+        return code, [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in out.getvalue().splitlines()]
+
+    def test_a_dry_run_names_the_folders_that_would_refuse_and_the_chats_it_would_stop_and_writes_nothing(self):
+        stop = self.started(self.SID, "personal", "~/clients/api", "09:00:00")
+        move = self.started(self.OTHER, "work", "~/other", "09:05:00")
+        before = self.files()
+        out = self.longhaul("folders", "work", "--add", "~/clients", "--dry-run")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.said(out), [
+            "longhaul would add ~/clients to work's folders",
+            "Then work may be used only in ~/clients.",
+            "~/clients would be reserved for work: a chat there on personal or spare would stop at its next message.",
+            "Chats it would change (running now, or started in the last 7 days):",
+            f"  chat 1b2c3d4e in ~/other on work (started {longhaul.clock(move)}): work may no longer be used there, so "
+            "it moves off work (in auto once Claude is idle, else when it is opened again).",
+            f"  chat 5ca8a797 in ~/clients/api on personal (started {longhaul.clock(stop)}): its next message would "
+            "stop, as ~/clients/api would be reserved for work.",
+            "Nothing changed: --dry-run only says what it would do."])
+        self.assertEqual(self.files(), before, "nothing written: not accounts.json, not the log, not a lock")
+        self.assertFalse((self.home / ".accounts.lock").exists())
+        # The change itself ends where the dry run said it would.
+        out = self.longhaul("folders", "work", "--add", "~/clients")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.said(out)[-1], "work may be used only in ~/clients.")
+        self.assertEqual(self.accounts()[2]["repositories"], ["~/clients"])
+
+    def test_json_gives_the_same_words_for_the_accounts_screen_and_counts_the_chats_it_would_stop(self):
+        stop = self.started(self.SID, "personal", "~/clients/api", "09:00:00")
+        before = self.files()
+        out = self.longhaul("folders", "work", "--add", "~/clients", "--add", "~/later", "--dry-run", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(json.loads(out.stdout), {
+            "changes": ["would add ~/clients to work's folders", "would add ~/later to work's folders"],
+            "notes": ["~/later does not exist yet; kept for when it does"],
+            "effects": [
+                "Then work may be used only in ~/clients, ~/later.",
+                "~/clients would be reserved for work: a chat there on personal or spare would stop at its next message.",
+                "~/later would be reserved for work: a chat there on personal or spare would stop at its next message.",
+                "Chats it would change (running now, or started in the last 7 days):",
+                f"  chat 5ca8a797 in ~/clients/api on personal (started {longhaul.clock(stop)}): its next message would "
+                "stop, as ~/clients/api would be reserved for work."],
+            "stops": 1, "problem": None})
+        self.assertEqual(self.files(), before)
+
+    def test_the_chats_running_now_are_judged_by_the_account_checks_own_rule_allowances_included(self):
+        # 4242 runs on personal there; 4343 on spare, allowed there (allowed.json),
+        # so the account check lets it through, but spare may no longer be
+        # used there, and the relay moves it; 4444 on the default sign-in,
+        # no account's. The log's line for 5ca8a797 is 4242's chat, said once.
+        self.started(self.SID, "personal", "~/clients/api", "09:00:00")
+        (self.home / "allowed.json").write_text(json.dumps(
+            {self.OTHER: {"account": "spare", "folder": str(self.tmp / "clients" / "api"), "at": time.time()}}))
+        api = str(self.tmp / "clients" / "api")
+        processes = [{"pid": 4242, "panel": False, "resume": None, "config_dir": "~/.claude-personal", "cwd": api,
+                      "session": self.SID},
+                     {"pid": 4343, "panel": True, "resume": self.OTHER, "config_dir": str(self.tmp / ".claude-spare"),
+                      "cwd": api, "session": None},
+                     {"pid": 4444, "panel": False, "resume": None, "config_dir": None, "cwd": str(self.tmp / "clients"),
+                      "session": None}]
+        before = self.files()
+        code, said = self.in_process("work", "--add", "~/clients", "--dry-run", processes=processes)
+        self.assertEqual(code, 0, said)
+        self.assertEqual(said[3:8], [
+            "Chats it would change (running now, or started in the last 7 days):",
+            "  chat 5ca8a797 in ~/clients/api on personal (running now): its next message would stop, as ~/clients/api "
+            "would be reserved for work.",
+            "  chat 1b2c3d4e in ~/clients/api on spare (running now): spare may no longer be used there, so it moves off "
+            "spare (in auto once Claude is idle, else when it is opened again).",
+            "  pid 4444 in ~/clients on the default sign-in (~/.claude) (running now): its next message would stop, as "
+            "~/clients would be reserved for work.",
+            "Nothing changed: --dry-run only says what it would do."])
+        self.assertEqual(sum("5ca8a797" in line for line in said), 1, "the log's line and the process are one chat")
+        self.assertEqual(self.files(), before)
+        # Made, the account check refuses the one and lets the other through.
+        self.assertEqual(self.in_process("work", "--add", "~/clients")[0], 0)
+        with mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), mock.patch.object(longhaul, "HOME", self.tmp), \
+                mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"), \
+                mock.patch.dict(os.environ, {"HOME": str(self.tmp)}):
+            for sid, folder, refused in ((self.SID, ".claude-personal", True), (self.OTHER, ".claude-spare", False)):
+                with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / folder)}):
+                    answer = longhaul.account_refusal({"session_id": sid, "cwd": api})
+                self.assertEqual(answer is not None, refused, sid)
+
+    def test_dropping_or_taking_off_a_folder_says_which_chats_would_go_through_again(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "work", "config_dir": "~/.claude-work", "repositories": ["~/clients"]})
+        start = self.started(self.SID, "personal", "~/clients/api", "09:00:00")
+        before = self.files()
+        freed = ["~/clients would no longer be reserved for work: a chat there on personal would go through again.",
+                 "Chats it would change (running now, or started in the last 7 days):",
+                 f"  chat 5ca8a797 in ~/clients/api on personal (started {longhaul.clock(start)}): its messages would go "
+                 "through again."]
+        out = self.longhaul("folders", "work", "--anywhere", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.said(out), ["longhaul would drop work's folders (~/clients)",
+                                          "Then work may be used anywhere.", *freed,
+                                          "Nothing changed: --dry-run only says what it would do."])
+        out = self.longhaul("folders", "work", "--remove", "~/clients", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.said(out)[:2], ["longhaul would remove ~/clients from work's folders",
+                                              "Then work may be used anywhere."])
+        self.assertEqual(self.said(out)[2:5], freed)
+        self.assertEqual(self.files(), before)
+
+    def test_a_folder_reserved_for_one_more_account_and_a_first_choice_stop_nothing(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal", "repositories": ["~/clients"]},
+                            {"name": "work", "config_dir": "~/.claude-work"})
+        out = self.longhaul("folders", "work", "--add", "~/clients", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("~/clients would be reserved for personal or work (now for personal): a chat there on work would "
+                      "go through again.", self.said(out))
+        out = self.longhaul("folders", "personal", "--prefer", "~/clients/api", "--dry-run", "--json")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        found = json.loads(out.stdout)
+        self.assertEqual(found["changes"], ["personal would be preferred in ~/clients/api"])
+        self.assertEqual(found["stops"], 0)
+        self.assertEqual(found["effects"][-1], "No chat running now or started in the last 7 days would stop or move.")
+        # Nothing to change: said so, by the change's own notes.
+        out = self.longhaul("folders", "personal", "--add", "~/clients", "--dry-run")
+        self.assertEqual(self.said(out)[0], "longhaul ~/clients is already one of personal's folders")
+
+    def test_ps_that_does_not_answer_is_said_and_the_log_is_still_read(self):
+        self.started(self.SID, "personal", "~/clients/api", "09:00:00")
+        code, said = self.in_process("work", "--add", "~/clients", "--dry-run", processes=None)
+        self.assertEqual(code, 0, said)
+        self.assertIn("The chats running now could not be listed (ps did not answer), so only those in Longhaul's log "
+                      "are looked at.", said)
+        self.assertTrue(any(line.startswith("  chat 5ca8a797 ") for line in said), said)
+
+    def test_a_refused_dry_run_says_why_exits_2_and_writes_nothing_not_even_the_log(self):
+        self.write_accounts({"name": "personal", "repositories": ["~/personal"]}, {"name": "work"})
+        before = self.files()
+        for args, said in (
+                (("nobody", "--add", "~/x"), "no account called nobody; the accounts are personal, work"),
+                (("work", "--add", "work"), "--add work is not an absolute path"),
+                (("work", "--remove", "~/x"), "~/x is not one of work's folders"),
+                (("work", "--anywhere", "--add", "~/x"), "--anywhere drops every folder"),
+                (("work", "--prefer", "~/personal"), "work may not be used in ~/personal")):
+            out = self.longhaul("folders", *args, "--dry-run")
+            self.assertEqual(out.returncode, 2, args)
+            self.assertIn(said, " ".join(self.said(out)), args)
+            out = self.longhaul("folders", *args, "--dry-run", "--json")
+            self.assertEqual(out.returncode, 2, args)
+            found = json.loads(out.stdout)
+            self.assertIn(said, found["problem"], args)
+            self.assertEqual(found["stops"], 0)
+        out = self.longhaul("folders", "work", "--add", "~/x", "--json")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--json goes with --dry-run", " ".join(self.said(out)))
+        self.assertEqual(self.files(), before, "a refusal writes nothing either: no log line, no lock")
+
+    def test_the_help_and_the_readme_name_the_dry_run(self):
+        usage = " ".join(longhaul.__doc__.split())
+        self.assertIn("longhaul folders NAME ... --dry-run [--json]", usage)
+        self.assertIn("longhaul folders NAME ... --dry-run", (HERE / "README.md").read_text())
+        out = self.longhaul("folders", "-h")
+        self.assertIn("--dry-run", out.stdout)
 
 
 class Fallback(unittest.TestCase):

@@ -136,6 +136,13 @@ Usage:
                           takes one off. A folder NAME may not be used in is
                           refused. A reopened chat goes back to the account it
                           ran on (`longhaul use` moves it)
+  longhaul folders NAME ... --dry-run [--json]
+                          what that change would do, and nothing changed (no
+                          log line either): where NAME may then be used, which
+                          folders would then refuse a chat on which account,
+                          and which chats running now or started in the last
+                          7 days it would stop, move or let through again;
+                          --json: the same as one JSON object, for /accounts
   longhaul fallback NAME [on|off]
                           whether NAME is a fallback, used only when no other
                           account allowed there has room (with neither word
@@ -3347,6 +3354,19 @@ def chat_allowed(sid: str, on: list[dict], top: str) -> bool:
             and os.path.realpath(entry["folder"]) == os.path.realpath(top))
 
 
+def kept_from(accounts: list[dict], top: str, on: list[dict], sid) -> list[str]:
+    """The account check's rule alone, for account_refusal() and for what
+    `folders ... --dry-run` says a change would stop: the accounts whose
+    lists keep the repository `top` (covers()), in the file's order, when
+    chat `sid` on `on` (the accounts its config folder is) is refused
+    there; [] when its prompts go through: no list keeps `top`, it runs on
+    one that does, or it is allowed there (chat_allowed())."""
+    kept = [a["name"] for a in accounts if covers(a, top)]
+    if not kept or any(a["name"] in kept for a in on) or (sid and chat_allowed(sid, on, top)):
+        return []
+    return kept
+
+
 def account_refusal(data: dict):
     """The hook's answer refusing the prompt in `data` (a UserPromptSubmit
     input), logged, or None to let it through: None unless the session
@@ -3368,12 +3388,10 @@ def account_refusal(data: dict):
     if problem:
         return None
     top = repository_of(cwd)
-    kept = [a["name"] for a in accounts if covers(a, top)]
-    if not kept:
-        return None
     folder = chat_config_dir()
     on = accounts_on(accounts, folder)
-    if any(a["name"] in kept for a in on) or chat_allowed(sid, on, top):
+    kept = kept_from(accounts, top, on, sid)
+    if not kept:
         return None
     label, where = chat_label(on, folder), home_path(top)
     log(ACCOUNT_LOGGED.format(sid=sid, where=where, names=", ".join(kept), label=label))
@@ -16702,97 +16720,290 @@ def folders(opts) -> int:
     "repositories" changed without a hand edit; the accounts screen's
     buttons run it. With no option it only reads: where_allowed()'s words,
     and a line when other accounts keep every folder (kept_out_by()).
-    --add keeps PATH as written, `~` and all, as add's --repo does,
-    absolute once expanded, one not there yet with a note; --remove takes
-    off each entry that is PATH, as written or by real path; removes come
-    before adds. --anywhere drops the list, as an account added with no
-    --repo has none, and so does a remove that leaves it empty.
-    accounts.json is written as add and remove write it, whole, the other
-    keys and the accounts' order kept, one log line per change; an
-    unknown NAME or a bad path writes nothing, exit 2.
+    The change is folders_change()'s; accounts.json is written as add and
+    remove write it, whole, the other keys and the accounts' order kept,
+    one log line per change; an unknown NAME or a bad path writes
+    nothing, exit 2.
 
     --prefer PATH and --no-prefer PATH (the owner, 2026-11-11: an account
     "tied to a folder") change the folders the account is preferred in
-    ("preferred", which pick() reads: preferred_here()) by the same rules,
-    after the folders it may be used in, which they may come with: PATH
-    kept as written, a remove matched by real path, the key dropped when
-    none is left. A PATH the account may not be used in (eligible(), with
-    its folders as they are now) is refused with why (may_not_text())."""
-    adds, drops = opts.add or [], opts.remove or []
-    prefers, unprefers = getattr(opts, "prefer", None) or [], getattr(opts, "no_prefer", None) or []
-    if opts.anywhere and (adds or drops):
-        say("--anywhere drops every folder: give it alone, not with --add or --remove")
+    the same way (folders_preferred()).
+
+    --dry-run (the UX review of 2026-11-11, M4: a folder rule locked
+    people out by surprise) works the change out by the same code and
+    writes nothing, not the log, not a lock: the change, where the account
+    may then be used, which folders would then refuse a chat on which
+    account, and which chats running now or started lately it would stop,
+    move or let through again (folders_preview()); exit 2, said, for what
+    the change itself would refuse. --json, with it alone, gives the same
+    as one object ({"changes", "notes", "effects", "stops", "problem"}),
+    for /accounts to show before it asks."""
+    adds, prefers = opts.add or [], getattr(opts, "prefer", None) or []
+    dry, as_json = getattr(opts, "dry_run", False), getattr(opts, "json", False)
+    if as_json and not dry:
+        show("--json goes with --dry-run: give both, or neither")
         return 2
-    for p in adds:  # a relative path would be read against whatever folder longhaul runs in
-        if not os.path.isabs(os.path.expanduser(p)):
-            say(f"--add {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
-            return 2
-    for p in prefers:
-        if not os.path.isabs(os.path.expanduser(p)):
-            say(f"--prefer {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
-            return 2
-    if not (adds or drops or opts.anywhere or prefers or unprefers):  # it only reads: no lock, nothing written
-        accounts, problem = read_accounts_file()
-        acct = folders_account(opts.name, accounts, problem, tell=print)
+    problems: list[str] = []
+    tell = problems.append if as_json else show if dry else say  # a dry run logs nothing
+
+    def refused() -> int:
+        if as_json:
+            print_json({"changes": [], "notes": [], "effects": [], "stops": 0, "problem": " ".join(problems)})
+        return 2
+    if opts.anywhere and (adds or opts.remove):
+        tell("--anywhere drops every folder: give it alone, not with --add or --remove")
+        return refused()
+    for flag, paths in (("--add", adds), ("--prefer", prefers)):
+        for p in paths:  # a relative path would be read against whatever folder longhaul runs in
+            if not os.path.isabs(os.path.expanduser(p)):
+                tell(f"{flag} {shown(p)} is not an absolute path; give the folder's full path, like ~/work/repo")
+                return refused()
+    if not (adds or opts.remove or opts.anywhere or prefers or getattr(opts, "no_prefer", None)):
+        accounts, problem = read_accounts_file()  # it only reads: no lock, nothing written
+        acct = folders_account(opts.name, accounts, problem, tell=problems.append if as_json else print)
         if acct is None:
-            return 2
-        print("\n".join(folders_lines(acct, accounts)))
+            return refused()
+        if as_json:
+            print_json({"changes": [], "notes": [], "effects": folders_lines(acct, accounts), "stops": 0,
+                        "problem": None})
+        else:
+            print("\n".join(folders_lines(acct, accounts)))
         return 0
-    notes, changes = [], []
+    if dry:
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem, tell=tell)
+        made = None if acct is None else folders_change(opts, accounts, acct, tell, dry=True)
+        if made is None:
+            return refused()
+        entry, changes, notes = made
+        effects, stops = folders_preview(accounts, [entry if a is acct else a for a in accounts], entry)
+        if as_json:
+            print_json({"changes": changes, "notes": notes, "effects": effects, "stops": stops, "problem": None})
+            return 0
+        for line in changes + notes:
+            show(line)
+        print("\n".join(effects + [DRY_RUN_SAID]))
+        return 0
     with locked("accounts"):
         accounts, problem = read_accounts_file()
         acct = folders_account(opts.name, accounts, problem)
-        if acct is None:
+        made = None if acct is None else folders_change(opts, accounts, acct, say)
+        if made is None:
             return 2
-        name, found = acct["name"], acct.get("repositories")
-        # the other keys, in their order; all of them when only the preferred folders change
-        entry = {k: v for k, v in acct.items() if k != "repositories"} if opts.anywhere or adds or drops else acct
-        if opts.anywhere:
-            listed = repositories_of(acct)
-            if listed == []:
-                notes.append(f"{name} has no list of folders: it may be used anywhere already")
-            else:
-                changes.append(f"dropped {name}'s folders ({', '.join(map(home_path, listed))})" if listed
-                               else f"dropped {name}'s folders: {REPOSITORIES_JUNK}")
-        elif adds or drops:
-            if found is not None and not isinstance(found, list):
-                say(f"{name}'s repositories field is not a list, so no folder can be added to it or taken from it: "
-                    f"`longhaul folders {name} --anywhere` drops it, then --add sets its folders")
-                return 2
-            paths = list(found or [])
-            for p in drops:
-                hits = [e for e in paths if same_folder(e, p)]
-                if not hits:
-                    say(f"{folder_shown(p)} is not one of {name}'s folders; it may be used {where_allowed(acct)}")
-                    return 2
-                paths = [e for e in paths if e not in hits]
-                changes += [f"removed {folder_shown(e)} from {name}'s folders" for e in hits]
-            for p in adds:
-                if any(same_folder(e, p) for e in paths):
-                    notes.append(f"{folder_shown(p)} is already one of {name}'s folders")
-                    continue
-                paths.append(p)  # kept as given, `~` included, as config_dir is; expanded at use
-                changes.append(f"added {folder_shown(p)} to {name}'s folders")
-                if not os.path.exists(os.path.expanduser(p)):
-                    notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
-            if paths:  # in its place when it was there, else last; none left, none kept
-                entry = {**acct, "repositories": paths}
-        if prefers or unprefers:
-            entry = folders_preferred(entry, [entry if a is acct else a for a in accounts], prefers, unprefers,
-                                      changes, notes)
-            if entry is None:
-                return 2
+        entry, changes, notes = made
         if changes:
             accounts[accounts.index(acct)] = entry
             write_accounts(accounts)
-        else:
-            entry = acct
     for line in changes:
         say(line)
     for line in notes:
         show(line)
     print("\n".join(folders_lines(entry, accounts)))
     return 0
+
+
+def folders_change(opts, accounts: list[dict], acct: dict, tell, dry: bool = False):
+    """What `longhaul folders` makes of `acct` (an entry of `accounts`),
+    written or not: (the entry after it, its changes, its notes), the
+    entry `acct` itself when nothing changes; None once `tell` has said
+    why it is refused. --add keeps PATH as written, `~` and all, as add's
+    --repo does, absolute once expanded, one not there yet with a note;
+    --remove takes off each entry that is PATH, as written or by real
+    path; removes come before adds. --anywhere drops the list, as an
+    account added with no --repo has none, and so does a remove that
+    leaves it empty. Then --no-prefer and --prefer (folders_preferred()).
+    `dry`: each change said as one that would be made."""
+    adds, drops = opts.add or [], opts.remove or []
+    prefers, unprefers = getattr(opts, "prefer", None) or [], getattr(opts, "no_prefer", None) or []
+    notes, changes = [], []
+    name, found = acct["name"], acct.get("repositories")
+    # the other keys, in their order; all of them when only the preferred folders change
+    entry = {k: v for k, v in acct.items() if k != "repositories"} if opts.anywhere or adds or drops else acct
+    if opts.anywhere:
+        listed = repositories_of(acct)
+        if listed == []:
+            notes.append(f"{name} has no list of folders: it may be used anywhere already")
+        else:
+            drop = "would drop" if dry else "dropped"
+            changes.append(f"{drop} {name}'s folders ({', '.join(map(home_path, listed))})" if listed
+                           else f"{drop} {name}'s folders: {REPOSITORIES_JUNK}")
+    elif adds or drops:
+        if found is not None and not isinstance(found, list):
+            tell(f"{name}'s repositories field is not a list, so no folder can be added to it or taken from it: "
+                 f"`longhaul folders {name} --anywhere` drops it, then --add sets its folders")
+            return None
+        paths = list(found or [])
+        for p in drops:
+            hits = [e for e in paths if same_folder(e, p)]
+            if not hits:
+                tell(f"{folder_shown(p)} is not one of {name}'s folders; it may be used {where_allowed(acct)}")
+                return None
+            paths = [e for e in paths if e not in hits]
+            changes += [f"{'would remove' if dry else 'removed'} {folder_shown(e)} from {name}'s folders" for e in hits]
+        for p in adds:
+            if any(same_folder(e, p) for e in paths):
+                notes.append(f"{folder_shown(p)} is already one of {name}'s folders")
+                continue
+            paths.append(p)  # kept as given, `~` included, as config_dir is; expanded at use
+            changes.append(f"{'would add' if dry else 'added'} {folder_shown(p)} to {name}'s folders")
+            if not os.path.exists(os.path.expanduser(p)):
+                notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
+        if paths:  # in its place when it was there, else last; none left, none kept
+            entry = {**acct, "repositories": paths}
+    if prefers or unprefers:
+        entry = folders_preferred(entry, [entry if a is acct else a for a in accounts], prefers, unprefers,
+                                  changes, notes, tell, dry)
+        if entry is None:
+            return None
+    return (entry if changes else acct), changes, notes
+
+
+def print_json(found) -> None:
+    """One JSON object on stdout, as status --json prints its own."""
+    try:
+        print(json.dumps(found, ensure_ascii=False))
+    except UnicodeEncodeError:  # a stdout that cannot take a folder's letters: the same object, escaped
+        print(json.dumps(found))
+
+
+# What `longhaul folders ... --dry-run` says last, and how far it looks for
+# the chats a change would stop or move: those running now
+# (doctor_processes()) and those Longhaul's log says started (or moved, or
+# reopened) in the last PREVIEW_DAYS days, at most PREVIEW_CHATS of them named.
+DRY_RUN_SAID = "Nothing changed: --dry-run only says what it would do."
+PREVIEW_DAYS = 7
+PREVIEW_CHATS = 10
+
+
+def or_words(names) -> str:
+    """a; a or b; a, b or c."""
+    names = list(names)
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
+
+
+def folders_preview(before: list[dict], after: list[dict], entry: dict) -> tuple:
+    """What `folders ... --dry-run` says a change would do, by the rules
+    that would then decide: (its lines, how many chats it would stop).
+    Where the account may then be used (folders_lines()); each folder a
+    list names, before or after, whose reserving accounts would change
+    (folder_effect()); then each chat running now or started lately
+    (preview_chats()) whose prompts the account check (kept_from()) would
+    then refuse, or let through again, or whose account may then no
+    longer be used there (eligible()), which the relay moves it off."""
+    shown_after = folders_lines(entry, after)
+    lines = [f"Then {shown_after[0]}", *shown_after[1:]]
+    names, seen = [a["name"] for a in after], set()
+    for acct in (*before, *after):
+        for path in repositories_of(acct) or ():
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                line = folder_effect(before, after, path, names)
+                if line:
+                    lines.append(line)
+    chats, listed = preview_chats(before)
+    if not listed:
+        lines.append("The chats running now could not be listed (ps did not answer), so only those in Longhaul's log "
+                     "are looked at.")
+    said, stops = [], 0
+    for chat in chats:
+        on_before, on_after = (preview_on(chat, accounts) for accounts in (before, after))
+        top = chat["top"]
+        was, now = (kept_from(accounts, top, on, chat["sid"])
+                    for accounts, on in ((before, on_before), (after, on_after)))
+        label = chat["label"]
+        if now and not was:
+            stops += 1
+            effect = f"its next message would stop, as {home_path(top)} would be reserved for {or_words(now)}"
+        elif was and not now:
+            effect = "its messages would go through again"
+        elif not now and on_after and any(a["name"] in eligible(before, top) for a in on_before) \
+                and not any(a["name"] in eligible(after, top) for a in on_after):
+            effect = (f"{label} may no longer be used there, so it moves off {label} (in auto once Claude is idle, "
+                      "else when it is opened again)")
+        else:
+            continue
+        said.append(f"  {chat['who']} in {chat['where']} on {label} ({chat['when']}): {effect}.")
+    if said:
+        lines.append(f"Chats it would change (running now, or started in the last {PREVIEW_DAYS} days):")
+        lines += said[:PREVIEW_CHATS] + ([f"  and {len(said) - PREVIEW_CHATS} more"] if len(said) > PREVIEW_CHATS else [])
+    else:
+        lines.append(f"No chat running now or started in the last {PREVIEW_DAYS} days would stop or move.")
+    return lines, stops
+
+
+def folder_effect(before: list[dict], after: list[dict], path: str, names: list[str]):
+    """One line of folders_preview(): the accounts the folder `path` would
+    be reserved for (covers()) after the change, beside those it is now,
+    and the accounts whose chats there it would then stop, or let through
+    again, by the account check's rule; None when they are the same."""
+    top = os.path.normpath(path)
+    was, now = ([a["name"] for a in accounts if covers(a, top)] for accounts in (before, after))
+    if was == now:
+        return None
+    refused = lambda kept: [n for n in names if kept and n not in kept]  # noqa: E731
+    stop = [n for n in refused(now) if n not in refused(was)]
+    free = [n for n in refused(was) if n not in refused(now)]
+    where = folder_shown(path)
+    head = ((f"{where} would be reserved for {or_words(now)}" + (f" (now for {or_words(was)})" if was else ""))
+            if now else f"{where} would no longer be reserved for {or_words(was)}")
+    parts = ([f"a chat there on {or_words(stop)} would stop at its next message"] if stop else []) \
+        + ([f"a chat there on {or_words(free)} would go through again"] if free else [])
+    return head + (": " + "; ".join(parts) if parts else "") + "."
+
+
+def preview_chats(accounts: list[dict]) -> tuple:
+    """The chats a folders change may stop or move: (the chats, whether
+    those running now could be listed). First each one running now
+    (doctor_processes(), Claude's own folders passed over as the doctor
+    passes them): its pid, its id when known, its folder and the config
+    folder it runs on. Then each one Longhaul's log says started, moved
+    or reopened in the last PREVIEW_DAYS days (activity_events()) and not
+    running, newest first, on the account its latest such line names,
+    while that account is listed. Ids, names, folders and times only."""
+    processes = doctor_processes()
+    allowed = {sid[:8]: sid for sid in allowances()}  # the log names a chat by its first 8 characters
+    found, running = [], set()
+    for chat in processes or ():
+        cwd, value = chat.get("cwd"), chat.get("config_dir")
+        if not (isinstance(cwd, str) and os.path.isabs(cwd)) or doctor_own_folder(cwd):
+            continue
+        sid = chat.get("session") or chat.get("resume")
+        sid = sid if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid) else None
+        config = os.path.abspath(doctor_expand(value)) if value else str(DEFAULT_CONFIG)
+        found.append({"sid": sid, "who": f"chat {sid[:8]}" if sid else f"pid {chat.get('pid')}", "when": "running now",
+                      "top": repository_of(cwd), "where": home_path(cwd), "config": config,
+                      "label": chat_label(accounts_on(accounts, config), config)})
+        if sid:
+            running.add(sid[:8])
+    verbs = {"Started on": "started", "Moved to": "moved", "Reopened on": "reopened"}
+    last: dict = {}
+    for e in activity_events(PREVIEW_DAYS):  # oldest first: the latest line wins
+        short = e.get("chat")
+        if not short or short in running:
+            continue
+        verb = next((v for k, v in verbs.items() if e["what"].startswith(k + " ")), None)
+        row = last.setdefault(short, {})
+        if verb and isinstance(e.get("where"), str):
+            row.update(where=e["where"], verb=verb, at=e["time"])
+        if e.get("account"):
+            row["account"] = e["account"]
+    names = {a["name"] for a in accounts}
+    recent = [(short, row) for short, row in last.items() if row.get("where") and row.get("account") in names
+              and os.path.isabs(doctor_expand(row["where"]))]
+    for short, row in sorted(recent, key=lambda item: -item[1]["at"]):
+        found.append({"sid": allowed.get(short), "who": f"chat {short}",
+                      "when": f"{row['verb']} {clock(row['at'])}", "top": doctor_expand(row["where"]),
+                      "where": row["where"], "account": row["account"], "label": row["account"]})
+    return found, processes is not None
+
+
+def preview_on(chat: dict, accounts: list[dict]) -> list[dict]:
+    """The accounts in `accounts` a chat of preview_chats() runs on: those
+    whose config folder its claude runs on, or the account the log names."""
+    if "config" in chat:
+        return accounts_on(accounts, chat["config"])
+    return [a for a in accounts if a["name"] == chat["account"]]
 
 
 # What `longhaul fallback`, status and the accounts screen say of a fallback
@@ -16853,36 +17064,38 @@ def fallback_cmd(opts) -> int:
 
 
 def folders_preferred(entry: dict, accounts: list[dict], prefers: list, unprefers: list, changes: list,
-                      notes: list):
+                      notes: list, tell=say, dry: bool = False):
     """`entry` with --no-prefer's folders taken off its "preferred", then
     --prefer's added (folders()'s rules), each change and note added to
     `changes` and `notes`; `accounts` holds `entry` in its place, for
     eligible(). None once the refusal is said: a field that is not a list,
     a folder to take off it is not preferred in, or one to add that it may
-    not be used in."""
+    not be used in, each said by `tell`. `dry`: each change said as one
+    that would be made (folders_change())."""
     name, found = entry["name"], entry.get("preferred")
     if found is not None and not isinstance(found, list):
-        say(f"{name}'s preferred field is not a list, so no folder can be added to it or taken from it; until it is "
+        tell(f"{name}'s preferred field is not a list, so no folder can be added to it or taken from it; until it is "
             f"mended in {home_path(str(LONGHAUL_HOME / 'accounts.json'))}, {name} is preferred nowhere")
         return None
     liked = list(found or [])
     for p in unprefers:
         hits = [e for e in liked if same_folder(e, p)]
         if not hits:
-            say(f"{folder_shown(p)} is not a folder {name} is preferred in")
+            tell(f"{folder_shown(p)} is not a folder {name} is preferred in")
             return None
         liked = [e for e in liked if e not in hits]
-        changes += [f"{name} is no longer preferred in {folder_shown(e)}" for e in hits]
+        changes += [f"{name} {'would no longer be' if dry else 'is no longer'} preferred in {folder_shown(e)}"
+                    for e in hits]
     for p in prefers:
         if any(same_folder(e, p) for e in liked):
             notes.append(f"{name} is preferred in {folder_shown(p)} already")
             continue
         where = os.path.normpath(os.path.expanduser(p))
         if name not in eligible(accounts, where):
-            say(f"{may_not_text(entry, where, accounts)}, so it cannot be preferred there")
+            tell(f"{may_not_text(entry, where, accounts)}, so it cannot be preferred there")
             return None
         liked.append(p)  # kept as given, `~` included, as "repositories" is
-        changes.append(f"{name} is preferred in {folder_shown(p)}")
+        changes.append(f"{name} {'would be' if dry else 'is'} preferred in {folder_shown(p)}")
         if not os.path.exists(where):
             notes.append(f"{folder_shown(p)} does not exist yet; kept for when it does")
     if liked:  # in its place when it was there, else last; none left, none kept
@@ -20190,6 +20403,11 @@ def main(argv: list[str]) -> int:
                                 "allowed); repeat for more")
             p.add_argument("--no-prefer", action="append", metavar="PATH",
                            help="a folder it is preferred in, taken off, matched by real path; repeat for more")
+            p.add_argument("--dry-run", action="store_true",
+                           help="say what the change would do (which folders would then refuse a chat on which "
+                                "account, and which chats running now or started lately it would stop) and change "
+                                "nothing")
+            p.add_argument("--json", action="store_true", help="with --dry-run: the same as one JSON object")
         if cmd == "allow":
             p.add_argument("chat", metavar="ID",
                            help="the chat: its id, or its first 8 characters or more (the account check's refusal "
