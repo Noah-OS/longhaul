@@ -12244,6 +12244,11 @@ class Shim(unittest.TestCase):
         return subprocess.run([str(HERE / "bin" / "longhaul"), *args], input=input, capture_output=True, text=True,
                               env={**self.env, **env}, timeout=30)
 
+    def usage(self, *args) -> str:
+        """What longhaul.py itself prints for `help all`, or for ARGS."""
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *(args or ("help", "all"))],
+                              capture_output=True, text=True, env=self.env, timeout=30).stdout
+
     def chat(self, *args, **env):
         """The shim as a chat's Bash tool runs it: inside a Claude Code
         session (its variables set, its account's folder the scratch one),
@@ -12265,8 +12270,8 @@ class Shim(unittest.TestCase):
     def test_the_shim_runs_the_read_only_commands_of_the_checkout_it_sits_in(self):
         out = self.shim("-h")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("usage: longhaul", out.stdout)
-        self.assertIn("longhaul inspect", out.stdout, "the Usage block reaches -h (review, Sprint 3)")
+        self.assertEqual(out.stdout, self.usage("-h"), "the one screen of -h (the UX review's M6)")
+        self.assertIn("longhaul inspect", out.stdout)
         out = self.shim("inspect", "nope")
         self.assertEqual(out.returncode, 1, "inspect ran, and found nothing: its own exit code")
         self.assertIn("longhaul inspect:", out.stderr)
@@ -12559,7 +12564,7 @@ class Shim(unittest.TestCase):
             self.assertIn("run it in a terminal", out.stderr, args)
         self.assertFalse((self.tmp / "home" / "advisor").exists(), "nothing was written")
         self.assertIn("advisor status", self.shim("nope").stderr, "the refusal names what does run")
-        self.assertIn("longhaul advisor status", self.shim("-h").stdout, "the Usage block names it")
+        self.assertIn("longhaul advisor status", self.usage(), "the Usage block names it")
 
     def test_the_shim_runs_doctor_which_only_reads(self):
         # The owner, 2026-10-25 ("Doctor + first-chat line"): /longhaul:doctor
@@ -12589,7 +12594,7 @@ class Shim(unittest.TestCase):
             self.assertIn("from here only `doctor` runs, with nothing after it", out.stderr, args)
         self.assertIn("doctor", self.shim("nope").stderr, "the refusal names what does run")
         self.assertIn("doctor", self.shim().stderr)
-        self.assertIn("longhaul doctor", self.shim("-h").stdout, "the Usage block names it")
+        self.assertIn("longhaul doctor", self.usage(), "the Usage block names it")
 
     def test_the_shim_runs_checkpoint_save_which_writes_the_checkpoint_and_its_record_under_the_home(self):
         # Sprint 4, C1: decision 5 of ADR-0001 amended by the owner. The model
@@ -12606,7 +12611,7 @@ class Shim(unittest.TestCase):
         out = self.shim("checkpoint", "save", "s1", input="{not json")
         self.assertEqual(out.returncode, 2, "the refusal's own exit code")
         self.assertIn("longhaul checkpoint: not saved", out.stderr)
-        self.assertIn("longhaul checkpoint", self.shim("-h").stdout, "the Usage block names it")
+        self.assertIn("longhaul checkpoint", self.usage(), "the Usage block names it")
         # The skill passes no id: the save takes the session's from the Bash
         # tool's environment (review, A13).
         out = self.shim("checkpoint", "save", input=json.dumps(state), CLAUDE_CODE_SESSION_ID="s9")
@@ -12938,7 +12943,7 @@ class Launcher(unittest.TestCase):
         self.assertFalse(self.target.is_symlink())
         out = self.launch("-h")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("usage: longhaul", out.stdout)
+        self.assertIn("longhaul help all", out.stdout)
         shutil.rmtree(copy)  # a lost cache: one line, reinstall
         out = self.launch("status")
         self.assertEqual(out.returncode, 1)
@@ -20221,6 +20226,13 @@ class Pipe(StreamHarness):
     def test_pipe_switch_flag_never_wins_over_auto_in_the_environment(self):
         self.assertEqual(self.stays("--switch", "never", LONGHAUL_SWITCH="auto")["switch"], "never")
 
+    def test_pipe_takes_wait_as_never_on_the_flag_and_in_the_environment(self):
+        # The UX review's M6: the stream's line says never, the word a driver knows.
+        self.assertEqual(self.stays("--switch", "wait", LONGHAUL_SWITCH="auto")["switch"], "never")
+        self.tearDown()
+        self.setUp()
+        self.assertEqual(self.stays(LONGHAUL_SWITCH="wait")["switch"], "never")
+
     def test_pipe_without_swap_writes_no_stays_line_in_any_mode(self):
         # Review, Sprint 2: only the auto cell of this row had a test.
         for mode in ("ask", "never", "auto"):
@@ -25518,6 +25530,43 @@ class StatusJson(unittest.TestCase):
         self.assertEqual((found["switch"], found["switch_problem"]), ("auto", None))
         self.assertEqual(self.read(self.status(LONGHAUL_SWITCH="never"))["switch"], "never")
 
+    def test_wait_reaches_the_screen_as_never_the_one_word_it_knows(self):
+        # "wait" is never by another word (the UX review's M6); the pane's
+        # Select knows ask, auto and never alone, so the JSON says never.
+        self.write_accounts({"name": "personal-1"})
+        modes = lambda found: (found["switch"], found["switch_problem"], found["panel_switch"])
+        self.assertEqual(modes(self.read(self.status(LONGHAUL_SWITCH="wait"))), ("never", None, "never"))
+        (self.home / "config.json").write_text('{"switch": "wait"}')
+        (self.home / "vscode.json").write_text('{"switch": "wait"}')
+        self.assertEqual(modes(self.read(self.status())), ("never", None, "never"), "a hand-written wait in either file")
+
+    def test_login_name_is_setup_name_relogin_by_another_name(self):
+        # The UX review's M6: `longhaul login NAME` runs setup itself, with
+        # the same options `setup NAME --relogin` gives it, so it says the same.
+        seen = []
+        with mock.patch.object(longhaul, "setup", side_effect=lambda opts: seen.append(vars(opts)) or 0):
+            self.assertEqual(longhaul.main(["login", "work"]), 0)
+            self.assertEqual(longhaul.main(["setup", "work", "--relogin"]), 0)
+        self.assertEqual(seen, [{"account": "work", "relogin": True}] * 2)
+        self.write_accounts({"name": "work", "config_dir": str(self.folder("work")), "email": "work@example.com"})
+        self.emails = {str(self.folder("work")): "work@example.com"}
+        logins = lambda: len((self.home / "logins.jsonl").read_text().splitlines())
+        self.assertEqual(self.longhaul("setup", "work").returncode, 0, "signed in, and the command linked, first")
+        self.assertFalse((self.home / "logins.jsonl").exists(), "no browser for an account signed in already")
+        said = []
+        for args in (("setup", "work", "--relogin"), ("login", "work")):
+            out = self.longhaul(*args)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            said.append((out.stdout, out.stderr))
+        self.assertEqual(logins(), 2, "each signed in again in the browser, though signed in already")
+        self.assertEqual(said[1], said[0], "the same words")
+        out = self.longhaul("login", "nobody")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no account called nobody; the accounts are work", out.stdout + out.stderr)
+        out = self.longhaul("login")
+        self.assertEqual(out.returncode, 2, "a NAME is needed: with none setup signs every account in")
+        self.assertIn("usage: longhaul login [-h] NAME", out.stderr)
+
     def test_panel_switch_is_the_panels_own_mode_which_vscode_json_can_set_apart(self):
         # The panel reads LONGHAUL_SWITCH, then "switch" in vscode.json, then
         # config.json (panel_switch_mode()); the screen says so when it is not "switch".
@@ -25732,8 +25781,200 @@ class Switch(unittest.TestCase):
         self.assertIn("longhaul switch [ask|auto|never]", longhaul.__doc__)
         out = self.switch("-h")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("usage: longhaul switch [-h] [{ask,auto,never}]", out.stdout)
+        self.assertIn("usage: longhaul switch [-h] [{ask,auto,never,wait}]", out.stdout)
         self.assertIn("LONGHAUL_SWITCH", out.stdout)
+        self.assertIn("wait: the same as never", " ".join(out.stdout.split()))
+
+    def test_wait_is_never_by_another_word_and_is_saved_as_never(self):
+        # The UX review of 2026-11-11 (M6): "never" reads as "never carry
+        # on", and it waits for the reset and carries on there. "wait" is
+        # read wherever a mode is given; the files keep "never", the one
+        # word older copies of Longhaul and the pane know.
+        out = self.switch("wait")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(self.config.read_text()), {"switch": "never"})
+        self.config.unlink()
+        self.assertEqual(self.switch("never").stdout, out.stdout, "the same words as never")
+        self.assertTrue(self.switch().stdout.startswith(f"Switching: never (saved in {self.where})"))
+        out = self.switch(LONGHAUL_SWITCH="wait")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(out.stdout.startswith(f"Switching: never (set by LONGHAUL_SWITCH, over never saved in "
+                                              f"{self.where}): {longhaul.SWITCH_MODES['never']}"), out.stdout)
+        # A "wait" written by hand in either file is never too, and the log has no complaint.
+        self.config.write_text(json.dumps({"switch": "wait"}))
+        self.assertTrue(self.switch().stdout.startswith(f"Switching: never (saved in {self.where})"))
+        vscode = self.home / "vscode.json"
+        vscode.write_text(json.dumps({"switch": "wait"}))
+        self.assertIn("The VS Code panel uses never, from the key switch in ~/home/vscode.json", self.switch().stdout)
+        with mock.patch.object(longhaul, "CONFIG", self.config), mock.patch.object(longhaul, "VSCODE_CONFIG", vscode), \
+                mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}):
+            self.assertEqual((longhaul.config_switch(), longhaul.switch_mode(), longhaul.saved_switch()),
+                             ("never", "never", "never"))
+            with mock.patch.object(longhaul, "log") as log:
+                self.assertEqual((longhaul.panel_switch_mode(), longhaul.panel_switch_in_force()), ("never", "never"))
+            log.assert_not_called()
+            self.assertEqual(longhaul.switch_mode("wait"), "never", "the flag's word")
+            with mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": "wait"}):
+                self.assertEqual((longhaul.switch_mode(), longhaul.panel_switch_mode()), ("never", "never"))
+                self.assertEqual(longhaul.panel_switch_source(), ("never", "env"))
+        self.assertFalse((self.home / "longhaul.log").exists() and "is not ask, auto or never"
+                         in (self.home / "longhaul.log").read_text())
+
+    def test_the_launch_flag_takes_wait_as_never(self):
+        seen = []
+        with mock.patch.object(longhaul, "run", side_effect=lambda opts: seen.append(opts.switch) or 0):
+            self.assertEqual(longhaul.main(["--switch", "wait"]), 0)
+            self.assertEqual(longhaul.main(["--switch", "never"]), 0)
+        self.assertEqual(seen, ["never", "never"])
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            longhaul.main(["--switch", "sometimes"])
+        self.assertRegex(err.getvalue(), r"invalid choice: .*sometimes.*ask.*auto.*never.*wait")
+
+
+class Help(unittest.TestCase):
+    """`longhaul -h` and `longhaul help [COMMAND|hooks|all]` (the UX review
+    of 2026-11-11, §3.5 and M6): -h printed all 362 lines of the Usage
+    block, opening with an old pitch and naming the 14 commands only the
+    plugin's hooks run. Now -h is one screen of the commands a person
+    types, and `help` takes the rest from the Usage block itself, which
+    stays the one source of the long text."""
+
+    USAGE = longhaul.__doc__[longhaul.__doc__.index("Usage:"):]
+    # Words the screen leaves to the glossary's one word per idea (§4.8).
+    RETIRED = r"\b(conversations?|sessions?|subscriptions?)\b"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def longhaul(self, *args):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.tmp / "home"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"))
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+
+    def screen(self) -> str:
+        out = self.longhaul("-h")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        return out.stdout
+
+    def entries(self) -> list:
+        """The Usage block's entries as the test reads them, apart from the
+        code's own reading: a line two spaces in starts one, and the lines
+        further in carry it on."""
+        found = []
+        for line in self.USAGE.splitlines()[1:]:
+            if re.match(r"  \S", line):
+                found.append(line + "\n")
+            else:
+                found[-1] += line + "\n"
+        return found
+
+    def test_dash_h_fits_one_screen_and_opens_with_what_longhaul_does(self):
+        screen = self.screen()
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 50, screen)
+        self.assertLessEqual(max(map(len, lines)), 80, max(lines, key=len))
+        # The README's claim: long chats and several accounts, the checkpoint
+        # and the compaction at 400k, the move at a limit, where the tokens went.
+        top = " ".join(screen.split("\n\n")[0].split())
+        self.assertTrue(top.startswith("Longhaul: a Claude Code plugin for long chats and more than one account."), top)
+        for said in ("At 400,000 tokens of context it has Claude save a checkpoint, then it compacts the chat.",
+                     "At a usage limit it asks, then moves the chat to another of your accounts",
+                     "It shows where a chat's tokens went."):
+            self.assertIn(said, top)
+        self.assertNotIn("stop the waste", screen, "the old pitch")
+        self.assertNotIn("Usage:", screen, "not the Usage block")
+        self.assertEqual([line.split()[:3] for line in lines[-3:]],
+                         [["longhaul", "help", "COMMAND"], ["longhaul", "help", "hooks"], ["longhaul", "help", "all"]])
+        self.assertNotRegex(screen, self.RETIRED)
+        for same in (("--help",), ("help",), ("help", "-h"), ("--account", "Pro", "-h"), ("-c", "--help")):
+            out = self.longhaul(*same)
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, screen, ""), same)
+
+    def test_dash_h_groups_the_commands_a_person_types_and_names_no_hooks_one(self):
+        screen = self.screen()
+        for group in ("Start Claude here", "Accounts", "At a limit", "See what happened", "Fix", "Set up", "More"):
+            self.assertRegex(screen, rf"(?m)^{group}")
+        for command in longhaul.HELP_HOOKS:
+            self.assertNotRegex(screen, rf"longhaul {re.escape(command)}\b", command)
+        self.assertNotRegex(screen, r"longhaul checkpoint\b", "its hook form, and save is the skill's")
+        self.assertNotRegex(screen, r"longhaul statusline(?! install)", "the bare form is the one Claude Code runs")
+        for said in ("longhaul login NAME", "longhaul switch ask|auto|wait", "longhaul doctor", "longhaul inspect",
+                     "longhaul activity", "longhaul repair", "longhaul add", "longhaul folders NAME"):
+            self.assertIn(said, screen)
+
+    def test_every_command_the_screen_names_has_its_entries_in_help(self):
+        named = set(re.findall(r"(?m)^  longhaul ([a-z][a-z-]*)", self.screen())) - {"help"}
+        self.assertGreater(len(named), 15, named)
+        for command in sorted(named):
+            out = self.longhaul("help", command)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), command)
+            self.assertTrue(out.stdout.startswith(f"  longhaul {command}"), (command, out.stdout[:80]))
+        launch = self.longhaul("help", "start").stdout
+        for flag in re.findall(r"(?m)^  longhaul (-[-a-z]*)", self.screen()):
+            self.assertIn(f"longhaul {flag}", launch, flag)
+
+    def test_help_all_prints_the_whole_usage_block_as_it_is(self):
+        out = self.longhaul("help", "all")
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, self.USAGE, ""))
+        self.assertIn("longhaul login NAME", self.USAGE, "the new words are in it too")
+        self.assertIn("longhaul help [COMMAND|hooks|all]", self.USAGE)
+
+    def test_help_command_prints_that_commands_entries_from_the_usage_block(self):
+        entries = self.entries()
+        for command, count in (("folders", 3), ("remove", 2), ("inspect", 2), ("trial", 3), ("advisor", 3),
+                               ("switch", 1), ("login", 1), ("help", 1), ("quota-note", 1), ("stop-failure", 1),
+                               ("-r", 2), ("log", 1)):
+            out = self.longhaul("help", command)
+            self.assertEqual((out.returncode, out.stderr), (0, ""), command)
+            mine = [e for e in entries if e in out.stdout]
+            self.assertEqual(len(mine), count, (command, out.stdout))
+            self.assertEqual(out.stdout, "".join(mine), "the entries alone, as the block has them, in its order")
+        # Bare `longhaul` and its options: the launch.
+        out = self.longhaul("help", "start")
+        self.assertEqual(out.stdout, "".join(e for e in entries if re.match(r"  longhaul (-|\s)", e)))
+        self.assertIn("longhaul --switch MODE", out.stdout)
+        for nothing in (("nope",), ("folders", "x"), ("--nope",)):
+            out = self.longhaul("help", *nothing)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), nothing)
+            self.assertEqual(len(out.stderr.splitlines()), 1, out.stderr)
+            self.assertIn("`longhaul help`", out.stderr)
+        self.assertIn('no command "nope"', self.longhaul("help", "nope").stderr)
+
+    def test_help_hooks_lists_what_the_hooks_run_under_one_line_that_says_so(self):
+        out = self.longhaul("help", "hooks")
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        first, rest = out.stdout.split("\n", 1)
+        self.assertIn("The plugin's hooks", first)
+        self.assertIn("you need not", first)
+        self.assertLessEqual(len(first), 80)
+        hooks = [e for e in self.entries() if e in rest]
+        self.assertEqual(rest, "".join(hooks))
+        heads = [e.split("\n")[0].split()[:2] for e in hooks]
+        self.assertEqual(sorted({h[1] for h in heads}),
+                         sorted(["guard", "checkpoint", "statusline", "advisor-hook", "reminder", "account-check",
+                                 "answer", "session-end", "filter", "autocompact-note", "precompact", "stop-failure",
+                                 "pipe"]))
+        self.assertNotIn("longhaul checkpoint save", rest, "the skill's, not a hook's")
+        self.assertNotIn("longhaul statusline install", rest, "a person's")
+
+    def test_every_usage_entry_is_reachable_by_help(self):
+        reached = self.longhaul("help", "hooks").stdout + self.longhaul("help", "start").stdout
+        for entry in self.entries():
+            head = entry.split("\n")[0].strip()
+            names = [part.split()[1] for part in head.split(" | ") if part.startswith("longhaul ")]
+            names += ["log"] if head.startswith("(log)") else []
+            shown = reached + "".join(self.longhaul("help", name).stdout for name in names)
+            self.assertIn(entry, shown, head)
+
+    def test_the_hooks_commands_are_the_ones_the_plugin_runs(self):
+        run = set(re.findall(r"main\(\['([a-z-]+)'\]\)", (HERE / "hooks" / "hooks.json").read_text()))
+        run |= set(longhaul.CODEX_HOOK_COMMANDS) | {"autocompact-note"}  # hooks/codex_hook.py; the hooks module
+        self.assertGreater(len(run), 10, run)
+        self.assertEqual(run - set(longhaul.HELP_HOOKS), {"checkpoint"}, "the hook form of checkpoint is its bare one")
+        self.assertIn("longhaul checkpoint", longhaul.HELP_HOOK_FORMS)
 
 
 class AccountCheck(unittest.TestCase):

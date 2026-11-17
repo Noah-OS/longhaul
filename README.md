@@ -210,7 +210,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_LOG` | routine lines left out | `debug`: every line, reminder checks below the threshold and short panel jobs included |
 | `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
 
-`longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul -h`, or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).
+`longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul help all` (`longhaul -h` shows the usual ones on one screen), or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).
 
 ## 8. Update and remove
 

@@ -2,6 +2,20 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+Help that fits one screen, and two shorter words.
+
+### Added
+
+- **`longhaul help [COMMAND|hooks|all]`.** `help COMMAND` prints that command's entries from the full list of commands, `help start` the options of a plain `longhaul`, `help hooks` the commands the plugin's hooks run (you need not run them), and `help all` the whole list, as `-h` printed it before.
+- **`longhaul login NAME`**: the same as `longhaul setup NAME --relogin`.
+- **`wait`**, another word for the switching mode `never`, wherever a mode is given: `longhaul switch wait`, `--switch wait`, `LONGHAUL_SWITCH=wait` and `longhaul pipe --switch wait`. It is saved as `never`, the word older copies of Longhaul and `/accounts` read.
+
+### Changed
+
+- **`longhaul -h` fits one screen**: 49 lines, none wider than 80 columns. It says what Longhaul does, then lists the commands a person types, one line each, grouped: start Claude here, accounts, at a limit, see what happened, fix, set up. Before, it printed all 362 lines of the full list, which opened with an old description and named the commands only the plugin's hooks run.
+
 ## 0.3.17 - 2026-11-17
 
 See what a change would do before it is made; and two more commands a chat may run.
