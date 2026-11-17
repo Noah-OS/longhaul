@@ -2315,6 +2315,143 @@ for _n, _case in enumerate(status_cases(), 1):
             _status_case_test(_case))
 
 
+class StatusLineState(unittest.TestCase):
+    """What `longhaul statusline` prints for each state of the review's
+    table (4.6, M3), from the files Longhaul keeps: one test per row, the
+    line read without its colours. The words of each line are the shared
+    cases' (StatusLineGrammar); these tests show the terminal finds the
+    state."""
+
+    SID = "5f0e3a52-0000-4000-8000-00000000c0de"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.work, self.personal = self.tmp / "claude-work", self.tmp / "claude-personal"
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "personal", "email": "p@example.com", "config_dir": str(self.personal)},
+            {"name": "work", "email": "w@example.com", "config_dir": str(self.work)}]))
+        for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                        mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"),
+                        mock.patch.object(longhaul, "LEDGER", self.home / "ledger.jsonl"),
+                        mock.patch.object(longhaul, "LABELS", self.home / "labels.json"),
+                        mock.patch.object(longhaul, "release_word", lambda: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.now = time.time()
+
+    def reading(self, five=12, week=40, ctx=88000, cost=0.03, resets=None):
+        resets = resets or self.now + 3600
+        limits = {}
+        if five is not None:
+            limits["five_hour"] = {"used_percentage": five, "resets_at": resets}
+        if week is not None:
+            limits["seven_day"] = {"used_percentage": week, "resets_at": resets + 86400}
+        data = {"session_id": self.SID, "cost": {"total_cost_usd": cost}, "rate_limits": limits}
+        if ctx is not None:
+            data["context_window"] = {"current_usage": {"input_tokens": 6, "cache_read_input_tokens": ctx - 6,
+                                                        "cache_creation_input_tokens": 0}}
+        return data
+
+    def line(self, data=None, on="work", now=None):
+        folder = {"work": self.work, "personal": self.personal}.get(on)
+        painted = longhaul.record_usage(self.reading() if data is None else data, str(folder) if folder else None,
+                                        now=now)
+        return ANSI.sub("", painted)
+
+    def chat_file(self, folder, value):
+        path = self.home / folder / f"{self.SID}.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(value))
+
+    def test_normal(self):
+        self.assertEqual(self.line(), "work · 5h 12% · wk 40% · ctx 88k")
+
+    def test_near_full_shows_the_reset(self):
+        resets = self.now + 3600
+        self.assertEqual(self.line(self.reading(five=91, resets=resets)),
+                         f"work · 5h 91% ({longhaul.clock(resets)}) · wk 40% · ctx 88k")
+
+    def test_at_a_limit_with_a_question_open(self):
+        self.chat_file("questions", {"id": "q-0123456789ab", "chat": self.SID, "relay_pid": os.getpid(),
+                                     "asked_at": int(self.now), "kind": "move", "from": "personal", "limit": "5-hour",
+                                     "resets_at": self.now + 3600, "to": "work", "to_resets_at": None,
+                                     "carries_on_at": self.now + 3660, "choices": ["move", "wait"]})
+        self.assertEqual(self.line(self.reading(five=100), on="personal"), "personal at limit · move to work? /accounts")
+        # Its relay gone (killed with kill -9): no one acts on an answer, so no question.
+        self.chat_file("questions", {**json.loads((self.home / "questions" / f"{self.SID}.json").read_text()),
+                                     "relay_pid": 2 ** 22 + 12345})
+        self.assertFalse(self.line(self.reading(five=100), on="personal").startswith("personal at limit · move"))
+
+    def test_at_a_limit_waiting_to_carry_on(self):
+        until = self.now + 3660
+        self.chat_file("waits", {"chat": self.SID, "until": until, "account": "work", "why": "answered"})
+        self.assertEqual(self.line(self.reading(five=100), on="personal"),
+                         f"personal at limit · carries on {longhaul.clock(until)} on work")
+
+    def test_at_a_limit_stopped(self):
+        until = self.now + 3600
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"personal": until}}))
+        self.assertEqual(self.line(self.reading(five=100), on="personal"),
+                         f"personal at limit until {longhaul.clock(until)} · stopped · /accounts")
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"personal": self.now - 5}}))
+        self.assertEqual(self.line(self.reading(five=100), on="personal"),
+                         f"personal · 5h 100% ({longhaul.clock(self.now + 3600)}) · wk 40% · ctx 88k", "lifted")
+
+    def test_just_moved_for_an_hour(self):
+        self.line(self.reading(five=97), on="personal", now=self.now - 60)
+        moved = self.line(self.reading(five=3, week=None, ctx=90000, cost=0.01), on="work", now=self.now)
+        self.assertEqual(moved, f"work (moved from personal {longhaul.clock(self.now)}) · 5h 3% · ctx 90k")
+        self.assertEqual(self.line(self.reading(five=4, week=None, ctx=91000, cost=0.02), on="work", now=self.now + 600),
+                         f"work (moved from personal {longhaul.clock(self.now)}) · 5h 4% · ctx 91k", "kept while it stays")
+        self.assertEqual(self.line(self.reading(five=5, week=None, ctx=92000, cost=0.03), on="work", now=self.now + 3601),
+                         "work · 5h 5% · ctx 92k", "an hour on: the numbers alone")
+        record = json.loads((self.home / "usage" / "sessions" / f"{self.SID}.json").read_text())
+        self.assertEqual((record["moved_from"], record["moved_at"]), ("personal", round(self.now, 1)))
+        self.assertFalse(any("moved_from" in json.loads(row) for row in longhaul.LEDGER.read_text().splitlines()),
+                         "the ledger's rows stay as they were")
+
+    def test_a_choice_pending(self):
+        self.chat_file("uses", {"id": "u-0123456789ab", "chat": self.SID, "account": "work", "at": int(self.now)})
+        self.assertEqual(self.line(on="personal"), "personal · → work at its next open", "no relay took it")
+        self.chat_file("uses", {"id": "u-0123456789ab", "chat": self.SID, "account": "work", "at": int(self.now),
+                                "relay_pid": os.getpid()})
+        self.assertEqual(self.line(on="personal"), "personal · → work after this turn", "a relay took it")
+        self.assertNotIn("→", self.line(on="work"), "on it already")
+
+    def test_a_message_stopped_by_a_folder_rule(self):
+        self.line(on="personal", now=self.now - 60)
+        longhaul.log(longhaul.ACCOUNT_LOGGED.format(sid=self.SID, where="~/clients", names="work", label="personal"))
+        self.assertEqual(self.line(on="personal"), "personal · message stopped: ~/clients is work's · /accounts")
+        self.assertEqual(self.line(self.reading(cost=0.5), on="personal", now=self.now + 5),
+                         "personal · 5h 12% · wk 40% · ctx 88k", "a reply since: the message went")
+
+    def test_no_reading_yet(self):
+        self.assertEqual(self.line({"session_id": self.SID, "cost": {"total_cost_usd": 0},
+                                    "context_window": {"used_percentage": 6, "context_window_size": 200000}}),
+                         "work · no usage reading yet · ctx 12k")
+
+    def test_vs_codes_own_sign_in(self):
+        (self.home / "accounts.json").unlink()
+        self.assertEqual(self.line(self.reading(week=None), on=None), "VS Code sign-in · 5h 12% · ctx 88k")
+        self.assertEqual(json.loads((self.home / "usage" / "sessions" / f"{self.SID}.json").read_text())["account"],
+                         "main", "the files keep its name")
+
+    def test_a_newer_release(self):
+        with mock.patch.object(longhaul, "release_word", lambda: "0.3.9"):
+            self.assertEqual(self.line(), "work · 5h 12% · wk 40% · ctx 88k · update 0.3.9")
+
+    def test_another_chats_files_change_nothing(self):
+        other = "another-chat"
+        for folder, value in (("questions", {"chat": other, "relay_pid": os.getpid(), "kind": "move", "to": "work"}),
+                              ("waits", {"chat": other, "until": self.now + 60, "account": "work"}),
+                              ("uses", {"chat": other, "account": "work", "at": int(self.now)})):
+            (self.home / folder).mkdir(exist_ok=True)
+            (self.home / folder / f"{other}.json").write_text(json.dumps(value))
+        longhaul.log(longhaul.ACCOUNT_LOGGED.format(sid=other, where="~/clients", names="work", label="personal"))
+        self.assertEqual(self.line(on="personal"), "personal · 5h 12% · wk 40% · ctx 88k")
+
 class CodexUsage(unittest.TestCase):
     """`longhaul usage`'s Codex line (docs plans/2026-10-27-codex.md, X2):
     the newest rate-limits reading in Codex's rollouts, beside the Claude

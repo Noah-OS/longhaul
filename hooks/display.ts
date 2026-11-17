@@ -189,7 +189,7 @@ async function event($: any, lh: string, sid: string, name: string, nowMs: numbe
     return { kind: 'pending', to: chosen, when: taken ? 'turn' : 'open' }
   }
   const movedAt = num(record.moved_at), from = text(record.moved_from)
-  if (movedAt !== null && nowS - movedAt >= 0 && nowS - movedAt < MOVED_FOR && from && record.account === name)
+  if (movedAt !== null && nowS - movedAt < MOVED_FOR && from && record.account === name)
     return { kind: 'moved', from, at: clock(movedAt, nowMs) }
   return null
 }

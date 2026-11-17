@@ -3614,9 +3614,94 @@ def context_tokens(window):
     return pct * size / 100 if pct is not None and size is not None else None
 
 
+STATUS_MOVED_FOR = 3600  # seconds a move shows on the line ("for an hour", the review's 4.6)
+STATUS_LOG_TAIL = 65536  # bytes of the log's end the line reads for this chat's stopped message
+STATUS_WAIT_STALE = 600  # seconds past its time a carry-on its relay left is none (question.ts's STALE)
+STATUS_REFUSED = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) account: refused a prompt in (\S+?): (.+?) is kept "
+                            r"for (.+?); the chat runs on (.+)$")  # ACCOUNT_LOGGED's line, as display.ts reads it
+
+
+def last_refusal(sid: str):
+    """The latest prompt of chat `sid` the account check refused, from the
+    log's last STATUS_LOG_TAIL bytes (ACCOUNT_LOGGED's line): (when, in
+    epoch seconds, the folder, the accounts that keep it); None for none."""
+    try:
+        with open(LONGHAUL_HOME / "longhaul.log", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - STATUS_LOG_TAIL))
+            raw = f.read(STATUS_LOG_TAIL)
+    except OSError:
+        return None
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    for text in reversed(lines[1:] if size > STATUS_LOG_TAIL else lines):
+        if sid not in text:
+            continue
+        m = STATUS_REFUSED.match(text)
+        if m is None or m.group(2) != sid:
+            continue
+        try:
+            at = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, OverflowError):
+            return None
+        return at, m.group(3), m.group(4).split(", ")
+    return None
+
+
+def status_event(sid, name: str, record: dict, now: float):
+    """The one event the line shows for chat `sid` on account `name`
+    (status_line()'s "event"), the first that holds of: its question at a
+    limit, open while its relay runs (QUESTIONS); its carry-on waiting
+    (WAITS); its account's recorded limit in state.json (stopped: no
+    question, no carry-on); its last prompt stopped by a folder rule, with
+    no reading since (`record`, the chat's usage/sessions record, written
+    at each reading that changed); a `longhaul use` choice of another
+    account (USES), after this turn when a relay took it, else at its next
+    open; a move within STATUS_MOVED_FOR (the record's moved_from and
+    moved_at, record_usage()'s). None for none, and for an id that is not a
+    plain one. Only reads."""
+    if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
+        return None
+    q = read_json(chat_file(QUESTIONS, sid))
+    if isinstance(q, dict) and q.get("chat") == sid and isinstance(q.get("to"), str) and q["to"]:
+        pid = q.get("relay_pid")
+        if q.get("kind") in ("move", "first_reset") and isinstance(pid, int) and not isinstance(pid, bool) \
+                and pid > 0 and pid_alive(pid):
+            if q["kind"] == "move":
+                return {"kind": "question", "to": q["to"]}
+            at = next((v for v in (as_number(q.get(k)) for k in ("carries_on_at", "to_resets_at", "resets_at"))
+                       if v is not None), None)
+            if at is not None:
+                return {"kind": "question", "to": q["to"], "at": clock(at)}
+    w = read_json(chat_file(WAITS, sid))
+    until = as_number(w.get("until")) if isinstance(w, dict) else None
+    if until is not None and w.get("chat") == sid and isinstance(w.get("account"), str) and w["account"] \
+            and until + STATUS_WAIT_STALE >= now:
+        return {"kind": "waiting", "at": clock(until), "on": w["account"]}
+    limited = as_number(load_state()["limited_until"].get(name))
+    if limited is not None and limited > now:
+        return {"kind": "stopped", "until": clock(limited)}
+    refused = last_refusal(sid)
+    seen = as_number(record.get("at"))
+    if refused and (seen is None or refused[0] >= math.floor(seen)):
+        return {"kind": "refused", "where": refused[1], "by": refused[2]}
+    use = read_json(chat_file(USES, sid))
+    chosen = choice_of(use, sid, now)
+    if chosen and chosen != name:
+        pid = use.get("relay_pid")
+        taken = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid)
+        return {"kind": "pending", "to": chosen, "when": "turn" if taken else "open"}
+    moved_at, moved_from = as_number(record.get("moved_at")), record.get("moved_from")
+    # No lower bound: "at" is rounded to a tenth of a second, so it may be a hair after `now`.
+    if moved_at is not None and now - moved_at < STATUS_MOVED_FOR and isinstance(moved_from, str) \
+            and moved_from and record.get("account") == name:
+        return {"kind": "moved", "from": moved_from, "at": clock(moved_at)}
+    return None
+
+
 def record_usage(data: dict, config_dir, now: float | None = None) -> str:
     """Keep this reading and return the status line (status_line(), in the
-    terminal's colours)."""
+    terminal's colours), with this chat's event (status_event())."""
     now = time.time() if now is None else now
     acct, entry = session_account(config_dir)
     limits = data.get("rate_limits") or {}
@@ -3631,6 +3716,7 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
 
     # Only a plain id (GUARD_ID) names a record: anything else would be a
     # path. Not logged: the status line runs at every update.
+    record = {}
     if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid):
         cost, ctx, cache = dict_at(data, "cost"), dict_at(data, "context_window"), dict_at(data, "prompt_cache")
         row = {"at": round(now, 1), "session": sid, "account": acct,
@@ -3649,6 +3735,7 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
             row["proc"] = data["proc"]
         last_path = USAGE_DIR / "sessions" / f"{sid}.json"
         last = read_json(last_path) or {}
+        record = last
         # ctx too: a /compact shrinks the context but leaves the cost alone.
         if any(row.get(k) != last.get(k) for k in ("account", "cost", "five", "week", "proc", "ctx", "model")):
             problem = append(LEDGER, json.dumps(row) + "\n", LEDGER_MAX)  # one short line: an atomic append
@@ -3658,10 +3745,18 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
             # has none, as the panel relay's never do (review, Phase 2).
             path = data.get("transcript_path")
             path = path if isinstance(path, str) else last.get("transcript")
-            write_json(last_path, {**row, "transcript": path} if isinstance(path, str) else row)
+            # A reading on another account than the last one: the chat moved
+            # (the line says so for STATUS_MOVED_FOR, status_event()); kept in
+            # the record alone, while it stays there, never in the ledger.
+            before = last.get("account")
+            moved = ({"moved_from": before, "moved_at": row["at"]} if isinstance(before, str) and before
+                     and before != acct else
+                     {k: last[k] for k in ("moved_from", "moved_at") if k in last} if before == acct else {})
+            record = {**row, **moved, **({"transcript": path} if isinstance(path, str) else {})}
+            write_json(last_path, record)
     return status_line({"account": status_name(acct, entry), "five": line_window(five), "week": line_window(week),
-                        "ctx": context_tokens(data.get("context_window")), "event": None, "update": release_word()},
-                       paint=True)
+                        "ctx": context_tokens(data.get("context_window")),
+                        "event": status_event(sid, acct, record, now), "update": release_word()}, paint=True)
 
 
 def statusline(opts) -> int:
