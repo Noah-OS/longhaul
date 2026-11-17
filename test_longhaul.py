@@ -14636,7 +14636,7 @@ class CodexReminder(unittest.TestCase):
         # The same id as a Claude Code session, its transcript Claude Code's:
         # its own record, Claude Code's words, and a rollout is no transcript.
         transcript = self.tmp / "claude.jsonl"
-        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 203_000,
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 403_000,
                  "output_tokens": 900}
         transcript.write_text(json.dumps({"type": "assistant", "isSidechain": False, "message": {
             "model": "claude-opus-4-5", "role": "assistant", "content": [], "usage": usage}}) + "\n")
@@ -14644,9 +14644,9 @@ class CodexReminder(unittest.TestCase):
         data = {"session_id": self.SID, "transcript_path": str(transcript), "cwd": str(self.tmp),
                 "hook_event_name": "UserPromptSubmit", "prompt": self.SECRET}
         self.assertEqual(self.hook("reminder", data, agent="claude"), {
-            "systemMessage": Reminder.USER.format(205), "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit", "additionalContext": Reminder.MODEL.format(205)}})
-        self.assertEqual(self.record(self.SID), {"reminder": {"at": 200_000}})
+            "systemMessage": Reminder.USER.format(405), "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "additionalContext": Reminder.MODEL.format(405)}})
+        self.assertEqual(self.record(self.SID), {"reminder": {"at": 400_000}}, "at Claude Code's default, 400k")
         self.assertIsNone(self.record(), "the Codex chat's own record, untouched")
         self.assertIsNone(self.hook("reminder", {**data, "session_id": "s2", "transcript_path": str(self.rollout)},
                                    agent="claude"), "Claude Code's reminder reads no rollout")
@@ -15090,8 +15090,8 @@ class Trial(unittest.TestCase):
         return out.getvalue()
 
     def test_the_reminder_is_silent_in_usual_and_said_in_habit_and_with_no_trial_on_both_paths(self):
-        transcript = self.tmp / "t.jsonl"
-        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 202_994,
+        transcript = self.tmp / "t.jsonl"  # 405,000 tokens: past the default, 400k
+        usage = {"input_tokens": 6, "cache_creation_input_tokens": 2_000, "cache_read_input_tokens": 402_994,
                  "output_tokens": 900}
         transcript.write_text(json.dumps({"type": "assistant", "uuid": "u1", "message": {
             "id": "msg_1", "model": "claude-opus-5-5", "role": "assistant", "content": [], "usage": usage}}) + "\n")
@@ -15108,7 +15108,7 @@ class Trial(unittest.TestCase):
         def said(out, event):
             answer = json.loads(out)
             return (answer["systemMessage"], answer["hookSpecificOutput"]) == (
-                Reminder.USER.format(205), {"hookEventName": event, "additionalContext": Reminder.MODEL.format(205)})
+                Reminder.USER.format(405), {"hookEventName": event, "additionalContext": Reminder.MODEL.format(405)})
 
         self.trial()
         usual, habit = self.ids("usual", 4, "u"), self.ids("habit", 3, "h")
