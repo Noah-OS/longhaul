@@ -27184,7 +27184,7 @@ class Doctor(unittest.TestCase):
         # The subagent reminder (the owner, 2026-10-25, "A reminder for long
         # subagent runs") has its own line after the context reminder's.
         self.assertEqual([t for _, t, _ in c["items"]], [
-            "context reminder: at 200,000 tokens", "subagent reminder: at 150k tokens", "auto-compact: on",
+            "context reminder: at 400,000 tokens", "subagent reminder: at 150k tokens", "auto-compact: on",
             "guard: advice", "Auto Model: guide: Claude picks each subagent's model; cap none",
             "trial: off"])
         os.environ.update(LONGHAUL_GUARD="block", LONGHAUL_AUTO_COMPACT="off", LONGHAUL_CHECKPOINT_AT="off",
@@ -27440,7 +27440,7 @@ class Doctor(unittest.TestCase):
         checks = longhaul.doctor_checks(quick=True)
         self.assertEqual(len(checks), 9, "the quick checks: no updates (network), no process list, no hooks")
         self.installed()  # the plugin installed: its checkpoint, auto-compact and guard work
-        line = (f"Longhaul {self.VERSION} is on. Working now: checkpoints, auto-compact at 200k tokens and the read "
+        line = (f"Longhaul {self.VERSION} is on. Working now: checkpoints, auto-compact at 400k tokens and the read "
                 "guard. Try it: /longhaul:checkpoint, then /clear. Extras: /longhaul:doctor.")
         self.assertIsNone(longhaul.guard_check(self.start(agent="a1"), "warn"), "a subagent's start")
         os.environ["CLAUDE_CODE_SESSION_ATTENDED"] = "0"
@@ -27452,7 +27452,7 @@ class Doctor(unittest.TestCase):
         self.assertEqual(self.seen()["version"], self.VERSION)
         self.assertEqual(oct(os.stat(self.home / "seen.json").st_mode & 0o777), "0o600")
         self.assertEqual(re.findall(r"setup: .*", self.log()),
-                         [f"setup: Longhaul {self.VERSION} is on; working now: checkpoints, auto-compact at 200k tokens "
+                         [f"setup: Longhaul {self.VERSION} is on; working now: checkpoints, auto-compact at 400k tokens "
                           "and the read guard; to fix: 0"])
         self.assertIsNone(longhaul.guard_check(self.start(), "warn"), "once per version")
         self.write(self.home / "seen.json", {"version": "0.0.1"})  # an update
@@ -27514,17 +27514,17 @@ class Doctor(unittest.TestCase):
         self.installed(enabled=False)
         self.assertEqual(working(), [], "turned off")
         self.installed()
-        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens", "the read guard"])
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 400k tokens", "the read guard"])
         self.assertTrue(said().endswith("Extras: /longhaul:doctor."), "the terminal command and the status line are "
                                                                       "extras, not faults")
         os.environ["LONGHAUL_GUARD"] = "off"
-        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens"], "the guard turned off")
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 400k tokens"], "the guard turned off")
         os.environ["LONGHAUL_GUARD"] = "loud"  # not a mode: its item is ⚠, so not named, and one to fix
-        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens"])
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 400k tokens"])
         self.assertTrue(said().endswith(". 1 to fix: /longhaul:doctor."), said())
         del os.environ["LONGHAUL_GUARD"]
         os.environ["LONGHAUL_AUTO_COMPACT"] = "off"
-        self.assertEqual(working(), ["checkpoints", "a checkpoint reminder at 200k tokens", "the read guard"])
+        self.assertEqual(working(), ["checkpoints", "a checkpoint reminder at 400k tokens", "the read guard"])
         os.environ["LONGHAUL_CHECKPOINT_AT"] = "off"  # no reminder: auto-compact has nothing to follow either
         del os.environ["LONGHAUL_AUTO_COMPACT"]
         self.assertEqual(working(), ["checkpoints", "the read guard"])
@@ -27534,9 +27534,9 @@ class Doctor(unittest.TestCase):
         self.settings(statusLine={"type": "command", "command": "~/.local/bin/longhaul statusline"})
         self.assertNotIn("the status line", working(), "it names a program that is not there: ✘")
         self.link(self.checkout(self.VERSION))
-        self.assertEqual(working(), ["checkpoints", "auto-compact at 200k tokens", "the read guard", "the status line"])
+        self.assertEqual(working(), ["checkpoints", "auto-compact at 400k tokens", "the read guard", "the status line"])
         # Whatever the switches, a name in "Working now" is never a line that did not pass.
-        names = {"checkpoints": ["Plugin"], "auto-compact at 200k tokens": ["Plugin", "Features"],
+        names = {"checkpoints": ["Plugin"], "auto-compact at 400k tokens": ["Plugin", "Features"],
                  "the read guard": ["Plugin", "Features"], "the status line": ["Plugin", "Status line"]}
         for guard in ("warn", "off", "loud"):
             os.environ["LONGHAUL_GUARD"] = guard
