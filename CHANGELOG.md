@@ -2,6 +2,22 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.16 - 2026-11-17
+
+What Longhaul did by itself, and why, in one place; and one status line, the same in the terminal and in the VS Code panel.
+
+### Added
+
+- **`longhaul activity [--chat ID] [--days N] [--json]`** lists what Longhaul did by itself, and why, from its own log: the account a chat started on or moved to, a message it stopped, a limit it recorded or forgot, a carry-on, a question, a checkpoint saved or put back, a compaction, a repair, a pause. Today by default, this chat first. Times, ids, account names and folders only, as the log holds; a line it cannot read is left out.
+- **An Activity page in `/accounts`**, drawn from the same list, with **Earlier days**; the list's first lines say which account this chat is on, and why.
+- **A start line in the log**: which account a chat starts on, moves to or reopens on, and why ("prefers work, and it had room").
+- **`status --json`** gives `"chat"` (the chat it runs in, its account and why) and `"line"` (its status line).
+
+### Changed
+
+- **One status line.** The terminal's status line and the panel's status entry use the same words: the account first, at most one event (at limit and a question, carries on at a time, stopped, moved from another account, a choice pending, a message stopped), then the 5-hour and week use (a reset time only at 70% or more), the context size, and `update` last. For example `work · 5h 91% (14:00) · wk 40% · ctx 88k`, or `personal at limit · carries on 14:01 on work`.
+- **The default sign-in** (`~/.claude`, which no account of yours names) is called "default sign-in" on the status line, in place of "main".
+
 ## 0.3.15 - 2026-11-17
 
 Longer before a compaction, and a way out of a stuck state from the accounts screen.
