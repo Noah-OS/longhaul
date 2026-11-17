@@ -2,6 +2,21 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.15 - 2026-11-17
+
+Longer before a compaction, and a way out of a stuck state from the accounts screen.
+
+### Changed
+
+- **Claude Code chats are asked for a checkpoint, and compacted, at 400,000 tokens of context, not 200,000.** Compacting at a fifth of a 1M window went worse in the author's long work (5.2 corrections per 100 messages at 200,000, 2.1 at 400,000; not a significant difference), and a test of 8 real compactions near 400,000 found recall no lower than at 200,000 (72% against 78% with the checkpoint; not significant either). On a model with a 200k window Claude Code compacts by itself first, so nothing changes there. Codex chats stay at 200,000, since Codex compacts by itself before 400,000. `LONGHAUL_CHECKPOINT_AT` still sets it; the first-chat line and the doctor name the threshold in force.
+- **The plugin's description** in `/plugin` says what Longhaul does, and that every measurement is published, the misses included.
+
+### Added
+
+- **`longhaul panel pause`, `resume` and `status`** turn Longhaul's part in VS Code panel chats off and on, without editing `vscode.json` by hand (its other keys are kept). A change counts for the chats opened after it.
+- **`longhaul repair --fix ID`** makes one finding's fix alone, after a yes or with `--yes`; the ids are in `repair --json`.
+- **A Troubleshoot page in `/accounts`**: what `repair` finds, each with a **Fix** button that asks first, and **Pause** or **Resume Longhaul in panel chats**. From a chat, `/longhaul:manage` still only lists.
+
 ## 0.3.14 - 2026-11-15
 
 One fix from a measurement. In the task-success test of 2026-11-14 (the wiki's Measurements page), every checkpoint made its next action a wait for the user, who had paused the work, and one run in 24 stopped on it after the user had said to carry on. No run without the checkpoint stopped.

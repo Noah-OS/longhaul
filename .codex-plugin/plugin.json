@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "description": "Long Codex chats: Codex saves a checkpoint, and it comes back after a compaction, a resume or a clear. Shows where the tokens go. Every feature measured in public, the misses included.",
   "keywords": ["sessions", "usage", "supervisor"],
   "hooks": "./hooks/codex-hooks.json",
