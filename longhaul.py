@@ -1339,7 +1339,10 @@ def start_logged(sid, verb: str, name: str, where: str, why: str) -> None:
     """The start line (M1): chat `sid` (or "a new chat", whose id is not
     known yet) starts on, moves to or reopens on (`verb`) account `name`
     in folder `where`, and why, for `longhaul activity` and the "why" of
-    `status --json`."""
+    `status --json`. Nothing for an id that is not a plain one (GUARD_ID):
+    the line holds ids, names, folders and times, never other text."""
+    if sid != "a new chat" and not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
+        return
     log(f"start: {sid} {verb} {name} in {where}: {why}")
 
 
@@ -1581,8 +1584,7 @@ class Watch:
             if self.start_line:
                 verb, where, why = self.start_line
                 self.start_line = None
-                if isinstance(self.sid, str) and re.fullmatch(GUARD_ID, self.sid):  # an id, never other text
-                    start_logged(self.sid, verb, self.acct_name, where, why)
+                start_logged(self.sid, verb, self.acct_name, where, why)
             self._read_transcript()
             if self.stops:
                 self._read_stops()
@@ -13402,8 +13404,6 @@ def wrap(argv: list[str]) -> int:
             note_session_account(resumed, acct["name"])
         started = ("starts on", home_path(top), reasons[-1]) if chat and reasons else None
         if not chat or not panel_mid_session():  # only the JSON false turns the relay off
-            if started and resumed and not re.fullmatch(GUARD_ID, resumed):
-                started = None  # an id, never other text, in the line
             if started:  # claude takes this process's place: the line is written now, a new chat's with no id
                 verb, where, why = started
                 start_logged(resumed or "a new chat", verb, acct["name"], where, why)

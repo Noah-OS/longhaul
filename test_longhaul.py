@@ -27260,6 +27260,10 @@ class StartReason(unittest.TestCase):
         lines = [line[20:] for line in log.read_text().splitlines()]
         self.assertEqual(lines, [f"start: {sid} starts on work in ~/work/acme: ~/work prefers work, and it had room"])
         self.assertEqual(longhaul.activity_event(lines[0])["what"], "Started on work")
+        # Only a plain id, or "a new chat": a record naming other text writes nothing.
+        for odd in ("../x", "sid with words", None, 7):
+            longhaul.start_logged(odd, "starts on", "work", "~/work", "it had room")
+        self.assertEqual(len(log.read_text().splitlines()), 1)
 
 
 class StartReasonPanel(StreamHarness):
