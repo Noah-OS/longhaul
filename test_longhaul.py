@@ -13447,7 +13447,8 @@ class ManageSkill(unittest.TestCase):
 
     ROOT = "${CLAUDE_PLUGIN_ROOT}/bin/longhaul"
     # The forms that only read: the only ones the skill's rule may approve by itself.
-    READS = ("status", "switch", "models", "update status", "uninstall --dry-run", "repair --dry-run")
+    READS = ("status", "switch", "models", "update status", "uninstall --dry-run", "repair --dry-run",
+             "activity", "panel")  # the last two since the owner's yes of 2026-11-17
 
     def skill(self):
         text = (HERE / "skills" / "manage" / "SKILL.md").read_text()
