@@ -2,6 +2,20 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## 0.3.17 - 2026-11-17
+
+See what a change would do before it is made; and two more commands a chat may run.
+
+### Added
+
+- **`longhaul folders NAME ... --dry-run [--json]`** says what a folder change would do and changes nothing: where the account may then be used, which folders would be kept for it, and which chats running now, or started in the last 7 days, would have their next message stopped. It uses the same rules as the change itself.
+- **`longhaul remove NAME --delete-folder --dry-run [--json]`** says what the delete would take (the sign-in folder, its size, and whether the chat history only links into `~/.claude` and so stays), and deletes nothing.
+- **`/accounts` previews each change.** A folder added or taken off, or every folder limit removed, shows what it would do and which chats it would stop, then waits for **Apply**. **Remove and delete its sign-in folder…** shows what goes, and says your project folders are never touched.
+
+### Changed
+
+- **From a chat**, `longhaul activity` and `longhaul panel status|pause|resume` run (the owner's yes): `/longhaul:manage` can say what Longhaul did today and pause or resume it in the VS Code panel's chats on your word. Before, both were refused with the wrong reason. A repair that fixes, and the dry runs, still run only in a terminal or `/accounts`.
+
 ## 0.3.16 - 2026-11-17
 
 What Longhaul did by itself, and why, in one place; and one status line, the same in the terminal and in the VS Code panel.

@@ -1,6 +1,6 @@
 {
   "name": "longhaul",
-  "version": "0.3.16",
+  "version": "0.3.17",
   "description": "Long Claude Code sessions and several accounts: a checkpoint, then a compaction at 400k tokens; a chat moved to another of your accounts at a usage limit; where the tokens went. Every feature measured in public, the misses included.",
   "author": {
     "name": "Amr Adel",
