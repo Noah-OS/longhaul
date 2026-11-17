@@ -17180,6 +17180,37 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     }
 
 
+def chat_line(sid, config_dir, now: float) -> str:
+    """status --json's "line" (M3): the status line, with no colours, of
+    the chat `sid` (CLAUDE_CODE_SESSION_ID) on the sign-in `config_dir`
+    (CLAUDE_CONFIG_DIR) as `longhaul statusline` draws it, from the files
+    alone: its account's last reading, the windows still open; the context
+    its usage/sessions record last gave (its share of the window), while
+    the record is of that account; its event (status_event()); a newer
+    release. Outside a chat, the sign-in's line with no event. Only reads,
+    and never raises: "longhaul", as the status line says on an error."""
+    try:
+        return chat_line_of(sid, config_dir, now)
+    except Exception:
+        return "longhaul"
+
+
+def chat_line_of(sid, config_dir, now: float) -> str:
+    """chat_line()'s work, which may raise."""
+    acct, entry = session_account(config_dir)
+    reading = read_json(USAGE_DIR / f"{acct}.json")
+    plain = isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)  # only a plain id names a file
+    found = read_json(USAGE_DIR / "sessions" / f"{sid}.json") if plain else None
+    record = found if isinstance(found, dict) else {}
+    five, week = (status_window(reading, key, now) for key in ("five_hour", "seven_day"))
+    pct, size = as_number(record.get("ctx")), as_number(record.get("ctx_size"))
+    ctx = pct * size / 100 if pct is not None and size is not None and record.get("account") == acct else None
+    return status_line({"account": status_name(acct, entry), "ctx": ctx, "event": status_event(sid, acct, record, now),
+                        **{key: None if w is None else {"used": w["used"], "resets": clock(w["resets_at"])}
+                           for key, w in (("five", five), ("week", week))},
+                        "update": release_word()})
+
+
 def status_json() -> int:
     """`longhaul status --json`: the screen's object alone on stdout; exit 2
     when accounts.json cannot be read, the rest still said, as status does."""
@@ -17214,12 +17245,13 @@ def status_json() -> int:
     # says so. Never null: a value that is not a mode is never, as there.
     # panel_paused: `longhaul panel pause` in force (panel_mid_session()), for
     # the Troubleshoot page's Pause or Resume. chat: the chat this runs in,
-    # and why it runs on its account (chat_why()).
+    # and why it runs on its account (chat_why()). line: its status line (chat_line()).
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
              "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None,
              "chat": chat_why(os.environ.get("CLAUDE_CODE_SESSION_ID"), accounts[ours]["name"] if ours is not None
-                              else None)}
+                              else None),
+             "line": chat_line(os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CLAUDE_CONFIG_DIR"), now)}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped

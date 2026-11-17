@@ -67,6 +67,10 @@ export type LonghaulStatus = {
   // The chat it runs in and why it is on its account (M1): the log's latest
   // reason; null outside a chat. Optional: an older longhaul.py does not give it.
   chat?: LonghaulChat | null
+  // Its status line (M3), as `longhaul statusline` draws it with no colours and
+  // the panel's entry draws it (hooks/display.ts's line()). Optional: an older
+  // longhaul.py does not give it.
+  line?: string
 }
 
 // This chat as `status --json` gives it: its short id, its account (null:

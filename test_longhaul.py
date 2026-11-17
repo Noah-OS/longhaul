@@ -24701,7 +24701,7 @@ class StatusJson(unittest.TestCase):
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
                     "preferred", "use_here", "reading_at"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
-            "chat"}
+            "chat", "line"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -24756,6 +24756,33 @@ class StatusJson(unittest.TestCase):
 
     def by_name(self, found: dict) -> dict:
         return {a["name"]: a for a in found["accounts"]}
+
+    def test_the_line_is_the_status_line_of_the_chat_it_runs_in(self):
+        # M3: the line `longhaul statusline` draws for this chat (status_line()), with no colours, from the
+        # files alone: its account's last reading, the context its record last gave, its event.
+        sid = "5ca8a797-1111-4222-8333-444455556666"
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        resets = time.time() + 3600
+        (self.home / "usage" / "sessions").mkdir(parents=True)
+        (self.home / "usage" / "work.json").write_text(json.dumps({
+            "at": time.time(), "five_hour": {"used_percentage": 91, "resets_at": resets},
+            "seven_day": {"used_percentage": 40, "resets_at": resets + 86400}}))
+        (self.home / "usage" / "sessions" / f"{sid}.json").write_text(json.dumps({
+            "at": time.time(), "session": sid, "account": "work", "ctx": 44, "ctx_size": 200000}))
+        chat = {"CLAUDE_CONFIG_DIR": str(self.folder("work")), "CLAUDE_CODE_SESSION_ID": sid}
+        before = self.files()
+        found = self.read(self.status(**chat))
+        self.assertEqual(found["line"], f"work · 5h 91% ({longhaul.clock(resets)}) · wk 40% · ctx 88k")
+        self.assertEqual(self.files(), before, "it only reads")
+        until = time.time() + 3660
+        (self.home / "waits").mkdir()
+        (self.home / "waits" / f"{sid}.json").write_text(json.dumps({"chat": sid, "until": until,
+                                                                      "account": "personal", "why": "answered"}))
+        self.assertEqual(self.read(self.status(**chat))["line"],
+                         f"work at limit · carries on {longhaul.clock(until)} on personal")
+        # Outside a chat: the line of the sign-in it runs on, with no event; the default one by its name.
+        self.assertEqual(self.read(self.status())["line"], "VS Code sign-in · no usage reading yet")
 
     def test_the_chat_it_runs_in_says_why_it_runs_on_its_account(self):
         # M1: the latest reason the log gives for the account the chat is on, from its start or its move.
@@ -24817,11 +24844,11 @@ class StatusJson(unittest.TestCase):
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
             "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None,
-            "chat": None})
+            "chat": None, "line": "VS Code sign-in · no usage reading yet"})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
-                                       "vscode", "panel_paused", "problem", "chat"],
+                                       "vscode", "panel_paused", "problem", "chat", "line"],
                          "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17), "
-                         "chat last (M1)")
+                         "chat (M1), then line (M3)")
         self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
 
     def test_emails_are_masked_and_never_shown_whole(self):
