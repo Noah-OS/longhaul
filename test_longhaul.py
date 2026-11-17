@@ -19550,7 +19550,7 @@ class KeepWorking(unittest.TestCase):
         self.assertIn("at its reopen to move from Max to Pro (Max's usage limit resets ", self.log_text())
         self.assertIn("panel: a message in sid-k waits for the answer to its question", self.log_text())
         self.assertEqual(len(self.notes), 1)
-        self.assertRegex(self.notes[0], r"^Max is at its usage limit until \S+\. Move this reopened chat to Pro\? "
+        self.assertRegex(self.notes[0], r"^Max is at its usage limit until [^.]+\. Move this reopened chat to Pro\? "
                                         r"Answer in Longhaul's pane in the panel; your messages wait for the answer")
 
     def test_a_reopen_names_the_limit_its_reading_gives(self):
@@ -27779,19 +27779,20 @@ class Activity(unittest.TestCase):
                 self.assertEqual((code, out), (2, ""))
                 self.assertIn(said, err)
 
-    def test_the_usage_block_names_it_and_the_shim_refuses_it(self):
+    def test_the_usage_block_names_it_and_the_shim_runs_it(self):
         doc = longhaul.__doc__
         self.assertIn("longhaul activity [--chat ID] [--days N] [--json]", doc)
         self.assertLess(doc.index("longhaul repair [--dry-run]"), doc.index("longhaul activity [--chat ID]"))
         readme = (HERE / "README.md").read_text()
         self.assertIn("longhaul activity", readme)
-        # bin/longhaul, what a chat's Claude may run, is the owner's boundary: activity is not in it until the owner says.
+        # bin/longhaul, what a chat's Claude may run, is the owner's boundary: activity is in it since the
+        # owner's yes of 2026-11-17, as it only reads Longhaul's own log.
         env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
         env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
         out = subprocess.run([str(HERE / "bin" / "longhaul"), "activity"], capture_output=True, text=True, env=env,
                              timeout=30)
-        self.assertEqual((out.returncode, out.stdout), (2, ""))
-        self.assertIn("Ask the user to run it in a terminal.", out.stderr)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        self.assertIn("Full log: ", out.stdout)
 
 
 class StartReason(unittest.TestCase):
