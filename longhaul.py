@@ -3678,7 +3678,8 @@ def status_event(sid, name: str, record: dict, now: float):
     if until is not None and w.get("chat") == sid and isinstance(w.get("account"), str) and w["account"] \
             and until + STATUS_WAIT_STALE >= now:
         return {"kind": "waiting", "at": clock(until), "on": w["account"]}
-    limited = as_number(load_state()["limited_until"].get(name))
+    # state.json read as load_state() reads it, without its line about a junk file: this runs at every update.
+    limited = as_number(dict_at(read_json(LONGHAUL_HOME / "state.json"), "limited_until").get(name))
     if limited is not None and limited > now:
         return {"kind": "stopped", "until": clock(limited)}
     refused = last_refusal(sid)

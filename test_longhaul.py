@@ -2399,6 +2399,14 @@ class StatusLineState(unittest.TestCase):
         self.assertEqual(self.line(self.reading(five=100), on="personal"),
                          f"personal · 5h 100% ({longhaul.clock(self.now + 3600)}) · wk 40% · ctx 88k", "lifted")
 
+    def test_a_state_file_it_cannot_read_is_no_limit_and_logs_nothing(self):
+        # The line runs at every update: load_state()'s line about a junk file would be written each time.
+        for junk in ("[]", "not json", '{"limited_until": 3}'):
+            with self.subTest(junk=junk):
+                (self.home / "state.json").write_text(junk)
+                self.assertEqual(self.line(on="personal"), "personal · 5h 12% · wk 40% · ctx 88k")
+                self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
+
     def test_just_moved_for_an_hour(self):
         self.line(self.reading(five=97), on="personal", now=self.now - 60)
         moved = self.line(self.reading(five=3, week=None, ctx=90000, cost=0.01), on="work", now=self.now)
