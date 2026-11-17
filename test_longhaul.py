@@ -23588,7 +23588,7 @@ class RemoveDeleteFolder(unittest.TestCase):
         for kept in (self.default / "settings.json", self.default / "plugins" / "kept.json",
                      self.default / "projects" / "-work" / "shared.jsonl", self.max / ".claude.json"):
             self.assertTrue(kept.exists(), f"{kept}: a link was removed, never what it reaches")
-        self.assertIn("Team's folder ~/.claude-team (", said)
+        self.assertIn("Team's sign-in folder ~/.claude-team (", said)
         self.assertIn("goes for good: Team's sign-in, and the chat history kept in it, 3 conversations (its "
                       "projects/ folder).", said)
         self.assertIn("Longhaul does not sign Team out: on a Mac, the sign-in Claude Code keeps for this folder in the "
@@ -23615,7 +23615,7 @@ class RemoveDeleteFolder(unittest.TestCase):
         out = self.longhaul("remove", "Pro", "--delete-folder", "--yes")
         said = self.said(out)
         self.assertEqual(out.returncode, 0, said)
-        self.assertIn("Pro's folder ~/.claude-pro (", said)
+        self.assertIn("Pro's sign-in folder ~/.claude-pro (", said)
         self.assertIn("goes for good: Pro's sign-in. Its chat history is in ~/.claude/projects, which it only links "
                       "to, and stays.", said)
         self.assertFalse(os.path.lexists(self.tmp / ".claude-pro"))
@@ -23762,7 +23762,8 @@ class RemoveDeleteFolder(unittest.TestCase):
     def test_the_help_and_the_usage_block_name_it(self):
         out = self.longhaul("remove", "-h")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("usage: longhaul remove [-h] [--delete-folder] [--yes] name", out.stdout)
+        self.assertIn("usage: longhaul remove [-h] [--delete-folder] [--yes] [--dry-run] [--json] name",
+                      " ".join(out.stdout.split()))
         self.assertIn("longhaul remove NAME [--delete-folder [--yes]]", longhaul.__doc__)
 
     def test_the_doctor_lists_leftover_claude_folders_no_account_uses_by_name_and_size(self):
@@ -23820,6 +23821,107 @@ class RemoveDeleteFolder(unittest.TestCase):
         [line] = [l for l in readme.splitlines() if l.startswith("**Sign in again, or remove an account.**")]
         self.assertIn("`longhaul remove work --delete-folder` deletes its folder too", line)
         self.assertIn("for good", line)
+
+    def snapshot(self) -> dict:
+        """Every file and link under the scratch folder: its size and time
+        (a link's own), so that a run that writes, deletes or locks shows."""
+        cache = self.tmp / "Library"  # Apple's /usr/bin/python3 keeps its bytecode there, under HOME
+        return {str(p): (p.lstat().st_size, p.lstat().st_mtime_ns) for p in self.tmp.rglob("*")
+                if cache not in p.parents and p != cache}
+
+    def test_a_dry_run_says_what_would_go_as_the_delete_does_and_changes_nothing(self):
+        self.folder("pro")
+        self.write_accounts(self.entry("Max"), self.entry("Team"), self.entry("Pro"))
+        before = self.snapshot()
+        out = self.longhaul("remove", "team", "--delete-folder", "--dry-run")
+        said = self.said(out)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), said)
+        size = longhaul.size_text(longhaul.folder_size(str(self.team)))
+        self.assertEqual(said.splitlines(), [
+            f"longhaul Team's sign-in folder ~/.claude-team ({size}) goes for good: Team's sign-in, and the chat history "
+            "kept in it, 3 conversations (its projects/ folder).",
+            "longhaul Longhaul does not sign Team out: on a Mac, the sign-in Claude Code keeps for this folder in the "
+            "Keychain may remain.",
+            "Nothing deleted, nothing changed: --dry-run only says what would go."])
+        out = self.longhaul("remove", "Pro", "--delete-folder", "--dry-run")
+        self.assertEqual(out.returncode, 0, self.said(out))
+        self.assertIn("goes for good: Pro's sign-in. Its chat history is in ~/.claude/projects, which it only links "
+                      "to, and stays.", self.said(out))
+        self.assertEqual(self.snapshot(), before, "nothing written or deleted: not the list, not the log, not a lock")
+        self.assertFalse((self.home / "longhaul.log").exists())
+        self.assertFalse((self.home / ".accounts.lock").exists())
+        self.assertNotIn(self.SECRET, said)
+
+    def test_json_gives_the_same_text_and_its_parts_for_the_accounts_screen(self):
+        self.folder("pro")
+        self.write_accounts(self.entry("Max"), self.entry("Team"), self.entry("Pro"))
+        before = self.snapshot()
+        out = self.longhaul("remove", "Team", "--delete-folder", "--dry-run", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        size = longhaul.size_text(longhaul.folder_size(str(self.team)))
+        self.assertEqual(json.loads(out.stdout), {
+            "name": "Team", "folder": "~/.claude-team", "there": True, "size": size, "conversations": 3,
+            "linked": None, "refused": None, "problem": None,
+            "lines": [f"Team's sign-in folder ~/.claude-team ({size}) goes for good: Team's sign-in, and the chat "
+                      "history kept in it, 3 conversations (its projects/ folder).",
+                      "Longhaul does not sign Team out: on a Mac, the sign-in Claude Code keeps for this folder in the "
+                      "Keychain may remain."]})
+        found = json.loads(self.longhaul("remove", "pro", "--delete-folder", "--dry-run", "--json").stdout)
+        self.assertEqual((found["name"], found["conversations"], found["linked"]), ("Pro", 0, "~/.claude/projects"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_dry_run_says_what_the_delete_would_refuse_exit_2_and_logs_nothing(self):
+        self.write_accounts(self.entry("Max"), self.entry("Team"), self.entry("Main", None))
+        before = self.snapshot()
+        out = self.longhaul("remove", "Main", "--delete-folder", "--dry-run", "--json")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        found = json.loads(out.stdout)
+        self.assertEqual(found["refused"], "Main uses the default folder ~/.claude, which the VS Code panel signs in "
+                                           "to and every account links into")
+        self.assertEqual(found["lines"], [f"It would not be deleted: {found['refused']}."])
+        self.assertEqual((found["folder"], found["there"], found["size"]), ("~/.claude", False, None))
+        chats = [{"pid": 4242, "panel": True, "config_dir": str(self.team), "cwd": str(self.tmp / "work")}]
+        code, said = self.in_process("Team", "--delete-folder", "--dry-run", processes=chats)
+        self.assertEqual(code, 2, said)
+        self.assertIn("It would not be deleted: 1 chat still runs on Team: pid 4242 (a VS Code tab) in ~/work; close it "
+                      "first.", said)
+        self.assertIn("Nothing deleted, nothing changed: --dry-run only says what would go.", said)
+        for args, words in ((("nobody", "--delete-folder", "--dry-run"), "no account called nobody; the accounts are "
+                                                                         "Max, Team, Main"),
+                            (("Team", "--delete-folder", "--json"), "--json goes with --dry-run"),
+                            (("Team", "--delete-folder", "--dry-run", "--keep"), "unrecognized arguments")):
+            out = self.longhaul("remove", *args)
+            self.assertEqual(out.returncode, 2, args)
+            self.assertIn(words, self.said(out) + out.stderr, args)
+        out = self.longhaul("remove", "Team", "--dry-run")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--dry-run goes with --delete-folder: plain `longhaul remove NAME` deletes nothing",
+                      self.said(out))
+        self.write_accounts(self.entry("Team"))
+        out = self.longhaul("remove", "Team", "--delete-folder", "--dry-run", "--json")
+        self.assertEqual(out.returncode, 2)
+        self.assertEqual(json.loads(out.stdout)["problem"], "that is the only account; longhaul needs at least one")
+        self.assertFalse((self.home / "longhaul.log").exists(), "a dry run logs nothing, refused or not")
+        self.assertTrue((self.team / ".claude.json").exists())
+        self.assertEqual({k: v for k, v in self.snapshot().items() if not k.endswith("accounts.json")},
+                         {k: v for k, v in before.items() if not k.endswith("accounts.json")})
+
+    def test_a_dry_run_for_a_folder_that_is_not_there_says_only_the_list_would_change(self):
+        shutil.rmtree(self.team)
+        out = self.longhaul("remove", "Team", "--delete-folder", "--dry-run", "--json")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        found = json.loads(out.stdout)
+        self.assertEqual((found["there"], found["size"], found["refused"]), (False, None, None))
+        self.assertEqual(found["lines"], ["Team's sign-in folder ~/.claude-team is not there, so nothing would be "
+                                          "deleted: Team would only be taken off the list."])
+        self.assertEqual([a["name"] for a in self.accounts()], ["Max", "Team"])
+
+    def test_the_help_and_the_readme_name_the_dry_run(self):
+        self.assertIn("longhaul remove NAME --delete-folder --dry-run [--json]", longhaul.__doc__)
+        self.assertIn("`longhaul remove work --delete-folder --dry-run`", (HERE / "README.md").read_text())
+        out = self.longhaul("remove", "-h")
+        self.assertIn("usage: longhaul remove [-h] [--delete-folder] [--yes] [--dry-run] [--json] name",
+                      " ".join(out.stdout.split()))
 
 
 class Folders(unittest.TestCase):

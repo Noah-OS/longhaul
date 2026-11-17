@@ -119,6 +119,13 @@ Usage:
                           saying what goes and a yes in a terminal (--yes:
                           without asking); never ~/.claude, a folder another
                           account uses, a link, or one a chat runs on
+  longhaul remove NAME --delete-folder --dry-run [--json]
+                          what --delete-folder would delete, in the words it
+                          says before it asks (the folder, its size, the
+                          conversations kept in it, or that its history is
+                          only linked into ~/.claude, so it stays), or why it
+                          would refuse; nothing changed, nothing logged;
+                          --json: the same as one JSON object, for /accounts
   longhaul folders NAME [--add PATH]... [--remove PATH]... [--anywhere]
                           where NAME may be used (with no option it only
                           reads); --add a folder it may be used in, and those
@@ -16342,7 +16349,20 @@ def guided_vscode() -> None:
 def remove(opts) -> int:
     """longhaul remove NAME: off longhaul's list. Its folder and sign-in are
     kept. With --delete-folder its folder goes too (remove_with_folder());
-    --yes alone answers nothing, so it is refused, nothing changed."""
+    --yes alone answers nothing, so it is refused, nothing changed. With
+    --delete-folder --dry-run, what would go is said and nothing changes
+    (delete_preview()); --json, with it, says it as one object. Either
+    alone is refused, said and not logged."""
+    dry, as_json = getattr(opts, "dry_run", False), getattr(opts, "json", False)
+    if as_json and not dry:
+        show("--json goes with --dry-run: give both, or neither")
+        return 2
+    if dry and not getattr(opts, "delete_folder", False):
+        show(f"--dry-run goes with --delete-folder: plain `longhaul remove NAME` deletes nothing, and takes "
+             f"{opts.name} off the list only")
+        return 2
+    if dry:
+        return delete_preview(opts.name, as_json)
     if getattr(opts, "delete_folder", False):
         return remove_with_folder(opts.name, opts.yes)
     if getattr(opts, "yes", False):
@@ -16467,26 +16487,14 @@ def remove_with_folder(name: str, assume_yes: bool) -> int:
     its own (setup --relogin signs in over the old sign-in), and it never
     runs one blind, so it says the entry may remain. One log line per
     outcome, paths and sizes only."""
-    accounts, problem = read_accounts_file()
-    if problem:
-        say(unreadable_text(problem))
+    plan = delete_plan(name)
+    if plan is None:
         return 2
-    acct = next((a for a in accounts if a["name"].lower() == name.lower()), None)
-    if acct is None:
-        say(f"no account called {name}; the accounts are {', '.join(a['name'] for a in accounts)}")
-        return 2
-    if len(accounts) == 1:
-        say("that is the only account; longhaul needs at least one")
-        return 2
+    acct, folder, there, size, why = plan
     name = acct["name"]
-    why = delete_refusal(acct, accounts)
-    folder = os.path.realpath(config_of(acct)) if why is None else ""
-    there = bool(folder) and os.path.isdir(folder)
-    why = why or (chats_refusal(acct) if there else None)
     if why:
         return refuse_delete(acct, why)
     shown_folder = home_path(folder)
-    size = folder_size(folder) if there else 0
     if there:
         for line in delete_lines(acct, folder, size):
             show(line)
@@ -16535,6 +16543,71 @@ def remove_with_folder(name: str, assume_yes: bool) -> int:
     show(f"removed {name} from longhaul's accounts and deleted its folder {shown_folder} ({size_text(size)}).")
     log(f"remove: {name}'s folder {shown_folder} deleted ({size_text(size)})")
     return 0
+
+
+def delete_plan(name: str, tell=say):
+    """What `remove NAME --delete-folder` would do, checked as it checks
+    before it asks: (the account, its folder by real path, whether that is
+    there, its size, why it may not be deleted or None), the folder "" and
+    not there once delete_refusal() refuses it, and the chats on it
+    (chats_refusal()) looked at only for a folder that is there. None
+    once `tell` has said why there is nothing to do: accounts.json cannot
+    be read, has no such account, or has only that one."""
+    accounts, problem = read_accounts_file()
+    if problem:
+        tell(unreadable_text(problem))
+        return None
+    acct = next((a for a in accounts if a["name"].lower() == name.lower()), None)
+    if acct is None:
+        tell(f"no account called {name}; the accounts are {', '.join(a['name'] for a in accounts)}")
+        return None
+    if len(accounts) == 1:
+        tell("that is the only account; longhaul needs at least one")
+        return None
+    why = delete_refusal(acct, accounts)
+    folder = os.path.realpath(config_of(acct)) if why is None else ""
+    there = bool(folder) and os.path.isdir(folder)
+    why = why or (chats_refusal(acct) if there else None)
+    return acct, folder, there, (folder_size(folder) if there and not why else 0), why
+
+
+def delete_preview(name: str, as_json: bool) -> int:
+    """`longhaul remove NAME --delete-folder --dry-run [--json]` (the UX
+    review of 2026-11-11, M4): what the delete would take, in
+    delete_lines()'s words, or why it would refuse, checked as it checks
+    (delete_plan()); nothing written, deleted or logged. Exit 2 when it
+    would refuse, or has nothing to do. --json: {"name", "folder" (as
+    shown), "there", "size", "conversations", "linked" (the folder its
+    projects/ only links to), "lines", "refused", "problem"}, for the
+    accounts screen's second Remove question."""
+    problems: list[str] = []
+    plan = delete_plan(name, tell=problems.append if as_json else show)
+    if plan is None:
+        if as_json:
+            print_json({"name": None, "folder": None, "there": False, "size": None, "conversations": None,
+                        "linked": None, "lines": [], "refused": None, "problem": " ".join(problems)})
+        return 2
+    acct, folder, there, size, why = plan
+    name, value = acct["name"], acct.get("config_dir")
+    shown_folder = home_path(folder) if folder else (home_path(str(config_of(acct))) if value is None
+                                                     or isinstance(value, str) else "(not a path)")
+    count, link = conversations_in(folder) if there and not why else (None, None)
+    if why:
+        lines = [f"It would not be deleted: {why}."]
+    elif there:
+        lines = delete_lines(acct, folder, size)
+    else:
+        lines = [f"{name}'s sign-in folder {shown_folder} is not there, so nothing would be deleted: {name} would only "
+                 "be taken off the list."]
+    if as_json:
+        print_json({"name": name, "folder": shown_folder, "there": there and not why,
+                    "size": size_text(size) if there and not why else None, "conversations": count,
+                    "linked": home_path(link) if link else None, "lines": lines, "refused": why, "problem": None})
+    else:
+        for line in lines:
+            show(line)
+        print("Nothing deleted, nothing changed: --dry-run only says what would go.")
+    return 2 if why else 0
 
 
 def delete_refusal(acct: dict, accounts: list):
@@ -16630,7 +16703,7 @@ def delete_lines(acct: dict, folder: str, size: int) -> list:
     shared one stays, and so does all it reaches. Then that Longhaul does
     not sign the account out (remove_with_folder() says why)."""
     name = acct["name"]
-    head = f"{name}'s folder {home_path(folder)} ({size_text(size)}) goes for good: {name}'s sign-in"
+    head = f"{name}'s sign-in folder {home_path(folder)} ({size_text(size)}) goes for good: {name}'s sign-in"
     count, link = conversations_in(folder)
     if link:
         head += f". Its chat history is in {home_path(link)}, which it only links to, and stays."
@@ -20380,6 +20453,10 @@ def main(argv: list[str]) -> int:
                            help="delete its config folder too, with the sign-in and any chat history kept in it, "
                                 "after saying what goes and a yes in a terminal")
             p.add_argument("--yes", action="store_true", help="with --delete-folder: delete without asking")
+            p.add_argument("--dry-run", action="store_true",
+                           help="with --delete-folder: say what would go (the folder, its size, the conversations "
+                                "kept in it, whether its history is only linked), and change nothing")
+            p.add_argument("--json", action="store_true", help="with --dry-run: the same as one JSON object")
         if cmd == "clear":
             p.add_argument("name", nargs="?", metavar="NAME",
                            help="only this account's recorded limit (default: every account's)")
