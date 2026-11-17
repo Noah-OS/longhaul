@@ -112,7 +112,7 @@ async function update($: any, lh: string): Promise<string | undefined> {
 // event at a limit, a choice pending or a message stopped takes the place of
 // the numbers; one it cannot read, or of a kind it does not know, is none.
 const RESET_AT = 70 // % of a window from which its reset is shown
-export const DEFAULT_NAME = 'VS Code sign-in' // ~/.claude's own sign-in, "main" in the files (the review's Q11)
+export const DEFAULT_NAME = 'default sign-in' // ~/.claude's own sign-in, "main" in the files (the review's Q11)
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const text = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null)

@@ -1910,7 +1910,7 @@ class Usage(unittest.TestCase):
             with self.subTest(case):
                 (self.relay / "accounts.json").write_text(text)
                 log.unlink(missing_ok=True)
-                self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mVS Code sign-in"))
+                self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mdefault sign-in"))
                 self.assertEqual(json.loads(record.read_text())["account"], "main", "as with no file")
                 self.assertTrue(longhaul.record_usage(self.reading(), str(self.pro)).startswith("\033[1mpro"))
                 said = [line for line in log.read_text().splitlines() if "accounts.json is not readable: " in line]
@@ -1919,7 +1919,7 @@ class Usage(unittest.TestCase):
                 out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], env=env, text=True,
                                      input=json.dumps(self.reading()), capture_output=True, timeout=30)
                 self.assertEqual((out.returncode, out.stderr), (0, ""))
-                self.assertTrue(out.stdout.startswith("\033[1mVS Code sign-in"), out.stdout)
+                self.assertTrue(out.stdout.startswith("\033[1mdefault sign-in"), out.stdout)
                 self.assertNotIn("statusline error", log.read_text())
                 out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "usage"], env=env, text=True,
                                      capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
@@ -1958,7 +1958,7 @@ class Usage(unittest.TestCase):
     def test_a_session_outside_longhaul_is_called_main(self):
         # Kept as "main" in the files; the line calls it as the review's Q11
         # and 4.6 do, as no list of accounts names it.
-        self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mVS Code sign-in\033[0m · 5h"))
+        self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mdefault sign-in\033[0m · 5h"))
         self.assertEqual(json.loads((longhaul.USAGE_DIR / "sessions" / "s1.json").read_text())["account"], "main")
 
     def test_an_unchanged_reading_adds_no_ledger_row(self):
@@ -2168,7 +2168,7 @@ class StatuslineUpdate(unittest.TestCase):
     def test_a_newer_release_ends_the_line_with_its_version(self):
         line = self.line()
         self.assertTrue(line.endswith(" · update 0.3.3"), line)
-        self.assertTrue(line.startswith("\033[1mVS Code sign-in\033[0m · 5h"),
+        self.assertTrue(line.startswith("\033[1mdefault sign-in\033[0m · 5h"),
                         "the account and the allowance come first")
         self.assertEqual(line.count("update"), 1)
 
@@ -2225,7 +2225,7 @@ class StatuslineUpdate(unittest.TestCase):
     def test_a_failure_in_the_word_never_blanks_the_line(self):
         with mock.patch.object(longhaul, "release_record", side_effect=RuntimeError("boom")):
             line = self.line()
-        self.assertTrue(line.startswith("\033[1mVS Code sign-in"), line)
+        self.assertTrue(line.startswith("\033[1mdefault sign-in"), line)
         self.assertIn("23%", line)
         self.assertNotIn("update", line)
 
@@ -2238,10 +2238,10 @@ class StatuslineUpdate(unittest.TestCase):
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}",
                              capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout, "\033[1mVS Code sign-in\033[0m · no usage reading yet · update 999.0.0\n")
+        self.assertEqual(out.stdout, "\033[1mdefault sign-in\033[0m · no usage reading yet · update 999.0.0\n")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}", capture_output=True,
                              text=True, env=dict(env, LONGHAUL_UPDATE_CHECK="off"), timeout=30)
-        self.assertEqual(out.stdout, "\033[1mVS Code sign-in\033[0m · no usage reading yet\n")
+        self.assertEqual(out.stdout, "\033[1mdefault sign-in\033[0m · no usage reading yet\n")
 
 
 # One status line, everywhere (the UX review of 2026-11-11, 4.6 and M3): the
@@ -2268,7 +2268,7 @@ STATUS_REVIEW_TABLE = [
     ("A choice pending", "personal · → work after this turn"),
     ("A message stopped by a folder rule", "personal · message stopped: ~/clients is work's · /accounts"),
     ("No reading yet", "work · no usage reading yet · ctx 12k"),
-    ("VS Code's own sign-in", "VS Code sign-in · 5h 12% · ctx 88k"),
+    ("The default sign-in", "default sign-in · 5h 12% · ctx 88k"),
     ("Newer release", "work · 5h 12% · wk 40% · ctx 88k · update 0.3.9"),
 ]
 
@@ -2447,7 +2447,7 @@ class StatusLineState(unittest.TestCase):
 
     def test_vs_codes_own_sign_in(self):
         (self.home / "accounts.json").unlink()
-        self.assertEqual(self.line(self.reading(week=None), on=None), "VS Code sign-in · 5h 12% · ctx 88k")
+        self.assertEqual(self.line(self.reading(week=None), on=None), "default sign-in · 5h 12% · ctx 88k")
         self.assertEqual(json.loads((self.home / "usage" / "sessions" / f"{self.SID}.json").read_text())["account"],
                          "main", "the files keep its name")
 
@@ -24797,7 +24797,7 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(self.read(self.status(**chat))["line"],
                          f"work at limit · carries on {longhaul.clock(until)} on personal")
         # Outside a chat: the line of the sign-in it runs on, with no event; the default one by its name.
-        self.assertEqual(self.read(self.status())["line"], "VS Code sign-in · no usage reading yet")
+        self.assertEqual(self.read(self.status())["line"], "default sign-in · no usage reading yet")
 
     def test_the_chat_it_runs_in_says_why_it_runs_on_its_account(self):
         # M1: the latest reason the log gives for the account the chat is on, from its start or its move.
@@ -24859,7 +24859,7 @@ class StatusJson(unittest.TestCase):
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
             "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None,
-            "chat": None, "line": "VS Code sign-in · no usage reading yet"})
+            "chat": None, "line": "default sign-in · no usage reading yet"})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
                                        "vscode", "panel_paused", "problem", "chat", "line"],
                          "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17), "
@@ -26266,7 +26266,7 @@ class StatuslineInstall(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(reading))):
             self.assertEqual(longhaul.main(["statusline"]), 0)
-        self.assertEqual(out.getvalue(), "\033[1mVS Code sign-in\033[0m · no usage reading yet\n",
+        self.assertEqual(out.getvalue(), "\033[1mdefault sign-in\033[0m · no usage reading yet\n",
                          "no allowance kept here: the account, and that there is none")
         env = {**os.environ, "HOME": str(self.user)}
         for stdin in (json.dumps(reading), "not json", ""):
@@ -26274,7 +26274,7 @@ class StatuslineInstall(unittest.TestCase):
                                   capture_output=True, text=True, timeout=30)
             self.assertEqual((done.returncode, done.stderr), (0, ""), stdin)
             self.assertEqual(done.stdout, "longhaul\n" if stdin == "not json"
-                             else "\033[1mVS Code sign-in\033[0m · no usage reading yet\n", stdin)
+                             else "\033[1mdefault sign-in\033[0m · no usage reading yet\n", stdin)
         self.assertFalse(self.path.exists(), "the display writes no settings")
         self.assertIn("longhaul statusline install|uninstall [--yes]", longhaul.__doc__, "the Usage block names it")
 

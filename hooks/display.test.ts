@@ -18,7 +18,7 @@ const MANIFEST = '/.claude-plugin/plugin.json' // under the plugin's root
 const NOW = Date.UTC(2026, 9, 31, 12, 0, 0)
 const RESETS = 4_000_000_000 // seconds: a window open whatever the clock says
 // The entry of a chat on ~/.claude's own sign-in with no reading kept yet.
-const BARE = 'VS Code sign-in · no usage reading yet'
+const BARE = 'default sign-in · no usage reading yet'
 const USAGE = { input_tokens: 6, cache_read_input_tokens: 600_000, cache_creation_input_tokens: 2_000, output_tokens: 900, model: 'claude-opus-4-5' }
 
 type World = {
@@ -127,10 +127,10 @@ test('after a turn the word comes last, after the allowance and the context', as
   w.usage = json({ at: NOW / 1000, five_hour: { used_percentage: 23, resets_at: RESETS }, seven_day: { used_percentage: 51, resets_at: RESETS } })
   await start($, w)
   await $.turn.complete({ answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: USAGE })
-  expect(w.statuses[w.statuses.length - 1]).toBe('VS Code sign-in · 5h 23% · wk 51% · ctx 612k · update 0.3.3')
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · 5h 23% · wk 51% · ctx 612k · update 0.3.3')
   w.release = json({ latest: '0.3.2' })
   await $.turn.complete({ answer: 'done', durationMs: 1000, isAborted: false, turnId: 't2', reason: 'answer', usage: USAGE })
-  expect(w.statuses[w.statuses.length - 1]).toBe('VS Code sign-in · 5h 23% · wk 51% · ctx 612k')
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · 5h 23% · wk 51% · ctx 612k')
 })
 
 // This chat's question and carry-on (the keep-working plan's K1, K2), as
@@ -151,12 +151,12 @@ test("the question and the carry-on take the entry's place while they are open, 
   expect(await start($, w)).toBe(`${BARE} · update 0.3.3`)
   write(w, `${HOME}/questions/${SID}.json`, QUESTION)
   await w.clock.advance(3000)
-  expect(w.statuses[w.statuses.length - 1]).toBe('VS Code sign-in at limit · move to personal-2? /accounts · update 0.3.3')
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in at limit · move to personal-2? /accounts · update 0.3.3')
   // The answer was wait: the relay removes the question and schedules the carry-on.
   write(w, `${HOME}/questions/${SID}.json`, null)
   write(w, `${HOME}/waits/${SID}.json`, WAIT)
   await w.clock.advance(3000)
-  const carries = `VS Code sign-in at limit · carries on ${clock(WAIT.until, NOW + 6000)} on personal-1`
+  const carries = `default sign-in at limit · carries on ${clock(WAIT.until, NOW + 6000)} on personal-1`
   expect(w.statuses[w.statuses.length - 1]).toBe(`${carries} · update 0.3.3`)
   // After a turn: the carry-on still holds the place of the numbers.
   w.usage = json({ at: NOW / 1000, five_hour: { used_percentage: 23, resets_at: RESETS }, seven_day: { used_percentage: 51, resets_at: RESETS } })
@@ -165,7 +165,7 @@ test("the question and the carry-on take the entry's place while they are open, 
   // The carry-on went: its file with it.
   write(w, `${HOME}/waits/${SID}.json`, null)
   await w.clock.advance(3000)
-  expect(w.statuses[w.statuses.length - 1]).toBe('VS Code sign-in · 5h 23% · wk 51% · ctx 612k · update 0.3.3')
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · 5h 23% · wk 51% · ctx 612k · update 0.3.3')
 })
 
 test("a question its relay left behind, or another chat's, adds nothing", async ($, on) => {
@@ -309,14 +309,14 @@ test('the entry: no reading yet', async ($, on) => {
   expect(entry()).toBe('work · no usage reading yet · ctx 12k')
 })
 
-test("the entry: VS Code's own sign-in", async ($, on) => {
+test("the entry: the default sign-in", async ($, on) => {
   const w = world(on)
   w.release = json({ latest: '0.3.2' })
   w.context = 88_000
   w.usage = READING(12, null)
   await start($, w)
   await $.turn.complete(TURN)
-  expect(w.statuses[w.statuses.length - 1]).toBe('VS Code sign-in · 5h 12% · ctx 88k')
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · 5h 12% · ctx 88k')
   // The one account with no folder of its own is ~/.claude's, as longhaul.py names it.
   write(w, `${HOME}/accounts.json`, [{ name: 'Max', config_dir: null }, { name: 'work', config_dir: '~/.claude-work' }])
   w.files[`${HOME}/usage/Max.json`] = { text: READING(12, null), at: 1 }

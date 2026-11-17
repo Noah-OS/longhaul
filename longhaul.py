@@ -3512,7 +3512,7 @@ def save_label(sid: str, label: str) -> None:
 # never colour alone; the update word last. hooks/status-line.cases.ts holds
 # the states and their lines, and both test suites check every one.
 STATUS_RESET_AT = 70  # % of a window from which its reset is shown
-STATUS_DEFAULT = "VS Code sign-in"  # the line's name for ~/.claude's own sign-in, "main" (the review's Q11)
+STATUS_DEFAULT = "default sign-in"  # the line's name for ~/.claude's own sign-in, "main" (the review's Q11)
 
 
 def half_up(value: float) -> int:
