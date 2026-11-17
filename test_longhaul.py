@@ -26812,6 +26812,338 @@ class PanelPause(unittest.TestCase):
         self.assertIn("`longhaul panel", longhaul.switch_panel_note() + longhaul.PANEL_ALONE)
 
 
+class Activity(unittest.TestCase):
+    """`longhaul activity [--chat ID] [--days N] [--json]` (the UX review of
+    2026-11-11, 4.3 and M1): what Longhaul did by itself, and why, from its
+    own decision lines in longhaul.log. Each kind of line it reads is
+    pinned here to the log call that writes it, so a change of wording
+    breaks a test, not the feed; a line no shape takes is never shown.
+    Every path is scratch."""
+
+    SID = "5ca8a797-1111-4222-8333-444455556666"
+    OTHER = "b71e22c0-1111-4222-8333-444455556666"
+    QID = "q-0123456789ab"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.user.mkdir()
+        self.home.mkdir()
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "VSCODE_CONFIG": self.home / "vscode.json",
+                            "USAGE_DIR": self.home / "usage", "DEFAULT_CONFIG": self.user / ".claude"}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"LONGHAUL_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)  # a run from inside a chat must not name a chat here
+        self.today = dt.date.today().isoformat()
+
+    def write_log(self, *lines, day=None, name="longhaul.log"):
+        """Lines in the log as log() writes them: a stamp, then the text."""
+        day = day or self.today
+        with open(self.home / name, "a") as f:
+            for i, text in enumerate(lines):
+                f.write(f"{day} {9 + i // 60:02d}:{i % 60:02d}:00 {text}\n" if not text.startswith("!") else text[1:] + "\n")
+
+    def run_cli(self, *args, chat=None):
+        out, err = io.StringIO(), io.StringIO()
+        env = {"CLAUDE_CODE_SESSION_ID": chat} if chat else {}
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.dict(os.environ, env):
+            code = longhaul.main(["activity", *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def events(self, *args):
+        code, out, err = self.run_cli("--json", *args)
+        self.assertEqual(code, 0, err)
+        return [(e["chat"], e["what"], e["why"]) for e in json.loads(out)]
+
+    # Each shape's lines, as each log call it is pinned to writes them, with
+    # the event each makes: (chat, what, why).
+    def samples(self):
+        s, o, q, s8 = self.SID, self.OTHER, self.QID, self.SID[:8]
+        return {
+            "{who}: {chat} was to start on {acct}, which {why}; the choice is dropped": [
+                (f"panel: {s8} was to start on work, which is not signed in as expected; the choice is dropped",
+                 (s8, "Dropped the choice of work (longhaul use)", "work is not signed in as expected")),
+                (f"terminal: {s8} was to start on work, which was removed from Longhaul's accounts since; the choice "
+                 "is dropped", (s8, "Dropped the choice of work (longhaul use)",
+                                "work was removed from Longhaul's accounts since")),
+                (f"pipe: {s8} was to start on work, which may not be used in ~/side; the choice is dropped",
+                 (s8, "Dropped the choice of work (longhaul use)", "work may not be used in ~/side"))],
+            "{who}: {chat} moved, while idle, from {off}, to {to}": [
+                (f"panel: {s} moved, while idle, from personal, which may no longer be used in ~/clients, to work",
+                 (s8, "Moved to work while idle", "it ran on personal, which may no longer be used in ~/clients"))],
+            "{who}: {chat} moved, while idle, from {from} to {to} (chosen with longhaul use)": [
+                (f"panel: {s} moved, while idle, from personal to work (chosen with longhaul use)",
+                 (s8, "Moved to work while idle", "chosen with longhaul use (it ran on personal)"))],
+            "panel: {chat} moved at its reopen from {from}, at its {kind} limit, to {to} (answered)": [
+                (f"panel: {s} moved at its reopen from personal, at its weekly limit, to work (answered)",
+                 (s8, "Moved to work at its reopen", "personal was at its weekly limit, and you answered move"))],
+            "{who}: {chat} does not move to {acct}, as chosen: {why}": [
+                (f"panel: {s} does not move to work, as chosen: it is not signed in as expected",
+                 (s8, "Did not move to work, as chosen", "it is not signed in as expected"))],
+            "account: refused a prompt in {chat}: {where} is kept for {names}; the chat runs on {label}": [
+                (f"account: refused a prompt in {o}: ~/side is kept for acme; the chat runs on personal",
+                 (o[:8], "Stopped a message; nothing was sent", "~/side is kept for acme, and the chat ran on personal"))],
+            "panel: {acct} hit its {kind} limit; {others} has room, so the chat stays as it is": [
+                ("panel: personal hit its session limit; no other account allowed here has room, so the chat stays as it is",
+                 (None, "personal hit its session limit; a panel chat stayed on it",
+                  "no other account allowed here had room"))],
+            "limit: {acct}'s recorded limit (until {at}) is forgotten: {why}": [
+                ("limit: personal's recorded limit (until 14:00) is forgotten: a reply came on it",
+                 (None, "Forgot personal's recorded limit (it was until 14:00)", "a reply came on it"))],
+            "clear: {acct}'s recorded limit forgotten (it was until {at})": [
+                ("clear: personal's recorded limit forgotten (it was until Tue 02:00)",
+                 (None, "Forgot personal's recorded limit (it was until Tue 02:00)", "asked with longhaul clear"))],
+            "clear: the recorded limits forgotten: {each}": [
+                ("clear: the recorded limits forgotten: personal (it was until 14:00), work (it was until Tue 02:00)",
+                 (None, "Forgot the recorded limits: personal (it was until 14:00), work (it was until Tue 02:00)",
+                  "asked with longhaul clear"))],
+            "repair: {acct}'s recorded limit forgotten (it was not a time)": [
+                ("repair: work's recorded limit forgotten (it was not a time)",
+                 (None, "Forgot work's recorded limit", "it was not a time (longhaul repair)"))],
+            "repair: state.json ({why}) replaced by one with no limit recorded": [
+                ("repair: state.json (not an object) replaced by one with no limit recorded",
+                 (None, "Wrote state.json again with no limit recorded", "it was not an object (longhaul repair)"))],
+            "repair: accounts.json ({why}) put back from its last good copy ({count}); "
+            "the broken one is kept as accounts.json.broken": [
+                ("repair: accounts.json (not JSON (Expecting value: line 1 column 1)) put back from its last good copy "
+                 "(2 accounts); the broken one is kept as accounts.json.broken",
+                 (None, "Put accounts.json back from its last good copy (2 accounts)",
+                  "it was not JSON (Expecting value: line 1 column 1) (longhaul repair)"))],
+            "repair: VS Code's Claude panel pointed at {where} (it named {gone}, which was gone)": [
+                ("repair: VS Code's Claude panel pointed at ~/new/longhaul-vscode (it named ~/old/longhaul-vscode, "
+                 "which was gone)", (None, "Pointed VS Code's Claude panel at ~/new/longhaul-vscode",
+                                     "it named ~/old/longhaul-vscode, which was gone (longhaul repair)"))],
+            "repair: {chat}'s question ({qid}) removed: {why}": [
+                (f"repair: {s}'s question ({q}) removed: its relay was gone",
+                 (s8, "Removed its question", "its relay was gone (longhaul repair)"))],
+            "repair: {chat}'s carry-on on {acct} at {at} cancelled: {why}": [
+                (f"repair: {s}'s carry-on on personal at 14:01 cancelled: its relay was gone",
+                 (s8, "Cancelled its carry-on on personal at 14:01", "its relay was gone (longhaul repair)"))],
+            "repair: {chat}'s choice of {acct}, no longer an account, removed": [
+                (f"repair: {s}'s choice of spare, no longer an account, removed",
+                 (s8, "Removed its choice of spare", "no longer an account (longhaul repair)"))],
+            "wait: {chat} carries on on {acct} at {at} ({why})": [
+                (f"wait: {s} carries on on work at 14:01 (auto)",
+                 (s8, "Set a carry-on on work at 14:01", "switching is auto"))],
+            "wait: {chat}'s carry-on on {acct} at {at} goes now: {why}": [
+                (f"wait: {s}'s carry-on on personal at 14:01 goes now: work has room",
+                 (s8, "Did not wait for 14:01 to carry on on personal", "work has room")),
+                (f"wait: {s}'s carry-on on personal at 14:01 goes now: work's recorded limit is gone",
+                 (s8, "Did not wait for 14:01 to carry on on personal", "work's recorded limit is gone")),
+                (f"wait: {s}'s carry-on on personal at 14:01 goes now: personal's recorded limit is gone",
+                 (s8, "Did not wait for 14:01 to carry on on personal", "personal's recorded limit is gone"))],
+            "wait: {chat} carried on on {acct} ({why})": [
+                (f"wait: {s} carried on on personal (never)",
+                 (s8, "Sent the carry-on message on personal", "switching is never"))],
+            "wait: {chat} carried on on {acct}, moved from {from} ({why})": [
+                (f"wait: {s} carried on on work, moved from personal (answered)",
+                 (s8, "Moved to work and sent the carry-on message",
+                  "personal was at its limit; you answered its question"))],
+            "wait: {chat} carried on without longhaul (a turn ran after the limit), so nothing was sent at {at}": [
+                (f"wait: {s} carried on without longhaul (a turn ran after the limit), so nothing was sent at 14:01",
+                 (s8, "Sent no carry-on at 14:01", "the chat had carried on by itself"))],
+            "wait: {chat}'s carry-on on {acct} is cancelled: {why}": [
+                (f"wait: {s}'s carry-on on personal is cancelled: work was chosen",
+                 (s8, "Cancelled its carry-on on personal", "work was chosen"))],
+            "question: asked {chat} ({qid}) to carry on on {to} at {at} ({every} is at its limit)": [
+                (f"question: asked {s} ({q}) to carry on on work at 14:00 (every account allowed here is at its limit)",
+                 (s8, "Asked whether to carry on on work at 14:00", "every account allowed here is at its limit"))],
+            "question: asked {chat} ({qid}) at its reopen to move from {from} to {to} ({from2}'s {kind} limit resets "
+            "{at}); its messages wait for the answer": [
+                (f"question: asked {s} ({q}) at its reopen to move from personal to work (personal's weekly limit resets "
+                 "Fri 02:00); its messages wait for the answer",
+                 (s8, "Asked whether to move to work", "it reopened on personal, at its weekly limit until Fri 02:00"))],
+            "question: asked {chat} ({qid}) to move from {from} to {to} ({from2}'s {kind} limit resets {at})": [
+                (f"question: asked {s} ({q}) to move from personal to work (personal's session limit resets 14:00)",
+                 (s8, "Asked whether to move to work", "personal hit its session limit (it resets 14:00)"))],
+            "question: {chat} answered {choice} ({qid})": [
+                (f"question: {s} answered move ({q})", (s8, "Got your answer: move", "answered in /accounts"))],
+            "question: {chat}'s question ({qid}) is withdrawn: {why}": [
+                (f"question: {s}'s question ({q}) is withdrawn: {tail}", (s8, "Withdrew its question", tail))
+                for tail in ("work has room now and switching is auto",
+                             "the chat carried on on personal (a reply came after the limit)",
+                             "personal's limit has reset with no answer; nothing moves",
+                             "work's recorded limit is gone", "a recorded limit is gone, so an account has room",
+                             "work was chosen")],
+            "retry: {chat} carried on after its turn stopped on an API server error at {at} ({n} s ago)": [
+                (f"retry: {s} carried on after its turn stopped on an API server error at 14:02 (61 s ago)",
+                 (s8, "Carried on after an API server error", "its turn stopped on one at 14:02"))],
+            "use: {chat} is to run on {acct}": [
+                (f"use: {s} is to run on work", (s8, "Set to run on work", "chosen with longhaul use"))],
+            "use: {chat} is to run on {acct} (it runs on {from})": [
+                (f"use: {s} is to run on work (it runs on personal)",
+                 (s8, "Set to run on work", "chosen with longhaul use (it ran on personal)"))],
+            "allow: {chat} may run on {acct} in {where}": [
+                (f"allow: {s} may run on personal in ~/side",
+                 (s8, "Allowed on personal in ~/side for 30 days", "asked with longhaul allow"))],
+            "checkpoint for {chat} saved ({n} bytes)": [
+                (f"checkpoint for {s} saved (4,096 bytes)",
+                 (s8, "Saved its checkpoint (4,096 bytes)", "Claude wrote it with /longhaul:checkpoint"))],
+            "checkpoint for {chat} put back after {source} ({n} bytes, written {age} s earlier)": [
+                (f"checkpoint for {s} put back after compact (4096 bytes, written 300 s earlier)",
+                 (s8, "Put its checkpoint back after compact", "it was saved 5 min ago"))],
+            "checkpoint for {old} carried into {chat} after clear ({n} bytes, written {age} s earlier)": [
+                (f"checkpoint for {o} carried into {s} after clear (4096 bytes, written 60 s earlier)",
+                 (s8, f"Brought back chat {o[:8]}'s checkpoint after /clear", "the same folder, soon after"))],
+            "autocompact: compacted {chat} after its checkpoint (the context was {n})": [
+                (f"autocompact: compacted {s} after its checkpoint (the context was 412,345)",
+                 (s8, "Compacted it at 412,345 tokens", "its checkpoint was saved, and it comes back"))],
+            "panel {pause}: switch_mid_session {word} in {file}, for the panel chats opened from now on": [
+                ("panel paused: switch_mid_session false in ~/.longhaul/vscode.json, for the panel chats opened from now "
+                 "on", (None, "Paused Longhaul in panel chats", "asked with longhaul panel pause")),
+                ("panel resumed: switch_mid_session true in ~/.longhaul/vscode.json, for the panel chats opened from now "
+                 "on", (None, "Resumed Longhaul in panel chats", "asked with longhaul panel resume"))],
+        }
+
+    @staticmethod
+    def loose(fragments):
+        """A log call's pieces as a pattern: each placeholder any text."""
+        text = "".join(fragments)
+        return re.compile(".+".join(map(re.escape, re.split(r"\{[^{}]*\}", text))) + r"\Z")
+
+    def test_each_shape_is_pinned_to_the_log_calls_that_write_it(self):
+        source = (HERE / "longhaul.py").read_text()
+        samples = self.samples()
+        self.assertEqual(sorted(samples), sorted(shape for shape, _, _ in longhaul.ACTIVITY_LINES),
+                         "a sample for each shape, and a shape for each sample")
+        for shape, _make, calls in longhaul.ACTIVITY_LINES:
+            for fragments in calls:
+                with self.subTest(call=fragments[0]):
+                    for piece in fragments:
+                        # As a string's whole text in the call: a word changed there is not found.
+                        self.assertIn(f'"{piece}"', source, f"{piece!r} is no longer in longhaul.py: change the shape too")
+                    lines = [line for line, _ in samples[shape] if self.loose(fragments).match(line)]
+                    self.assertTrue(lines, f"no sample is a line this call writes: {fragments}")
+
+    def test_each_line_makes_its_event(self):
+        for shape, cases in self.samples().items():
+            for line, want in cases:
+                with self.subTest(line=line):
+                    got = longhaul.activity_event(line)
+                    self.assertIsNotNone(got, f"no shape takes it (expected {shape!r})")
+                    self.assertEqual((got["chat"], got["what"], got["why"]), want)
+
+    def test_a_line_no_shape_takes_is_never_shown(self):
+        s = self.SID
+        odd = [f"use: {s} is to run on work\x1b]0;x", "launch personal: --resume x --append-system-prompt hello there",
+               f"panel chat on work in ~/x: --resume {s} -p", "relay in 4242 user/", "state: running -> limit",
+               f"guard: advised on a whole read of ~/secret.txt (40,000 bytes) in {s}",
+               f"wait: {s} carries on on work at 14:01", "question: asked nobody", "!not a log line at all",
+               f"!2026-13-45 99:99:99 use: {s} is to run on work", "limit: a b's recorded limit (until x) is forgotten: y z",
+               f"panel: {s} moved, while idle, from personal, to two words"]
+        self.write_log(*odd)
+        self.assertEqual(self.events(), [])
+        code, out, _ = self.run_cli()
+        self.assertEqual((code, out.splitlines()[0]), (0, "Nothing Longhaul did by itself today."))
+        for line in odd:
+            self.assertNotIn(line.lstrip("!")[:30], out)
+
+    def test_inside_a_chat_this_chat_comes_first_then_the_others_then_the_log(self):
+        s, o = self.SID, self.OTHER
+        self.write_log(f"account: refused a prompt in {o}: ~/side is kept for acme; the chat runs on personal",
+                       f"wait: {s} carries on on work at 14:01 (auto)",
+                       "limit: personal's recorded limit (until 14:00) is forgotten: a reply came on it",
+                       f"autocompact: compacted {s} after its checkpoint (the context was 412,345)")
+        for how in ({"chat": s}, {"args": ("--chat", s[:6])}):
+            with self.subTest(how=how):
+                code, out, _ = self.run_cli(*how.get("args", ()), chat=how.get("chat"))
+                self.assertEqual(code, 0)
+                self.assertEqual(out.splitlines(), [
+                    "What Longhaul did · today", "",
+                    f"This chat ({s[:8] if 'chat' in how else s[:6]})",
+                    "  09:01  Set a carry-on on work at 14:01: switching is auto.",
+                    "  09:03  Compacted it at 412,345 tokens: its checkpoint was saved, and it comes back.", "",
+                    "Other chats",
+                    f"  09:00  {o[:8]} · Stopped a message; nothing was sent: ~/side is kept for acme, and the chat ran "
+                    "on personal.",
+                    "  09:02  Forgot personal's recorded limit (it was until 14:00): a reply came on it.", "",
+                    f"Full log: {longhaul.home_path(str(self.home / 'longhaul.log'))}"])
+
+    def test_outside_a_chat_every_event_names_its_chat(self):
+        s = self.SID
+        self.write_log(f"wait: {s} carries on on work at 14:01 (auto)")
+        code, out, _ = self.run_cli()
+        self.assertEqual(out.splitlines(), ["What Longhaul did · today", "",
+                                            f"  09:00  {s[:8]} · Set a carry-on on work at 14:01: switching is auto.",
+                                            "", f"Full log: {longhaul.home_path(str(self.home / 'longhaul.log'))}"])
+        code, out, _ = self.run_cli("--chat", self.OTHER)  # a chat with nothing today
+        self.assertIn(f"This chat ({self.OTHER[:8]})\n  Nothing today.\n\nOther chats\n", out)
+
+    def test_today_unless_days_says_more_and_json_gives_the_four_fields(self):
+        s = self.SID
+        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        self.write_log(f"use: {s} is to run on work", day=yesterday)
+        self.write_log(f"allow: {s} may run on personal in ~/side")
+        self.assertEqual(self.events(), [(s[:8], "Allowed on personal in ~/side for 30 days", "asked with longhaul allow")])
+        self.assertEqual(self.events("--days", "2"), [(s[:8], "Set to run on work", "chosen with longhaul use"),
+                                                      (s[:8], "Allowed on personal in ~/side for 30 days",
+                                                       "asked with longhaul allow")])
+        code, out, _ = self.run_cli("--json", "--days", "2")
+        found = json.loads(out)
+        self.assertEqual([sorted(e) for e in found], [["chat", "time", "what", "why"]] * 2)
+        self.assertEqual(found[0]["time"], int(time.mktime(time.strptime(f"{yesterday} 09:00:00", "%Y-%m-%d %H:%M:%S"))))
+        code, out, _ = self.run_cli("--days", "2")
+        self.assertTrue(out.startswith("What Longhaul did · the last 2 days\n"), out)
+        self.assertIn(f"  {longhaul.clock(found[0]['time'])}  {s[:8]} · Set to run on work", out)
+        shutil.rmtree(self.home)
+        self.assertEqual(self.run_cli("--days", "3")[1].splitlines()[0], "Nothing Longhaul did by itself in the last 3 days.")
+        self.assertFalse(self.home.exists(), "it only reads")
+
+    def test_the_part_moved_aside_comes_first_and_a_big_log_is_read_from_its_end(self):
+        s = self.SID
+        self.write_log(f"use: {s} is to run on personal", name="longhaul.log.1")
+        self.write_log(f"use: {s} is to run on work")
+        self.assertEqual([what for _, what, _ in self.events()], ["Set to run on personal", "Set to run on work"])
+        with mock.patch.object(longhaul, "LOG_READ_MAX", 60):
+            # The last 60 bytes of each: the line cut there is dropped, never read as a shorter one.
+            self.assertEqual(self.events(), [])
+            self.write_log(f"use: {s[:8]} is to run on work")
+            self.assertEqual([what for _, what, _ in self.events()], ["Set to run on work"])
+
+    def test_lines_the_real_calls_write_come_back(self):
+        s = self.SID
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"personal": time.time() + 3600,
+                                                                            "work": time.time() + 7200}}))
+        until = longhaul.forget_limit("personal", "a reply came on it")
+        self.assertIsNotNone(until)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(longhaul.main(["clear"]), 0)
+            self.assertEqual(longhaul.main(["panel", "pause"]), 0)
+            self.assertEqual(longhaul.main(["autocompact-note", s, "412345"]), 0)
+        got = self.events()
+        self.assertEqual(got[0], (None, f"Forgot personal's recorded limit (it was until {longhaul.clock(until)})",
+                                  "a reply came on it"))
+        self.assertTrue(got[1][1].startswith("Forgot the recorded limits: work (it was until "), got)
+        self.assertEqual(got[2:], [(None, "Paused Longhaul in panel chats", "asked with longhaul panel pause"),
+                                   (s[:8], "Compacted it at 412,345 tokens", "its checkpoint was saved, and it comes back")])
+
+    def test_a_bad_chat_or_number_of_days_is_refused(self):
+        for args, said in ((("--days", "0"), "--days is a number of days, 1 or more"),
+                           (("--chat", "../x"), "../x is not a chat's id")):
+            with self.subTest(args=args):
+                code, out, err = self.run_cli(*args)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn(said, err)
+
+    def test_the_usage_block_names_it_and_the_shim_refuses_it(self):
+        doc = longhaul.__doc__
+        self.assertIn("longhaul activity [--chat ID] [--days N] [--json]", doc)
+        self.assertLess(doc.index("longhaul repair [--dry-run]"), doc.index("longhaul activity [--chat ID]"))
+        readme = (HERE / "README.md").read_text()
+        self.assertIn("longhaul activity", readme)
+        # bin/longhaul, what a chat's Claude may run, is the owner's boundary: activity is not in it until the owner says.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+        out = subprocess.run([str(HERE / "bin" / "longhaul"), "activity"], capture_output=True, text=True, env=env,
+                             timeout=30)
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertIn("Ask the user to run it in a terminal.", out.stderr)
+
+
 class Doctor(unittest.TestCase):
 
     """`longhaul doctor` and /longhaul:doctor (the owner's decision of

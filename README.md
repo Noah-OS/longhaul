@@ -101,6 +101,8 @@ Once the plugin is loaded, most of it works by itself.
 
 **Keeping a long session on track:** let the reminder ask for the checkpoint, or type `/longhaul:checkpoint` yourself, then `/compact` or `/clear`; the work picks up from the checkpoint. Instructions to `/compact` kept no more in a test of 8 real compactions, so Longhaul does not suggest them ([Measurements](https://github.com/Noah-OS/longhaul/wiki/Measurements)).
 
+**What Longhaul did by itself, and why:** `longhaul activity` in a terminal lists today's decisions from Longhaul's log: the account a chat started on and why, a move at a limit or while idle, a message stopped in a folder kept for another account, a recorded limit forgotten, a question or a carry-on at a limit, a `longhaul use` choice, a checkpoint saved or put back, a compaction, a repair, a pause in the panel. The chat it runs in (or `--chat ID`) comes first, then the others. `--days 7` goes back a week; `--json` gives the events as JSON. It shows ids, account names, folders and times, never a word of a chat, and its last line names the full log.
+
 ## 4. More than one account
 
 Longhaul can run your chats across several of your own Claude subscriptions. Each account is its own claude.ai sign-in, in its own folder. This is advanced and experimental; it is off until you add a second account.

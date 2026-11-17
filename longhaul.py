@@ -388,6 +388,16 @@ Usage:
                           as JSON, each with its id; --fix ID makes that one
                           alone (exit 1 for an id with no fix). Try it before
                           an uninstall
+  longhaul activity [--chat ID] [--days N] [--json]
+                          what Longhaul did by itself today, and why, from
+                          its own lines in the log: where a chat started and
+                          why, moves, prompts stopped, limits forgotten,
+                          questions, carry-ons, `use` choices, checkpoints,
+                          compactions, repairs, the panel paused; this chat
+                          (or --chat ID) first, then the others. --days N:
+                          today and the days before, N in all; --json: the
+                          events as [{"time", "chat", "what", "why"}]. Ids,
+                          account names, folders and times only; it only reads
   (log)                       LONGHAUL_HOME/longhaul.log leaves out its routine
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
@@ -16890,6 +16900,344 @@ def status_json() -> int:
     return 2 if problem else 0
 
 
+# ---------------------------------------------------------------- activity
+
+# `longhaul activity` (the UX review of 2026-11-11, 4.3 and M1): what
+# Longhaul did by itself, and why, read back from its own decision lines in
+# longhaul.log. Each entry below is one kind of line: its shape, with a
+# named part for each value the line holds; what it makes of them (what
+# happened, why, and the account the chat runs on after it, when it moved);
+# and the text of each log call in this file that writes it, piece by piece
+# as the call spells it, which a test finds in this file, so that a change
+# of wording breaks a test rather than the feed. A line no shape takes is
+# skipped, never shown: the feed holds Longhaul's own words around ids,
+# account names, folders, times and numbers, as the log does, and no word of
+# a conversation.
+LOG_READ_MAX = 16 * 2**20  # bytes read at most from the end of each of longhaul.log.1 and longhaul.log
+ACTIVITY_NAME = r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,62}"
+ACTIVITY_CHAT = r"[A-Za-z0-9_-]{1,100}"
+ACTIVITY_FIELDS = {  # each part's pattern by its name, a digit at its end dropped; any other is r".+?"
+    "chat": ACTIVITY_CHAT, "old": ACTIVITY_CHAT, "new": r"a new chat|" + ACTIVITY_CHAT, "acct": ACTIVITY_NAME,
+    "to": ACTIVITY_NAME, "from": ACTIVITY_NAME, "who": r"panel|pipe|terminal", "qid": r"q-[0-9a-f]{12}",
+    "n": r"[0-9][0-9,]*", "verb": r"starts on|moves to|reopens on", "choice": r"[a-z]+", "pause": r"paused|resumed",
+    "kind": r"[a-z][a-z -]{0,30}?", "source": r"[a-z]+",
+}
+ACTIVITY_WORDS = {"auto": "switching is auto", "never": "switching is never", "ask": "switching is ask",
+                  "answered": "you answered its question"}
+START_VERBS = {"starts on": "Started on", "moves to": "Moved to", "reopens on": "Reopened on"}
+
+
+def carry_word(why: str) -> str:
+    """A carry-on's reason (Relay.schedule()'s `why`) in words."""
+    return ACTIVITY_WORDS.get(why, why)
+
+
+def event(what: str, why: str, account: str | None = None) -> dict:
+    return {"what": what, "why": why, "account": account}
+
+
+ACTIVITY_LINES = [
+    # A `longhaul use` choice dropped at the chat's open (resumed_index(), take_choice()).
+    ("{who}: {chat} was to start on {acct}, which {why}; the choice is dropped",
+     lambda g: event(f"Dropped the choice of {g['acct']} (longhaul use)", f"{g['acct']} {g['why']}"),
+     [("{who}: {resumed[:8]} was to start on {chosen}, which {why}; the choice is dropped",),
+      ("{who}: {sid[:8]} was to start on {name}, which was removed from Longhaul's accounts since; ",
+       "the choice is dropped"),
+      ("{who}: {sid[:8]} was to start on {name}, which may not be used in {home_path(top)}; the choice is dropped",)]),
+    # Moves while idle: off an account removed or no longer allowed here; to the one `use` chose.
+    ("{who}: {chat} moved, while idle, from {off}, to {to}",
+     lambda g: event(f"Moved to {g['to']} while idle", f"it ran on {g['off']}", g["to"]),
+     [("{self.who}: {sid} moved, while idle, from {text}, to {new}",)]),
+    ("{who}: {chat} moved, while idle, from {from} to {to} (chosen with longhaul use)",
+     lambda g: event(f"Moved to {g['to']} while idle", f"chosen with longhaul use (it ran on {g['from']})", g["to"]),
+     [("{self.who}: {sid} moved, while idle, from {here} to {name} (chosen with longhaul use)",)]),
+    ("panel: {chat} moved at its reopen from {from}, at its {kind} limit, to {to} (answered)",
+     lambda g: event(f"Moved to {g['to']} at its reopen",
+                     f"{g['from']} was at its {g['kind']} limit, and you answered move", g["to"]),
+     [("panel: {sid} moved at its reopen from {here['name']}, at its {limit['kind']} limit, to {name} ", "(answered)")]),
+    ("{who}: {chat} does not move to {acct}, as chosen: {why}",
+     lambda g: event(f"Did not move to {g['acct']}, as chosen", g["why"]),
+     [("{self.who}: {sid} does not move to {name}, as chosen: {problem}",)]),
+    # A prompt stopped in a folder kept for other accounts (account_check()).
+    ("account: refused a prompt in {chat}: {where} is kept for {names}; the chat runs on {label}",
+     lambda g: event("Stopped a message; nothing was sent",
+                     f"{g['where']} is kept for {g['names']}, and the chat ran on {g['label']}"),
+     [("account: refused a prompt in {sid}: {where} is kept for {names}; the chat runs on {label}",)]),
+    # Recorded limits: met, forgotten, cleared, repaired.
+    ("panel: {acct} hit its {kind} limit; {others} has room, so the chat stays as it is",
+     lambda g: event(f"{g['acct']} hit its {g['kind']} limit; a panel chat stayed on it", f"{g['others']} had room"),
+     [("panel: {here['name']} hit its {limit['kind']} limit; {others} has room, so the chat stays as it is",)]),
+    ("limit: {acct}'s recorded limit (until {at}) is forgotten: {why}",
+     lambda g: event(f"Forgot {g['acct']}'s recorded limit (it was until {g['at']})", g["why"]),
+     [("limit: {name}'s recorded limit (until {clock(found[0])}) is forgotten: {why}",)]),
+    ("clear: {acct}'s recorded limit forgotten (it was until {at})",
+     lambda g: event(f"Forgot {g['acct']}'s recorded limit (it was until {g['at']})", "asked with longhaul clear"),
+     [("clear: {match}'s recorded limit forgotten (it was until {clock(recorded[match])})",)]),
+    ("clear: the recorded limits forgotten: {each}",
+     lambda g: event(f"Forgot the recorded limits: {g['each']}", "asked with longhaul clear"),
+     [("clear: the recorded limits forgotten: {each}",)]),
+    ("repair: {acct}'s recorded limit forgotten (it was not a time)",
+     lambda g: event(f"Forgot {g['acct']}'s recorded limit", "it was not a time (longhaul repair)"),
+     [("repair: {name}'s recorded limit forgotten ", "(it was not a time)")]),
+    ("repair: state.json ({why}) replaced by one with no limit recorded",
+     lambda g: event("Wrote state.json again with no limit recorded", f"it was {g['why']} (longhaul repair)"),
+     [("repair: state.json ({why}) replaced by one with no limit recorded",)]),
+    ("repair: accounts.json ({why}) put back from its last good copy ({count}); "
+     "the broken one is kept as accounts.json.broken",
+     lambda g: event(f"Put accounts.json back from its last good copy ({g['count']})",
+                     f"it was {g['why']} (longhaul repair)"),
+     [("repair: accounts.json ({problem}) put back from its last good copy ({plural(len(kept), 'account')}); ",
+       "the broken one is kept as accounts.json.broken")]),
+    ("repair: VS Code's Claude panel pointed at {where} (it named {gone}, which was gone)",
+     lambda g: event(f"Pointed VS Code's Claude panel at {g['where']}",
+                     f"it named {g['gone']}, which was gone (longhaul repair)"),
+     [("repair: VS Code's Claude panel pointed at {home_path(str(here))} (it named {home_path(gone)}, which was ",
+       "gone)")]),
+    ("repair: {chat}'s question ({qid}) removed: {why}",
+     lambda g: event("Removed its question", f"{g['why']} (longhaul repair)"),
+     [("{sid}'s question ({shown(q.get('id'), 40)}) removed: its relay ", "was gone")]),
+    ("repair: {chat}'s carry-on on {acct} at {at} cancelled: {why}",
+     lambda g: event(f"Cancelled its carry-on on {g['acct']} at {g['at']}", f"{g['why']} (longhaul repair)"),
+     [("{sid}'s carry-on {on} cancelled: {why}",)]),
+    ("repair: {chat}'s choice of {acct}, no longer an account, removed",
+     lambda g: event(f"Removed its choice of {g['acct']}", "no longer an account (longhaul repair)"),
+     [("{sid}'s choice of {name}, no longer an account, removed",)]),
+    # Carry-ons at a reset (Relay.schedule(), carry_on(), carry_on_now(), tend_lifted()).
+    ("wait: {chat} carries on on {acct} at {at} ({why})",
+     lambda g: event(f"Set a carry-on on {g['acct']} at {g['at']}", carry_word(g["why"])),
+     [("wait: {sid} carries on on {name} at {clock(self.carry['until'])} ({why})",)]),
+    ("wait: {chat}'s carry-on on {acct} at {at} goes now: {why}",
+     lambda g: event(f"Did not wait for {g['at']} to carry on on {g['acct']}", g["why"]),
+     [("wait: {c['chat']}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {name} has room",),
+      ("wait: {sid}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {name}'s recorded ",
+       "limit is gone"),
+      ("wait: {sid}'s carry-on on {c['account']} at {clock(c['until'])} goes now: {c['account']}'s ",
+       "recorded limit is gone")]),
+    ("wait: {chat} carried on on {acct} ({why})",
+     lambda g: event(f"Sent the carry-on message on {g['acct']}", carry_word(g["why"]), g["acct"]),
+     [("wait: {sid} carried on on {name} ({why})",)]),
+    ("wait: {chat} carried on on {acct}, moved from {from} ({why})",
+     lambda g: event(f"Moved to {g['acct']} and sent the carry-on message",
+                     f"{g['from']} was at its limit; {carry_word(g['why'])}", g["acct"]),
+     [("wait: {sid} carried on on {name}, moved from {here['name']} ({why})",)]),
+    ("wait: {chat} carried on without longhaul (a turn ran after the limit), so nothing was sent at {at}",
+     lambda g: event(f"Sent no carry-on at {g['at']}", "the chat had carried on by itself"),
+     [("wait: {c['chat']} carried on without longhaul (a turn ran after the limit), so nothing was sent ",
+       "at {clock(c['until'])}")]),
+    ("wait: {chat}'s carry-on on {acct} is cancelled: {why}",
+     lambda g: event(f"Cancelled its carry-on on {g['acct']}", g["why"]),
+     [("wait: {self.carry['chat']}'s carry-on on {self.carry['account']} is cancelled: {name} was chosen",)]),
+    # Questions at a limit, their answers and their withdrawals (Relay.ask(), on_answer()).
+    ("question: asked {chat} ({qid}) to carry on on {to} at {at} ({every} is at its limit)",
+     lambda g: event(f"Asked whether to carry on on {g['to']} at {g['at']}", f"{g['every']} is at its limit"),
+     [("question: asked {sid} ({q['id']}) to carry on on {there} at {clock(until)} ",
+       "({self.every()} is at its limit)")]),
+    ("question: asked {chat} ({qid}) at its reopen to move from {from} to {to} ({from2}'s {kind} limit resets {at}); "
+     "its messages wait for the answer",
+     lambda g: event(f"Asked whether to move to {g['to']}",
+                     f"it reopened on {g['from']}, at its {g['kind']} limit until {g['at']}"),
+     [("question: asked {sid} ({q['id']}) at its reopen to move from {here['name']} to {there} ",
+       "({here['name']}'s {limit['kind']} limit resets {clock(resets)}); its messages wait for the answer")]),
+    ("question: asked {chat} ({qid}) to move from {from} to {to} ({from2}'s {kind} limit resets {at})",
+     lambda g: event(f"Asked whether to move to {g['to']}",
+                     f"{g['from']} hit its {g['kind']} limit (it resets {g['at']})"),
+     [("question: asked {sid} ({q['id']}) to move from {here['name']} to {there} ",
+       "({here['name']}'s {limit['kind']} limit resets {clock(resets)})")]),
+    ("question: {chat} answered {choice} ({qid})",
+     lambda g: event(f"Got your answer: {g['choice']}", "answered in /accounts"),
+     [("question: {q['chat']} answered {choice} ({q['id']})",)]),
+    ("question: {chat}'s question ({qid}) is withdrawn: {why}",
+     lambda g: event("Withdrew its question", g["why"]),
+     [("question: {q['chat']}'s question ({q['id']}) is withdrawn: {room}",),
+      ("question: {q['chat']}'s question ({q['id']}) is withdrawn: the chat carried on on ",
+       "{q['from']} (a reply came after the limit)"),
+      ("question: {q['chat']}'s question ({q['id']}) is withdrawn: {q['from']}'s limit has ",
+       "reset with no answer; nothing moves"),
+      ("question: {sid}'s question ({q['id']}) is withdrawn: {name}'s recorded limit is gone",),
+      ("question: {sid}'s question ({q['id']}) is withdrawn: a recorded limit is gone, so an ", "account has room"),
+      ("question: {self.question['chat']}'s question ({self.question['id']}) is withdrawn: {name} was chosen",)]),
+    # One carry-on after an API server error (Relay.tend_retry()).
+    ("retry: {chat} carried on after its turn stopped on an API server error at {at} ({n} s ago)",
+     lambda g: event("Carried on after an API server error", f"its turn stopped on one at {g['at']}"),
+     [("retry: {sid} carried on after its turn stopped on an API server error at {clock(at)} ",
+       "({time.time() - at:.0f} s ago)")]),
+    # `longhaul use` and `longhaul allow`.
+    ("use: {chat} is to run on {acct}",
+     lambda g: event(f"Set to run on {g['acct']}", "chosen with longhaul use"),
+     [("use: {sid} is to run on {name}",)]),
+    ("use: {chat} is to run on {acct} (it runs on {from})",
+     lambda g: event(f"Set to run on {g['acct']}", f"chosen with longhaul use (it ran on {g['from']})"),
+     [("use: {sid} is to run on {name}", " (it runs on {current})")]),
+    ("allow: {chat} may run on {acct} in {where}",
+     lambda g: event(f"Allowed on {g['acct']} in {g['where']} for {ALLOWED_DAYS} days", "asked with longhaul allow"),
+     [("allow: {sid} may run on {name} in {where}",)]),
+    # Checkpoints and the compaction after one.
+    ("checkpoint for {chat} saved ({n} bytes)",
+     lambda g: event(f"Saved its checkpoint ({g['n']} bytes)", "Claude wrote it with /longhaul:checkpoint"),
+     [("checkpoint for {sid} saved ({size:,} bytes)",)]),
+    ("checkpoint for {chat} put back after {source} ({n} bytes, written {age} s earlier)",
+     lambda g: event(f"Put its checkpoint back after {g['source']}",
+                     f"it was saved {ago_text(int(g['age']))}" if g["age"].isdigit() else "it was saved earlier"),
+     [("checkpoint for {sid} put back after {data['source']} ({len(raw)} bytes, written {age} s earlier)",)]),
+    ("checkpoint for {old} carried into {chat} after clear ({n} bytes, written {age} s earlier)",
+     lambda g: event(f"Brought back chat {g['old'][:8]}'s checkpoint after /clear", "the same folder, soon after"),
+     [("checkpoint for {old} carried into {sid} after clear ({len(raw)} bytes, ",
+       "written {max(0, int(now - at))} s earlier)")]),
+    ("autocompact: compacted {chat} after its checkpoint (the context was {n})",
+     lambda g: event(f"Compacted it at {g['n']} tokens", "its checkpoint was saved, and it comes back"),
+     [("autocompact: compacted {sid} after its checkpoint (the context was {int(tokens):,})",)]),
+    # `longhaul panel pause|resume`.
+    ("panel {pause}: switch_mid_session {word} in {file}, for the panel chats opened from now on",
+     lambda g: event(f"{'Paused' if g['pause'] == 'paused' else 'Resumed'} Longhaul in panel chats",
+                     f"asked with longhaul panel {'pause' if g['pause'] == 'paused' else 'resume'}"),
+     [("panel {'paused' if pause else 'resumed'}: switch_mid_session {word} in {file}, for the panel chats opened ",
+       "from now on")]),
+]
+
+
+def activity_regex(shape: str):
+    """`shape` as a pattern for a whole log line's text: each {name} a group
+    of its field's pattern (ACTIVITY_FIELDS), the rest as written."""
+    out, pos = "", 0
+    for m in re.finditer(r"\{(\w+)\}", shape):
+        field = ACTIVITY_FIELDS.get(re.sub(r"\d+$", "", m.group(1)), r".+?")
+        out += re.escape(shape[pos:m.start()]) + f"(?P<{m.group(1)}>{field})"
+        pos = m.end()
+    return re.compile(out + re.escape(shape[pos:]) + r"\Z")
+
+
+# Each shape's pattern, with its longest plain piece, which a line must hold
+# before the pattern is tried: most lines are none of these.
+ACTIVITY_PATTERNS = [(max(re.split(r"\{\w+\}", shape), key=len), activity_regex(shape), make)
+                     for shape, make, _ in ACTIVITY_LINES]
+
+
+def activity_event(text: str):
+    """The event a log line's text (its stamp taken off) makes: {"chat":
+    its first 8 characters or None, "what", "why", "account"}; None for a
+    line no shape takes. A value that is not text Longhaul writes (control
+    characters) is shown as shown() shows it."""
+    for piece, pattern, make in ACTIVITY_PATTERNS:
+        if piece not in text:
+            continue
+        m = pattern.match(text)
+        if m is None:
+            continue
+        g = m.groupdict()
+        chat = g.get("chat") or g.get("new")
+        found = make(g)
+        return {"chat": None if chat in (None, "a new chat") else chat[:8], "what": shown(found["what"]),
+                "why": shown(found["why"]), "account": found["account"], "where": g.get("where")}
+    return None
+
+
+def log_tail_lines(path: Path) -> list[str]:
+    """The lines of one log file, its last LOG_READ_MAX bytes at most (a
+    first line cut there is dropped); [] for one not there or unreadable."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOG_READ_MAX))
+            raw = f.read(LOG_READ_MAX)
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    return lines[1:] if size > LOG_READ_MAX else lines
+
+
+LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ")
+
+
+def activity_events(days: float | None = None, holding: str | None = None) -> list[dict]:
+    """Longhaul's own decisions in its log (longhaul.log.1, then
+    longhaul.log, as they were written), oldest first: {"time" (epoch
+    seconds), "chat", "what", "why", "account", "where"}. `days`: today's
+    and the days before, that many in all (None: every line kept);
+    `holding`: only lines with that text in them, a chat's short id,
+    looked for before any is parsed."""
+    log_file = LONGHAUL_HOME / "longhaul.log"
+    first = (dt.date.today() - dt.timedelta(days=max(1, int(days)) - 1)).isoformat() if days else ""
+    found = []
+    for path in (log_file.with_name(log_file.name + ".1"), log_file):
+        for line in log_tail_lines(path):
+            if line[:10] < first or (holding and holding not in line):
+                continue
+            stamp = LOG_STAMP.match(line)
+            if stamp is None:
+                continue
+            got = activity_event(line[stamp.end():])
+            if got is None:
+                continue
+            try:
+                at = time.mktime(time.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, OverflowError):
+                continue
+            found.append({"time": int(at), **got})
+    return found
+
+
+def activity(opts) -> int:
+    """`longhaul activity [--chat ID] [--days N] [--json]`: what Longhaul
+    did by itself, and why, from its own lines in the log (activity_events()),
+    today's unless --days says more days (today and the ones before). The
+    chat --chat names (an id, or its first characters), else the chat this
+    runs in (CLAUDE_CODE_SESSION_ID), comes first as "This chat", then
+    "Other chats", whose lines name their chat; an event of no one chat (a
+    limit forgotten, Longhaul paused in the panel) is among them. --json
+    gives the events alone, oldest first: [{"time" (epoch seconds), "chat"
+    (its first 8 characters, or null), "what", "why"}]. The last line names
+    the full log. Only reads."""
+    if opts.days < 1:
+        print("longhaul activity: --days is a number of days, 1 or more", file=sys.stderr)
+        return 2
+    mine = opts.chat if opts.chat is not None else os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    if mine is not None and not re.fullmatch(GUARD_ID, mine):
+        print(f"longhaul activity: {shown(mine, 60)} is not a chat's id", file=sys.stderr)
+        return 2
+    events = activity_events(opts.days)
+    if opts.json:
+        print(json.dumps([{k: e[k] for k in ("time", "chat", "what", "why")} for e in events], ensure_ascii=False))
+        return 0
+    when = "today" if opts.days == 1 else f"in the last {opts.days} days"
+    full = f"Full log: {home_path(str(LONGHAUL_HOME / 'longhaul.log'))}"
+    if not events:
+        print(f"Nothing Longhaul did by itself {when}.")
+        print(full)
+        return 0
+    short = mine[:8] if mine else None
+
+    def ours(e):
+        return short is not None and e["chat"] is not None and e["chat"].startswith(short)
+
+    width = max(len(clock(e["time"])) for e in events)
+
+    def line(e, named):
+        who = f"{e['chat']} · " if named and e["chat"] else ""
+        return f"  {clock(e['time']):<{width}}  {who}{e['what']}: {e['why']}."
+    print(f"What Longhaul did · {'today' if opts.days == 1 else f'the last {opts.days} days'}")
+    here = [e for e in events if ours(e)]
+    rest = [e for e in events if not ours(e)]
+    if short is not None:
+        where = next((e["where"] for e in reversed(here) if e.get("where")), None)
+        print()
+        print(f"This chat ({short}{f' · {where}' if where else ''})")
+        for e in here:
+            print(line(e, False))
+        if not here:
+            print(f"  Nothing {when}.")
+        if rest:
+            print()
+            print("Other chats")
+    else:
+        print()
+    for e in rest:
+        print(line(e, True))
+    print()
+    print(full)
+    return 0
+
+
 def forget_limit(name: str, why: str, upto: float | None = None):
     """Forget `name`'s recorded limit in state.json, with one log line
     saying `why` and until when it had been recorded; that time, or None
@@ -19370,7 +19718,7 @@ def main(argv: list[str]) -> int:
                             "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow", "switch", "answer", "use", "repair", "panel"):
+                            "models-hook", "allow", "switch", "answer", "use", "repair", "panel", "activity"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -19513,6 +19861,14 @@ def main(argv: list[str]) -> int:
             p.add_argument("--fix", metavar="ID",
                            help="make only the fix of the finding with this id, as --json names it, after a yes in a "
                                 "terminal or with --yes; an id with no fix changes nothing, exit 1")
+        if cmd == "activity":
+            p.add_argument("--chat", metavar="ID",
+                           help="the chat shown first, as This chat: its id, or its first characters (default: the "
+                                "chat this runs in, from inside one)")
+            p.add_argument("--days", type=int, default=1, metavar="N",
+                           help="today and the days before it, N in all (default: 1, today)")
+            p.add_argument("--json", action="store_true",
+                           help='the events alone, oldest first: [{"time", "chat", "what", "why"}]; it only reads')
         if cmd == "statusline":
             p.add_argument("action", nargs="?", choices=["install", "uninstall"],
                            help="install: Claude Code's status line set to Longhaul's in settings.json, a copy of "
@@ -19545,7 +19901,7 @@ def main(argv: list[str]) -> int:
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
                 "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd, "repair": repair,
-                "panel": panel_cmd}[cmd](opts)
+                "panel": panel_cmd, "activity": activity}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:
