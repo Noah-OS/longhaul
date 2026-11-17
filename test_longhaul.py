@@ -2168,7 +2168,8 @@ class StatuslineUpdate(unittest.TestCase):
     def test_a_newer_release_ends_the_line_with_its_version(self):
         line = self.line()
         self.assertTrue(line.endswith(" · update 0.3.3"), line)
-        self.assertTrue(line.startswith("\033[1mVS Code sign-in\033[0m · 5h"), "the account and the allowance come first")
+        self.assertTrue(line.startswith("\033[1mVS Code sign-in\033[0m · 5h"),
+                        "the account and the allowance come first")
         self.assertEqual(line.count("update"), 1)
 
     def test_versions_are_compared_as_numbers(self):
@@ -2378,7 +2379,8 @@ class StatusLineState(unittest.TestCase):
                                      "asked_at": int(self.now), "kind": "move", "from": "personal", "limit": "5-hour",
                                      "resets_at": self.now + 3600, "to": "work", "to_resets_at": None,
                                      "carries_on_at": self.now + 3660, "choices": ["move", "wait"]})
-        self.assertEqual(self.line(self.reading(five=100), on="personal"), "personal at limit · move to work? /accounts")
+        self.assertEqual(self.line(self.reading(five=100), on="personal"),
+                         "personal at limit · move to work? /accounts")
         # Its relay gone (killed with kill -9): no one acts on an answer, so no question.
         self.chat_file("questions", {**json.loads((self.home / "questions" / f"{self.SID}.json").read_text()),
                                      "relay_pid": 2 ** 22 + 12345})
@@ -2411,10 +2413,13 @@ class StatusLineState(unittest.TestCase):
         self.line(self.reading(five=97), on="personal", now=self.now - 60)
         moved = self.line(self.reading(five=3, week=None, ctx=90000, cost=0.01), on="work", now=self.now)
         self.assertEqual(moved, f"work (moved from personal {longhaul.clock(self.now)}) · 5h 3% · ctx 90k")
-        self.assertEqual(self.line(self.reading(five=4, week=None, ctx=91000, cost=0.02), on="work", now=self.now + 600),
-                         f"work (moved from personal {longhaul.clock(self.now)}) · 5h 4% · ctx 91k", "kept while it stays")
-        self.assertEqual(self.line(self.reading(five=5, week=None, ctx=92000, cost=0.03), on="work", now=self.now + 3601),
-                         "work · 5h 5% · ctx 92k", "an hour on: the numbers alone")
+        later = self.reading(five=4, week=None, ctx=91000, cost=0.02)
+        self.assertEqual(self.line(later, on="work", now=self.now + 600),
+                         f"work (moved from personal {longhaul.clock(self.now)}) · 5h 4% · ctx 91k",
+                         "kept while it stays")
+        later = self.reading(five=5, week=None, ctx=92000, cost=0.03)
+        self.assertEqual(self.line(later, on="work", now=self.now + 3601), "work · 5h 5% · ctx 92k",
+                         "an hour on: the numbers alone")
         record = json.loads((self.home / "usage" / "sessions" / f"{self.SID}.json").read_text())
         self.assertEqual((record["moved_from"], record["moved_at"]), ("personal", round(self.now, 1)))
         self.assertFalse(any("moved_from" in json.loads(row) for row in longhaul.LEDGER.read_text().splitlines()),
@@ -21253,7 +21258,8 @@ class Display(unittest.TestCase):
 
     def test_it_only_reads_longhauls_files_and_sends_nothing(self):
         # Read-only on ~/.longhaul: no write, no network, and the one program
-        # it runs is tail on the log.
+        # it runs itself is tail on the log (and, through question.ts's
+        # running(), kill -0 on the relay that took a `longhaul use` choice).
         for banned in ("$.fs.write", "fetch(", "$.http", "XMLHttpRequest", "$.model", "$.tool.call"):
             self.assertNotIn(banned, self.SOURCE, banned)
         self.assertEqual(re.findall(r"\$\.process\.run\(\[([^\]]*)\]", self.SOURCE),
@@ -21265,9 +21271,10 @@ class Display(unittest.TestCase):
     def test_its_status_entry_ends_with_a_newer_release_as_the_terminals_line_does(self):
         # K3 (2026-10-31): release.json and the plugin's own manifest, read
         # and never asked for; hooks/display.test.ts tests it turn by turn
-        # under `claude plugin test .`, and ships beside it.
+        # under `claude plugin test .`, and ships beside it. The word is
+        # line()'s last part (M3), as status_line()'s.
         for name in ("release.json", "/.claude-plugin/plugin.json", "LONGHAUL_UPDATE_CHECK",
-                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "update ${latest}"):
+                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "update ${update}"):
             self.assertIn(name, self.SOURCE)
         self.assertTrue((HERE / "hooks" / "display.test.ts").is_file())
         self.assertIn("!hooks/display.test.ts", (HERE / ".gitignore").read_text().splitlines(), "shipped, not ignored")

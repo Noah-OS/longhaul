@@ -8,7 +8,8 @@ import { CHAT, clock, found, running } from './question.ts'
 // usage/sessions record, state.json, uses/<chat>.json, longhaul.log,
 // release.json), the plugin's own manifest and this chat's question and
 // carry-on as the accounts pane's look found them, and sends nothing
-// anywhere; any failure shows nothing.
+// anywhere; any failure shows nothing. It runs tail on the log, and
+// question.ts's kill -0 on the relay that took a `longhaul use` choice.
 
 type Window = { used_percentage?: number; resets_at?: number }
 type Reading = { at?: number; five_hour?: Window; seven_day?: Window }
