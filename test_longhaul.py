@@ -24486,7 +24486,8 @@ class StatusJson(unittest.TestCase):
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
                     "preferred", "use_here", "reading_at"}
-    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem"}
+    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
+            "chat"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -24542,6 +24543,40 @@ class StatusJson(unittest.TestCase):
     def by_name(self, found: dict) -> dict:
         return {a["name"]: a for a in found["accounts"]}
 
+    def test_the_chat_it_runs_in_says_why_it_runs_on_its_account(self):
+        # M1: the latest reason the log gives for the account the chat is on, from its start or its move.
+        sid, other = "5ca8a797-1111-4222-8333-444455556666", "b71e22c0-1111-4222-8333-444455556666"
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))},
+                            {"name": "spare", "config_dir": str(self.folder("spare"))})
+        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        today = dt.date.today().isoformat()
+        (self.home / "longhaul.log").write_text("".join(f"{line}\n" for line in (
+            f"{yesterday} 09:14:00 start: {sid} starts on personal in ~/x: ~/x prefers personal, and it had room",
+            f"{today} 11:52:00 start: {sid} moves to work in ~/x: personal hit its session limit (resets 14:00), and "
+            "switching is auto",
+            f"{today} 11:53:00 start: {other} moves to spare in ~/y: work hit its weekly limit (resets Fri 02:00), and "
+            "switching is auto",
+            f"{today} 12:00:00 wait: {sid} carries on on spare at 14:01 (auto)",
+            f"{today} 12:01:00 use: {sid} is to run on spare")))
+        before = self.files()
+        moved = int(time.mktime(time.strptime(f"{today} 11:52:00", "%Y-%m-%d %H:%M:%S")))
+        found = self.read(self.status(CLAUDE_CODE_SESSION_ID=sid, CLAUDE_CONFIG_DIR=str(self.folder("work"))))
+        self.assertEqual(found["chat"], {"id": sid[:8], "account": "work", "what": "Moved to work",
+                                         "why": "personal hit its session limit (resets 14:00), and switching is auto",
+                                         "at": moved})
+        found = self.read(self.status(CLAUDE_CODE_SESSION_ID=sid, CLAUDE_CONFIG_DIR=str(self.folder("personal"))))
+        self.assertEqual((found["chat"]["what"], found["chat"]["why"]),
+                         ("Started on personal", "~/x prefers personal, and it had room"), "any day the log holds")
+        # On an account the log gives no reason for (spare: only a carry-on and a choice name it), or none Longhaul
+        # knows: the chat is named, with no why.
+        for folder, name in ((self.folder("spare"), "spare"), (self.tmp / "elsewhere", None)):
+            found = self.read(self.status(CLAUDE_CODE_SESSION_ID=sid, CLAUDE_CONFIG_DIR=str(folder)))
+            self.assertEqual(found["chat"], {"id": sid[:8], "account": name, "what": None, "why": None, "at": None})
+        self.assertIsNone(self.read(self.status())["chat"], "outside a chat: none")
+        self.assertIsNone(self.read(self.status(CLAUDE_CODE_SESSION_ID="../x"))["chat"], "not a chat's id: none")
+        self.assertEqual(self.files(), before, "it only reads")
+
     def test_one_json_object_on_stdout_with_every_field_and_nothing_written(self):
         self.write_accounts({"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "first@example.com"},
                             {"name": "work", "config_dir": str(self.folder("work")), "email": "work@example.com",
@@ -24567,10 +24602,12 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
-            "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None})
+            "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None,
+            "chat": None})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
-                                       "vscode", "panel_paused", "problem"],
-                         "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17)")
+                                       "vscode", "panel_paused", "problem", "chat"],
+                         "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17), "
+                         "chat last (M1)")
         self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
 
     def test_emails_are_masked_and_never_shown_whole(self):

@@ -198,7 +198,9 @@ Usage:
   longhaul status [--json]      accounts, sign-ins, limits, links; --json: the
                           accounts, their usage and this folder's as one JSON
                           object, emails masked (exit 2: accounts.json could
-                          not be read), for the accounts screen; it only reads
+                          not be read), for the accounts screen, with the chat
+                          it runs in and why that chat is on its account (the
+                          log's latest reason); it only reads
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
                           the status line, the VS Code panel, the accounts, the
@@ -17011,10 +17013,13 @@ def status_json() -> int:
     # vscode.json before config.json, so its own may differ, and the screen
     # says so. Never null: a value that is not a mode is never, as there.
     # panel_paused: `longhaul panel pause` in force (panel_mid_session()), for
-    # the Troubleshoot page's Pause or Resume.
+    # the Troubleshoot page's Pause or Resume. chat: the chat this runs in,
+    # and why it runs on its account (chat_why()).
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
-             "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None}
+             "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None,
+             "chat": chat_why(os.environ.get("CLAUDE_CODE_SESSION_ID"), accounts[ours]["name"] if ours is not None
+                              else None)}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped
@@ -17362,6 +17367,25 @@ def activity(opts) -> int:
     print()
     print(full)
     return 0
+
+
+def chat_why(sid, account: str | None):
+    """status --json's "chat" (M1): for chat `sid` (CLAUDE_CODE_SESSION_ID,
+    the chat it runs in), on `account` (None: not one Longhaul knows),
+    {"id": its first 8 characters, "account", "what", "why", "at"}: the
+    latest event in the log (activity_events(), every day it holds) that
+    put the chat on that account (its start, a move, a carry-on that moved
+    it), what it was, why, and when (epoch seconds); those three null when
+    the log gives none. None outside a chat, or for an id that is not one."""
+    if not isinstance(sid, str) or not re.fullmatch(GUARD_ID, sid):
+        return None
+    short, last = sid[:8], None
+    if account is not None:
+        for e in activity_events(holding=short):
+            if e["chat"] == short and e["account"] == account:
+                last = e
+    return {"id": short, "account": account, "what": last and last["what"], "why": last and last["why"],
+            "at": last and last["time"]}
 
 
 def forget_limit(name: str, why: str, upto: float | None = None):
