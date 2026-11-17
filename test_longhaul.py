@@ -13480,6 +13480,33 @@ class Reminder(unittest.TestCase):
                          + [line.format(kind, f"j{n}") for n, (_, kind) in enumerate(cases)])
         self.assertNotIn(self.S, self.log())
 
+    def test_the_default_is_400k_on_claude_code_and_a_setting_wins(self):
+        # The owner's rule (2026-11-17): compact at about 40% of the 1M
+        # window, not 20%. The 400k measure (docs live/2026-11-02-400k) found
+        # no recall loss against 200k. Codex keeps 200k (CodexReminder).
+        self.assertEqual((longhaul.REMINDER_AT, longhaul.CODEX_REMINDER_AT), (400_000, 200_000))
+        unset = {"LONGHAUL_CHECKPOINT_AT": None}
+        self.grow(205_400)
+        self.assertEqual(self.remind(**unset), "", "205k is under the default")
+        self.assertIsNone(self.record(), "nothing said, nothing recorded")
+        self.assertEqual(self.remind(self.ask(session_id="s2"), LONGHAUL_CHECKPOINT_AT="200000"), self.reminded(205),
+                         "a setting wins")
+        self.assertEqual(self.record("s2"), {"reminder": {"at": 200_000}})
+        self.grow(401_000)
+        self.assertEqual(self.remind(**unset), self.reminded(401))
+        self.assertEqual(self.record(), {"reminder": {"at": 400_000}})
+        self.assertEqual(self.remind(**unset), "", "once")
+        self.assertIn("reminder: s1 reminded at 400,000 tokens (the context is 401,000)", self.log())
+        self.assertEqual([c for c in self.checks() if c.startswith("reminder check: s1 ")], [
+            "reminder check: s1 context=205400 threshold=400000 told=0 below-threshold",
+            "reminder check: s1 context=401000 threshold=400000 told=0 fired",
+            "reminder check: s1 context=401000 threshold=400000 told=400000 already-reminded"])
+        # A value that is no threshold falls back to this default, and the log says which.
+        self.assertEqual(self.remind(self.ask(session_id="s3"), LONGHAUL_CHECKPOINT_AT="abc"), self.reminded(401))
+        self.assertIn("reminder: LONGHAUL_CHECKPOINT_AT is not a whole number, so the default, 400,000 tokens, is used "
+                      "(s3)", self.log())
+        self.assertEqual(self.remind(self.ask(session_id="s4"), LONGHAUL_CHECKPOINT_AT="off"), "", "off is off")
+
     def test_only_the_main_conversations_last_response_counts(self):
         synthetic = self.response(990_000)
         synthetic["message"]["model"] = "<synthetic>"
@@ -14496,6 +14523,29 @@ class CodexReminder(unittest.TestCase):
             f"reminder check: codex-{self.SID} context=205400 threshold=200000 told=200000 already-reminded"])
         self.assertNotIn(self.SECRET, self.log())
         self.assertNotIn(self.SECRET, json.dumps(self.record()))
+
+    def test_a_codex_chat_s_default_stays_200k_and_a_setting_wins(self):
+        # Codex compacts by itself at 90% of its model's window (about 245k on
+        # today's 272k models): Claude Code's 400k would never be reached there.
+        self.assertEqual((longhaul.CODEX_REMINDER_AT, longhaul.REMINDER_AT), (200_000, 400_000))
+        self.grow(205_400)
+        self.assertIsNone(self.remind(LONGHAUL_CHECKPOINT_AT="400000"), "a setting wins")
+        self.assertIsNone(self.guard(LONGHAUL_CHECKPOINT_AT="400000"), "on the guard's hook too")
+        self.assertEqual(self.remind(), self.reminded(205), "200k unless set")
+        self.assertEqual(self.record(), {"reminder": {"at": 200_000}})
+        self.assertIn(f"reminder: codex-{self.SID} reminded at 200,000 tokens (the context is 205,400)", self.log())
+        self.assertEqual(self.checks(), [
+            f"reminder check: codex-{self.SID} context=205400 threshold=400000 told=0 below-threshold",
+            f"reminder check: codex-{self.SID} context=205400 threshold=200000 told=0 fired"])
+        other = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e00"
+        self.assertEqual(self.guard(self.tool(session_id=other)), self.reminded(205, "PreToolUse"),
+                         "the guard's hook: the same default")
+        self.assertEqual(self.record(f"codex-{other}"), {"reminder": {"at": 200_000}})
+        # A value that is no threshold falls back to Codex's default, and the log says which.
+        third = "019f9d8e-7c2a-7b31-9d4e-3a5b6c7d8e01"
+        self.assertEqual(self.remind(self.ask(session_id=third), LONGHAUL_CHECKPOINT_AT="abc"), self.reminded(205))
+        self.assertIn("reminder: LONGHAUL_CHECKPOINT_AT is not a whole number, so the default, 200,000 tokens, is used "
+                      f"(codex-{third})", self.log())
 
     def test_the_hook_as_codex_runs_it_says_it_and_exits_0(self):
         self.grow(605_000)
@@ -27108,6 +27158,20 @@ class Doctor(unittest.TestCase):
         self.assertEqual((c["mark"], [t for t in self.items(c) if "hook.cjs" in t]), ("ok", []),
                          "Longhaul never ran Trail there: its settings are not looked at")
 
+    def test_the_context_reminder_s_default_is_400k_and_a_setting_wins(self):
+        # The owner's rule (2026-11-17): compact at about 40% of the 1M window, not 20%.
+        c = longhaul.doctor_features()
+        self.assertEqual(self.items(c)["context reminder: at 400,000 tokens"], "ok")
+        self.assertIn("auto-compact at 400k tokens", c["works"])
+        os.environ["LONGHAUL_CHECKPOINT_AT"] = "200000"
+        c = longhaul.doctor_features()
+        self.assertEqual(self.items(c)["context reminder: at 200,000 tokens"], "ok", "a setting wins")
+        self.assertIn("auto-compact at 200k tokens", c["works"])
+        os.environ["LONGHAUL_CHECKPOINT_AT"] = "abc"
+        c = longhaul.doctor_features()
+        self.assertEqual(self.items(c)["context reminder: LONGHAUL_CHECKPOINT_AT is not a whole number, so the default "
+                                       "(400,000 tokens) is in force"], "warn")
+
     def test_the_features_line_names_each_switch_and_where_auto_model_applies(self):
         c = longhaul.doctor_features()
         self.assertEqual(c["mark"], "ok")
@@ -28453,6 +28517,21 @@ class CodexDoctorConfig(unittest.TestCase):
             self.assertEqual(self.item("compacts")[1], default + "Longhaul's reminder is off (LONGHAUL_CHECKPOINT_AT=off)")
         with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_AT": "250000"}):
             self.assertTrue(self.item("compacts")[1].endswith("Longhaul's reminder, at 250,000 tokens, comes after that"))
+
+    @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")
+    def test_the_codex_line_names_codex_s_own_default_200k_not_claude_code_s(self):
+        # Claude Code's default is 400k (the owner, 2026-11-17); a Codex chat's
+        # stays 200k, before Codex's own compaction at 90% of the window.
+        self.assertEqual((longhaul.CODEX_REMINDER_AT, longhaul.REMINDER_AT), (200_000, 400_000))
+        self.config()
+        self.assertTrue(self.item("compacts")[1].endswith("Longhaul's reminder asks for a checkpoint at 200,000 tokens, "
+                                                          "before that"))
+        with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_AT": "400000"}):
+            self.assertTrue(self.item("compacts")[1].endswith("Longhaul's reminder, at 400,000 tokens, comes after that"),
+                            "a setting wins")
+        with mock.patch.dict(os.environ, {"LONGHAUL_CHECKPOINT_AT": "abc"}):
+            self.assertTrue(self.item("compacts")[1].endswith("Longhaul's reminder asks for a checkpoint at 200,000 "
+                                                              "tokens, before that"), "no threshold: the default")
         self.assertFalse([text for _, text in self.items() if "paste" in text], "the owner's decision: no paste line")
 
     @unittest.skipUnless(TOMLLIB, "tomllib is Python 3.11's: before it config.toml is not read")

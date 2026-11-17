@@ -285,12 +285,13 @@ Usage:
                           UserPromptSubmit hook, adds a line naming the decision
                           points while the experiment is fully on
   longhaul reminder             the plugin's UserPromptSubmit hook: once the context
-                          passes LONGHAUL_CHECKPOINT_AT tokens (200000 unless set;
-                          off turns it off), and again at each multiple, says to
-                          save a checkpoint and start fresh; the guard's PreToolUse
-                          hook says it too, whatever LONGHAUL_GUARD is, and each
-                          multiple is said once, the count starting again after
-                          a compaction; never in a trial's usual arm. A subagent
+                          passes LONGHAUL_CHECKPOINT_AT tokens (400000 unless set,
+                          200000 in Codex; off turns it off), and again at each
+                          multiple, says to save a checkpoint and start fresh;
+                          the guard's PreToolUse hook says it too, whatever
+                          LONGHAUL_GUARD is, and each multiple is said once, the
+                          count starting again after a compaction; never in a
+                          trial's usual arm. A subagent
                           whose own context passes LONGHAUL_SUBAGENT_AT tokens
                           (150000 unless set; off turns it off), and each multiple,
                           is told by the guard's hook to finish its step and
@@ -10169,7 +10170,7 @@ def advisor(opts) -> int:
 # again, and the history baseline (98 sessions) found re-reads 1.3% of
 # what was read, where long contexts and compactions (48 in 49 sessions)
 # make the cost. Once the context passes LONGHAUL_CHECKPOINT_AT tokens
-# (REMINDER_AT; off turns it off), and again at each multiple of it, the
+# (REMINDER_AT, 400k; off turns it off), and again at each multiple of it, the
 # user is told how to save a checkpoint and start fresh (REMINDER_USER)
 # and the model is asked to save one at its next stopping point
 # (REMINDER_MODEL). The size is the last main-conversation response's
@@ -10216,7 +10217,9 @@ def advisor(opts) -> int:
 #
 # On OpenAI Codex (the Codex plan's X6, Phase 2; hooks/codex_hook.py runs
 # both hooks with --agent codex) the same steps, records and lines hold,
-# keyed codex-<id> (codex_hook_input()). What is Codex's own: the size is
+# keyed codex-<id> (codex_hook_input()). What is Codex's own: the default
+# threshold, CODEX_REMINDER_AT (200k; reminder_default()), since Codex
+# compacts by itself at 90% of its model's window, under 400k; the size is
 # read from the chat's rollout at transcript_path, which Codex appends to
 # (reminder_rollout_size(); docs discovery/2026-10-28-codex-hooks.md): the
 # last token_count's last_token_usage.total_tokens, Codex's own count of
@@ -10233,7 +10236,16 @@ def advisor(opts) -> int:
 # a "reminded at" line in the shared log names, and a Codex chat's line
 # names codex-<id>, which no Claude Code session's id is.
 
-REMINDER_AT = 200_000  # tokens: the default threshold
+# The default threshold of a Claude Code chat: 400k since 2026-11-17, 200k
+# before. The owner's rule is to compact at about 40% of the 1M window, not
+# 20%, and the 200k cycle made long work worse; the 400k measure (docs
+# live/2026-11-02-400k) found no recall loss against 200k (72% against 78%
+# with the checkpoint, p = 0.28, not shown either way). On a model with a
+# 200k window Claude Code compacts on its own first, so neither fires there.
+REMINDER_AT = 400_000  # tokens
+# A Codex chat's: Codex compacts by itself at 90% of its model's window
+# (about 245k on today's 272k models), so 400k would never be reached there.
+CODEX_REMINDER_AT = 200_000  # tokens
 SUBAGENT_AT = 150_000  # tokens: the default threshold of a subagent's own context
 REMINDER_USER = ("Longhaul: this conversation's context is about {k}k tokens, and every request carries all of it "
                  "again. To start fresh without losing the thread: /longhaul:checkpoint, then /clear. The checkpoint "
@@ -10267,9 +10279,18 @@ CODEX_SUBAGENT_MODEL = ("Longhaul: your context as a sub-agent is about {k}k tok
                         "rest to a fresh sub-agent.")
 
 
+def reminder_default(data: dict) -> int:
+    """The context reminder's threshold, in tokens, when
+    LONGHAUL_CHECKPOINT_AT sets none, for a hook input: CODEX_REMINDER_AT
+    for a Codex hook's input, else REMINDER_AT."""
+    return CODEX_REMINDER_AT if data.get("longhaul_agent") == "codex" else REMINDER_AT
+
+
 def reminder_threshold(name: str = "LONGHAUL_CHECKPOINT_AT", default: int = REMINDER_AT) -> tuple:
     """A threshold setting (LONGHAUL_CHECKPOINT_AT, or `name` with its
-    `default`: LONGHAUL_SUBAGENT_AT's is SUBAGENT_AT), read at call time:
+    `default`: LONGHAUL_CHECKPOINT_AT's is REMINDER_AT on Claude Code and
+    CODEX_REMINDER_AT on Codex, reminder_default(); LONGHAUL_SUBAGENT_AT's
+    is SUBAGENT_AT), read at call time:
     (tokens, None); (None, None) for off, in any case; or (the default,
     the kind of value it is) for anything else, which the caller logs by
     that kind, never the value. Unset or empty is the default."""
@@ -10408,7 +10429,7 @@ def reminder_check(data: dict) -> dict:
     the threshold, a context more than a step under the highest told is a
     compaction (reminder_fell()), after which the mark is forgotten:
     "reset"."""
-    at, junk = reminder_threshold()
+    at, junk = reminder_threshold(default=reminder_default(data))
     if at is None:
         return {"code": "off"}
     if data.get("agent_id") is not None:
@@ -10441,7 +10462,7 @@ def reminder_check(data: dict) -> dict:
         found["told"] = as_int(said.get("at"))
         logged = said.get("junk") if isinstance(said.get("junk"), list) else []
         if junk and junk not in logged:
-            log(f"reminder: LONGHAUL_CHECKPOINT_AT is {junk}, so the default, {REMINDER_AT:,} tokens, is used "
+            log(f"reminder: LONGHAUL_CHECKPOINT_AT is {junk}, so the default, {at:,} tokens, is used "
                 f"({record.stem})")
             said["junk"] = [*logged, junk]
         fell = reminder_fell(said, size, at)
@@ -18974,7 +18995,7 @@ def codex_config_items(home: Path) -> list:
     else:
         said, point = ("Codex compacts at its default, 90% of the model's context window (about 245k tokens on today's "
                        "272k models)"), CODEX_COMPACT_TODAY
-    at = reminder_threshold()[0]
+    at = reminder_threshold(default=CODEX_REMINDER_AT)[0]  # a Codex chat's default, not Claude Code's
     if at is None:
         reminder = "Longhaul's reminder is off (LONGHAUL_CHECKPOINT_AT=off)"
     elif at < point:
