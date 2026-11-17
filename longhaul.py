@@ -368,7 +368,7 @@ Usage:
   longhaul clear [NAME]         forget the recorded limits, or NAME's alone; a chat
                           waiting for one carries on within a few seconds, and
                           the panel chats that do are named
-  longhaul repair [--dry-run] [--yes] [--json]
+  longhaul repair [--dry-run] [--yes] [--json] [--fix ID]
                           what is stuck or broken in Longhaul's records, one
                           line each with what its fix does: a wait or question
                           whose relay is gone, a `use` choice no chat will
@@ -378,7 +378,9 @@ Usage:
                           Longhaul that is gone. Each fix after a yes in a
                           terminal (--yes: all of them); --dry-run, and no
                           terminal without --yes, only list; --json lists them
-                          as JSON. Try it before an uninstall
+                          as JSON, each with its id; --fix ID makes that one
+                          alone (exit 1 for an id with no fix). Try it before
+                          an uninstall
   (log)                       LONGHAUL_HOME/longhaul.log leaves out its routine
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
@@ -17239,17 +17241,61 @@ def repair_findings(now: float | None = None) -> list:
     return found + repair_waits(now) + repair_questions(now) + repair_uses(now)
 
 
+def repair_one(found: list, fid: str, opts) -> int:
+    """`longhaul repair --fix ID` (the Troubleshoot page's Fix, the UX
+    review's 4.4): the finding of `found` with that id alone, what it is
+    and what its fix does, then the fix after a yes in a terminal, or with
+    --yes, logged as `longhaul repair` logs it. --dry-run, and no terminal
+    without --yes, say so and change nothing (exit 0, as a listing). An id
+    no finding has, or a finding with no fix here, changes nothing: exit
+    1; so does a fix that could not be made, with why."""
+    f = next((f for f in found if f["id"] == fid), None)
+    if f is None:
+        print(f"Nothing to repair has the id {shown(fid, 120)}, so nothing changed; `longhaul repair --json` lists "
+              "the ids.")
+        return 1
+    print(f"To repair: {f['what']}. Fix: {f['fix']}.")
+    if not f["fixable"]:
+        print("Nothing changed: there is no fix for it here.")
+        return 1
+    asks = not opts.dry_run and not opts.yes and terminal()
+    if opts.dry_run or not (opts.yes or asks):
+        print("Nothing changed: --dry-run only lists." if opts.dry_run else
+              "Nothing changed: `longhaul repair --fix` asks before the fix, in a terminal; run it in one, or add "
+              "--yes.")
+        return 0
+    if asks:
+        try:
+            agreed = yes("Fix it?")
+        except (EOFError, KeyboardInterrupt):
+            print("\nStopped: left as it is.")
+            return 0
+        if not agreed:
+            print("Left as it is.")
+            return 0
+    why = f["do"]()
+    print(f"Not fixed: {why}." if why else "Fixed.")
+    return 1 if why else 0
+
+
 def repair(opts) -> int:
-    """`longhaul repair [--dry-run] [--yes] [--json]`: what is stuck or
-    broken in Longhaul's records (repair_findings()), one line each with
-    what its fix does, numbered; then, in a terminal, each fix after its
-    own yes, or every fix with --yes. --dry-run lists them and changes
-    nothing; so does a run with no terminal and no --yes, which says how to
-    fix them. --json prints them alone, as [{"id", "what", "fix",
-    "fixable"}], for a later pane button, and changes nothing. With none:
-    "Nothing to repair.", exit 0. Exit 1 when a fix that was to be made
-    could not be, or a finding has no fix here; else 0."""
+    """`longhaul repair [--dry-run] [--yes] [--json] [--fix ID]`: what is
+    stuck or broken in Longhaul's records (repair_findings()), one line
+    each with what its fix does, numbered; then, in a terminal, each fix
+    after its own yes, or every fix with --yes. --dry-run lists them and
+    changes nothing; so does a run with no terminal and no --yes, which
+    says how to fix them. --json prints them alone, as [{"id", "what",
+    "fix", "fixable"}], for the pane's Troubleshoot page, and changes
+    nothing; --fix ID makes the one with that id alone (repair_one()), and
+    takes no --json. With none: "Nothing to repair.", exit 0. Exit 1 when
+    a fix that was to be made could not be, or a finding has no fix here;
+    else 0."""
+    if opts.fix is not None and opts.json:
+        print("longhaul repair: --json only lists, and --fix ID fixes one: give one of them.", file=sys.stderr)
+        return 2
     found = repair_findings()
+    if opts.fix is not None:
+        return repair_one(found, opts.fix, opts)
     if opts.json:
         rows = [{key: f[key] for key in ("id", "what", "fix", "fixable")} for f in found]
         try:
@@ -19355,6 +19401,9 @@ def main(argv: list[str]) -> int:
             p.add_argument("--yes", action="store_true", help="make every fix without asking (needed without a terminal)")
             p.add_argument("--json", action="store_true",
                            help="the findings alone, as JSON: [{id, what, fix, fixable}]; it changes nothing")
+            p.add_argument("--fix", metavar="ID",
+                           help="make only the fix of the finding with this id, as --json names it, after a yes in a "
+                                "terminal or with --yes; an id with no fix changes nothing, exit 1")
         if cmd == "statusline":
             p.add_argument("action", nargs="?", choices=["install", "uninstall"],
                            help="install: Claude Code's status line set to Longhaul's in settings.json, a copy of "
