@@ -1,16 +1,17 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsFolder, LonghaulAccountsForm, LonghaulAccountsPage,
-  LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulAccountsTrouble, LonghaulQuestion,
-  LonghaulRepairFinding, LonghaulStatus, LonghaulWait } from '../types'
+import type { LonghaulAccount, LonghaulAccountsActivity, LonghaulAccountsAnswer, LonghaulAccountsFolder,
+  LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning,
+  LonghaulAccountsTrouble, LonghaulActivityEvent, LonghaulQuestion, LonghaulRepairFinding, LonghaulStatus,
+  LonghaulWait } from '../types'
 import { status as showStatus } from './display.ts'
 import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
 
 // Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
 // does (the owner, 2026-10-30: "a model showing up front of us and we can do
 // some action there"). First a short list, one line per account, then
-// "+ Add account", "Settings" and "Troubleshoot"; the arrows move the focus,
+// "+ Add account", "Activity", "Settings" and "Troubleshoot"; the arrows move the focus,
 // Enter opens an item's page, Escape goes back, and from the list closes the pane. An
 // account's page has its details and its actions (Sign in again or Sign in,
 // Remove), then its folders, each with Remove, a field to add one and
@@ -22,7 +23,10 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // `repair --json` finds stuck, each with a Fix that asks first, and Longhaul
 // paused or resumed in the panel's chats (`panel pause|resume`), which
 // /longhaul:manage does not run (bin/longhaul refuses both until the owner
-// says otherwise). The pane draws `longhaul.py status --json` and runs
+// says otherwise); Activity's (the UX review's 4.3, M1) what Longhaul did by
+// itself today and why, from `activity --json`, this chat first, with
+// Earlier days for a week, then a month. Above the list, why this chat runs
+// on its account (status --json's "chat"). The pane draws `longhaul.py status --json` and runs
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
 // /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06); and
@@ -88,6 +92,8 @@ const wait = atom({ plugin: 'longhaul', key: 'accountsWait' } as const, null, { 
 const details = atom({ plugin: 'longhaul', key: 'accountsDetails' } as const, null, { shape: 'accounts-details-1' })
 // What the Troubleshoot page's last look at `repair --json` found.
 const trouble = atom({ plugin: 'longhaul', key: 'accountsTrouble' } as const, null, { shape: 'accounts-trouble-1' })
+// What the Activity page's last read of `activity --json` found.
+const activity = atom({ plugin: 'longhaul', key: 'accountsActivity' } as const, null, { shape: 'accounts-activity-1' })
 
 // This module's own mark on what it runs: a reload loads a new module, with
 // a new mark, so an action marked by another one was cut off by the reload.
@@ -98,6 +104,7 @@ let kicked = false // this module looked at what it found once, from a drawing
 let readOnce = false // this module has read the rows, or is reading them
 let reads: Promise<void> = Promise.resolve() // the reads, one after another
 let looks: Promise<void> = Promise.resolve() // the looks at what is stuck, one after another
+let activityReads: Promise<void> = Promise.resolve() // the reads of what Longhaul did, one after another
 let polling = false // the 3 s look for a question runs
 let looking = false // one look at a time
 
@@ -156,7 +163,7 @@ function folderProblem(path: string): string | null {
 async function readStatus($: any): Promise<LonghaulAccountsRead> {
   let ran: { exitCode: number; stdout: string; stderr: string }
   try {
-    ran = await $.process.run([...base($), 'status', '--json'], { timeoutMs: STATUS_TIMEOUT })
+    ran = await $.process.run([...base($), 'status', '--json'], { timeoutMs: STATUS_TIMEOUT, ...(await chatEnv($)) })
   } catch (err: any) {
     return { status: null, problem: mask(`it did not answer (${err?.message || err})`), update: false, lines: [] }
   }
@@ -172,6 +179,16 @@ async function readStatus($: any): Promise<LonghaulAccountsRead> {
   const problem = ran.exitCode !== 0 ? said.at(-1) ?? 'it stopped and said nothing'
     : status === null ? 'its answer was not JSON' : 'its answer has no list of accounts'
   return { status: null, problem, update: false, lines: said }
+}
+
+// This chat's id for longhaul.py, as a chat's own commands find it
+// (CLAUDE_CODE_SESSION_ID), so status and activity know which chat is this
+// one: { env } to spread into a run's options, or nothing when the id is not
+// known or not an id.
+async function chatEnv($: any): Promise<{ env?: Record<string, string> }> {
+  let sid = ''
+  try { sid = String(await $.session.id()) } catch {}
+  return /^[A-Za-z0-9_-]{1,100}$/.test(sid) ? { env: { CLAUDE_CODE_SESSION_ID: sid } } : {}
 }
 
 // The record as the pane draws it: each field of its type, or "not known",
@@ -194,7 +211,10 @@ function clean(s: any): LonghaulStatus {
       reading_at: num(a.reading_at), folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
-  return { accounts, listed: s.listed === true, here,
+  const chat = s.chat && typeof s.chat === 'object' && typeof s.chat.id === 'string'
+    ? { id: s.chat.id as string, account: str(s.chat.account), what: str(s.chat.what), why: str(s.chat.why),
+      at: num(s.chat.at) } : null
+  return { accounts, listed: s.listed === true, here, chat,
     switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
     panel_switch: (MODES as readonly unknown[]).includes(s.panel_switch) ? s.panel_switch : null,
     vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem) }
@@ -236,6 +256,55 @@ function lookAgain($: any, fresh = false): Promise<void> {
     await update($, trouble, () => got)
   }).catch(() => {})
   return looks
+}
+
+// `activity --json --days N` read into what the Activity page draws: each
+// event with a time, its chat (or none) and what and why as text, masked
+// (any other is left out), or why there are none, with the command's last
+// lines for Details; this chat's short id, and where the full log is.
+async function readActivity($: any, days: number): Promise<LonghaulAccountsActivity> {
+  const env = await chatEnv($)
+  const chat = env.env ? env.env.CLAUDE_CODE_SESSION_ID!.slice(0, 8) : null
+  let log = 'longhaul.log in ~/.longhaul'
+  try {
+    const home = String((await $.env.get('HOME')) || '')
+    const lh = String((await $.env.get('LONGHAUL_HOME')) || `${home}/.longhaul`)
+    log = `${home && (lh === home || lh.startsWith(`${home}/`)) ? `~${lh.slice(home.length)}` : lh}/longhaul.log`
+  } catch {}
+  const none = { events: null, days, update: false, chat, log }
+  let ran: { exitCode: number; stdout: string; stderr: string }
+  try {
+    ran = await $.process.run([...base($), 'activity', '--json', '--days', String(days)],
+      { timeoutMs: STATUS_TIMEOUT, ...env })
+  } catch (err: any) {
+    return { ...none, problem: mask(`it did not answer (${err?.message || err})`), lines: [] }
+  }
+  const said = tail(ran.stdout, ran.stderr)
+  // An older longhaul.py has no activity: its argparse refuses the word.
+  if (/unrecognized arguments:.*\bactivity\b/.test(`${ran.stdout}\n${ran.stderr}`))
+    return { ...none, problem: 'This Longhaul is older than this pane: it has no activity.', update: true, lines: said }
+  let rows: any = null
+  try { rows = JSON.parse(ran.stdout) } catch {}
+  if (ran.exitCode === 0 && Array.isArray(rows)) {
+    const events: LonghaulActivityEvent[] = rows
+      .filter((e: any) => e && typeof e === 'object' && typeof e.time === 'number' && Number.isFinite(e.time)
+        && (e.chat === null || typeof e.chat === 'string') && typeof e.what === 'string' && typeof e.why === 'string')
+      .map((e: any) => ({ time: e.time, chat: e.chat === null ? null : mask(e.chat), what: mask(e.what), why: mask(e.why) }))
+    return { ...none, events, problem: null, lines: [] }
+  }
+  const problem = ran.exitCode !== 0 ? said.at(-1) ?? 'it stopped and said nothing' : 'its answer was not a list'
+  return { ...none, problem, lines: said }
+}
+
+// Reads what Longhaul did over `days` days, after any read already under
+// way; `fresh` clears the last read first, so the page says it is reading.
+function lookActivity($: any, days: number, fresh = false): Promise<void> {
+  activityReads = activityReads.then(async () => {
+    if (fresh) await update($, activity, () => null)
+    const got = await readActivity($, days)
+    await update($, activity, () => got)
+  }).catch(() => {})
+  return activityReads
 }
 
 // Reads the rows again, after any read already under way.
@@ -518,7 +587,7 @@ function pageOf(asked: LonghaulAccountsPage, status: LonghaulStatus | null, canT
     const name = asked.slice('account:'.length)
     return NAME.test(name) && status.accounts.some(a => a.name === name) ? asked : 'list'
   }
-  return asked === 'add' || asked === 'settings' || asked === 'troubleshoot' ? asked : 'list'
+  return asked === 'add' || asked === 'settings' || asked === 'activity' || asked === 'troubleshoot' ? asked : 'list'
 }
 
 // The control an account's page opens with the focus on (the UX review's
@@ -556,6 +625,7 @@ async function go($: any, to: LonghaulAccountsPage, first: string): Promise<void
   await update($, shown, () => to)
   focusOn($, first)
   if (to === 'troubleshoot') await lookAgain($, true)
+  if (to === 'activity') await lookActivity($, DAYS[0], true)
 }
 
 // One step back: a Remove waiting for its yes is cancelled, a page goes
@@ -656,6 +726,7 @@ type Ctx = {
   answer: LonghaulAccountsAnswer | null
   details: string | null // whose Details are open
   trouble: LonghaulAccountsTrouble | null // the Troubleshoot page's last look; null: looking
+  activity: LonghaulAccountsActivity | null // the Activity page's last read; null: reading
   nowMs: number // the clock, for times shown as longhaul.py shows them
 }
 
@@ -665,7 +736,8 @@ type Ctx = {
 function drawPane($: any, c: Ctx): any {
   const { Box } = c.E
   const body = c.page === 'list' ? listPage($, c) : c.page === 'add' ? addPage($, c)
-    : c.page === 'settings' ? settingsPage($, c) : c.page === 'troubleshoot' ? troublePage($, c) : accountPage($, c)
+    : c.page === 'settings' ? settingsPage($, c) : c.page === 'troubleshoot' ? troublePage($, c)
+    : c.page === 'activity' ? activityPage($, c) : accountPage($, c)
   return (
     <Box flexDirection="column" gap={1}>
       {questionPart($, c)}
@@ -709,8 +781,9 @@ function questionPart($: any, c: Ctx): any {
 }
 
 // The list: its title (the engine draws a pane's own only while several
-// are open), the carry-on waiting, then one line per account, "+ Add
-// account" and "Settings", then where we are.
+// are open), the carry-on waiting, why this chat runs on its account, then
+// one line per account, "+ Add account", "Activity", "Settings" and
+// "Troubleshoot", then where we are.
 function listPage($: any, c: Ctx): any {
   const { Box, Text } = c.E
   return (
@@ -718,11 +791,22 @@ function listPage($: any, c: Ctx): any {
       <Text bold>{TITLE}</Text>
       {waitPart($, c)}
       {readPart($, c)}
+      {whyPart($, c)}
       {itemsPart($, c)}
       {herePart($, c)}
       {phonePart($, c)}
     </Box>
   )
+}
+
+// Why this chat runs on its account (the UX review's 4.1, rule 1): the
+// log's latest reason, as status --json's "chat" gives it; nothing where
+// it gives none.
+function whyPart($: any, c: Ctx): any {
+  const { Text } = c.E
+  const chat = c.status?.chat
+  if (!chat || !chat.account || !chat.why) return null
+  return <Text>{mask(`This chat: ${chat.account}. Why: ${chat.why}.`)}</Text>
 }
 
 function waitPart($: any, c: Ctx): any {
@@ -850,6 +934,8 @@ function itemsPart($: any, c: Ctx): any {
   if (c.canType) {
     items.push({ key: 'row-add', head: '+ Add account', text: '', warn: false, extra: '',
       open: () => void go($, 'add', 'add-name') })
+    items.push({ key: 'row-activity', head: 'Activity: what Longhaul did, and why', text: '', warn: false, extra: '',
+      open: () => void go($, 'activity', 'back') })
     const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
     items.push({ key: 'row-settings', head: `Settings (switching: ${s.switch ?? 'not known'} · VS Code panel: ${vs})`,
       text: '', warn: false, extra: '', open: () => void go($, 'settings', 'switch') })
@@ -1270,6 +1356,65 @@ function troublePage($: any, c: Ctx): any {
   )
 }
 
+// Activity's page (the UX review's 4.3, M1): what `activity --json` gives,
+// this chat's first, then the other chats', each with its chat's short id
+// (an event of no one chat has none), at most SHOWN_EVENTS of each, the
+// latest; "Nothing Longhaul did by itself today." when there is none; the
+// full log's path; Earlier days, which reads a week, then a month. It only
+// reads, so it offers no action and asks nothing.
+const DAYS = [1, 7, 30] as const
+const SHOWN_EVENTS = 40
+
+function activityPage($: any, c: Ctx): any {
+  const { Box, Text, Button } = c.E
+  const a = c.activity
+  if (a === null)
+    return <Box flexDirection="column" gap={1}><Text bold>What Longhaul did</Text><Text dimColor>Reading what Longhaul did…</Text></Box>
+  const when = a.days === 1 ? 'today' : `the last ${a.days} days`
+  const next = DAYS.find(d => d > a.days)
+  const open = c.details === 'activity'
+  const line = (e: LonghaulActivityEvent, named: boolean) =>
+    <Text>{`${clock(e.time, c.nowMs)}  ${named && e.chat ? `${e.chat} · ` : ''}${e.what}: ${e.why}.`}</Text>
+  const some = (list: LonghaulActivityEvent[], named: boolean) => [
+    ...(list.length > SHOWN_EVENTS
+      ? [<Text dimColor>{`…and ${list.length - SHOWN_EVENTS} earlier: the full log has them.`}</Text>] : []),
+    ...list.slice(-SHOWN_EVENTS).map(e => line(e, named))]
+  const events = a.events ?? []
+  const mine = a.chat ? events.filter(e => e.chat === a.chat) : []
+  const others = a.chat ? events.filter(e => e.chat !== a.chat) : events
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>{`What Longhaul did · ${when}`}</Text>
+      {a.events === null && (
+        <Box flexDirection="column">
+          <Text color="error">{a.update ? a.problem ?? ''
+            : `Longhaul could not read what it did: ${mask(a.problem ?? '').replace(/[.\s]+$/, '')}.`}</Text>
+          {a.update && <Text>{UPDATE}</Text>}
+          <Box flexDirection="row" gap={1}>
+            <Button key="activity-retry" label="Retry" onPress={() => void lookActivity($, a.days)} />
+            {a.lines.length > 1 && <Button key="activity-details" label={open ? 'Hide details' : 'Details'} dimColor
+              onPress={() => void toggle($, 'activity')} />}
+          </Box>
+          {open && a.lines.map(l => <Text dimColor>{l}</Text>)}
+        </Box>
+      )}
+      {a.events !== null && !events.length
+        && <Text>{`Nothing Longhaul did by itself ${a.days === 1 ? 'today' : `in the last ${a.days} days`}.`}</Text>}
+      {mine.length > 0 && <Box flexDirection="column"><Text bold>This chat</Text>{some(mine, false)}</Box>}
+      {others.length > 0 && (
+        <Box flexDirection="column">{mine.length > 0 && <Text bold>Other chats</Text>}{some(others, true)}</Box>
+      )}
+      {a.events !== null && (
+        <Box flexDirection="column">
+          <Text dimColor>{`Full log: ${a.log}`}</Text>
+          {next !== undefined
+            && <Button key="activity-earlier" label="Earlier days" onPress={() => void lookActivity($, next)} />}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
 function runningPart($: any, c: Ctx): any {
   const { Text } = c.E
   return c.now ? <Text color="warning">{c.now.note}</Text> : null
@@ -1309,7 +1454,7 @@ function footPart($: any, c: Ctx): any {
   // Back holds the ring on an account's page with nothing harmless above it (harmless()).
   const a = c.page.startsWith('account:') ? c.status?.accounts.find(x => `account:${x.name}` === c.page) : undefined
   const ring = (a !== undefined && harmless(a) === 'back' && c.idle && !asking(c, String(a.name)))
-    || (c.page === 'troubleshoot' && c.idle && !c.confirm)
+    || (c.page === 'troubleshoot' && c.idle && !c.confirm) || c.page === 'activity'
   return (
     <Box flexDirection="column">
       <Button key="back" label="Back" dimColor onPress={() => void back($)} {...(ring ? { autoFocus: true } : {})} />
@@ -1385,9 +1530,10 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open, found] = await Promise.all([read($, lastRead),
-      read($, running), read($, result), read($, confirming), read($, form), read($, shown), read($, marked),
-      read($, question), read($, wait), read($, answered), read($, folder), read($, details), read($, trouble)])
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open, found, did] = await Promise.all([
+      read($, lastRead), read($, running), read($, result), read($, confirming), read($, form), read($, shown),
+      read($, marked), read($, question), read($, wait), read($, answered), read($, folder), read($, details),
+      read($, trouble), read($, activity)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
@@ -1396,7 +1542,7 @@ export const register: Register = on => {
     const status = have?.status ?? null
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
       form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans,
-      details: open, trouble: found, nowMs }
+      details: open, trouble: found, activity: did, nowMs }
     return drawPane($, c)
   })
 }

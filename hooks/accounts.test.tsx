@@ -33,7 +33,8 @@ const ACCOUNTS = [
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, panel_paused: false, problem: null }
-const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-settings', 'row-troubleshoot']
+const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-activity', 'row-settings',
+  'row-troubleshoot']
 // What Remove asks, and Remove and delete its sign-in folder… asks then.
 const REMOVE_WORK_2 = "Remove work-2 from Longhaul's list? Its sign-in folder ~/.claude-work-2 stays, and its sign-in "
   + 'with it. Your project folders are never touched.'
@@ -54,6 +55,7 @@ type Ran = { exitCode: number; stdout: string; stderr: string }
 type World = {
   runs: string[][] // each longhaul.py run's arguments, after the script
   timeouts: number[] // each run's timeoutMs, in the same order
+  envs: (Record<string, string> | null)[] // each run's env, in the same order
   opened: any[] // each $.ui.open's argument
   closed: any[] // each ui.close that reached the engine: the pane closed
   focused: string[] // each element $.ui.focus was asked to move the ring to
@@ -77,7 +79,7 @@ const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
 // The engine beneath the plugins, from memory: programs, files, panes, the
 // clock, and what display.ts asks at a session's start.
 function world(on: any): World {
-  const w: World = { runs: [], timeouts: [], opened: [], closed: [], focused: [], toasts: [], files: {}, alive: new Set([RELAY]),
+  const w: World = { runs: [], timeouts: [], envs: [], opened: [], closed: [], focused: [], toasts: [], files: {}, alive: new Set([RELAY]),
     status: done(JSON.stringify(STATUS)), answer: {}, slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
   mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home' })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
@@ -105,6 +107,7 @@ function world(on: any): World {
     const rest = argv.slice(3)
     w.runs.push(rest)
     w.timeouts.push(e.init?.timeoutMs)
+    w.envs.push(e.init?.env ?? null)
     if (w.slow.has(rest[0]!)) await w.clock.sleep(60_000)
     const said = w.answer[rest[0]!]
     const ran = rest[0] === 'status' ? w.status : typeof said === 'function' ? said(rest) : said ?? done('Done.')
@@ -208,6 +211,7 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
   expect(await row('row-spare-3')).toBe('  spare-3     signed in as someone else   (used nowhere)')
   expect(await row('row-team-4')).toBe('  team-4      could not check')
   expect(await row('row-add')).toBe('  + Add account')
+  expect(await row('row-activity')).toBe('  Activity: what Longhaul did, and why')
   expect(await row('row-settings')).toBe('  Settings (switching: ask · VS Code panel: off)')
   const all = await texts(ui)
   expect(all[0]).toBe('Longhaul accounts')
@@ -786,6 +790,122 @@ both('a look for what is stuck that fails says why, with Retry; an older Longhau
   expect(all).toContain(`⚠ ${FINDINGS[1]!.what}.`)
   expect(all.filter(t => t.startsWith('⚠ ')).length).toBe(2)
   expect((await buttons(ui)).filter(k => k.startsWith('fix-'))).toEqual(['fix-1'])
+  await ui.unmount()
+})
+
+// What `activity --json` gives, as longhaul.py's activity() words it: this
+// chat's events and others', oldest first.
+const OTHER = 'b71e22c0'
+const EVENTS = [
+  { time: AT - 3 * HOUR, chat: SID.slice(0, 8), what: 'Started on personal-1', why: '~/code prefers personal-1, and it had room' },
+  { time: AT - 2 * HOUR, chat: OTHER, what: 'Stopped a message; nothing was sent',
+    why: '~/side is kept for work-2, and the chat ran on personal-1' },
+  { time: AT - HOUR, chat: null, what: "Forgot work-2's recorded limit (it was until 14:00)", why: 'a reply came on it' },
+  { time: AT - 600, chat: SID.slice(0, 8), what: 'Compacted it at 412,345 tokens',
+    why: 'its checkpoint was saved, and it comes back' },
+]
+const EARLIER = { time: AT - 50 * HOUR, chat: SID.slice(0, 8), what: 'Set to run on personal-1', why: 'chosen with longhaul use' }
+
+// activity as longhaul.py answers it: today's events, and with more days the earlier one first.
+function activities(w: World, found = EVENTS): void {
+  w.answer.activity = rest => done(`${JSON.stringify(rest[3] === '1' ? found : [EARLIER, ...found])}\n`)
+}
+
+both('Activity lists what activity --json gives, this chat first; Earlier days asks for more days', async ($, on, surface) => {
+  const w = world(on)
+  activities(w)
+  const { ui } = await opened($, w, surface)
+  expect(after(w)).toEqual([]) // the list reads no activity
+  await open(ui, 'row-activity')
+  expect(after(w)).toEqual([['activity', '--json', '--days', '1']])
+  expect(w.envs.at(-1)).toEqual({ CLAUDE_CODE_SESSION_ID: SID }) // so it knows this chat
+  expect(await ringed(ui)).toEqual(['back'])
+  let all = await texts(ui)
+  const at = (e: { time: number }) => clock(e.time)
+  expect(all).toContain('What Longhaul did · today')
+  const mine = all.indexOf('This chat'), others = all.indexOf('Other chats')
+  expect(mine).toBeGreaterThan(-1)
+  expect(others).toBeGreaterThan(mine)
+  expect(all.slice(mine + 1, others)).toEqual([
+    `${at(EVENTS[0]!)}  Started on personal-1: ~/code prefers personal-1, and it had room.`,
+    `${at(EVENTS[3]!)}  Compacted it at 412,345 tokens: its checkpoint was saved, and it comes back.`])
+  expect(all).toContain(`${at(EVENTS[1]!)}  ${OTHER} · Stopped a message; nothing was sent: ~/side is kept for work-2, `
+    + 'and the chat ran on personal-1.')
+  expect(all).toContain(`${at(EVENTS[2]!)}  Forgot work-2's recorded limit (it was until 14:00): a reply came on it.`)
+  expect(all).toContain(`Full log: ${HOME}/longhaul.log`)
+  // Earlier days: a week, then a month, then no more.
+  await ui.press({ key: 'activity-earlier' })
+  expect(w.runs.at(-1)).toEqual(['activity', '--json', '--days', '7'])
+  all = await texts(ui)
+  expect(all).toContain('What Longhaul did · the last 7 days')
+  expect(all).toContain(`${clock(EARLIER.time)}  Set to run on personal-1: chosen with longhaul use.`)
+  await ui.press({ key: 'activity-earlier' })
+  expect(w.runs.at(-1)).toEqual(['activity', '--json', '--days', '30'])
+  expect(await texts(ui)).toContain('What Longhaul did · the last 30 days')
+  expect(await ui.find({ key: 'activity-earlier' })).toBeUndefined()
+  // Back to its line; opened again, today's once more.
+  await ui.press({ key: 'back' })
+  expect((await ui.find({ key: 'row-activity' }))?.text).toBe('› Activity: what Longhaul did, and why')
+  await open(ui, 'row-activity')
+  expect(w.runs.at(-1)).toEqual(['activity', '--json', '--days', '1'])
+  expect(await texts(ui)).toContain('What Longhaul did · today')
+  await ui.unmount()
+})
+
+both('Activity with nothing to show says so; a read that fails says why, with Retry; an older Longhaul says to update',
+  async ($, on, surface) => {
+    const w = world(on)
+    w.answer.activity = done('[]\n') // nothing on any day
+    const { ui } = await opened($, w, surface)
+    await open(ui, 'row-activity')
+    let all = await texts(ui)
+    expect(all).toContain('Nothing Longhaul did by itself today.')
+    expect(all).not.toContain('This chat')
+    await ui.press({ key: 'activity-earlier' })
+    expect(await texts(ui)).toContain('Nothing Longhaul did by itself in the last 7 days.')
+    await ui.press({ key: 'back' })
+    // An event of no shape the pane takes is left out; text is masked.
+    activities(w, [null, 'x', { time: 'now', chat: null, what: 'odd', why: 'odd' }, { ...EVENTS[2], why: 7 },
+      { ...EVENTS[1], why: 'mailed someone@example.com' }] as any)
+    await open(ui, 'row-activity')
+    all = await texts(ui)
+    expect(all.filter(t => /odd|recorded limit/.test(t))).toEqual([])
+    expect(all.some(t => t.includes('s•••@example.com') && !t.includes('someone@'))).toBe(true)
+    await ui.press({ key: 'back' })
+    w.answer.activity = done('', 2, 'usage: longhaul [-h]\nlonghaul: error: unrecognized arguments: activity --json --days 1\n')
+    await open(ui, 'row-activity')
+    all = await texts(ui)
+    expect(all).toContain('This Longhaul is older than this pane: it has no activity.')
+    expect(all.some(t => t.startsWith('To update Longhaul:'))).toBe(true)
+    w.answer.activity = done('', 1, 'Traceback (most recent call last):\nPermissionError: [Errno 13] Permission denied\n')
+    await ui.press({ key: 'activity-retry' })
+    expect(w.runs.at(-1)).toEqual(['activity', '--json', '--days', '1'])
+    all = await texts(ui)
+    expect(all).toContain('Longhaul could not read what it did: PermissionError: [Errno 13] Permission denied.')
+    await ui.press({ key: 'activity-details' })
+    expect(await texts(ui)).toContain('Traceback (most recent call last):')
+    w.answer.activity = done('not json\n')
+    await ui.press({ key: 'activity-retry' })
+    expect(await texts(ui)).toContain('Longhaul could not read what it did: its answer was not a list.')
+    await ui.unmount()
+  })
+
+both("the list says why this chat runs on its account, from status --json's chat", async ($, on, surface) => {
+  const w = world(on)
+  const CHAT = { id: SID.slice(0, 8), account: 'personal-1', what: 'Started on personal-1',
+    why: '~/code prefers personal-1, and it had room', at: AT - 3 * HOUR }
+  w.status = done(JSON.stringify({ ...STATUS, chat: CHAT }))
+  const { ui } = await opened($, w, surface)
+  expect(w.envs[0]).toEqual({ CLAUDE_CODE_SESSION_ID: SID }) // the read names this chat
+  expect(await texts(ui)).toContain('This chat: personal-1. Why: ~/code prefers personal-1, and it had room.')
+  // No reason in the log, no chat, or an older Longhaul: no line.
+  for (const chat of [{ ...CHAT, what: null, why: null, at: null }, null, undefined]) {
+    w.status = done(JSON.stringify({ ...STATUS, chat }))
+    await open(ui, 'row-settings')
+    await ui.press({ key: 'clear' })
+    await ui.press({ key: 'back' })
+    expect((await texts(ui)).filter(t => t.startsWith('This chat:'))).toEqual([])
+  }
   await ui.unmount()
 })
 

@@ -64,6 +64,30 @@ export type LonghaulStatus = {
   // and the Troubleshoot page then offers both Pause and Resume.
   panel_paused?: boolean | null
   problem: string | null
+  // The chat it runs in and why it is on its account (M1): the log's latest
+  // reason; null outside a chat. Optional: an older longhaul.py does not give it.
+  chat?: LonghaulChat | null
+}
+
+// This chat as `status --json` gives it: its short id, its account (null:
+// not one Longhaul knows), and the latest event that put it there, what,
+// why and when (epoch seconds), each null when the log gives none.
+export type LonghaulChat = {
+  id: string; account: string | null; what: string | null; why: string | null; at: number | null
+}
+
+// One thing Longhaul did by itself, as `longhaul.py activity --json` gives
+// it: when (epoch seconds), the chat (its first 8 characters, null for an
+// event of no one chat), what happened and why.
+export type LonghaulActivityEvent = { time: number; chat: string | null; what: string; why: string }
+
+// The Activity page's last read: the events over `days` days (null: the
+// read failed, and why; update: this Longhaul is older than the pane and
+// has no activity), the command's last lines for its Details, this chat's
+// short id (null: not known), and where the full log is.
+export type LonghaulAccountsActivity = {
+  events: LonghaulActivityEvent[] | null; days: number; problem: string | null; update: boolean; lines: string[]
+  chat: string | null; log: string
 }
 
 // The pane's last read: the answer, or why there is none (update: this
@@ -74,7 +98,7 @@ export type LonghaulAccountsRead = {
 }
 
 // Which page the pane shows: the list, or one item's page.
-export type LonghaulAccountsPage = 'list' | 'add' | 'settings' | 'troubleshoot' | `account:${string}`
+export type LonghaulAccountsPage = 'list' | 'add' | 'settings' | 'activity' | 'troubleshoot' | `account:${string}`
 
 // One thing `longhaul.py repair --json` finds stuck or broken: its id (what
 // `repair --fix ID` takes), what is wrong and what its fix does, in plain
@@ -147,8 +171,9 @@ declare module 'claude-code' {
       accountsWait: Shaped<LonghaulWait | null> // this chat's carry-on at a reset
       accountsAsked: Shaped<string | null> // the last question id the pane was opened for
       accountsAnswer: Shaped<LonghaulAccountsAnswer | null>
-      accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", "trouble", or none
+      accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", "trouble", "activity", or none
       accountsTrouble: Shaped<LonghaulAccountsTrouble | null> // null: not looked yet, or looking again
+      accountsActivity: Shaped<LonghaulAccountsActivity | null> // null: not read yet, or reading again
     }
   }
 }

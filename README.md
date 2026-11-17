@@ -101,7 +101,7 @@ Once the plugin is loaded, most of it works by itself.
 
 **Keeping a long session on track:** let the reminder ask for the checkpoint, or type `/longhaul:checkpoint` yourself, then `/compact` or `/clear`; the work picks up from the checkpoint. Instructions to `/compact` kept no more in a test of 8 real compactions, so Longhaul does not suggest them ([Measurements](https://github.com/Noah-OS/longhaul/wiki/Measurements)).
 
-**What Longhaul did by itself, and why:** `longhaul activity` in a terminal lists today's decisions from Longhaul's log: the account a chat started on and why, a move at a limit or while idle, a message stopped in a folder kept for another account, a recorded limit forgotten, a question or a carry-on at a limit, a `longhaul use` choice, a checkpoint saved or put back, a compaction, a repair, a pause in the panel. The chat it runs in (or `--chat ID`) comes first, then the others. `--days 7` goes back a week; `--json` gives the events as JSON. It shows ids, account names, folders and times, never a word of a chat, and its last line names the full log.
+**What Longhaul did by itself, and why:** `longhaul activity` in a terminal lists today's decisions from Longhaul's log: the account a chat started on and why, a move at a limit or while idle, a message stopped in a folder kept for another account, a recorded limit forgotten, a question or a carry-on at a limit, a `longhaul use` choice, a checkpoint saved or put back, a compaction, a repair, a pause in the panel. The chat it runs in (or `--chat ID`) comes first, then the others. `--days 7` goes back a week; `--json` gives the events as JSON. It shows ids, account names, folders and times, never a word of a chat, and its last line names the full log. In `/accounts`, **Activity** shows the same, with **Earlier days** for the last week, then the last month.
 
 ## 4. More than one account
 
@@ -109,8 +109,10 @@ Longhaul can run your chats across several of your own Claude subscriptions. Eac
 
 **See your accounts:** type `/accounts` in a chat, in the terminal or in the VS Code panel. It opens a list, as `/mcp` does:
 
+- above them, why this chat runs on its account, when Longhaul's log says (for example "This chat: work. Why: ~/clients prefers work, and it had room.");
 - one line per account: its plan, its sign-in, its week's use or its limit, and where it may be used;
 - `+ Add account`;
+- `Activity`: what Longhaul did by itself today, and why, this chat first (see [Day to day](#3-day-to-day));
 - `Settings`: switching, the VS Code panel on or off, and forgetting the recorded limits.
 
 Use the arrow keys to move and Enter to open a line. Escape, or **Back**, goes back to the list; Escape on the list closes it. An account's page shows its 5-hour and week use, its folder and its email, masked (`y•••@example.com`). On the phone, `/accounts` shows the list only. In a terminal, `longhaul status` lists the accounts too.
