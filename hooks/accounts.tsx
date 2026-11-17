@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LonghaulAccount, LonghaulAccountsActivity, LonghaulAccountsAnswer, LonghaulAccountsFolder,
-  LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning,
-  LonghaulAccountsTrouble, LonghaulActivityEvent, LonghaulQuestion, LonghaulRepairFinding, LonghaulStatus,
+  LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsPreview, LonghaulAccountsRead, LonghaulAccountsResult,
+  LonghaulAccountsRunning, LonghaulAccountsTrouble, LonghaulActivityEvent, LonghaulQuestion, LonghaulRepairFinding, LonghaulStatus,
   LonghaulWait } from '../types'
 import { status as showStatus } from './display.ts'
 import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
@@ -16,8 +16,10 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // account's page has its details and its actions (Sign in again or Sign in,
 // Remove), then its folders, each with Remove, a field to add one and
 // Remove all folder limits… (the owner, 2026-11-05: "I can't edit the
-// accounts"; it asks first since the UX review's Q12), then
-// whether it is a fallback, with the button that turns it (2026-11-06); Add
+// accounts"; it asks first since the UX review's Q12), each change of
+// them, and Remove and delete its sign-in folder…, showing first what it
+// would do, from its own command's --dry-run --json (the UX review's M4),
+// then whether it is a fallback, with the button that turns it (2026-11-06); Add
 // account's page the form; Settings' page switching, the VS Code panel and
 // forgetting the limits; Troubleshoot's (the UX review's 4.4, M2) what
 // `repair --json` finds stuck, each with a Fix that asks first, and Longhaul
@@ -94,6 +96,8 @@ const details = atom({ plugin: 'longhaul', key: 'accountsDetails' } as const, nu
 const trouble = atom({ plugin: 'longhaul', key: 'accountsTrouble' } as const, null, { shape: 'accounts-trouble-1' })
 // What the Activity page's last read of `activity --json` found.
 const activity = atom({ plugin: 'longhaul', key: 'accountsActivity' } as const, null, { shape: 'accounts-activity-1' })
+// What the open question's dry run said its change would do (M4).
+const preview = atom({ plugin: 'longhaul', key: 'accountsPreview' } as const, null, { shape: 'accounts-preview-1' })
 
 // This module's own mark on what it runs: a reload loads a new module, with
 // a new mark, so an action marked by another one was cut off by the reload.
@@ -408,15 +412,80 @@ async function remove($: any, name: string): Promise<void> {
 // With its sign-in folder, the account's own Claude Code folder (0.3.9; the
 // owner, 2026-11-11: "when I delete an account it does not delete its
 // files"): `remove NAME --delete-folder --yes`, after the pane's own second
-// yes. longhaul.py checks first and refuses, nothing changed, a folder it
-// may not delete (the default one, another account's, one a chat runs on);
-// its words show in the result. The pane says "sign-in folder" wherever it
-// means that folder (the UX review's Q4): "folder" alone is a project's.
-async function removeWithFolder($: any, name: string): Promise<void> {
+// yes. That question shows what the delete would take, read first with
+// `--dry-run --json` (the UX review's M4, §4.7 string 7: delete_lines()'s
+// words, the folder, its size, the conversations kept in it or that its
+// history is only linked and stays), and offers only Cancel where it would
+// refuse. longhaul.py checks again before it deletes, and refuses, nothing
+// changed, a folder it may not delete (the default one, another account's,
+// one a chat runs on); its words show in the result. The pane says
+// "sign-in folder" wherever it means that folder (the UX review's Q4):
+// "folder" alone is a project's.
+async function askDelete($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
-  await act($, { label: `Remove and delete its sign-in folder: ${name}`,
-    doing: `Removing ${name} and deleting its sign-in folder…`,
-    argv: ['remove', name, '--delete-folder', '--yes'], timeoutMs: STATUS_TIMEOUT, then: 'list' })
+  await ahead($, { account: name, kind: 'delete', argv: ['remove', name, '--delete-folder', '--yes'],
+    label: `Remove and delete its sign-in folder: ${name}`, doing: `Removing ${name} and deleting its sign-in folder…`,
+    path: null, clears: false }, ['remove', name, '--delete-folder', '--dry-run', '--json'],
+  `Reading what deleting ${name}'s sign-in folder would take…`, 'remove-no')
+}
+
+// What a change would do, read before it asks (the UX review's M4: a folder
+// rule locked people out by surprise, and the delete question was vaguer
+// than the terminal's): `dry`, the change's own command with --dry-run
+// --json, which writes nothing. Its answer opens the question (delete:,
+// folders: or anywhere: NAME), with the focus on its Cancel; a change the
+// dry run refuses shows as a failed action's result, in its words, and asks
+// nothing. An answer that cannot be read (a longhaul.py older than this
+// pane) still asks, as before, and says why it says no more.
+type Ahead = Omit<LonghaulAccountsPreview, 'lines' | 'refused' | 'stops' | 'unread'>
+async function ahead($: any, p: Ahead, dry: string[], reading: string, cancel: string): Promise<void> {
+  if (busy) return
+  busy = true
+  let asked: string | null = null
+  try {
+    const from = await read($, shown)
+    await update($, confirming, () => null)
+    await update($, running, () => ({ by: SELF, label: p.label, note: reading, page: from }))
+    let said: any = null, unread = ''
+    try {
+      const ran = await $.process.run([...base($), ...dry], { timeoutMs: STATUS_TIMEOUT })
+      try { said = JSON.parse(ran.stdout) } catch {}
+      unread = tail(ran.stdout, ran.stderr).at(-1) ?? 'it said nothing'
+    } catch (err: any) { unread = mask(`it did not answer (${err?.message || err})`) }
+    const strs = (x: unknown): string[] => (Array.isArray(x) ? x.filter(l => typeof l === 'string').map(l => mask(l)) : [])
+    await update($, running, r => (r && r.by === SELF ? null : r))
+    if (said && typeof said === 'object' && typeof said.problem === 'string' && said.problem) {
+      await update($, details, () => null)
+      await update($, result, () => ({ ok: false, label: p.label, lines: [mask(said.problem)], after: null, page: from }))
+      return
+    }
+    const ok = !!said && typeof said === 'object' && Array.isArray(p.kind === 'delete' ? said.lines : said.effects)
+    const got: LonghaulAccountsPreview = { ...p,
+      lines: !ok ? [] : p.kind === 'delete' ? strs(said.lines) : [...strs(said.notes), ...strs(said.effects)],
+      refused: ok && p.kind === 'delete' && typeof said.refused === 'string' ? mask(said.refused) : null,
+      stops: ok && typeof said.stops === 'number' ? said.stops : 0, unread: ok ? null : unread }
+    await update($, preview, () => got)
+    asked = `${p.kind === 'delete' || p.kind === 'anywhere' ? p.kind : 'folders'}:${p.account}`
+  } finally {
+    await update($, running, r => (r && r.by === SELF ? null : r)).catch(() => {})
+    busy = false
+  }
+  if (asked) await ask($, asked, cancel)
+}
+
+// The yes to a question ahead() opened: its change, only for the account
+// whose page it is, and only while the last read still allows it.
+async function apply($: any, name: string): Promise<void> {
+  const p = busy ? null : await read($, preview)
+  const a = p && p.account === name ? await known($, name) : null
+  if (!p || !a) return
+  if (p.kind === 'delete' && p.refused) return
+  if (p.kind === 'remove' && !a.only_in?.includes(String(p.path))) return
+  if (p.kind === 'add' && (a.only_in === null || folderProblem(String(p.path)))) return
+  if (p.kind === 'anywhere' && a.only_in !== null && !a.only_in.length) return // no list to drop
+  await act($, { label: p.label, doing: p.doing, argv: p.argv, timeoutMs: STATUS_TIMEOUT,
+    ...(p.kind === 'delete' ? { then: 'list' as const } : {}),
+    ...(p.clears ? { done: async () => { await update($, folder, () => NO_FOLDER) } } : {}) })
 }
 
 // This chat on the account (`use NAME --chat ID`): the relay moves it the
@@ -446,13 +515,17 @@ async function clearOne($: any, name: string): Promise<void> {
 }
 
 // Whether a yes is being asked for on this account's page: its Remove, its
-// Remove with the sign-in folder, or Remove all folder limits.
+// Remove with the sign-in folder, a change of its folders, or Remove all
+// folder limits.
 function asking(c: Ctx, name: string): boolean {
-  return c.confirm === name || c.confirm === `delete:${name}` || c.confirm === `anywhere:${name}`
+  return [name, `delete:${name}`, `folders:${name}`, `anywhere:${name}`].includes(String(c.confirm))
 }
 
 // The Folders part's three: a folder typed on this account's page added,
 // one of its folders from the last read taken off, or its list dropped.
+// Each says first what it would do (ahead(): which folders would then
+// refuse a chat on which account, and which chats it would stop), then
+// waits for a yes (the UX review's M4).
 async function addFolder($: any, name: string): Promise<void> {
   if (busy || !(await known($, name))) return
   const typed = await read($, folder)
@@ -460,9 +533,17 @@ async function addFolder($: any, name: string): Promise<void> {
   const problem = folderProblem(path)
   await update($, folder, f => ({ account: name, path: f.account === name ? f.path : '', problem }))
   if (problem) return
-  await act($, { label: mask(`Add folder ${path}: ${name}`), doing: mask(`Adding ${path} to ${name}'s folders…`),
-    argv: ['folders', name, '--add', path], timeoutMs: STATUS_TIMEOUT,
-    done: async () => { await update($, folder, () => NO_FOLDER) } })
+  await aheadFolders($, name, 'add', path, true)
+}
+
+function aheadFolders($: any, name: string, kind: 'add' | 'remove', path: string, clears: boolean): Promise<void> {
+  const add = kind === 'add'
+  const argv = ['folders', name, add ? '--add' : '--remove', path]
+  return ahead($, { account: name, kind, argv, path, clears,
+    label: mask(`${add ? 'Add' : 'Remove'} folder ${path}: ${name}`),
+    doing: mask(add ? `Adding ${path} to ${name}'s folders…` : `Taking ${path} off ${name}'s folders…`) },
+  [...argv, '--dry-run', '--json'],
+  mask(add ? `Reading what adding ${path} would change…` : `Reading what taking ${path} off would change…`), 'folders-no')
 }
 
 // This chat's folder added to the folders an account runs only in, the fix
@@ -472,15 +553,13 @@ async function addHere($: any, name: string): Promise<void> {
   const a = busy ? null : await known($, name)
   const here = (await read($, lastRead))?.status?.here
   if (!a || !here || a.use_here !== 'not_allowed' || !a.only_in?.length || folderProblem(here.folder)) return
-  await act($, { label: mask(`Add folder ${here.folder}: ${name}`), doing: mask(`Adding ${here.folder} to ${name}'s folders…`),
-    argv: ['folders', name, '--add', here.folder], timeoutMs: STATUS_TIMEOUT })
+  await aheadFolders($, name, 'add', here.folder, false)
 }
 
 async function removeFolder($: any, name: string, path: string): Promise<void> {
   const a = busy ? null : await known($, name)
   if (!a?.only_in?.includes(path)) return
-  await act($, { label: mask(`Remove folder ${path}: ${name}`), doing: mask(`Taking ${path} off ${name}'s folders…`),
-    argv: ['folders', name, '--remove', path], timeoutMs: STATUS_TIMEOUT })
+  await aheadFolders($, name, 'remove', path, false)
 }
 
 // One of the folders it is first choice in taken off (`folders NAME
@@ -495,9 +574,10 @@ async function unprefer($: any, name: string, path: string): Promise<void> {
 async function anywhere($: any, name: string): Promise<void> {
   const a = busy ? null : await known($, name)
   if (!a || (a.only_in !== null && !a.only_in.length)) return // no list to drop
-  await act($, { label: `Remove all folder limits: ${name}`, doing: `Removing ${name}'s folder limits…`,
-    argv: ['folders', name, '--anywhere'],
-    timeoutMs: STATUS_TIMEOUT })
+  await ahead($, { account: name, kind: 'anywhere', argv: ['folders', name, '--anywhere'], path: null, clears: false,
+    label: `Remove all folder limits: ${name}`, doing: `Removing ${name}'s folder limits…` },
+  ['folders', name, '--anywhere', '--dry-run', '--json'], `Reading what removing ${name}'s folder limits would change…`,
+  'anywhere-no')
 }
 
 // Its fallback mark turned the other way (the owner, 2026-11-06): `fallback
@@ -727,6 +807,7 @@ type Ctx = {
   details: string | null // whose Details are open
   trouble: LonghaulAccountsTrouble | null // the Troubleshoot page's last look; null: looking
   activity: LonghaulAccountsActivity | null // the Activity page's last read; null: reading
+  preview: LonghaulAccountsPreview | null // what the open question's dry run said
   nowMs: number // the clock, for times shown as longhaul.py shows them
 }
 
@@ -1029,9 +1110,10 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
         <Box flexDirection="row" gap={1}>
           {a.only_in !== null && <Button key="folder-add" label="Add folder" onPress={() => void addFolder($, name)} />}
           {(a.only_in === null || a.only_in.length > 0) && <Button key="folder-anywhere" label="Remove all folder limits…"
-            onPress={() => void ask($, `anywhere:${name}`, 'anywhere-no')} />}
+            onPress={() => void anywhere($, name)} />}
         </Box>
       )}
+      {c.idle && c.confirm === `folders:${name}` && changeQuestion($, c, name)}
       {c.idle && c.confirm === `anywhere:${name}` && (
         <Box flexDirection="column">
           <Text color="warning">{mask(a.only_in === null
@@ -1039,13 +1121,78 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
               + 'account reserves.'
             : `Remove all of ${name}'s folder limits? ${a.only_in.join(', ')} would no longer be reserved for ${name}, `
               + 'and it could run in any folder no other account reserves.')}</Text>
+          {previewLines(c, name, 'anywhere', 'change')}
           <Box flexDirection="row" gap={1}>
             <Button key="anywhere-yes" label="Remove all folder limits" variant="primary"
-              onPress={() => void anywhere($, name)} />
+              onPress={() => void apply($, name)} />
             <Button key="anywhere-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
         </Box>
       )}
+    </Box>
+  )
+}
+
+// What the open question's dry run said (ahead()), when it is this
+// account's and this kind's: its lines, or why it could not be read.
+function previewOf(c: Ctx, name: string, kinds: LonghaulAccountsPreview['kind'][]): LonghaulAccountsPreview | null {
+  const p = c.preview
+  return p && p.account === name && kinds.includes(p.kind) ? p : null
+}
+
+function previewLines(c: Ctx, name: string, kind: LonghaulAccountsPreview['kind'], what: string): any {
+  const { Text } = c.E
+  const p = previewOf(c, name, [kind])
+  if (!p) return null
+  return [...p.lines.map(line => <Text>{line}</Text>),
+    p.unread ? <Text dimColor>{`What it would ${what} could not be read: ${p.unread}`}</Text> : null]
+}
+
+// A folder added or taken off (`folders NAME --add|--remove PATH`): what it
+// would do, then its yes and Cancel. The question names how many chats it
+// would stop, in the warning's colour.
+function changeQuestion($: any, c: Ctx, name: string): any {
+  const { Box, Text, Button } = c.E
+  const p = previewOf(c, name, ['add', 'remove'])
+  const cancel = <Button key="folders-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
+  if (!p) return cancel
+  const add = p.kind === 'add'
+  const stops = p.stops > 0 ? ` It would stop ${p.stops === 1 ? '1 chat' : `${p.stops} chats`}.` : ''
+  return (
+    <Box flexDirection="column">
+      <Text color={stops ? 'warning' : undefined}>
+        {mask(`${add ? `Add ${p.path} to` : `Take ${p.path} off`} ${name}'s folders?${stops}`)}
+      </Text>
+      {previewLines(c, name, p.kind, 'change')}
+      <Box flexDirection="row" gap={1}>
+        <Button key="folders-yes" label={add ? 'Add the folder' : 'Take it off'} variant="primary"
+          onPress={() => void apply($, name)} />
+        {cancel}
+      </Box>
+    </Box>
+  )
+}
+
+// Remove and delete its sign-in folder's question: delete_lines()'s words,
+// read first (askDelete()), then the delete and Cancel; Cancel alone where
+// the delete would refuse. Today's sentence where they could not be read.
+function deleteQuestion($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button } = c.E
+  const name = String(a.name)
+  const p = previewOf(c, name, ['delete'])
+  const said = p !== null && p.unread === null
+  return (
+    <Box flexDirection="column">
+      <Text color="warning">{mask(said ? `Delete ${name}'s sign-in folder for good?`
+        : `Remove ${name} and delete its sign-in folder${a.folder ? ` ${a.folder}` : ''}? Its sign-in and the chat `
+          + `history kept in it go for good. ${UNTOUCHED}`)}</Text>
+      {previewLines(c, name, 'delete', 'take')}
+      {said && <Text>{UNTOUCHED}</Text>}
+      <Box flexDirection="row" gap={1}>
+        {!p?.refused && <Button key="remove-folder-yes" label="Delete the sign-in folder" variant="primary"
+          onPress={() => void apply($, name)} />}
+        <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
+      </Box>
     </Box>
   )
 }
@@ -1189,22 +1336,12 @@ function accountPage($: any, c: Ctx): any {
           <Box flexDirection="row" gap={1}>
             <Button key="remove-yes" label="Remove" variant="primary" onPress={() => void remove($, name)} />
             <Button key="remove-folder" label="Remove and delete its sign-in folder…" dimColor
-              onPress={() => void ask($, `delete:${name}`, 'remove-no')} />
+              onPress={() => void askDelete($, name)} />
             <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
           </Box>
         </Box>
       )}
-      {c.idle && c.confirm === `delete:${name}` && (
-        <Box flexDirection="column">
-          <Text color="warning">{mask(`Remove ${name} and delete its sign-in folder${a.folder ? ` ${a.folder}` : ''}? Its `
-            + `sign-in and the chat history kept in it go for good. ${UNTOUCHED}`)}</Text>
-          <Box flexDirection="row" gap={1}>
-            <Button key="remove-folder-yes" label="Delete the sign-in folder" variant="primary"
-              onPress={() => void removeWithFolder($, name)} />
-            <Button key="remove-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
-          </Box>
-        </Box>
-      )}
+      {c.idle && c.confirm === `delete:${name}` && deleteQuestion($, c, a)}
       {preferredPart($, c, a)}
       {foldersPart($, c, a)}
       {fallbackPart($, c, a)}
@@ -1530,10 +1667,10 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open, found, did] = await Promise.all([
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open, found, did, dry] = await Promise.all([
       read($, lastRead), read($, running), read($, result), read($, confirming), read($, form), read($, shown),
       read($, marked), read($, question), read($, wait), read($, answered), read($, folder), read($, details),
-      read($, trouble), read($, activity)])
+      read($, trouble), read($, activity), read($, preview)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
@@ -1542,7 +1679,7 @@ export const register: Register = on => {
     const status = have?.status ?? null
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
       form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans,
-      details: open, trouble: found, activity: did, nowMs }
+      details: open, trouble: found, activity: did, preview: dry, nowMs }
     return drawPane($, c)
   })
 }

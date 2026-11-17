@@ -35,11 +35,44 @@ const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', m
   switch: 'ask', switch_problem: null, vscode: false, panel_paused: false, problem: null }
 const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-activity', 'row-settings',
   'row-troubleshoot']
-// What Remove asks, and Remove and delete its sign-in folder… asks then.
+// What Remove asks, and Remove and delete its sign-in folder… asks then:
+// what `remove NAME --delete-folder --dry-run --json` says it would take,
+// in delete_lines()'s words (the UX review's M4, §4.7 string 7).
 const REMOVE_WORK_2 = "Remove work-2 from Longhaul's list? Its sign-in folder ~/.claude-work-2 stays, and its sign-in "
   + 'with it. Your project folders are never touched.'
-const DELETE_WORK_2 = 'Remove work-2 and delete its sign-in folder ~/.claude-work-2? Its sign-in and the chat history '
+const DELETE_WORK_2 = "Delete work-2's sign-in folder for good?"
+const UNTOUCHED = 'Your project folders are never touched.'
+const DELETE_LINES = (name: string) => [
+  `${name}'s sign-in folder ~/.claude-${name} (412 MB) goes for good: ${name}'s sign-in. Its chat history is in `
+    + '~/.claude/projects, which it only links to, and stays.',
+  `Longhaul does not sign ${name} out: on a Mac, the sign-in Claude Code keeps for this folder in the Keychain may remain.`]
+// What it said before it could read that (an older longhaul.py, or one that failed).
+const DELETE_VAGUE = 'Remove work-2 and delete its sign-in folder ~/.claude-work-2? Its sign-in and the chat history '
   + 'kept in it go for good. Your project folders are never touched.'
+// What `folders NAME ... --dry-run --json` says a change would do (folders_preview()).
+const PREVIEW = { changes: ['would remove ~/clients from work-2\'s folders'], notes: [],
+  effects: ['Then work-2 may be used only in ~/work.',
+    '~/clients would no longer be reserved for work-2: a chat there on personal-1 or team-4 would go through again.',
+    'Chats it would change (running now, or started in the last 7 days):',
+    '  chat 5ca8a797 in ~/clients/api on personal-1 (started 09:00): its messages would go through again.'],
+  stops: 0, problem: null }
+const STOPS = { ...PREVIEW, changes: ['would add ~/new to work-2\'s folders'],
+  effects: ['Then work-2 may be used only in ~/work, ~/clients, ~/new.',
+    '~/new would be reserved for work-2: a chat there on personal-1 or team-4 would stop at its next message.',
+    'Chats it would change (running now, or started in the last 7 days):',
+    '  chat 1b2c3d4e in ~/new on personal-1 (running now): its next message would stop, as ~/new would be reserved '
+      + 'for work-2.'],
+  stops: 1 }
+// The dry run's answer from its arguments, and the change's own.
+function dryOr(dry: (rest: string[]) => any, real: Ran = done('Done.')): (rest: string[]) => Ran {
+  return rest => {
+    if (!rest.includes('--dry-run')) return real
+    const said = dry(rest)
+    return done(JSON.stringify(said), said?.refused || said?.problem ? 2 : 0)
+  }
+}
+const DELETE_DRY = (rest: string[]) => ({ name: rest[1], folder: `~/.claude-${rest[1]}`, there: true, size: '412 MB',
+  conversations: 0, linked: '~/.claude/projects', lines: DELETE_LINES(rest[1]!), refused: null, problem: null })
 
 // A question as longhaul.py's Relay.ask() writes it, and a wait as Relay.schedule() does.
 const RELAY = 4242
@@ -80,7 +113,8 @@ const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
 // clock, and what display.ts asks at a session's start.
 function world(on: any): World {
   const w: World = { runs: [], timeouts: [], envs: [], opened: [], closed: [], focused: [], toasts: [], files: {}, alive: new Set([RELAY]),
-    status: done(JSON.stringify(STATUS)), answer: {}, slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
+    status: done(JSON.stringify(STATUS)), answer: { remove: dryOr(DELETE_DRY), folders: dryOr(() => PREVIEW) },
+    slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
   mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home' })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: SID }))
@@ -300,7 +334,7 @@ both("an account's page opens with the focus on its first harmless control, neve
   await ui.press({ key: 'remove-folder' })
   expect(await ringed(ui)).toEqual(['remove-no'])
   await ui.press({ key: 'remove-no' })
-  expect(after(w)).toEqual([])
+  expect(after(w)).toEqual([['remove', 'spare-3', '--delete-folder', '--dry-run', '--json']]) // a read: nothing changed
   await ui.unmount()
 })
 
@@ -346,30 +380,89 @@ both('Sign in again for a signed-in account, Sign in for one that is not, the no
   await ui.unmount()
 })
 
-both('Remove with its sign-in folder asks twice and runs remove --delete-folder --yes; Cancel runs nothing', async ($, on, surface) => {
+both('Remove with its sign-in folder asks twice, the second time with what it would take, and runs remove --delete-folder --yes; Cancel runs nothing', async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-work-2')
   await ui.press({ key: 'remove-work-2' })
+  expect(after(w)).toEqual([])
+  // The second question reads what the delete would take first, and changes nothing (M4).
   await ui.press({ key: 'remove-folder' })
-  expect(after(w)).toEqual([])
-  expect(await texts(ui)).toContain(DELETE_WORK_2)
+  expect(after(w)).toEqual([['remove', 'work-2', '--delete-folder', '--dry-run', '--json']])
+  const all = await texts(ui)
+  for (const t of [DELETE_WORK_2, ...DELETE_LINES('work-2'), UNTOUCHED]) expect(all).toContain(t)
+  expect(all).not.toContain(DELETE_VAGUE)
+  expect(all.indexOf(DELETE_WORK_2)).toBeLessThan(all.indexOf(DELETE_LINES('work-2')[0]!))
   expect(await ui.find({ key: 'remove-yes' })).toBeUndefined()
+  expect(await ringed(ui)).toEqual(['remove-no'])
   await ui.press({ key: 'remove-no' })
-  expect(after(w)).toEqual([])
+  expect(after(w).length).toBe(1)
   expect(await ui.find({ key: 'remove-folder-yes' })).toBeUndefined()
+  expect(await texts(ui)).not.toContain(DELETE_LINES('work-2')[0])
   await ui.press({ key: 'remove-work-2' })
   await ui.press({ key: 'remove-folder' })
   w.status = done(JSON.stringify({ ...STATUS, accounts: ACCOUNTS.filter(a => a.name !== 'work-2') }))
   await ui.press({ key: 'remove-folder-yes' })
-  expect(after(w)).toEqual([['remove', 'work-2', '--delete-folder', '--yes'], ['status', '--json']])
+  expect(after(w).slice(2)).toEqual([['remove', 'work-2', '--delete-folder', '--yes'], ['status', '--json']])
   expect(await buttons(ui)).toEqual(ROWS.filter(k => k !== 'row-work-2'))
+  await ui.unmount()
+})
+
+both('the second Remove question says why the sign-in folder would not go, and then offers only Cancel', async ($, on, surface) => {
+  const w = world(on)
+  const why = '1 chat still runs on work-2: pid 4242 (a VS Code tab) in ~/work; close it first'
+  w.answer.remove = dryOr(rest => ({ ...DELETE_DRY(rest), there: false, size: null, conversations: null, linked: null,
+    refused: why, lines: [`It would not be deleted: ${why}.`] }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'remove-work-2' })
+  // While it reads, it says so and offers nothing.
+  w.slow.add('remove')
+  await ui.press({ key: 'remove-folder' })
+  expect(await texts(ui)).toContain("Reading what deleting work-2's sign-in folder would take…")
+  expect(await ui.find({ key: 'remove-no' })).toBeUndefined()
+  await w.clock.advance(60_000)
+  w.slow.delete('remove')
+  const all = await texts(ui)
+  expect(all).toContain(DELETE_WORK_2)
+  expect(all).toContain(`It would not be deleted: ${why}.`)
+  expect(await ui.find({ key: 'remove-folder-yes' })).toBeUndefined()
+  expect(await ringed(ui)).toEqual(['remove-no'])
+  await ui.press({ key: 'remove-no' })
+  expect(after(w)).toEqual([['remove', 'work-2', '--delete-folder', '--dry-run', '--json']])
+  // A longhaul.py with no --dry-run: today's sentence, why there is no more, and the delete still offered
+  // (longhaul.py checks again before it deletes anything).
+  w.answer.remove = rest => (rest.includes('--dry-run')
+    ? done('', 2, 'longhaul remove: error: unrecognized arguments: --dry-run --json\n') : done('Done.'))
+  await ui.press({ key: 'remove-work-2' })
+  await ui.press({ key: 'remove-folder' })
+  const old = await texts(ui)
+  expect(old).toContain(DELETE_VAGUE)
+  expect(old).toContain('What it would take could not be read: longhaul remove: error: unrecognized arguments: '
+    + '--dry-run --json')
+  expect(await ui.find({ key: 'remove-folder-yes' })).toBeDefined()
+  await ui.unmount()
+})
+
+both('a folder change whose dry run cannot be read still asks, and says why it says no more', async ($, on, surface) => {
+  const w = world(on)
+  w.answer.folders = rest => (rest.includes('--dry-run') ? done('', 2, 'longhaul folders: error: unrecognized '
+    + 'arguments: --dry-run --json\n') : done('Done.'))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'folder-remove-0' })
+  const all = await texts(ui)
+  expect(all).toContain("Take ~/work off work-2's folders?")
+  expect(all).toContain('What it would change could not be read: longhaul folders: error: unrecognized arguments: '
+    + '--dry-run --json')
+  await ui.press({ key: 'folders-yes' })
+  expect(after(w).slice(1)).toEqual([['folders', 'work-2', '--remove', '~/work'], ['status', '--json']])
   await ui.unmount()
 })
 
 both('the pane says "sign-in folder" for an account\'s own folder, never a bare "folder"', async ($, on, surface) => {
   const w = world(on)
-  w.answer.remove = done('', 2, 'Not deleted, nothing changed: a chat runs on it.\n')
+  w.answer.remove = dryOr(DELETE_DRY, done('', 2, 'Not deleted, nothing changed: a chat runs on it.\n'))
   const { ui } = await opened($, w, surface)
   const seen: string[] = []
   for (const name of ['personal-1', 'work-2', 'spare-3', 'team-4']) {
@@ -478,16 +571,19 @@ both('the Use row says why Use for this chat is not offered, with its fix', asyn
   // The fixes run their commands.
   await open(ui, 'row-work-2')
   expect((await ui.find({ key: 'use-add-work-2' }))?.text).toBe('Add ~/code/x to its folders')
-  await ui.press({ key: 'use-add-work-2' })
-  expect(after(w)).toEqual([['folders', 'work-2', '--add', '~/code/x'], ['status', '--json']])
+  await ui.press({ key: 'use-add-work-2' }) // what it would do first, then a yes (M4)
+  expect(after(w)).toEqual([['folders', 'work-2', '--add', '~/code/x', '--dry-run', '--json']])
+  expect(await texts(ui)).toContain('Add ~/code/x to work-2\'s folders?')
+  await ui.press({ key: 'folders-yes' })
+  expect(after(w).slice(1)).toEqual([['folders', 'work-2', '--add', '~/code/x'], ['status', '--json']])
   await ui.press({ key: 'back' })
   await open(ui, 'row-full-7')
   await ui.press({ key: 'clear-full-7' })
-  expect(after(w).slice(2)).toEqual([['clear', 'full-7'], ['status', '--json']])
+  expect(after(w).slice(3)).toEqual([['clear', 'full-7'], ['status', '--json']])
   await ui.press({ key: 'back' })
   await open(ui, 'row-out-8')
   await ui.press({ key: 'signin-out-8' })
-  expect(after(w).slice(4)).toEqual([['setup', 'out-8'], ['status', '--json']])
+  expect(after(w).slice(5)).toEqual([['setup', 'out-8'], ['status', '--json']])
   await ui.unmount()
 })
 
@@ -1221,37 +1317,67 @@ both("an account's Folders: each folder with Remove, a field to add one, and Rem
   expect((await ui.find({ key: 'folder-remove-1' }))?.text).toBe('Remove')
   expect((await ui.find({ key: 'folder-anywhere' }))?.text).toBe('Remove all folder limits…')
   expect(await ui.find({ key: 'folder-path' })).toBeDefined()
+  // Each change says first what it would do (`folders ... --dry-run --json`, M4), then waits for a yes.
   await ui.press({ key: 'folder-remove-1' })
-  expect(after(w)).toEqual([['folders', 'work-2', '--remove', '~/clients'], ['status', '--json']])
-  expect(w.timeouts.slice(1)).toEqual([60_000, 60_000])
+  expect(after(w)).toEqual([['folders', 'work-2', '--remove', '~/clients', '--dry-run', '--json']])
+  let seen = await texts(ui)
+  expect(seen).toContain("Take ~/clients off work-2's folders?")
+  for (const t of PREVIEW.effects) expect(seen).toContain(t)
+  expect(seen).not.toContain(PREVIEW.changes[0]) // the question says the change
+  expect(await ringed(ui)).toEqual(['folders-no'])
+  expect(await ui.find({ key: 'folder-remove-0' })).toBeUndefined() // nothing else while it asks
+  expect(await ui.find({ key: 'signin-work-2' })).toBeUndefined()
+  expect((await ui.find({ key: 'folders-yes' }))?.text).toBe('Take it off')
+  await ui.press({ key: 'folders-yes' })
+  expect(after(w).slice(1)).toEqual([['folders', 'work-2', '--remove', '~/clients'], ['status', '--json']])
+  expect(w.timeouts.slice(1)).toEqual([60_000, 60_000, 60_000])
   expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove folder ~/clients: work-2'))).toBe(true)
-  // A folder typed, trimmed, then the field empty again once it worked.
+  expect(await texts(ui)).not.toContain(PREVIEW.effects[1]) // the question is gone with its yes
+  // A folder typed, trimmed: one that would stop a chat says so first; Cancel runs nothing.
+  w.answer.folders = dryOr(() => STOPS)
   await ui.input({ key: 'folder-path', text: ' ~/new ' })
   await ui.press({ key: 'folder-add' })
-  expect(after(w).slice(2)).toEqual([['folders', 'work-2', '--add', '~/new'], ['status', '--json']])
+  expect(after(w).slice(3)).toEqual([['folders', 'work-2', '--add', '~/new', '--dry-run', '--json']])
+  seen = await texts(ui)
+  expect(seen).toContain("Add ~/new to work-2's folders? It would stop 1 chat.")
+  for (const t of STOPS.effects) expect(seen).toContain(t)
+  expect((await ui.find({ key: 'folders-yes' }))?.text).toBe('Add the folder')
+  await ui.press({ key: 'folders-no' })
+  expect(after(w).length).toBe(4)
+  expect(await ui.find({ key: 'folders-yes' })).toBeUndefined()
+  // Then the field empty again once it worked.
+  await ui.press({ key: 'folder-add' })
+  await ui.press({ key: 'folders-yes' })
+  expect(after(w).slice(4)).toEqual([['folders', 'work-2', '--add', '~/new', '--dry-run', '--json'],
+    ['folders', 'work-2', '--add', '~/new'], ['status', '--json']])
   expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Add folder ~/new: work-2'))).toBe(true)
   expect((await ui.find({ key: 'folder-path' }))?.text).toBe('')
-  // It asks first, naming the folders it would un-reserve (the read after Add folder still lists two).
+  // It asks first, naming the folders it would un-reserve (the read after Add folder still lists two),
+  // with what it would do.
+  w.answer.folders = dryOr(() => PREVIEW)
   await ui.press({ key: 'folder-anywhere' })
-  expect(after(w).slice(4)).toEqual([])
-  expect(await texts(ui)).toContain('Remove all of work-2\'s folder limits? ~/work, ~/clients would no longer be '
+  expect(after(w).slice(7)).toEqual([['folders', 'work-2', '--anywhere', '--dry-run', '--json']])
+  seen = await texts(ui)
+  expect(seen).toContain('Remove all of work-2\'s folder limits? ~/work, ~/clients would no longer be '
     + 'reserved for work-2, and it could run in any folder no other account reserves.')
+  for (const t of PREVIEW.effects) expect(seen).toContain(t)
   expect(await ringed(ui)).toEqual(['anywhere-no'])
   expect(await ui.find({ key: 'folder-remove-0' })).toBeUndefined() // nothing else while it asks
   expect(await ui.find({ key: 'signin-work-2' })).toBeUndefined()
   await ui.press({ key: 'anywhere-no' })
-  expect(after(w).slice(4)).toEqual([])
+  expect(after(w).length).toBe(8)
   expect(await ui.find({ key: 'anywhere-yes' })).toBeUndefined()
   // Back cancels it too.
   await ui.press({ key: 'folder-anywhere' })
   await ui.press({ key: 'back' })
   expect(await ui.find({ key: 'anywhere-yes' })).toBeUndefined()
   expect(await ui.find({ key: 'folder-anywhere' })).toBeDefined()
-  expect(after(w).slice(4)).toEqual([])
+  expect(after(w).length).toBe(9)
   // Only a yes runs it.
   await ui.press({ key: 'folder-anywhere' })
   await ui.press({ key: 'anywhere-yes' })
-  expect(after(w).slice(4)).toEqual([['folders', 'work-2', '--anywhere'], ['status', '--json']])
+  expect(after(w).slice(9)).toEqual([['folders', 'work-2', '--anywhere', '--dry-run', '--json'],
+    ['folders', 'work-2', '--anywhere'], ['status', '--json']])
   expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove all folder limits: work-2'))).toBe(true)
   await ui.unmount()
 })
@@ -1292,7 +1418,9 @@ both('an account kept out of every folder: its line says so, its page names who 
     + 'here (or / is removed from theirs).')
   await ui.input({ key: 'folder-path', text: '~/code' })
   await ui.press({ key: 'folder-add' })
-  expect(after(w)).toEqual([['folders', 'spare-5', '--add', '~/code'], ['status', '--json']])
+  await ui.press({ key: 'folders-yes' })
+  expect(after(w)).toEqual([['folders', 'spare-5', '--add', '~/code', '--dry-run', '--json'],
+    ['folders', 'spare-5', '--add', '~/code'], ['status', '--json']])
   // Kept out by one: worded for one.
   w.status = done(JSON.stringify({ ...STATUS, accounts: [keeper('personal-1'), { ...spare, kept_out_by: ['personal-1'] }] }))
   await ui.press({ key: 'signin-spare-5' })
@@ -1306,6 +1434,7 @@ both('an account kept out of every folder: its line says so, its page names who 
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-remove-0', 'folder-add',
     'folder-anywhere', 'fallback', 'back'])
   await ui.press({ key: 'folder-remove-0' })
+  await ui.press({ key: 'folders-yes' })
   expect(after(w).slice(-2)).toEqual([['folders', 'personal-1', '--remove', '/'], ['status', '--json']])
   await ui.unmount()
 })
@@ -1319,27 +1448,37 @@ both('a folders field that is not a list: the page says so, offers Remove all fo
   expect(await buttons(ui)).toEqual(['signin-spare-3', 'remove-spare-3', 'folder-anywhere', 'fallback', 'back'])
   expect(await ui.find({ key: 'folder-path' })).toBeUndefined()
   await ui.press({ key: 'folder-anywhere' })
-  expect(after(w)).toEqual([])
+  expect(after(w)).toEqual([['folders', 'spare-3', '--anywhere', '--dry-run', '--json']])
   expect(await texts(ui)).toContain("Drop spare-3's repositories field? It is not a list of paths; spare-3 could then "
     + 'run in any folder no other account reserves.')
   await ui.press({ key: 'anywhere-yes' })
-  expect(after(w)).toEqual([['folders', 'spare-3', '--anywhere'], ['status', '--json']])
+  expect(after(w).slice(1)).toEqual([['folders', 'spare-3', '--anywhere'], ['status', '--json']])
   await ui.unmount()
 })
 
-both('a folders run that is refused shows why; a typed email is masked, and passed whole', async ($, on, surface) => {
+both('a folders change its dry run refuses shows why and asks nothing; a typed email is masked, and passed whole', async ($, on, surface) => {
   const w = world(on)
-  w.answer.folders = done('', 2, "longhaul ~/clients is not one of work-2's folders; it may be used only in ~/work\n")
+  const why = "~/clients is not one of work-2's folders; it may be used only in ~/work"
+  w.answer.folders = dryOr(() => ({ changes: [], notes: [], effects: [], stops: 0, problem: why }))
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-work-2')
   await ui.press({ key: 'folder-remove-1' })
   let all = await texts(ui)
   expect(all.some(t => t.startsWith('✘') && t.includes('Remove folder ~/clients: work-2'))).toBe(true)
-  expect(all).toContain("longhaul ~/clients is not one of work-2's folders; it may be used only in ~/work")
-  expect(await ui.find({ key: 'folder-remove-1' })).toBeDefined() // the rows read again, and the buttons back
-  w.answer.folders = done('Done.')
+  expect(all).toContain(why)
+  expect(await ui.find({ key: 'folders-yes' })).toBeUndefined()
+  expect(after(w)).toEqual([['folders', 'work-2', '--remove', '~/clients', '--dry-run', '--json']]) // nothing else ran
+  expect(await ui.find({ key: 'folder-remove-1' })).toBeDefined() // the buttons back
+  // A run the change itself refuses shows its words, as before.
+  w.answer.folders = dryOr(() => PREVIEW, done('', 2, `longhaul ${why}\n`))
+  await ui.press({ key: 'folder-remove-1' })
+  await ui.press({ key: 'folders-yes' })
+  expect(await texts(ui)).toContain(`longhaul ${why}`)
+  w.answer.folders = dryOr(() => PREVIEW)
   await ui.input({ key: 'folder-path', text: '/srv/first.last@example.com' })
   await ui.press({ key: 'folder-add' })
+  expect(await texts(ui)).toContain("Add /•••@example.com to work-2's folders?")
+  await ui.press({ key: 'folders-yes' })
   expect(after(w).slice(-2)).toEqual([['folders', 'work-2', '--add', '/srv/first.last@example.com'], ['status', '--json']])
   all = await texts(ui)
   expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /•••@example.com: work-2'))).toBe(true)

@@ -126,6 +126,18 @@ export type LonghaulAccountsResult = {
   ok: boolean | null; label: string; lines: string[]; after: string | null; page: LonghaulAccountsPage
 }
 
+// What a dry run said a change would do (the UX review's M4), for the
+// question that asks before it runs: the account; which change (delete:
+// its sign-in folder; add, remove, anywhere: its folders); the change's
+// own arguments, label and what the pane says while it runs; the folder
+// (add, remove); whether the typed folder is cleared once it worked; the
+// lines to show, emails masked; why it would refuse (delete); how many
+// chats it would stop; and, when the answer could not be read, why.
+export type LonghaulAccountsPreview = {
+  account: string; kind: 'delete' | 'add' | 'remove' | 'anywhere'; argv: string[]; label: string; doing: string
+  path: string | null; clears: boolean; lines: string[]; refused: string | null; stops: number; unread: string | null
+}
+
 // What the Add fields hold, and what was wrong with them.
 export type LonghaulAccountsForm = { name: string; email: string; only: string; problem: string | null }
 
@@ -178,6 +190,7 @@ declare module 'claude-code' {
       accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", "trouble", "activity", or none
       accountsTrouble: Shaped<LonghaulAccountsTrouble | null> // null: not looked yet, or looking again
       accountsActivity: Shaped<LonghaulAccountsActivity | null> // null: not read yet, or reading again
+      accountsPreview: Shaped<LonghaulAccountsPreview | null> // what the open question's dry run said
     }
   }
 }
