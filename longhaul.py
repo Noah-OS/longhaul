@@ -209,12 +209,15 @@ Usage:
                           it writes ~/.local/bin/longhaul, a launcher that runs
                           the newest Longhaul Claude Code has installed; run
                           from a checkout of your own, it links there instead
-  longhaul status [--json]      accounts, sign-ins, limits, links; --json: the
+  longhaul status [--json [--no-check]]
+                          accounts, sign-ins, limits, links; --json: the
                           accounts, their usage and this folder's as one JSON
                           object, emails masked (exit 2: accounts.json could
                           not be read), for the accounts screen, with the chat
                           it runs in and why that chat is on its account (the
-                          log's latest reason); it only reads
+                          log's latest reason); it only reads. --no-check: the
+                          same at once, with no sign-in checked (each null,
+                          and "checked": false), for the screen to draw first
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
                           the status line, the VS Code panel, the accounts, the
@@ -17248,7 +17251,10 @@ def preferred_lines(acct: dict, accounts: list[dict]) -> list[str]:
 
 def status(opts) -> int:
     if getattr(opts, "json", False):
-        return status_json()
+        return status_json(check=not getattr(opts, "no_check", False))
+    if getattr(opts, "no_check", False):  # plain status always checks: a flag that did nothing would mislead
+        print("longhaul status: --no-check goes with --json", file=sys.stderr)
+        return 2
     state = load_state()
     now = time.time()
     accounts, problem = load_accounts()
@@ -17410,7 +17416,8 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
                    accounts: list[dict], allowed_here: list | None = None) -> dict:
     """One account's entry in the screen's object, from its auth_status()
     answer `a`. A check that could not say leaves signed_in and as_expected
-    null, never false: that is not "signed out". As expected is what
+    null, never false: that is not "signed out"; one not run (NOT_CHECKED,
+    status --json --no-check) too, with check_failed null. As expected is what
     signed_in_as_expected() lets run: any sign-in for an entry with no
     email, else that email, in any case. sign_in_failed_at is from
     SIGN_IN_FAILED's entries (`failed`), while still news (sign_in_failed_at()).
@@ -17450,7 +17457,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "email": masked_email(acct.get("email")),
         "signed_in": signed_in,
         "as_expected": as_expected,
-        "check_failed": str(a.get("why")) if unknown else None,
+        "check_failed": str(a["why"]) if unknown and a.get("why") is not None else None,
         "sign_in_failed_at": sign_in_failed_at(failed.get(acct["name"]), reading),
         "plan": plan if signed_in and isinstance(plan, str) else None,
         "limited_until": until if limited else None,
@@ -17498,9 +17505,18 @@ def chat_line_of(sid, config_dir, now: float) -> str:
                         "update": release_word()})
 
 
-def status_json() -> int:
+# What status_account() is given for a sign-in not checked: as a check that
+# could not say, with no reason, as none ran.
+NOT_CHECKED = {"unknown": True, "why": None}
+
+
+def status_json(check: bool = True) -> int:
     """`longhaul status --json`: the screen's object alone on stdout; exit 2
-    when accounts.json cannot be read, the rest still said, as status does."""
+    when accounts.json cannot be read, the rest still said, as status does.
+    check False is --no-check (the UX review's M7): no claude runs, so it
+    answers at once, and the screen draws its rows from it while the full
+    one checks each sign-in, which may take AUTH_TIMEOUT. "checked" says
+    which it is."""
     state = load_state()
     now = time.time()
     accounts, problem = load_accounts()
@@ -17521,8 +17537,9 @@ def status_json() -> int:
             here = {"folder": home_path(top), "may_use": allowed_here}
         except OSError:  # the folder it runs in was removed: no "here" to say
             pass
+    checks = status_checks(accounts) if check else [NOT_CHECKED] * len(accounts)
     rows = [status_account(acct, a, state, now, i == ours, failed, accounts, allowed_here)
-            for i, (acct, a) in enumerate(zip(accounts, status_checks(accounts)))]
+            for i, (acct, a) in enumerate(zip(accounts, checks))]
     try:
         mode, mode_problem = switch_mode(), None
     except ValueError as e:
@@ -17533,12 +17550,14 @@ def status_json() -> int:
     # panel_paused: `longhaul panel pause` in force (panel_mid_session()), for
     # the Troubleshoot page's Pause or Resume. chat: the chat this runs in,
     # and why it runs on its account (chat_why()). line: its status line (chat_line()).
+    # checked: false for --no-check, whose sign-ins were not checked (M7).
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
              "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None,
              "chat": chat_why(os.environ.get("CLAUDE_CODE_SESSION_ID"), accounts[ours]["name"] if ours is not None
                               else None),
-             "line": chat_line(os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CLAUDE_CONFIG_DIR"), now)}
+             "line": chat_line(os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CLAUDE_CONFIG_DIR"), now),
+             "checked": check}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped
@@ -20399,6 +20418,8 @@ def main(argv: list[str]) -> int:
         if cmd == "status":
             p.add_argument("--json", action="store_true",
                            help="the same as one JSON object, emails masked, for the accounts screen; it only reads")
+            p.add_argument("--no-check", action="store_true",
+                           help="with --json: at once, with no sign-in checked (signed_in null, \"checked\": false)")
         if cmd == "checkpoint":
             p.add_argument("action", nargs="?", choices=["save"], help="save: the state on stdin (default: the hook)")
             p.add_argument("session", nargs="?",

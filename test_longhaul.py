@@ -25062,7 +25062,7 @@ class StatusJson(unittest.TestCase):
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
                     "preferred", "use_here", "reading_at"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
-            "chat", "line"}
+            "chat", "line", "checked"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -25205,12 +25205,12 @@ class StatusJson(unittest.TestCase):
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
             "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None,
-            "chat": None, "line": "default sign-in · no usage reading yet"})
+            "chat": None, "line": "default sign-in · no usage reading yet", "checked": True})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
-                                       "vscode", "panel_paused", "problem", "chat", "line"],
+                                       "vscode", "panel_paused", "problem", "chat", "line", "checked"],
                          "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17), "
-                         "chat (M1), then line (M3)")
-        self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
+                         "chat (M1), then line (M3), then checked (M7)")
+        self.assertIn("longhaul status [--json [--no-check]]", longhaul.__doc__, "the Usage block names it")
 
     def test_emails_are_masked_and_never_shown_whole(self):
         # The screen tells the accounts apart; it never shows who they are.
@@ -25270,6 +25270,95 @@ class StatusJson(unittest.TestCase):
         found = self.read(self.status(FAKE_AUTH_HANG="1", LONGHAUL_AUTH_TIMEOUT="2"))
         self.assertLess(time.monotonic() - start, 6, "in parallel: one after another would take 8 s")
         self.assertEqual([a["check_failed"] for a in found["accounts"]], ["no answer in 2s"] * 4)
+
+    # M7 (the UX review of 2026-11-11): `status --json --no-check` is the
+    # same object at once, with no sign-in checked, for the pane to draw its
+    # rows before the checks, which may take AUTH_TIMEOUT, come back.
+
+    SIGN_IN = {"signed_in", "as_expected", "check_failed", "plan", "use_here"}  # what only the check tells
+
+    def recording_claude(self) -> Path:
+        """A claude that leaves a line in claude-ran at each run, then
+        answers as the stand-in does; the file it writes, returned."""
+        ran, claude = self.tmp / "claude-ran", self.tmp / "claude-bin"
+        claude.write_text(f'#!/bin/sh\necho "$1 $2" >> "{ran}"\nexec "{sys.executable}" "{HERE / "fake_stream.py"}" "$@"\n')
+        claude.chmod(0o755)
+        return ran
+
+    def quick(self, cwd=None, **extra_env):
+        return self.longhaul("status", "--json", "--no-check", cwd=cwd, **extra_env)
+
+    def test_no_check_is_the_same_object_with_no_sign_in_checked_and_runs_no_claude(self):
+        now, sid = time.time(), "5ca8a797-1111-4222-8333-444455556666"
+        (self.tmp / "work").mkdir()
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1")), "email": "first@example.com"},
+                            {"name": "out", "config_dir": str(self.folder("out")), "email": "out@example.com"},
+                            {"name": "wrong", "config_dir": str(self.folder("wrong")), "email": "wrong@example.com",
+                             "fallback": True},
+                            {"name": "work", "config_dir": str(self.folder("work")), "repositories": ["~/work"]},
+                            {"name": "odd", "config_dir": 5})
+        self.emails = {str(self.folder("p1")): "first@example.com", str(self.folder("wrong")): "stranger@example.com",
+                       str(self.folder("work")): "work@example.com"}
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"work": now + 3600}}))
+        (self.home / "usage").mkdir()
+        (self.home / "usage" / "personal-1.json").write_text(json.dumps({
+            "at": now - 60, "five_hour": {"used_percentage": 40, "resets_at": int(now + 3600)}}))
+        (self.home / longhaul.SIGN_IN_FAILED).write_text(json.dumps({"wrong": int(now) - 600}))
+        ran = self.recording_claude()
+        chat = {"CLAUDE_CONFIG_DIR": str(self.folder("p1")), "CLAUDE_CODE_SESSION_ID": sid,
+                "LONGHAUL_CLAUDE_BIN": str(self.tmp / "claude-bin")}
+        before = self.files()
+        start = time.monotonic()
+        quick = self.read(self.quick(FAKE_AUTH_HANG="1", **chat))
+        self.assertLess(time.monotonic() - start, 15, "no check waited on: a hung one would take 20 s")
+        self.assertFalse(ran.exists(), "no claude ran")
+        self.assertEqual(self.files(), before, "it only reads")
+        full = self.read(self.status(**chat))
+        self.assertEqual(len(ran.read_text().splitlines()), 4, "the full one checks each account with a folder")
+        self.assertEqual((quick["checked"], full["checked"]), (False, True))
+        self.assertEqual({k: v for k, v in quick.items() if k not in ("accounts", "checked")},
+                         {k: v for k, v in full.items() if k not in ("accounts", "checked")}, "the rest is the same")
+        self.assertEqual([a["name"] for a in quick["accounts"]], ["personal-1", "out", "wrong", "work", "odd"])
+        for q, f in zip(quick["accounts"], full["accounts"]):
+            with self.subTest(q["name"]):
+                self.assertEqual({k: v for k, v in q.items() if k not in self.SIGN_IN},
+                                 {k: v for k, v in f.items() if k not in self.SIGN_IN})
+                # As for a check that could not say, which is never "signed out", with no reason: none ran.
+                self.assertEqual((q["signed_in"], q["as_expected"], q["check_failed"], q["plan"]),
+                                 (None, None, None, None))
+        # use_here trusts a sign-in not checked, as `longhaul use` trusts one that could not be.
+        self.assertEqual({a["name"]: a["use_here"] for a in full["accounts"]},
+                         {"personal-1": "this_chat", "out": "not_signed_in", "wrong": "not_signed_in",
+                          "work": "not_allowed", "odd": "ok"})
+        self.assertEqual({a["name"]: a["use_here"] for a in quick["accounts"]},
+                         {"personal-1": "this_chat", "out": "ok", "wrong": "ok", "work": "not_allowed", "odd": "ok"})
+        self.assertEqual(self.by_name(quick)["wrong"]["sign_in_failed_at"], int(now) - 600, "from the files: still said")
+        self.assertEqual(self.by_name(quick)["work"]["limited_until"], now + 3600)
+        self.assertEqual(self.by_name(quick)["personal-1"]["five_hour"], {"used": 40, "resets_at": int(now + 3600)})
+
+    def test_no_check_says_an_accounts_file_that_cannot_be_read_with_exit_2_as_the_full_one(self):
+        path, ran = self.home / "accounts.json", self.recording_claude()
+        for case, text in unreadable_accounts({"name": "personal-1", "email": "first@example.com"}).items():
+            with self.subTest(case):
+                path.write_text(text)
+                found = self.read(self.quick(LONGHAUL_CLAUDE_BIN=str(self.tmp / "claude-bin")), code=2)
+                full = self.read(self.status(), code=2)
+                self.assertEqual({**found, "checked": True}, full)
+                self.assertIs(found["checked"], False)
+        self.assertFalse(ran.exists())
+
+    def test_no_check_goes_with_json_and_plain_status_is_unchanged(self):
+        self.write_accounts({"name": "personal-1", "config_dir": str(self.folder("p1")), "email": "first@example.com"})
+        self.emails = {str(self.folder("p1")): "first@example.com"}
+        ran = self.recording_claude()
+        out = self.longhaul("status", "--no-check", LONGHAUL_CLAUDE_BIN=str(self.tmp / "claude-bin"))
+        self.assertEqual((out.returncode, out.stdout), (2, ""))
+        self.assertIn("--no-check goes with --json", out.stderr)
+        self.assertFalse(ran.exists(), "refused before any check")
+        out = self.longhaul("status", LONGHAUL_CLAUDE_BIN=str(self.tmp / "claude-bin"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertRegex(out.stdout, r"personal-1 +first@example\.com \(max\)")
+        self.assertIn("auth status", ran.read_text().splitlines(), "plain status checks, as before")
 
     def test_a_limit_and_a_usage_window_only_while_still_ahead(self):
         now = time.time()
