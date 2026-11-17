@@ -36,9 +36,10 @@ longhaul runs `claude` in this terminal with Remote Control on and watches it:
   (LONGHAUL_HOME/waits/<chat>.json) goes only to a chat idle since its
   limit: when Claude Code's own wait or you carried on first, nothing is
   sent. The relay stays in each panel chat for this, in every mode;
-  "switch_mid_session": false in LONGHAUL_HOME/vscode.json turns it off,
-  and the panel then runs Claude alone: no question, no carry-on, no
-  move. `longhaul pipe` cannot ask, so there "ask" acts as "never": it
+  `longhaul panel pause` ("switch_mid_session": false in
+  LONGHAUL_HOME/vscode.json) turns it off, and the panel then runs Claude
+  alone: no question, no carry-on, no move; `longhaul panel resume` turns
+  it back on. `longhaul pipe` cannot ask, so there "ask" acts as "never": it
   moves only in auto (an unattended move is never made without an
   explicit yes).
   In "ask" this terminal never moves early (to ask it would close Claude);
@@ -177,8 +178,14 @@ Usage:
                           limit, and to carry on once, a minute after a turn
                           stopped on an API server error while nothing else
                           happened in the chat (LONGHAUL_API_RETRY=off: not);
-                          "switch_mid_session": false in
-                          ~/.longhaul/vscode.json runs Claude alone there
+                          `longhaul panel pause` runs Claude alone there
+  longhaul panel [status|pause|resume]
+                          whether Longhaul stays in the VS Code panel's chats
+                          (status, the default); pause: Claude runs alone in
+                          them, with no question, carry-on or move at a limit
+                          ("switch_mid_session": false in ~/.longhaul/
+                          vscode.json, its other keys kept); resume: Longhaul
+                          again. A change counts for the chats opened after it
   longhaul setup [NAME] [--relogin]
                           sign each account in to its own folder (a browser
                           sign-in; --relogin: again, even if signed in); only
@@ -12820,8 +12827,9 @@ def trace(direction: str, pid, line: bytes, note: str = "") -> None:
 
 def vscode_config() -> dict:
     """{"switch_mid_session": bool, "switch": "ask"|"auto"|"never"}, the
-    user's own file (longhaul only reads it); {} when it is not there or
-    not an object. switch_mid_session: see panel_mid_session(). switch:
+    user's own file, which `longhaul panel pause|resume` writes too, its
+    other keys kept (panel_cmd()); {} when it is not there or not an
+    object. switch_mid_session: see panel_mid_session(). switch:
     the panel's switching, after LONGHAUL_SWITCH in the wrapper's
     environment and before config.json's (panel_switch_mode())."""
     found = read_json(VSCODE_CONFIG)
@@ -12849,7 +12857,7 @@ def panel_mid_session() -> bool:
 
 # What status, `longhaul switch` and the doctor say of a panel with the relay off.
 PANEL_ALONE = ('The VS Code panel runs Claude alone ("switch_mid_session": false in {file}): at a limit there is '
-               "no question, no carry-on and no move.")
+               "no question, no carry-on and no move. `longhaul panel resume` turns Longhaul back on there.")
 
 
 def panel_mid_session_odd() -> str:
@@ -12861,6 +12869,100 @@ def panel_mid_session_odd() -> str:
         return ""
     return (f"{json.dumps(found['switch_mid_session'])} for switch_mid_session in {home_path(str(VSCODE_CONFIG))} "
             "is not true or false, so it is on, the default")
+
+
+# `longhaul panel [status|pause|resume]` (the UX review of 2026-11-11, 2.4
+# and M2): before it, turning Longhaul's part in the panel's chats off meant
+# writing vscode.json by hand ("your file: make it if it is not there"),
+# and the owner uninstalled for want of a middle step. It writes the one
+# key panel_mid_session() reads, the file's other keys kept in their order.
+PANEL_COUNTS = "A change counts for the chats opened after it; a chat open now keeps what it started with."
+
+
+def panel_file():
+    """(vscode.json as an object, None) for panel_cmd(): {} when it is not
+    there; or (None, what is wrong with it), in a few words, a JSON error
+    with its line and column, never the text."""
+    raw = repair_raw(VSCODE_CONFIG)
+    if raw is None:
+        if not os.path.lexists(VSCODE_CONFIG):
+            return {}, None
+        try:
+            VSCODE_CONFIG.read_bytes()
+        except OSError as e:
+            return None, f"not readable ({e.strerror or e})"
+        return None, "not readable"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not UTF-8 text"
+    found, problem = repair_json(text)
+    if problem:
+        return None, problem
+    return (found, None) if isinstance(found, dict) else (None, "not a JSON object")
+
+
+def panel_cmd(opts) -> int:
+    """`longhaul panel [status|pause|resume]`: status (the default) says
+    whether Longhaul stays in the VS Code panel's chats, and only reads;
+    pause sets "switch_mid_session" false in vscode.json, resume sets it
+    true, each under a lock, written whole (write_json(): 0600) with every
+    other key kept, and one log line per change; a word that changes
+    nothing writes and logs nothing (resume with no file makes none). A
+    file that does not parse is named with its error and left as it is,
+    exit 1. Read when a panel chat starts, so a change counts for the
+    chats opened after it."""
+    file = home_path(str(VSCODE_CONFIG))
+    if opts.action == "status":
+        found, problem = panel_file()
+        if not panel_mid_session():
+            print(f'Panel chats: paused ("switch_mid_session": false in {file}). Claude runs alone in each VS Code '
+                  "panel chat: at a limit there is no question, no carry-on and no move; `longhaul panel resume` "
+                  f"turns Longhaul back on. {PANEL_COUNTS}")
+            return 0
+        odd = f"{file} is {problem}, so none of its keys count" if problem else panel_mid_session_odd()
+        print(f"Panel chats: on{f' ({odd})' if odd else ''}. Longhaul stays in each VS Code panel chat to ask, carry "
+              f"on and move at a limit; `longhaul panel pause` stops that. {PANEL_COUNTS}")
+        return 0
+    pause = opts.action == "pause"
+
+    def unchanged(found, problem):
+        """What to say when this word changes nothing, with its exit code; else None."""
+        if problem:
+            return (f"{file} is {problem}, so it was left as it is: fix it or remove it, then run `longhaul panel "
+                    f"{opts.action}` again.", 1)
+        value = found.get("switch_mid_session")
+        if pause and value is False:
+            return (f'Already paused: "switch_mid_session" is false in {file}, so nothing changed. `longhaul panel '
+                    'resume` turns Longhaul back on in panel chats.', 0)
+        if not pause and (value is True or "switch_mid_session" not in found):
+            return "Not paused: Longhaul stays in VS Code panel chats already, so nothing changed.", 0
+        return None
+    # Read first with no lock, so a word that changes nothing makes nothing,
+    # not even the lock file or LONGHAUL_HOME; then again under the lock.
+    said = unchanged(*panel_file())
+    if said is None:
+        with locked("vscode-config"):
+            found, problem = panel_file()
+            said = unchanged(found, problem)
+            if said is None:
+                found["switch_mid_session"] = not pause  # in its place when the key is there, else last
+                write_json(VSCODE_CONFIG, found)
+    if said is not None:
+        print(said[0])
+        return said[1]
+    word = "false" if pause else "true"
+    log(f"panel {'paused' if pause else 'resumed'}: switch_mid_session {word} in {file}, for the panel chats opened "
+        "from now on")
+    if pause:
+        print(f'Paused: Claude runs alone in the VS Code panel chats opened from now on ("switch_mid_session": false '
+              f"in {file}, its other keys kept): at a limit there is no question, no carry-on and no move. A chat "
+              "open now keeps Longhaul until it is closed and opened again. `longhaul panel resume` turns it back on.")
+    else:
+        print(f"Resumed: Longhaul stays in the VS Code panel chats opened from now on, to ask, carry on and move at a "
+              f'limit ("switch_mid_session": true in {file}, its other keys kept). A chat open now runs Claude alone '
+              "until it is closed and opened again.")
+    return 0
 
 
 def panel_switch_source() -> tuple:
@@ -16596,8 +16698,7 @@ def status(opts) -> int:
         odd = panel_mid_session_odd()
         tail = (f"The VS Code panel stays in each chat{f' ({odd})' if odd else ''}: at a limit it asks in ask, moves "
                 f"by itself in auto, and carries on after the reset in never; it is {shown}, unless VS Code was "
-                f'started with LONGHAUL_SWITCH set. "switch_mid_session": false in {home_path(str(VSCODE_CONFIG))} '
-                "turns that off.")
+                "started with LONGHAUL_SWITCH set. `longhaul panel pause` turns that off.")
     print(f"Switching: {mode} ({source}): {SWITCH_MODES[mode]}. Change it with `longhaul switch ask|auto|never`, "
           f"--switch or LONGHAUL_SWITCH. {tail} longhaul pipe moves a session only when its driver passes --swap and the mode "
           "there is auto. A conversation resumed by id starts on the account it last ran on in ask and never; "
@@ -17897,11 +17998,12 @@ def doctor_vscode() -> dict:
     said, file = f"through Longhaul ({home_path(path)})", home_path(str(VSCODE_CONFIG))
     if not panel_mid_session():  # the user's own choice: said, not judged
         return doctor_result(f"{said}; Claude runs alone in its chats (switch_mid_session is false in {file}): at "
-                             "a limit there is no question, no carry-on and no move")
+                             "a limit there is no question, no carry-on and no move; `longhaul panel resume` turns "
+                             "Longhaul back on")
     odd = panel_mid_session_odd()
     if odd:
         return doctor_result(f"{said}, which stays in each chat to ask and carry on at a limit ({odd})", mark="warn",
-                             step=f"set switch_mid_session to true or false in {file}, or remove it")
+                             step="`longhaul panel resume` sets it to true, or `longhaul panel pause` to false")
     return doctor_result(f"{said}, which stays in each chat to ask and carry on at a limit")
 
 
@@ -19266,7 +19368,7 @@ def main(argv: list[str]) -> int:
                             "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow", "switch", "answer", "use", "repair"):
+                            "models-hook", "allow", "switch", "answer", "use", "repair", "panel"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -19390,6 +19492,11 @@ def main(argv: list[str]) -> int:
             p.add_argument("--yes", action="store_true",
                            help="on: change VS Code's settings without asking, a program of your own in the setting "
                                 "replaced too (needed without a terminal)")
+        if cmd == "panel":
+            p.add_argument("action", nargs="?", choices=["status", "pause", "resume"], default="status",
+                           help="status (the default): whether Longhaul stays in the VS Code panel's chats; pause: "
+                                "Claude runs alone there, with no question, carry-on or move at a limit; resume: "
+                                "Longhaul again. Each counts for the chats opened after it")
         if cmd == "uninstall":
             p.add_argument("--dry-run", action="store_true", help="list what it would remove, and remove nothing")
             p.add_argument("--purge", action="store_true",
@@ -19435,7 +19542,8 @@ def main(argv: list[str]) -> int:
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
-                "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd, "repair": repair}[cmd](opts)
+                "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd, "repair": repair,
+                "panel": panel_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

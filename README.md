@@ -145,19 +145,15 @@ A chat you reopen (after a VS Code reload, or with its tab reopened) on an accou
 
 With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:01 on Pro` (a minute after the reset, to be safe).
 
-Longhaul stays in each panel chat in every mode. To turn that off, put this key in `~/.longhaul/vscode.json` (your file: make it if it is not there; Longhaul only reads it). The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. It counts for the chats you open after it.
+Longhaul stays in each panel chat in every mode. To turn that off, run `longhaul panel pause` in a terminal. The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. `longhaul panel resume` turns Longhaul back on, and `longhaul panel` says which is in force. Each counts for the chats you open after it. Both write `"switch_mid_session"` in `~/.longhaul/vscode.json` and keep the file's other keys.
 
-```
-{"switch_mid_session": false}
-```
-
-A `"switch"` key in the same file gives the panel a mode of its own; `/accounts`, then `Settings`, says so.
+A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own; `/accounts`, then `Settings`, says so.
 
 **Keep a folder for one account:** `longhaul add work you@example.com --repo ~/work` uses that account only in `~/work` and the repositories inside it, and keeps the folder for it: a chat there on another account is refused before anything is sent. When the account kept for a folder is at its limit, `longhaul` in a terminal asks whether to run the chat on another one; `longhaul allow <chat id>` lets one refused chat's prompts through on its account for 30 days.
 
 **Change an account's folders.** In `/accounts`, open the account: its Folders part lists them, each with **Remove**; type a folder and press **Add folder**, or press **Remove all folder limits…** to drop the list (it names the folders first and asks). In a terminal, `longhaul folders work` says where `work` may be used; `longhaul folders work --add ~/clients` adds a folder, `--remove ~/work` takes one off, and `--anywhere` drops the list. An account with no folders of its own is used only where no other account's folders reach: beside an account whose folders include `/`, it is used nowhere until it has folders of its own, and `/accounts`, `longhaul status` and `longhaul folders` say so.
 
-**Choose the account for one chat.** `longhaul use work --chat <chat id>` runs that chat on `work` from now on (a short id works when only one chat starts with it; run from inside a chat, `longhaul use work` needs no `--chat`). A chat in the VS Code panel moves the next time Claude is idle in it, with a line in the chat saying so; any other chat (closed, in a terminal, or with `"switch_mid_session": false`) starts on `work` when it is next opened, and the command says which. It refuses an account not allowed in the chat's folder, one at its usage limit, or one not signed in as expected. A choice is no lock: at a usage limit the switching mode decides, as for any chat.
+**Choose the account for one chat.** `longhaul use work --chat <chat id>` runs that chat on `work` from now on (a short id works when only one chat starts with it; run from inside a chat, `longhaul use work` needs no `--chat`). A chat in the VS Code panel moves the next time Claude is idle in it, with a line in the chat saying so; any other chat (closed, in a terminal, or with Longhaul paused in panel chats) starts on `work` when it is next opened, and the command says which. It refuses an account not allowed in the chat's folder, one at its usage limit, or one not signed in as expected. A choice is no lock: at a usage limit the switching mode decides, as for any chat.
 
 **Prefer an account in a folder.** `longhaul folders work --prefer ~/clients` makes `work` the first choice for a new chat in `~/clients` or a folder inside it, and for a chat there that moves at a usage limit, while `work` has room (the deepest preferred folder wins); `--no-prefer ~/clients` takes it off, and `longhaul folders work` and `longhaul status` show it. When `work` is at its limit, nearly full, or not signed in, the usual rules pick. A reopened chat goes back to the account it ran on; `longhaul use` moves that one. A folder `work` may not be used in is refused, with why.
 

@@ -654,7 +654,7 @@ class Loop(unittest.TestCase):
         # The owner's decision 3, 2026-10-31: the panel's relay is in every chat by default.
         self.assertIn("The VS Code panel stays in each chat: at a limit it asks in ask, moves by itself in auto, and "
                       "carries on after the reset in never; it is ask (the default), unless VS Code was started with "
-                      'LONGHAUL_SWITCH set. "switch_mid_session": false in ', last)
+                      "LONGHAUL_SWITCH set. `longhaul panel pause` turns that off.", last)
         self.assertNotIn("never moves a chat", last)
         # Sprint 5, D3d: a resume by id is a move too.
         self.assertIn("A conversation resumed by id starts on the account it last ran on in ask and never", last)
@@ -26647,7 +26647,156 @@ class Repair(unittest.TestCase):
         self.assertIn("longhaul repair [--dry-run] [--yes] [--json] [--fix ID]", longhaul.__doc__)
 
 
+class PanelPause(unittest.TestCase):
+    """`longhaul panel [status|pause|resume]` (the UX review of 2026-11-11,
+    2.4 and M2): Longhaul's part in the VS Code panel's chats turned off
+    and on again without writing vscode.json by hand. pause sets
+    "switch_mid_session" false, resume true, every other key kept; written
+    whole, 0600, one log line per change. A file that does not parse is
+    named with its error and left as it is. Every path is scratch."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.user, self.home = self.tmp / "user", self.tmp / "home"
+        self.user.mkdir()
+        self.file = self.home / "vscode.json"
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.user, "VSCODE_CONFIG": self.file}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"LONGHAUL_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.shown = longhaul.home_path(str(self.file))
+
+    def run_cli(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = longhaul.main(["panel", *args])
+        return code, out.getvalue()
+
+    def log(self):
+        path = self.home / "longhaul.log"
+        return path.read_text() if path.exists() else ""
+
+    def mine(self, text):
+        self.home.mkdir(exist_ok=True)
+        self.file.write_text(text)
+        os.chmod(self.file, 0o644)
+
+    def on_said(self):
+        return ("Panel chats: on. Longhaul stays in each VS Code panel chat to ask, carry on and move at a limit; "
+                "`longhaul panel pause` stops that. A change counts for the chats opened after it; a chat open now "
+                "keeps what it started with.\n")
+
+    def paused_said(self):
+        return (f'Panel chats: paused ("switch_mid_session": false in {self.shown}). Claude runs alone in each VS '
+                "Code panel chat: at a limit there is no question, no carry-on and no move; `longhaul panel resume` "
+                "turns Longhaul back on. A change counts for the chats opened after it; a chat open now keeps what it "
+                "started with.\n")
+
+    def test_status_is_the_default_says_on_and_writes_nothing(self):
+        for args in ((), ("status",)):
+            self.assertEqual(self.run_cli(*args), (0, self.on_said()), args)
+        self.assertFalse(self.home.exists(), "nothing made, not even the log")
+        self.mine('{"switch_mid_session": false}')
+        self.assertEqual(self.run_cli(), (0, self.paused_said()))
+        self.assertEqual(self.log(), "")
+
+    def test_pause_then_resume_keep_every_other_key_write_0600_whole_and_log_one_line_each(self):
+        self.mine('{\n  "switch": "auto",\n  "switch_mid_session": true,\n  "mine": [1, {"a": null}]\n}\n')
+        inode = self.file.stat().st_ino
+        code, out = self.run_cli("pause")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, f'Paused: Claude runs alone in the VS Code panel chats opened from now on ("switch_mid_'
+                              f'session": false in {self.shown}, its other keys kept): at a limit there is no question, '
+                              "no carry-on and no move. A chat open now keeps Longhaul until it is closed and opened "
+                              "again. `longhaul panel resume` turns it back on.\n")
+        found = json.loads(self.file.read_text())
+        self.assertEqual(list(found.items()), [("switch", "auto"), ("switch_mid_session", False),
+                                               ("mine", [1, {"a": None}])], "the keys and their order kept")
+        self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
+        self.assertNotEqual(self.file.stat().st_ino, inode, "a new file put in its place, never written in place")
+        self.assertEqual(sorted(p.name for p in self.home.iterdir() if not p.name.startswith(".") or
+                                p.name.endswith(".tmp")), ["longhaul.log", "vscode.json"], "no temporary file left")
+        self.assertFalse(longhaul.panel_mid_session())
+        self.assertEqual(longhaul.panel_switch_source(), ("auto", "vscode"), "the panel's own mode kept")
+        self.assertEqual(self.log().count("panel paused: "), 1, self.log())
+        self.assertIn(f"panel paused: switch_mid_session false in {self.shown}, for the panel chats opened from now on",
+                      self.log())
+        self.assertEqual(self.run_cli(), (0, self.paused_said()))
+        # Again: nothing to change, nothing written or logged.
+        before = (self.file.read_bytes(), self.file.stat().st_mtime_ns, self.log())
+        self.assertEqual(self.run_cli("pause"), (0, f'Already paused: "switch_mid_session" is false in {self.shown}, '
+                                                    "so nothing changed. `longhaul panel resume` turns Longhaul back "
+                                                    "on in panel chats.\n"))
+        self.assertEqual((self.file.read_bytes(), self.file.stat().st_mtime_ns, self.log()), before)
+        code, out = self.run_cli("resume")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, f"Resumed: Longhaul stays in the VS Code panel chats opened from now on, to ask, carry on "
+                              f'and move at a limit ("switch_mid_session": true in {self.shown}, its other keys kept). '
+                              "A chat open now runs Claude alone until it is closed and opened again.\n")
+        self.assertEqual(list(json.loads(self.file.read_text()).items()),
+                         [("switch", "auto"), ("switch_mid_session", True), ("mine", [1, {"a": None}])])
+        self.assertTrue(longhaul.panel_mid_session())
+        self.assertIn(f"panel resumed: switch_mid_session true in {self.shown}, for the panel chats opened from now on",
+                      self.log())
+        self.assertEqual(len([l for l in self.log().splitlines() if "panel paused: " in l or "panel resumed: " in l]),
+                         2, "one line per change")
+        before = (self.file.read_bytes(), self.log())
+        self.assertEqual(self.run_cli("resume"), (0, "Not paused: Longhaul stays in VS Code panel chats already, so "
+                                                     "nothing changed.\n"))
+        self.assertEqual((self.file.read_bytes(), self.log()), before)
+        self.assertEqual(self.run_cli(), (0, self.on_said()))
+
+    def test_pause_with_no_file_makes_one_and_resume_with_none_makes_nothing(self):
+        self.assertEqual(self.run_cli("resume")[0], 0)
+        self.assertFalse(self.file.exists(), "on already: no file made for it")
+        code, out = self.run_cli("pause")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.file.read_text()), {"switch_mid_session": False})
+        self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
+
+    def test_a_value_neither_true_nor_false_is_on_and_each_word_sets_it(self):
+        self.mine('{"switch_mid_session": "false", "switch": "never"}')
+        code, out = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith(f'Panel chats: on ("false" for switch_mid_session in {self.shown} is not true '
+                                       "or false, so it is on, the default). Longhaul stays"), out)
+        self.assertEqual(self.run_cli("resume")[0], 0)
+        self.assertEqual(json.loads(self.file.read_text()), {"switch_mid_session": True, "switch": "never"})
+        self.mine('{"switch_mid_session": 0}')
+        self.assertEqual(self.run_cli("pause")[0], 0)
+        self.assertEqual(json.loads(self.file.read_text()), {"switch_mid_session": False})
+
+    def test_a_file_that_does_not_parse_is_named_with_its_error_and_left_as_it_is(self):
+        for text, why in (('{"switch": ', "not JSON (Expecting value at line 1 column 12)"),
+                          ("[false]", "not a JSON object"), (b"\xff{}", "not UTF-8 text")):
+            for word in ("pause", "resume"):
+                with self.subTest(text=text, word=word):
+                    self.home.mkdir(exist_ok=True)
+                    self.file.write_bytes(text) if isinstance(text, bytes) else self.file.write_text(text)
+                    before = sorted((p.name, p.read_bytes()) for p in self.home.iterdir())
+                    code, out = self.run_cli(word)
+                    self.assertEqual((code, out), (1, f"{self.shown} is {why}, so it was left as it is: fix it or "
+                                                      f"remove it, then run `longhaul panel {word}` again.\n"))
+                    self.assertEqual(sorted((p.name, p.read_bytes()) for p in self.home.iterdir()), before,
+                                     "nothing written, not even the log")
+            code, out = self.run_cli("status")
+            self.assertEqual(code, 0, out)
+            self.assertTrue(out.startswith(f"Panel chats: on ({self.shown} is {why}, so none of its keys count). "), out)
+
+    def test_the_usage_block_the_doctor_and_switch_name_the_command_not_the_hand_edit(self):
+        self.assertIn("longhaul panel [status|pause|resume]", longhaul.__doc__)
+        self.assertNotIn('"switch_mid_session": false in\n                          ~/.longhaul/vscode.json runs',
+                         longhaul.__doc__)
+        self.assertIn("`longhaul panel resume`", longhaul.PANEL_ALONE)
+        self.mine('{"switch_mid_session": "no"}')
+        self.assertIn("`longhaul panel", longhaul.switch_panel_note() + longhaul.PANEL_ALONE)
+
+
 class Doctor(unittest.TestCase):
+
     """`longhaul doctor` and /longhaul:doctor (the owner's decision of
     2026-10-25, "Doctor + first-chat line"): people were lost, not knowing
     what was installed and what they had to do to get the benefit, and on
@@ -26971,12 +27120,13 @@ class Doctor(unittest.TestCase):
         c = longhaul.doctor_vscode()
         self.assertEqual(c["mark"], "ok")
         self.assertIn("Claude runs alone in its chats (switch_mid_session is false in ", c["said"])
-        self.assertIn("at a limit there is no question, no carry-on and no move", c["said"])
+        self.assertIn("at a limit there is no question, no carry-on and no move; `longhaul panel resume` turns "
+                      "Longhaul back on", c["said"])
         self.write(self.home / "vscode.json", '{"switch_mid_session": "no"}')
         c = longhaul.doctor_vscode()
         self.assertEqual(c["mark"], "warn")
         self.assertIn('("no" for switch_mid_session in ', c["said"])
-        self.assertIn("set switch_mid_session to true or false in ", c["step"])
+        self.assertEqual(c["step"], "`longhaul panel resume` sets it to true, or `longhaul panel pause` to false")
         (self.home / "vscode.json").unlink()
         self.write(self.vscode, json.dumps({longhaul.VSCODE_WRAPPER_KEY: str(self.tmp / "gone" / "longhaul-vscode")}))
         c = longhaul.doctor_vscode()
