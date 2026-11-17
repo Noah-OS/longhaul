@@ -77,6 +77,66 @@ async function update($: any, lh: string): Promise<string | undefined> {
   } catch { return undefined }
 }
 
+// One status line, everywhere (the UX review of 2026-11-11, 4.6 and M3):
+// longhaul.py's status_line() in TypeScript, the same state to the same line,
+//   <account>[ (event)] · 5h <n>%[ (<reset>)] · wk <n>% · ctx <n>k[ · update x]
+// the account first, at most one event, a window's reset only from 70% on,
+// the update word last. hooks/status-line.cases.ts holds the states and
+// their lines, and both test suites check each one. The state: account, as
+// shown; five and week, { used, resets (a time as clock() shows it) } or
+// null; ctx, the context in tokens, or null; event, null or { kind:
+// 'question' (to, and at for a carry-on at a reset), 'waiting' (at, on),
+// 'stopped' (until), 'refused' (where, by), 'pending' (to, when: 'turn' or
+// 'open') or 'moved' (from, at) }; update, a newer release, or null. An
+// event at a limit, a choice pending or a message stopped takes the place of
+// the numbers; one it cannot read, or of a kind it does not know, is none.
+const RESET_AT = 70 // % of a window from which its reset is shown
+export const DEFAULT_NAME = 'VS Code sign-in' // ~/.claude's own sign-in, "main" in the files (the review's Q11)
+
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+const text = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null)
+const halfUp = (v: number): number => Math.floor(v + 0.5) // as longhaul.py's half_up()
+const obj = (v: unknown): Record<string, any> => (v && typeof v === 'object' && !Array.isArray(v) ? v as any : {})
+
+export function line(state: unknown): string {
+  const s = obj(state)
+  const name = text(s.account) ?? 'longhaul'
+  const ev = obj(s.event)
+  const kind = ev.kind, to = text(ev.to), at = text(ev.at)
+  const by: unknown[] = Array.isArray(ev.by) ? ev.by : []
+  const owners = by.filter(n => text(n) !== null) as string[]
+  let parts: string[] | null = null
+  if (kind === 'question' && to)
+    parts = [`${name} at limit`, `${at ? `carry on ${at}${to === name ? '' : ` on ${to}`}?` : `move to ${to}?`} /accounts`]
+  else if (kind === 'waiting' && at) {
+    const on = text(ev.on)
+    parts = [`${name} at limit`, `carries on ${at}${on && on !== name ? ` on ${on}` : ''}`]
+  } else if (kind === 'stopped' && text(ev.until))
+    parts = [`${name} at limit until ${ev.until}`, 'stopped', '/accounts']
+  else if (kind === 'refused' && text(ev.where) && owners.length && owners.length === by.length)
+    parts = [name, `message stopped: ${ev.where} is ${owners.map(n => `${n}'s`).join(' or ')}`, '/accounts']
+  else if (kind === 'pending' && to)
+    parts = [name, `→ ${to} ${ev.when === 'open' ? 'at its next open' : 'after this turn'}`]
+  if (!parts) {
+    const from = text(ev.from)
+    parts = [kind === 'moved' && from && at ? `${name} (moved from ${from} ${at})` : name]
+    const shares: string[] = []
+    for (const [label, key] of [['5h', 'five'], ['wk', 'week']] as const) {
+      const w = obj(s[key])
+      const used = num(w.used)
+      if (used === null) continue
+      const resets = text(w.resets)
+      shares.push(`${label} ${halfUp(used)}%${halfUp(used) >= RESET_AT && resets ? ` (${resets})` : ''}`)
+    }
+    parts.push(...(shares.length ? shares : ['no usage reading yet']))
+    const ctx = num(s.ctx)
+    if (ctx !== null && ctx >= 0) parts.push(`ctx ${halfUp(ctx / 1000)}k`)
+  }
+  const update = text(s.update)
+  if (update) parts.push(`update ${update}`)
+  return parts.join(' · ')
+}
+
 // The status entry: the account, its allowance, the context, this chat's
 // question or carry-on, a newer release last. accounts.tsx calls it too,
 // when its look finds the question or the carry-on changed.

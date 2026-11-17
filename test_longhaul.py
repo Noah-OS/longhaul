@@ -1910,7 +1910,7 @@ class Usage(unittest.TestCase):
             with self.subTest(case):
                 (self.relay / "accounts.json").write_text(text)
                 log.unlink(missing_ok=True)
-                self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mmain"))
+                self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mVS Code sign-in"))
                 self.assertEqual(json.loads(record.read_text())["account"], "main", "as with no file")
                 self.assertTrue(longhaul.record_usage(self.reading(), str(self.pro)).startswith("\033[1mpro"))
                 said = [line for line in log.read_text().splitlines() if "accounts.json is not readable: " in line]
@@ -1919,7 +1919,7 @@ class Usage(unittest.TestCase):
                 out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], env=env, text=True,
                                      input=json.dumps(self.reading()), capture_output=True, timeout=30)
                 self.assertEqual((out.returncode, out.stderr), (0, ""))
-                self.assertTrue(out.stdout.startswith("\033[1mmain"), out.stdout)
+                self.assertTrue(out.stdout.startswith("\033[1mVS Code sign-in"), out.stdout)
                 self.assertNotIn("statusline error", log.read_text())
                 out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "usage"], env=env, text=True,
                                      capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
@@ -1956,7 +1956,10 @@ class Usage(unittest.TestCase):
         self.assertIn("40%", line)
 
     def test_a_session_outside_longhaul_is_called_main(self):
-        self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mmain"))
+        # Kept as "main" in the files; the line calls it as the review's Q11
+        # and 4.6 do, as no list of accounts names it.
+        self.assertTrue(longhaul.record_usage(self.reading(), None).startswith("\033[1mVS Code sign-in\033[0m · 5h"))
+        self.assertEqual(json.loads((longhaul.USAGE_DIR / "sessions" / "s1.json").read_text())["account"], "main")
 
     def test_an_unchanged_reading_adds_no_ledger_row(self):
         longhaul.record_usage(self.reading(), str(self.pro))
@@ -2165,7 +2168,7 @@ class StatuslineUpdate(unittest.TestCase):
     def test_a_newer_release_ends_the_line_with_its_version(self):
         line = self.line()
         self.assertTrue(line.endswith(" · update 0.3.3"), line)
-        self.assertTrue(line.startswith("\033[1mmain\033[0m · 5h"), "the account and the allowance come first")
+        self.assertTrue(line.startswith("\033[1mVS Code sign-in\033[0m · 5h"), "the account and the allowance come first")
         self.assertEqual(line.count("update"), 1)
 
     def test_versions_are_compared_as_numbers(self):
@@ -2221,7 +2224,7 @@ class StatuslineUpdate(unittest.TestCase):
     def test_a_failure_in_the_word_never_blanks_the_line(self):
         with mock.patch.object(longhaul, "release_record", side_effect=RuntimeError("boom")):
             line = self.line()
-        self.assertTrue(line.startswith("\033[1mmain"), line)
+        self.assertTrue(line.startswith("\033[1mVS Code sign-in"), line)
         self.assertIn("23%", line)
         self.assertNotIn("update", line)
 
@@ -2234,10 +2237,82 @@ class StatuslineUpdate(unittest.TestCase):
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}",
                              capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout, "\033[1mmain\033[0m · update 999.0.0\n")
+        self.assertEqual(out.stdout, "\033[1mVS Code sign-in\033[0m · no usage reading yet · update 999.0.0\n")
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input="{}", capture_output=True,
                              text=True, env=dict(env, LONGHAUL_UPDATE_CHECK="off"), timeout=30)
-        self.assertEqual(out.stdout, "\033[1mmain\033[0m\n")
+        self.assertEqual(out.stdout, "\033[1mVS Code sign-in\033[0m · no usage reading yet\n")
+
+
+# One status line, everywhere (the UX review of 2026-11-11, 4.6 and M3): the
+# states and their lines, which hooks/display.test.ts reads too, so the
+# terminal's line and the panel's status entry cannot drift apart. The file
+# is a TypeScript module (the plugin's tests import code alone) whose array
+# is JSON as written.
+STATUS_CASES = HERE / "hooks" / "status-line.cases.ts"
+
+
+def status_cases() -> list:
+    text = STATUS_CASES.read_text(encoding="utf-8")
+    return json.loads(text[text.index("= [", text.index("export const CASES")) + 2:])
+
+
+# The review's table (4.6), word for word: the shared cases must open with it.
+STATUS_REVIEW_TABLE = [
+    ("Normal", "work · 5h 12% · wk 40% · ctx 88k"),
+    ("Near full", "work · 5h 91% (14:00) · wk 40% · ctx 88k"),
+    ("At a limit, question open", "personal at limit · move to work? /accounts"),
+    ("At a limit, waiting", "personal at limit · carries on 14:01 on work"),
+    ("At a limit, stopped (No)", "personal at limit until 14:00 · stopped · /accounts"),
+    ("Just moved (for an hour)", "work (moved from personal 11:52) · 5h 3% · ctx 90k"),
+    ("A choice pending", "personal · → work after this turn"),
+    ("A message stopped by a folder rule", "personal · message stopped: ~/clients is work's · /accounts"),
+    ("No reading yet", "work · no usage reading yet · ctx 12k"),
+    ("VS Code's own sign-in", "VS Code sign-in · 5h 12% · ctx 88k"),
+    ("Newer release", "work · 5h 12% · wk 40% · ctx 88k · update 0.3.9"),
+]
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+class StatusLineGrammar(unittest.TestCase):
+    """status_line(), the one builder of the line: each shared case's state
+    draws its line exactly (one test per case, below the class), and the
+    terminal's colours change no word of it."""
+
+    def test_the_shared_cases_open_with_the_reviews_table(self):
+        cases = status_cases()
+        self.assertEqual([(c["state"], c["line"]) for c in cases[:len(STATUS_REVIEW_TABLE)]], STATUS_REVIEW_TABLE)
+        self.assertEqual(len({c["state"] for c in cases}), len(cases), "each state named once")
+
+    def test_the_reviews_lines_are_about_60_characters(self):
+        for state, line in STATUS_REVIEW_TABLE:
+            with self.subTest(state):
+                self.assertLessEqual(len(line), 60, line)
+
+    def test_the_terminals_colours_change_no_word(self):
+        for case in status_cases():
+            with self.subTest(case["state"]):
+                painted = longhaul.status_line(case["given"], paint=True)
+                self.assertEqual(ANSI.sub("", painted), case["line"])
+                self.assertTrue(painted.startswith(f"\033[1m{case['given']['account']}\033[0m"), painted)
+
+    def test_a_state_it_cannot_read_still_names_the_account(self):
+        for given in ({"account": "work"}, {"account": "work", "five": "x", "week": [], "ctx": "big", "event": 3},
+                      {"account": "work", "five": {"used": None}, "event": {"kind": "question"}},
+                      {"account": "work", "event": {"kind": "refused", "where": "~/x", "by": "work"}}):
+            with self.subTest(given=given):
+                self.assertTrue(longhaul.status_line(given).startswith("work"))
+
+
+def _status_case_test(case):
+    def test(self):
+        self.assertEqual(longhaul.status_line(case["given"]), case["line"])
+    return test
+
+
+for _n, _case in enumerate(status_cases(), 1):
+    setattr(StatusLineGrammar, f"test_case_{_n:02d}_{re.sub(r'[^a-z0-9]+', '_', _case['state'].lower()).strip('_')}",
+            _status_case_test(_case))
 
 
 class CodexUsage(unittest.TestCase):
@@ -5261,6 +5336,8 @@ class Plugin(unittest.TestCase):
                      "hooks/index.ts", "hooks/display.ts", "hooks/autocompact.ts", "hooks/accounts.tsx",
                      "hooks/question.ts",
                      "hooks/autocompact.test.ts", "hooks/display.test.ts", "hooks/accounts.test.tsx",
+                     # The status line's states and lines, which both test suites read (M3).
+                     "hooks/status-line.cases.ts",
                      "types/index.d.ts",
                      # The Codex layer (X4): its manifest, hooks file and skills.
                      ".codex-plugin/plugin.json", "hooks/codex-hooks.json", "codex-skills/checkpoint/SKILL.md",
@@ -26010,13 +26087,15 @@ class StatuslineInstall(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(json.dumps(reading))):
             self.assertEqual(longhaul.main(["statusline"]), 0)
-        self.assertEqual(out.getvalue(), "\033[1mmain\033[0m\n", "no allowance kept here: the account alone")
+        self.assertEqual(out.getvalue(), "\033[1mVS Code sign-in\033[0m · no usage reading yet\n",
+                         "no allowance kept here: the account, and that there is none")
         env = {**os.environ, "HOME": str(self.user)}
         for stdin in (json.dumps(reading), "not json", ""):
             done = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input=stdin, env=env,
                                   capture_output=True, text=True, timeout=30)
             self.assertEqual((done.returncode, done.stderr), (0, ""), stdin)
-            self.assertEqual(done.stdout, "longhaul\n" if stdin == "not json" else "\033[1mmain\033[0m\n", stdin)
+            self.assertEqual(done.stdout, "longhaul\n" if stdin == "not json"
+                             else "\033[1mVS Code sign-in\033[0m · no usage reading yet\n", stdin)
         self.assertFalse(self.path.exists(), "the display writes no settings")
         self.assertIn("longhaul statusline install|uninstall [--yes]", longhaul.__doc__, "the Usage block names it")
 

@@ -3503,19 +3503,122 @@ def save_label(sid: str, label: str) -> None:
         write_json(LABELS, labels)
 
 
-def gauge(name: str, part: dict) -> str:
-    pct = part.get("used_percentage")
-    if pct is None:
-        return ""
-    color = "32" if pct < 70 else "33" if pct < 90 else "31"
-    when = f" (resets {clock(part['resets_at'])})" if part.get("resets_at") else ""
-    return f" · {name} \033[{color}m{pct}%\033[0m{when}"
+# One status line, everywhere (the UX review of 2026-11-11, 4.6 and M3): the
+# terminal's status line and the panel's status entry (hooks/display.ts's
+# line(), the same grammar in TypeScript) draw one line from one state:
+#   <account>[ (event)] · 5h <n>%[ (<reset>)] · wk <n>% · ctx <n>k[ · update x]
+# The account first, always; at most one event; a window's reset only from
+# STATUS_RESET_AT on; words carry the state ("at limit", "moved", "stopped"),
+# never colour alone; the update word last. hooks/status-line.cases.ts holds
+# the states and their lines, and both test suites check every one.
+STATUS_RESET_AT = 70  # % of a window from which its reset is shown
+STATUS_DEFAULT = "VS Code sign-in"  # the line's name for ~/.claude's own sign-in, "main" (the review's Q11)
+
+
+def half_up(value: float) -> int:
+    """A number rounded half up, as display.ts's Math.floor(x + 0.5) rounds
+    it (Python's round() takes 40.5 to 40)."""
+    return math.floor(value + 0.5)
+
+
+def status_line(state: dict, paint: bool = False) -> str:
+    """The status line from `state`, the shape hooks/status-line.cases.ts
+    gives: "account", as shown; "five" and "week", {"used", "resets" (a
+    time as clock() shows it)} or None; "ctx", the context in tokens, or
+    None; "event", None or {"kind": "question" (to, and at for a carry-on
+    at a reset), "waiting" (at, on), "stopped" (until), "refused" (where,
+    by: the accounts that keep the folder), "pending" (to, when: "turn" or
+    "open") or "moved" (from, at)}; "update", a newer release, or None. An
+    event at a limit, a choice pending or a message stopped takes the place
+    of the numbers; one it cannot read, or of a kind it does not know, is
+    none. `paint`: the account in bold and each share in green, yellow or
+    red, the terminal's look; the words are the same. Never raises on a
+    state's shape: the line runs at every update."""
+    s = state if isinstance(state, dict) else {}
+    name = s.get("account") if isinstance(s.get("account"), str) and s.get("account") else "longhaul"
+    head = f"\033[1m{name}\033[0m" if paint else name
+    ev = s.get("event") if isinstance(s.get("event"), dict) else {}
+
+    def word(key):
+        value = ev.get(key)
+        return value if isinstance(value, str) and value else None
+    kind, to, at = ev.get("kind"), word("to"), word("at")
+    by = ev.get("by") if isinstance(ev.get("by"), list) else []
+    owners = [n for n in by if isinstance(n, str) and n]
+    parts = None
+    if kind == "question" and to:
+        ask = (f"carry on {at}{'' if to == name else ' on ' + to}?" if at else f"move to {to}?")
+        parts = [f"{head} at limit", f"{ask} /accounts"]
+    elif kind == "waiting" and at:
+        on = word("on")
+        parts = [f"{head} at limit", f"carries on {at}{' on ' + on if on and on != name else ''}"]
+    elif kind == "stopped" and word("until"):
+        parts = [f"{head} at limit until {word('until')}", "stopped", "/accounts"]
+    elif kind == "refused" and word("where") and owners and len(owners) == len(by):
+        parts = [head, f"message stopped: {word('where')} is {' or '.join(n + chr(39) + 's' for n in owners)}",
+                 "/accounts"]
+    elif kind == "pending" and to:
+        parts = [head, f"→ {to} {'at its next open' if ev.get('when') == 'open' else 'after this turn'}"]
+    if parts is None:
+        moved = kind == "moved" and word("from") and at
+        parts = [f"{head} (moved from {word('from')} {at})" if moved else head]
+        shares = []
+        for label, key in (("5h", "five"), ("wk", "week")):
+            window = s.get(key) if isinstance(s.get(key), dict) else {}
+            used = as_number(window.get("used"))
+            if used is None:
+                continue
+            used = half_up(used)
+            colour = "32" if used < 70 else "33" if used < 90 else "31"
+            share = f"\033[{colour}m{used}%\033[0m" if paint else f"{used}%"
+            resets = window.get("resets")
+            shown_reset = used >= STATUS_RESET_AT and isinstance(resets, str) and resets
+            shares.append(f"{label} {share}{f' ({resets})' if shown_reset else ''}")
+        parts += shares or ["no usage reading yet"]
+        ctx = as_number(s.get("ctx"))
+        if ctx is not None and ctx >= 0:
+            parts.append(f"ctx {half_up(ctx / 1000)}k")
+    update = s.get("update")
+    if isinstance(update, str) and update:
+        parts.append(f"update {update}")
+    return " · ".join(parts)
+
+
+def status_name(name: str, entry: dict) -> str:
+    """What the line calls the account a chat runs on (session_account()'s
+    name and entry): STATUS_DEFAULT for "main", ~/.claude's own sign-in
+    when no account of Longhaul's is on it, which no list names; else the
+    name."""
+    return STATUS_DEFAULT if name == "main" and "config_dir" not in entry else name
+
+
+def line_window(part):
+    """A status-line reading's usage window as status_line() takes it,
+    {"used", "resets" (clock()'s, or None)}; None with no share."""
+    part = part if isinstance(part, dict) else {}
+    used, resets = as_number(part.get("used_percentage")), as_number(part.get("resets_at"))
+    return None if used is None else {"used": used, "resets": clock(resets) if resets is not None else None}
+
+
+def context_tokens(window):
+    """The context a status-line reading's context_window gives, in tokens:
+    its current_usage's input, cache read and cache write (what
+    used_percentage is a share of), else used_percentage of
+    context_window_size; None for neither, as early in a chat."""
+    window = window if isinstance(window, dict) else {}
+    now = window.get("current_usage") if isinstance(window.get("current_usage"), dict) else {}
+    parts = [as_number(now.get(k)) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+    if any(p is not None for p in parts):
+        return sum(p for p in parts if p is not None)
+    pct, size = as_number(window.get("used_percentage")), as_number(window.get("context_window_size"))
+    return pct * size / 100 if pct is not None and size is not None else None
 
 
 def record_usage(data: dict, config_dir, now: float | None = None) -> str:
-    """Keep this reading and return the status line text."""
+    """Keep this reading and return the status line (status_line(), in the
+    terminal's colours)."""
     now = time.time() if now is None else now
-    acct, _ = session_account(config_dir)
+    acct, entry = session_account(config_dir)
     limits = data.get("rate_limits") or {}
     sid = data.get("session_id")
     if limits:
@@ -3556,7 +3659,9 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
             path = data.get("transcript_path")
             path = path if isinstance(path, str) else last.get("transcript")
             write_json(last_path, {**row, "transcript": path} if isinstance(path, str) else row)
-    return f"\033[1m{acct}\033[0m{gauge('5h', five)}{gauge('week', week)}{release_word()}"
+    return status_line({"account": status_name(acct, entry), "five": line_window(five), "week": line_window(week),
+                        "ctx": context_tokens(data.get("context_window")), "event": None, "update": release_word()},
+                       paint=True)
 
 
 def statusline(opts) -> int:
@@ -11509,21 +11614,21 @@ def release_status() -> dict:
             "check": "off" if release_switch() else "on"}
 
 
-def release_word() -> str:
-    """The status line's end (record_usage()), " · update 0.3.3" when the
-    check is on and release.json's latest is newer than this copy runs, ""
-    otherwise. The line runs at every update and must never fail, so this
-    only reads: the record, then the manifest once the record names a
-    version; GitHub is asked by the day's check alone, and any failure
-    here leaves the word out, not the line."""
+def release_word():
+    """The status line's update word (status_line()'s "update"), "0.3.3"
+    when the check is on and release.json's latest is newer than this copy
+    runs, None otherwise. The line runs at every update and must never
+    fail, so this only reads: the record, then the manifest once the record
+    names a version; GitHub is asked by the day's check alone, and any
+    failure here leaves the word out, not the line."""
     try:
         if release_switch():
-            return ""
+            return None
         found = release_version(release_record().get("latest"))
         latest = ".".join(map(str, found)) if found else None
-        return f" · update {latest}" if latest and release_newer(latest, release_running(release_manifest())) else ""
+        return latest if latest and release_newer(latest, release_running(release_manifest())) else None
     except Exception:
-        return ""
+        return None
 
 
 def release_reload(data: dict) -> str:

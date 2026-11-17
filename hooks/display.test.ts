@@ -1,5 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { line } from './display.ts'
+import { CASES } from './status-line.cases.ts'
+
 // hooks/display.ts's status entry, the panel's stand-in for the status line:
 // `claude plugin test .` from the checkout. It ends with "update 0.3.3" when
 // release.json's latest is newer than the plugin's own manifest (the
@@ -176,4 +179,21 @@ test("a question its relay left behind, or another chat's, adds nothing", async 
   write(w, `${HOME}/questions/${SID}.json`, { ...QUESTION, chat: 'another-chat' })
   await w.clock.advance(3000)
   expect(w.statuses[w.statuses.length - 1]).toBe('main · update 0.3.3')
+})
+
+// One status line, everywhere (the UX review of 2026-11-11, 4.6 and M3): each
+// shared case's state draws, here, the line longhaul.py's status_line() draws
+// for it (test_longhaul.py reads the same cases), so the panel's entry and the
+// terminal's line cannot drift apart.
+for (const c of CASES)
+  test(`the line for: ${c.state}`, () => {
+    expect(line(c.given)).toBe(c.line)
+  })
+
+test('a state it cannot read still names the account', () => {
+  for (const given of [{ account: 'work' }, { account: 'work', five: 'x', week: [], ctx: 'big', event: 3 },
+                       { account: 'work', five: { used: null }, event: { kind: 'question' } },
+                       { account: 'work', event: { kind: 'refused', where: '~/x', by: 'work' } }])
+    expect(line(given).startsWith('work')).toBe(true)
+  expect(line(null)).toBe('longhaul · no usage reading yet')
 })

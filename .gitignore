@@ -27,6 +27,7 @@
 !hooks/accounts.tsx
 !hooks/accounts.test.tsx
 !hooks/question.ts
+!hooks/status-line.cases.ts
 !types/
 !types/index.d.ts
 !hooks/codex_hook.py
