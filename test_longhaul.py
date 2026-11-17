@@ -12494,6 +12494,34 @@ class Shim(unittest.TestCase):
         self.assertFalse(home.exists(), "--purge took ~/.longhaul's stand-in")
         self.assertIn("What stays:", out.stdout)
 
+    def test_the_shim_runs_activity_and_panel_in_their_forms_alone(self):
+        # The owner's yes of 2026-11-17: `activity` only reads Longhaul's own
+        # log, and `panel pause` is undone by `panel resume`, so a chat may run
+        # them on the user's word ("pause Longhaul in VS Code", "what did
+        # Longhaul do today?"). A repair that fixes still does not run from here.
+        for args in (("activity",), ("activity", "--json"), ("activity", "--days", "7")):
+            out = self.chat(*args)
+            self.assertEqual(out.returncode, 0, (args, out.stderr))
+            self.assertNotIn("does not run from inside a session", out.stderr, args)
+        for args in (("panel",), ("panel", "status")):
+            out = self.chat(*args)
+            self.assertEqual(out.returncode, 0, (args, out.stderr))
+            self.assertIn("Panel chats: on", out.stdout, args)
+        out = self.chat("panel", "pause")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(json.loads((self.tmp / "home" / "vscode.json").read_text())["switch_mid_session"])
+        out = self.chat("panel", "resume")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(json.loads((self.tmp / "home" / "vscode.json").read_text())["switch_mid_session"])
+        for args in (("panel", "pause", "--yes"), ("panel", "off"), ("panel", "pause", "resume")):
+            out = self.chat(*args)
+            self.assertEqual(out.returncode, 2, args)
+            self.assertIn("`panel`, `panel status`, `panel pause` or `panel resume`", out.stderr, args)
+        out = self.chat("repair", "--fix", "x", "--yes")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("run it in a terminal", out.stderr)
+        self.assertIn("activity", self.shim().stderr, "the list of what runs from here names it")
+
     def test_the_shim_runs_allow(self):
         # The ask-first plan's decision 2 (the owner, 2026-10-29): a chat refused
         # in a kept folder cannot ask its own Claude, so another chat may allow it.

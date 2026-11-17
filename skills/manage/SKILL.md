@@ -1,7 +1,7 @@
 ---
 name: manage
 description: "Run Longhaul's setup from this chat: accounts (add, sign in, remove, pick a chat's), switching, subagent models, the VS Code panel, the status line, auto-update, clearing limits, uninstalling. Each change runs only after the user's yes."
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul models) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul switch) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul models) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul update status) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul activity) Bash(${CLAUDE_PLUGIN_ROOT}/bin/longhaul panel)
 ---
 
 Longhaul's setup actions, which once needed a terminal, run from this chat
@@ -52,7 +52,8 @@ a time, an accounts.json that will not read, the VS Code panel pointing at
 a Longhaul that is gone): offer this before any uninstall.
 - What is stuck, one line each with what its fix does (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run`. Show it as it is.
 - The fixes do not run from here: tell the user to run `longhaul repair` in a terminal, which asks before each fix (`longhaul repair --yes` makes them all; `longhaul repair --fix ID --yes` one alone), or to press **Fix** on the Troubleshoot page of `/accounts`, which asks too.
-- Longhaul off in the VS Code panel's chats, without an uninstall: this does not run from here either. Tell the user to run `longhaul panel pause` in a terminal, or press **Pause Longhaul in panel chats** on the Troubleshoot page of `/accounts`; `longhaul panel resume` turns it back on. Each counts for the chats opened after it.
+- Longhaul off in the VS Code panel's chats, without an uninstall: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul panel pause`; back on: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul panel resume`; which is in force: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul panel`. Each counts for the chats opened after it: say so. The Troubleshoot page of `/accounts` has the same as a button.
+- What Longhaul did by itself, and why (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul activity` (today; `--days 7` for a week, `--chat ID` for one chat). Show its lines as they are.
 
 Uninstall:
 - What it would remove (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run`; with ~/.longhaul too: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run --purge`. Show it before asking.
