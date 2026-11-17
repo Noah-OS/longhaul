@@ -26864,6 +26864,15 @@ class Activity(unittest.TestCase):
     def samples(self):
         s, o, q, s8 = self.SID, self.OTHER, self.QID, self.SID[:8]
         return {
+            "start: {new} {verb} {acct} in {where}: {why}": [
+                (f"start: {s} starts on work in ~/clients/acme: ~/clients prefers work, and it had room",
+                 (s8, "Started on work", "~/clients prefers work, and it had room")),
+                (f"start: {s} moves to work in ~/x: personal hit its session limit (resets 14:00), and switching is auto",
+                 (s8, "Moved to work", "personal hit its session limit (resets 14:00), and switching is auto")),
+                (f"start: {s} reopens on work in ~/x: Claude crashed (exit 1)",
+                 (s8, "Reopened on work", "Claude crashed (exit 1)")),
+                ("start: a new chat starts on work in ~/x: the only account allowed in ~/x",
+                 (None, "Started on work", "the only account allowed in ~/x"))],
             "{who}: {chat} was to start on {acct}, which {why}; the choice is dropped": [
                 (f"panel: {s8} was to start on work, which is not signed in as expected; the choice is dropped",
                  (s8, "Dropped the choice of work (longhaul use)", "work is not signed in as expected")),
@@ -27142,6 +27151,170 @@ class Activity(unittest.TestCase):
                              timeout=30)
         self.assertEqual((out.returncode, out.stdout), (2, ""))
         self.assertIn("Ask the user to run it in a terminal.", out.stderr)
+
+
+class StartReason(unittest.TestCase):
+    """Where Longhaul picks the account a chat starts on (or moves it to),
+    one log line says which and why (M1): "start: SID starts on NAME in
+    FOLDER: WHY", in the log's style, ids, account names, folders and times
+    only. pick_why() words pick()'s choice; the line is written once the
+    chat has an id."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        for name, value in {"LONGHAUL_HOME": self.home, "HOME": self.tmp, "USAGE_DIR": self.home / "usage"}.items():
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.now = time.time()
+        self.work = self.tmp / "work"
+        (self.work / "acme").mkdir(parents=True)
+
+    def why(self, accounts, limited=None, skip=(), seen=None, top=None):
+        state = {"limited_until": limited or {}}
+        i, until = longhaul.pick(accounts, state, 0, now=self.now, skip=skip, seen=seen, top=top)
+        return accounts[i]["name"], longhaul.pick_why(accounts, state, i, until, skip=skip, seen=seen, top=top,
+                                                      now=self.now)
+
+    @staticmethod
+    def reading(used, resets_in=3600):
+        return {"five_hour": {"used_percentage": used, "resets_at": time.time() + resets_in}}
+
+    def test_pick_why_says_why_pick_chose_each_account(self):
+        a, b = {"name": "personal"}, {"name": "work"}
+        top = str(self.work / "acme")
+        self.assertEqual(self.why([a]), ("personal", "the only account"))
+        self.assertEqual(self.why([a, b]), ("personal", "it had room, and it comes first in turn"))
+        self.assertEqual(self.why([a, b], limited={"personal": self.now + 600}),
+                         ("work", "it had room, and personal was at its limit"))
+        until = self.now + 600
+        self.assertEqual(self.why([a, b], limited={"personal": self.now + 900, "work": until}),
+                         ("work", f"every account was at its limit, and work resets first, at {longhaul.clock(until)}"))
+        self.assertEqual(self.why([a, b], seen={"personal": self.reading(96), "work": self.reading(10)}),
+                         ("work", "it had room, and personal is nearly full"))
+        self.assertEqual(self.why([a, b], seen={"personal": self.reading(40, 7200), "work": self.reading(40, 600)}),
+                         ("work", "it had room, and its unused allowance runs out first"))
+        self.assertEqual(self.why([{"name": "personal", "fallback": True}, b], limited={"work": self.now + 600}),
+                         ("personal", "a fallback, and no other account allowed here had room"))
+        self.assertEqual(self.why([a, b], skip={"personal"}), ("work", "the only account signed in as expected"))
+        # The folder: kept for one account; preferred by one.
+        kept = [{"name": "personal", "repositories": [str(self.work)]}, b]
+        self.assertEqual(self.why(kept, skip=longhaul.denied_in(kept, top), top=top),
+                         ("personal", "the only account allowed in ~/work/acme"))
+        liked = [a, {"name": "work", "preferred": [str(self.work)]}]
+        self.assertEqual(self.why(liked, top=top), ("work", "~/work prefers work, and it had room"))
+        self.assertEqual(self.why(liked, limited={"work": self.now + 600}, top=top),
+                         ("personal", "it had room, and work was at its limit"))
+
+    def test_the_line_is_written_once_the_chat_has_an_id_and_once_only(self):
+        cfg = self.tmp / "cfg"
+        (cfg / "sessions").mkdir(parents=True)
+        w = longhaul.Watch({"name": "work", "config_dir": str(cfg)}, 4242, self.now, False)
+        w.start_line = ("starts on", "~/work/acme", "~/work prefers work, and it had room")
+        log = self.home / "longhaul.log"
+        w.step()
+        self.assertFalse(log.exists(), "no id yet: nothing written")
+        sid = "5ca8a797-1111-4222-8333-444455556666"
+        (cfg / "sessions" / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": sid, "status": "idle"}))
+        w.step()
+        w.step()
+        lines = [line[20:] for line in log.read_text().splitlines()]
+        self.assertEqual(lines, [f"start: {sid} starts on work in ~/work/acme: ~/work prefers work, and it had room"])
+        self.assertEqual(longhaul.activity_event(lines[0])["what"], "Started on work")
+
+
+class StartReasonPanel(StreamHarness):
+    """The start line from the VS Code panel's wrapper: a new chat once its
+    claude names its id, a reopened one by the reason it starts where it
+    last ran, and a move at a limit by the limit."""
+
+    def starts(self):
+        return [line[20:] for line in self.log_text().splitlines() if line[20:].startswith("start: ")]
+
+    def hello(self, args=None, **env):
+        p = self.start(args, **env)
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertEqual(self.wait_for(self.result_for(self.user(p, "hello")))["result"], "reply to: hello")
+        p.stdin.close()
+        p.wait(10)
+
+    def test_a_new_chat_and_a_reopened_one_each_say_why(self):
+        self.plan(["reply"] * 3)
+        here = self.shown(self.tmp)
+        self.hello()
+        self.assertEqual(self.starts(), [f"start: sid-1 starts on Max in {here}: it had room, and it comes first in turn"])
+        (self.relay / "usage" / "sessions").mkdir(parents=True, exist_ok=True)
+        (self.relay / "usage" / "sessions" / "sid-c.json").write_text(json.dumps({"account": "Pro"}))
+        self.hello([*self.EXT_ARGS, "--resume=sid-c"], LONGHAUL_SWITCH="ask")
+        self.assertEqual(self.starts()[1:], [f"start: sid-c starts on Pro in {here}: the one it last ran on (switching "
+                                             "is ask)"])
+        # With Longhaul paused in panel chats claude runs in the wrapper's place: the line is written before.
+        self.switch_mid_session(False)
+        (self.relay / "usage" / "sessions" / "sid-c.json").write_text(json.dumps({"account": "Pro"}))
+        self.hello([*self.EXT_ARGS, "--resume=sid-c"], LONGHAUL_SWITCH="ask")
+        self.assertEqual(self.starts()[2:], [f"start: sid-c starts on Pro in {here}: the one it last ran on (switching "
+                                             "is ask)"])
+        self.hello()
+        [paused] = self.starts()[3:]  # Max's reading from the chats before may decide it now: "it had room, and ..."
+        self.assertTrue(paused.startswith(f"start: a new chat starts on Max in {here}: it had room, and "), paused)
+        self.assertEqual(longhaul.activity_event(paused)["chat"], None, "no id yet: no chat named")
+
+    def test_a_move_at_a_limit_says_the_limit(self):
+        self.plan(["limit", "reply"])
+        p = self.start()
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        u = self.user(p, "build it")
+        self.wait_for(self.result_for(u))
+        carry = self.wait_for(lambda m: m.get("type") == "user" and m.get("uuid") != u)
+        self.wait_for(self.result_for(carry["uuid"]))
+        p.stdin.close()
+        p.wait(10)
+        here = self.shown(self.tmp)
+        [start, move] = self.starts()
+        self.assertTrue(start.startswith("start: sid-1 starts on Max in "), start)
+        self.assertRegex(move, rf"^start: sid-1 moves to Pro in {re.escape(here)}: Max hit its session limit "
+                               r"\(resets [^)]+\), and switching is auto$")
+        self.assertEqual(longhaul.activity_event(move)["what"], "Moved to Pro")
+
+
+class StartReasonTerminal(unittest.TestCase):
+    """The start line from `longhaul` in a terminal: each launch, the first
+    by how its account was chosen, a later one by why it moved. Loop's
+    harness, borrowed rather than inherited, so its tests do not run twice."""
+
+    setUp = Loop.setUp
+    run_longhaul = Loop.run_longhaul
+
+    def starts(self):
+        log = self.home / "longhaul.log"
+        return [line[20:] for line in log.read_text().splitlines() if line[20:].startswith("start: ")]
+
+    def test_the_first_launch_says_why_and_a_move_at_a_limit_says_the_limit(self):
+        here = longhaul.home_path(os.path.realpath(self.tmp))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"])
+        self.assertEqual(len(calls), 2, out.stderr)
+        start, move = self.starts()
+        self.assertEqual(start, f"start: sid-1 starts on Max in {here}: it had room, and it comes first in turn")
+        self.assertRegex(move, rf"^start: sid-1 moves to Pro in {re.escape(here)}: Max hit its session limit "
+                               r"\(resets [^)]+\), and switching is auto$")
+
+    def test_a_resumed_chat_says_it_starts_where_it_last_ran_or_as_asked(self):
+        here = longhaul.home_path(os.path.realpath(self.tmp))
+        (self.home / "usage" / "sessions").mkdir(parents=True)
+        (self.home / "usage" / "sessions" / "sid-old.json").write_text(json.dumps({"account": "Pro"}))
+        path = self.max / "projects" / "-tmp-proj" / "sid-old.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH="ask")
+        self.assertEqual(len(calls), 1, out.stderr)
+        self.assertEqual(self.starts(), [f"start: sid-old starts on Pro in {here}: the one it last ran on (switching is "
+                                         "ask)"])
+        out, calls = self.run_longhaul(["exit"], "-r", "sid-old", "--account", "Max", runs=1, LONGHAUL_SWITCH="ask")
+        self.assertEqual(self.starts()[1:], [f"start: sid-old starts on Max in {here}: asked for with --account"])
 
 
 class Doctor(unittest.TestCase):

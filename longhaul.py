@@ -1278,6 +1278,69 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     return i, limited[accounts[i]["name"]]
 
 
+def preferred_folder(acct: dict, top: str) -> str:
+    """The deepest of `acct`'s preferred folders that is `top` or holds it,
+    as preference_depth() finds it, shown; `top` itself when none is."""
+    real, best, depth = os.path.realpath(top), None, 0
+    for entry in preferred_of(acct) or ():
+        found = os.path.realpath(entry)
+        if (real == found or inside(real, found)) and len(found) > depth:
+            best, depth = entry, len(found)
+    return home_path(best or top)
+
+
+def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: dict | None = None,
+             top: str | None = None, now: float | None = None) -> str:
+    """Why pick(), given the same, chose accounts[i] (with `until`, its
+    answer when every account was at a limit), in a few words for the
+    start line (start_logged()): the only one allowed in the folder, the
+    one the folder prefers, the one with room while the others were at
+    their limits or nearly full, the one whose unused allowance runs out
+    first, or the next in turn. Names, folders and times only."""
+    now = time.time() if now is None else now
+    seen = seen or {}
+    name, n = accounts[i]["name"], len(accounts)
+    where = home_path(top) if top is not None else None
+    allowed = eligible(accounts, top) if top is not None else [a["name"] for a in accounts]
+    narrowed = where is not None and len(allowed) < n
+    if until:
+        every = f"every account allowed in {where}" if narrowed else "every account"
+        return f"{every} was at its limit, and {name} resets first, at {clock(until)}"
+    if narrowed and allowed == [name]:
+        return f"the only account allowed in {where}"
+    if n == 1:
+        return "the only account"
+    limited = state.get("limited_until", {})
+    usable = [j for j in range(n) if accounts[j]["name"] not in skip]
+    free = [j for j in usable if limited.get(accounts[j]["name"], 0) <= now]
+    if top is not None and free and preferred_here(accounts, free, top, seen, now) == i:
+        return f"{preferred_folder(accounts[i], top)} prefers {name}, and it had room"
+    if len(usable) == 1:
+        return f"the only account {'allowed here ' if narrowed else ''}signed in as expected"
+    if is_fallback(accounts[i]):
+        return "a fallback, and no other account allowed here had room"
+    others = [accounts[j]["name"] for j in usable if j != i]
+    full = [o for o in others if limited.get(o, 0) > now]
+    if full and len(full) == len(others):
+        one = len(full) == 1
+        return f"it had room, and {', '.join(full)} {'was' if one else 'were'} at {'its' if one else 'their'} limit"
+    near = [o for o in others if o not in full and near_full(seen.get(o), now)]
+    if near and not near_full(seen.get(name), now):
+        return f"it had room, and {', '.join(near)} {'is' if len(near) == 1 else 'are'} nearly full"
+    mine = expires(seen.get(name), now)
+    if mine != float("inf") and any(expires(seen.get(o), now) > mine for o in others if o not in full):
+        return "it had room, and its unused allowance runs out first"
+    return "it had room, and it comes first in turn"
+
+
+def start_logged(sid, verb: str, name: str, where: str, why: str) -> None:
+    """The start line (M1): chat `sid` (or "a new chat", whose id is not
+    known yet) starts on, moves to or reopens on (`verb`) account `name`
+    in folder `where`, and why, for `longhaul activity` and the "why" of
+    `status --json`."""
+    log(f"start: {sid} {verb} {name} in {where}: {why}")
+
+
 def last_account(sid: str | None, accounts: list[dict]) -> str | None:
     """The account a conversation last ran on, or None. It is the "account"
     in the session's record under USAGE_DIR/sessions (the status line and
@@ -1318,7 +1381,7 @@ def note_session_account(sid: str, name: str) -> None:
 
 
 def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str, binary: str,
-                  unmanaged=(), top: str | None = None) -> int | None:
+                  unmanaged=(), top: str | None = None, reasons: list | None = None) -> int | None:
     """The index of the account a session resumed by id last ran on, for
     the panel wrapper and longhaul pipe (`who` names which in the log). In
     ask and never a session starts where it last ran, limited or not: there
@@ -1352,6 +1415,8 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
             why = f"is at its limit until {clock(until)}, and with switching set to auto longhaul picks"
         else:
             log(f"{who}: {resumed[:8]} starts on {chosen}, as `longhaul use` chose for it")
+            if reasons is not None:  # why, for the start line (start_logged())
+                reasons.append("chosen with longhaul use")
             return idx
         log(f"{who}: {resumed[:8]} was to start on {chosen}, which {why}; the choice is dropped")
     if mode == "auto":
@@ -1369,6 +1434,8 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
         why = "is not signed in as expected"
     else:
         log(f"{who}: {resumed[:8]} last ran on {last}; with switching set to {mode} it starts there")
+        if reasons is not None:
+            reasons.append(f"the one it last ran on (switching is {mode})")
         return idx
     log(f"{who}: {resumed[:8]} last ran on {last}, which {why}; picking an account")
     return None
@@ -1491,6 +1558,10 @@ class Watch:
         self.paths: dict[str, Path | None] = {}
         self.rc_seen = False
         self.rc_lost_at = None
+        # (verb, folder, why) of the start line (start_logged()), written
+        # once the chat's id is known: a new chat has none before its
+        # claude names it.
+        self.start_line: tuple | None = None
 
     def step(self) -> None:
         s = read_json(self.cfg / "sessions" / f"{self.pid}.json")
@@ -1505,6 +1576,11 @@ class Watch:
             if self.rc:
                 self._remote_control(s)
         if self.sid:
+            if self.start_line:
+                verb, where, why = self.start_line
+                self.start_line = None
+                if isinstance(self.sid, str) and re.fullmatch(GUARD_ID, self.sid):  # an id, never other text
+                    start_logged(self.sid, verb, self.acct_name, where, why)
             self._read_transcript()
             if self.stops:
                 self._read_stops()
@@ -2698,6 +2774,11 @@ def run(opts) -> int:
     elif chosen:
         say(f"{resume[:8]} starts on {chosen}, as `longhaul use` chose for it")
         forced = chosen if mode == "auto" else None
+    # Why each launch runs where it does, for its start line (start_logged()):
+    # `use_choice` names the account `longhaul use` chose, `then` why a relaunch
+    # moved or reopened, set when the launch before it ended; `launched` the
+    # account of the launch before, if any.
+    use_choice, then, launched, reason = chosen or None, None, None, "it had room"
     if resume and mode != "auto" and not forced:
         stay = chosen or last_account(resume, accounts)
         if stay in denied:
@@ -2751,6 +2832,7 @@ def run(opts) -> int:
             if elsewhere == "stop":
                 return stopped()
             if elsewhere is not None:
+                reason = f"{stay} was at its limit until {clock(resets)}, and you said yes to {names[elsewhere]}"
                 idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
             elif resets + RESET_MARGIN > time.time():
                 what, waiting = waiting or (f"{stay} is at its limit, and with switching set to {mode} "
@@ -2765,6 +2847,8 @@ def run(opts) -> int:
                 return 1
             else:
                 idx, until, chosen = names.index(stay), None, True
+                reason = ("chosen with longhaul use" if stay == use_choice
+                          else f"the one it last ran on (switching is {mode})")
         elif forced:
             i, forced = names.index(forced), None
             resets = state["limited_until"].get(names[i], 0)
@@ -2775,11 +2859,15 @@ def run(opts) -> int:
                 say(f"{names[i]} is at its limit until {clock(resets)}; picking an account")
             elif signed_in_as_expected(accounts[i]):
                 idx, until, chosen = i, None, True
+                reason = "chosen with longhaul use" if names[i] == use_choice else "asked for with --account"
+        picked = not chosen
         while not chosen:
             idx, until = pick(accounts, state, idx, skip=wrong, seen=seen, top=top)
             if idx is None or until or signed_in_as_expected(accounts[idx]):
                 break
             wrong.add(accounts[idx]["name"])
+        if picked and idx is not None:
+            reason = pick_why(accounts, state, idx, until, skip=wrong, seen=seen, top=top)
         if idx is None:
             # "allowed here" with any account denied, as the panel's refusal says:
             # a denied account may well be signed in as expected (final review, Sprint 7, G5).
@@ -2797,6 +2885,7 @@ def run(opts) -> int:
                                   lambda: bool(refresh()) or lifted()):
                     return 0
                 continue
+            reason = f"every account allowed here was at its limit, and you said yes to {names[elsewhere]}"
             idx, forced, stay = elsewhere, None, (names[elsewhere] if mode != "auto" else None)
         acct = accounts[idx]
         if left and acct["name"] != left[0]:
@@ -2834,6 +2923,8 @@ def run(opts) -> int:
         proc = subprocess.Popen(cmd, env=env_for(acct))
         w = Watch(acct, proc.pid, started, opts.rc, offsets=marks,
                   handled=state.get("handled_limits", []), label=opts.name, stops=True)
+        verb = "starts on" if launched is None else "moves to" if launched != acct["name"] else "reopens on"
+        w.start_line, launched, then = (verb, home_path(top), then or reason), acct["name"], None
 
         def other_has_room(here=acct["name"], skip=frozenset(wrong)) -> bool:
             # A normal account only: the early move leaves an account that is
@@ -2985,6 +3076,10 @@ def run(opts) -> int:
             if answer == "stop":
                 return stopped()
             if answer == "yes":  # always, in "auto"
+                then = (f"{acct['name']} hit its {w.limit['kind']} limit while {every} was at its limit, and {new} "
+                        "reset first" if wait else
+                        f"{acct['name']} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])}), and "
+                        + ("switching is auto" if mode == "auto" else "you said yes"))
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
                     old=acct["name"], kind=w.limit["kind"], new=new, every=every)
                 if mode == "ask" and wait:  # the wait at the top of the loop says when
@@ -3001,6 +3096,7 @@ def run(opts) -> int:
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
                     old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
                 carry = (acct["name"], w.limit["kind"])
+                then = f"{acct['name']} hit its {w.limit['kind']} limit, and it carried on there at its reset"
                 log(msg)  # the wait at the top of the loop says it, with the time
             if asked:  # the wait this question was about, for start_elsewhere(): asked once
                 asked_for = (stay, state["limited_until"].get(stay, 0))
@@ -3014,6 +3110,7 @@ def run(opts) -> int:
                           seen=readings(accounts), top=top)
             msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
                    f"longhaul moved it to {accounts[nxt]['name']}.")
+            then = f"{acct['name']} was at {used:g}% of its allowance, and switching is auto"
             say(msg)
             notify(msg)
             idx = nxt
@@ -3022,6 +3119,7 @@ def run(opts) -> int:
             # allowed here: as the early move, no carry-on message.
             prompt = None
             nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts), top=top)
+            then = f"it ran on {off(acct['name']) or acct['name']}, and switching is auto"
             msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul "
             msg += f"moved it to {accounts[nxt]['name']}." if nxt is not None else "moved it."
             say(msg)
@@ -3030,6 +3128,7 @@ def run(opts) -> int:
         elif why == "reconnect":
             prompt = None
             reconnects.append(time.time())
+            then = "Remote Control was lost"
             say("Remote Control was lost, so longhaul reopened the conversation to connect it again.")
             notify("Remote Control was lost; reopened the conversation to connect it again.")
         elif why == "completed":
@@ -3038,6 +3137,7 @@ def run(opts) -> int:
             return 0
         else:
             prompt = None
+            then = f"Claude crashed (exit {proc.returncode})"
             now = time.time()
             crashes = [t for t in crashes if now - t < REOPEN_WINDOW] + [now]
             if len(crashes) > MAX_REOPENS:
@@ -13141,13 +13241,14 @@ def signed_in_cached(acct: dict, binary: str) -> bool:
 
 
 def choose_for_panel(accounts: list[dict], binary: str, start: int = 0, state: dict | None = None,
-                     wrong: set | None = None, top: str | None = None):
+                     wrong: set | None = None, top: str | None = None, reasons: list | None = None):
     """The account a panel claude runs on: pick()'s rules and the email
     check, also when every account is at a limit (an account signed in as
     someone else is never used, limited or not). (index, until) as pick()
     returns; (None, None) when no account is signed in as it should be.
     `top`: the chat's repository, for pick()'s preferred accounts (none
-    for a short job)."""
+    for a short job). `reasons`, a list, gets pick_why()'s words for the
+    one chosen."""
     state = load_state() if state is None else state
     wrong = set() if wrong is None else wrong
     seen = readings(accounts)
@@ -13156,6 +13257,8 @@ def choose_for_panel(accounts: list[dict], binary: str, start: int = 0, state: d
         if i is None:
             return None, None
         if signed_in_cached(accounts[i], binary):
+            if reasons is not None:
+                reasons.append(pick_why(accounts, state, i, until, skip=wrong, seen=seen, top=top))
             return i, until
         wrong.add(accounts[i]["name"])
 
@@ -13247,7 +13350,9 @@ def wrap(argv: list[str]) -> int:
             log(f"panel: {msg}")
             notify(msg)
             return 1
-        idx = resumed_index(resumed, accounts, mode, "panel", binary, top=top)  # a reopened chat: where it last ran
+        reasons: list[str] = []  # why the chat starts where it does, for its start line (start_logged())
+        idx = resumed_index(resumed, accounts, mode, "panel", binary, top=top,
+                            reasons=reasons)  # a reopened chat: where it last ran
         ask_first = None
         if idx is not None:
             until = load_state()["limited_until"].get(accounts[idx]["name"], 0)
@@ -13264,7 +13369,7 @@ def wrap(argv: list[str]) -> int:
                 notify(f"{accounts[idx]['name']} is at its limit until {clock(until)}; the chat stays on it "
                        f"(switching is {mode})")
         if idx is None:
-            idx, _ = choose_for_panel(accounts, binary, wrong=set(denied), top=top)
+            idx, _ = choose_for_panel(accounts, binary, wrong=set(denied), top=top, reasons=reasons)
         if idx is None and denied:
             # Not run unchanged: ~/.claude can be the denied account, or signed in
             # as it, so the chat would run outside the policy (final review,
@@ -13293,7 +13398,13 @@ def wrap(argv: list[str]) -> int:
             # the next reopen (review, Sprint 5). A new chat's id is not known
             # before the exec: the status line or the relay records it.
             note_session_account(resumed, acct["name"])
+        started = ("starts on", home_path(top), reasons[-1]) if chat and reasons else None
         if not chat or not panel_mid_session():  # only the JSON false turns the relay off
+            if started and resumed and not re.fullmatch(GUARD_ID, resumed):
+                started = None  # an id, never other text, in the line
+            if started:  # claude takes this process's place: the line is written now, a new chat's with no id
+                verb, where, why = started
+                start_logged(resumed or "a new chat", verb, acct["name"], where, why)
             os.execve(binary, [binary] + args, wrapper_env(acct))
         # The mode is read again as it changes (Relay.refresh()), unless
         # LONGHAUL_SWITCH in VS Code's environment set it, which wins.
@@ -13302,6 +13413,7 @@ def wrap(argv: list[str]) -> int:
         relay.bad.update(denied)  # switch() never moves the chat onto an account not allowed here
         relay.denied, relay.top = denied, top
         relay.ask_first = ask_first
+        relay.start_line = started
         relay.start()
     except Exception as e:
         try:
@@ -13420,12 +13532,13 @@ def pipe(argv: list[str]) -> int:
             limited = load_state()["limited_until"].get(opts.account, 0) > time.time()
             if not limited and opts.account not in unmanaged and signed_in_cached(accounts[start], CLAUDE):
                 idx = start
+        reasons = ["asked for with --account"] if idx is not None else []  # for the start line (start_logged())
         if idx is None:
             # A resumed session: where it last ran, if that account is still
             # one longhaul manages. A new session (--session-id) is picked.
-            idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged, top)
+            idx = resumed_index(resumed, accounts, mode, "pipe", CLAUDE, unmanaged, top, reasons=reasons)
         if idx is None:
-            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied, top=top)
+            idx, _ = choose_for_panel(accounts, CLAUDE, start, wrong=set(unmanaged) | denied, top=top, reasons=reasons)
         if idx is None:  # "allowed here" with any account denied, as run() says (final review, Sprint 7, G5)
             which = "no account allowed here" if denied else "no account"
             log(f"pipe: {which} is signed in as expected, so longhaul did not start Claude")
@@ -13449,6 +13562,7 @@ def pipe(argv: list[str]) -> int:
                       swap=opts.swap, says=True, mode=mode, reread=reread, marks=marks)
         relay.bad.update(unmanaged | denied)  # switch() never moves the session onto an account in bad
         relay.denied, relay.unmanaged, relay.top, relay.managed_only = denied, unmanaged, top, True
+        relay.start_line = ("starts on", home_path(top), reasons[-1]) if reasons else None
         relay.start()
     except Exception as e:
         log(f"pipe: could not start: {e!r}")
@@ -13516,6 +13630,7 @@ class Relay:
         # chosen again. off_done: the (account, off()) pairs already acted
         # on, each once.
         self.top = None
+        self.start_line = None  # (verb, folder, why) for the chat's start line, which its Watch writes
         self.managed_only = False
         self.unmanaged: set = set()
         self.gone: set = set()
@@ -14829,6 +14944,7 @@ class Relay:
         handled = load_state().get("handled_limits", [])
         self.child = self.spawn(self.idx, self.args)
         self.watch = Watch(self.accounts[self.idx], self.child.pid, started, False, offsets=marks, handled=handled)
+        self.watch.start_line = self.start_line
         if self.ask_first:
             self.watch.sid, self.held = resume_id(self.args), []
 
@@ -14850,6 +14966,9 @@ class Relay:
                     ended = None
                 if ended is not None and not self.swapping:
                     self.readers[self.child.pid].join(timeout=10)
+                    if self.watch.start_line:  # a chat that ended within a round: its start line, from its record
+                        with contextlib.suppress(Exception):
+                            self.watch.step()
                     code = ended if ended >= 0 else 128 - ended
                     log(f"panel chat {self.watch.sid} ended (exit {code}) after {self.switches} switch(es)")
                     break
@@ -14948,7 +15067,10 @@ class Relay:
         if self.move_to(nxt, CARRY_ON.format(old=here["name"], kind=limit["kind"], new=new), moved):
             msg = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
                    f"the panel chat carries on with {new}.")
-            log(msg)
+            log(msg)  # display.ts reads this one as it is; the start line names the chat
+            how = "switching is auto" if self.mode == "auto" else "you answered move"
+            start_logged(sid, "moves to", new, home_path(self.top or os.getcwd()),
+                         f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}), and {how}")
             if not self.says:  # a driver tells its user from the `moved` line; a notification would say it twice
                 notify(msg)
 
@@ -16937,6 +17059,10 @@ def event(what: str, why: str, account: str | None = None) -> dict:
 
 
 ACTIVITY_LINES = [
+    # Where a chat starts, or moves to or reopens on, and why (start_logged()).
+    ("start: {new} {verb} {acct} in {where}: {why}",
+     lambda g: event(f"{START_VERBS[g['verb']]} {g['acct']}", g["why"], g["acct"]),
+     [("start: {sid} {verb} {name} in {where}: {why}",)]),
     # A `longhaul use` choice dropped at the chat's open (resumed_index(), take_choice()).
     ("{who}: {chat} was to start on {acct}, which {why}; the choice is dropped",
      lambda g: event(f"Dropped the choice of {g['acct']} (longhaul use)", f"{g['acct']} {g['why']}"),
