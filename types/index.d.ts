@@ -71,6 +71,11 @@ export type LonghaulStatus = {
   // the panel's entry draws it (hooks/display.ts's line()). Optional: an older
   // longhaul.py does not give it.
   line?: string
+  // Whether each sign-in was checked: false for `status --json --no-check`'s
+  // record (M7), which the pane draws first, each sign-in "checking…" until
+  // the full one is in. Optional: an older longhaul.py, or a read stored
+  // before it, checked them all.
+  checked?: boolean
 }
 
 // This chat as `status --json` gives it: its short id, its account (null:

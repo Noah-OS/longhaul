@@ -2,6 +2,16 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+### Added
+
+- **`longhaul status --json --no-check`** gives the same object at once, with no sign-in checked: each account's `signed_in` and `as_expected` are null, and `"checked"` is false (true in the full form). It starts no `claude`, so it never waits on an account that does not answer. Plain `status` is unchanged.
+
+### Changed
+
+- **`/accounts` shows its accounts at once.** It used to say "Reading Longhaul's accounts…" until every sign-in was checked: a few seconds, and 20 seconds when one account did not answer. Now the list comes first, each sign-in "checking…", and the sign-ins fill in when the checks are done. If the checks fail, the list stays and says why, each sign-in "could not check". After a change, its result shows once the list is read again, without waiting for the checks, and the list never goes blank while it is read.
+
 ## 0.3.17 - 2026-11-17
 
 See what a change would do before it is made; and two more commands a chat may run.

@@ -86,9 +86,12 @@ const WAIT_FILE = `${HOME}/waits/${SID}.json`
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
 type World = {
-  runs: string[][] // each longhaul.py run's arguments, after the script
+  runs: string[][] // each longhaul.py run's arguments, after the script; the quick reads apart, in quick
   timeouts: number[] // each run's timeoutMs, in the same order
   envs: (Record<string, string> | null)[] // each run's env, in the same order
+  // Each `status --json --no-check` (M7), which each read of the rows runs
+  // beside the full one: kept apart, so runs reads as it did before it.
+  quick: { rest: string[]; timeoutMs: number; env: Record<string, string> | null }[]
   opened: any[] // each $.ui.open's argument
   closed: any[] // each ui.close that reached the engine: the pane closed
   focused: string[] // each element $.ui.focus was asked to move the ring to
@@ -96,14 +99,31 @@ type World = {
   files: Record<string, { text: string; at: number }> // LONGHAUL_HOME's files, by path
   alive: Set<number> // the pids `kill -0` finds
   status: Ran // what `status --json` answers
+  fails: string | null // why `status --json` does not answer at all (it ran past its time), or null
+  // What `status --json --no-check` answers; null: `status`'s, with no sign-in checked (unchecked()).
+  noCheck: Ran | null
   // What each other command answers, by its first word: as it is, or from its arguments.
   answer: Record<string, Ran | ((rest: string[]) => Ran)>
-  slow: Set<string> // commands that answer only once the test moves the clock on
+  slow: Set<string> // commands that answer only once the test moves the clock on; "quick": the quick read
   placed: boolean
   clock: ReturnType<typeof mock.clock>
 }
 
 const done = (stdout = '', exitCode = 0, stderr = ''): Ran => ({ exitCode, stdout, stderr })
+
+// What `status --json --no-check` answers where `status --json` answers
+// `full`: its record with no sign-in checked, as longhaul.py's NOT_CHECKED
+// makes it (null, no reason, no plan; use_here trusts it), "checked": false;
+// or its failure, as it is.
+function unchecked(full: Ran): Ran {
+  let s: any = null
+  try { s = JSON.parse(full.stdout) } catch {}
+  if (!s || typeof s !== 'object' || !Array.isArray(s.accounts)) return full
+  const accounts = s.accounts.map((a: any) => (a && typeof a === 'object'
+    ? { ...a, signed_in: null, as_expected: null, check_failed: null, plan: null,
+      ...(a.use_here === 'not_signed_in' ? { use_here: 'ok' } : {}) } : a))
+  return { ...full, stdout: JSON.stringify({ ...s, accounts, checked: false }) }
+}
 
 // /accounts as the user types it at the prompt of a fullscreen terminal.
 const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
@@ -112,8 +132,9 @@ const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
 // The engine beneath the plugins, from memory: programs, files, panes, the
 // clock, and what display.ts asks at a session's start.
 function world(on: any): World {
-  const w: World = { runs: [], timeouts: [], envs: [], opened: [], closed: [], focused: [], toasts: [], files: {}, alive: new Set([RELAY]),
-    status: done(JSON.stringify(STATUS)), answer: { remove: dryOr(DELETE_DRY), folders: dryOr(() => PREVIEW) },
+  const w: World = { runs: [], timeouts: [], envs: [], quick: [], opened: [], closed: [], focused: [], toasts: [], files: {},
+    alive: new Set([RELAY]), status: done(JSON.stringify(STATUS)), fails: null, noCheck: null,
+    answer: { remove: dryOr(DELETE_DRY), folders: dryOr(() => PREVIEW) },
     slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
   mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home' })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
@@ -139,12 +160,20 @@ function world(on: any): World {
     if (argv[0] !== 'python3' || argv[1] !== '-I' || !/^\/.*\/longhaul\.py$/.test(argv[2] ?? ''))
       return { deny: 'not run here' }
     const rest = argv.slice(3)
+    if (rest[0] === 'status' && rest.includes('--no-check')) {
+      w.quick.push({ rest, timeoutMs: e.init?.timeoutMs, env: e.init?.env ?? null })
+      const ran = w.noCheck ?? unchecked(w.status) // as the files stood when it started
+      if (w.slow.has('quick')) await w.clock.sleep(60_000)
+      return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     w.runs.push(rest)
     w.timeouts.push(e.init?.timeoutMs)
     w.envs.push(e.init?.env ?? null)
+    const read = rest[0] === 'status' ? { ran: w.status, fails: w.fails } : null // as the files stood when it started
     if (w.slow.has(rest[0]!)) await w.clock.sleep(60_000)
+    if (read?.fails) return { deny: read.fails }
     const said = w.answer[rest[0]!]
-    const ran = rest[0] === 'status' ? w.status : typeof said === 'function' ? said(rest) : said ?? done('Done.')
+    const ran = read ? read.ran : typeof said === 'function' ? said(rest) : said ?? done('Done.')
     return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return w
@@ -222,6 +251,8 @@ both('/accounts opens the pane and reads the accounts', async ($, on, surface) =
   expect(said.text).toMatch(/pane/)
   expect(w.runs).toEqual([['status', '--json']])
   expect(w.timeouts).toEqual([60_000])
+  // Beside it, the quick read the rows are drawn from first (M7), for this chat too.
+  expect(w.quick).toEqual([{ rest: ['status', '--json', '--no-check'], timeoutMs: 15_000, env: { CLAUDE_CODE_SESSION_ID: SID } }])
   await ui.unmount()
 })
 
@@ -1168,6 +1199,183 @@ both('no "rows" and no "exit code" in what the pane says', async ($, on, surface
   for (const t of seen) expect(t).not.toMatch(/\brows?\b|exit code/i)
   expect(seen.some(t => t.startsWith('Longhaul could not read your accounts: longhaul: error: something.'))).toBe(true)
   expect(seen.some(t => t.startsWith('Longhaul could not read your accounts: its answer was not JSON.'))).toBe(true)
+  await ui.unmount()
+})
+
+// M7 (the UX review of 2026-11-11): the rows come from `status --json
+// --no-check`, which runs no claude, at once; each sign-in says
+// "checking…" until the full read, which checks them and may take 20 s
+// for an account that does not answer, comes back.
+
+const QUICK_ROWS = {
+  'row-personal-1': '  personal-1  checking… · 5h 40% · week 12%   (this chat)',
+  'row-work-2': `  work-2      checking… · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
+  'row-spare-3': '  spare-3     checking…   (used nowhere)',
+  'row-team-4': '  team-4      checking…',
+}
+const FULL_ROWS = {
+  'row-personal-1': '  personal-1  max · signed in · 5h 40% · week 12%   (this chat)',
+  'row-work-2': `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
+  'row-spare-3': '  spare-3     signed in as someone else   (used nowhere)',
+  'row-team-4': '  team-4      could not check',
+}
+
+// Each account's line, by its key, the focus ring's › left out.
+async function rows(ui: any): Promise<Record<string, string | undefined>> {
+  const found: Record<string, string | undefined> = {}
+  for (const key of ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4'])
+    found[key] = (await ui.find({ key }))?.text?.replace(/^›/, ' ')
+  return found
+}
+
+both('the rows are drawn before any sign-in check returns, each sign-in checking…, then filled in', async ($, on, surface) => {
+  const w = world(on)
+  w.slow.add('status') // the full read answers only once the clock moves on, as a check that hangs
+  const { said, ui } = await opened($, w, surface)
+  expect(said.text).toMatch(/pane is open/) // the command waited for the rows, not for the checks
+  expect(w.quick.map(q => q.rest)).toEqual([['status', '--json', '--no-check']])
+  expect(w.runs).toEqual([['status', '--json']]) // under way
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect(await rows(ui)).toEqual(QUICK_ROWS)
+  let all = await texts(ui)
+  expect(all.join('\n')).not.toMatch(/Reading Longhaul's accounts|could not|NOT signed in|someone else/)
+  expect(all).toContain('Here, in ~/code/x: personal-1, team-4 may be used.')
+  // "checking…" is no warning: only the limit colours a line.
+  const shade = async (text: string) => (await ui.findAll({ type: 'Text' })).find((t: any) => t.text === text)?.props.color
+  expect(await shade('checking… · 5h 40% · week 12%')).toBeUndefined()
+  expect(await shade(`checking… · limit until ${clock(AT + 3 * HOUR)} (in 3 h)`)).toBe('warning')
+  // An account's page says it too, and its buttons are as for a check that could not say.
+  await open(ui, 'row-work-2')
+  all = await texts(ui)
+  expect(all).toContain('checking…')
+  expect((await ui.find({ key: 'signin-work-2' }))?.text).toBe('Sign in again')
+  await ui.press({ key: 'back' })
+  await w.clock.advance(60_000)
+  expect(w.runs).toEqual([['status', '--json']]) // that one read, no other
+  expect(await rows(ui)).toEqual(FULL_ROWS)
+  expect((await texts(ui)).join('\n')).not.toMatch(/checking…/)
+  await open(ui, 'row-work-2')
+  expect((await ui.find({ key: 'signin-work-2' }))?.text).toBe('Sign in')
+  await ui.unmount()
+})
+
+both('a full read that fails after the quick one keeps the rows, says so, and each sign-in could not check', async ($, on, surface) => {
+  const w = world(on)
+  w.noCheck = unchecked(done(JSON.stringify(STATUS)))
+  w.status = done('', 1, 'Traceback (most recent call last):\nValueError: something broke\n')
+  const { ui } = await opened($, w, surface)
+  expect(await buttons(ui)).toEqual(['retry', 'read-details', ...ROWS])
+  const first = (await ui.findAll({ type: 'Text' }))[1] // after the title, where a failed read shows
+  expect(first?.text).toBe('Longhaul could not check the sign-ins: ValueError: something broke.')
+  expect(first?.props.color).toBe('error')
+  expect(await rows(ui)).toEqual({ 'row-personal-1': '  personal-1  could not check · 5h 40% · week 12%   (this chat)',
+    'row-work-2': `  work-2      could not check · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
+    'row-spare-3': '  spare-3     could not check   (used nowhere)', 'row-team-4': '  team-4      could not check' })
+  expect((await texts(ui)).join('\n')).not.toMatch(/checking…|could not read/)
+  await ui.press({ key: 'read-details' })
+  expect(await texts(ui)).toContain('Traceback (most recent call last):')
+  // One that ran past its time, the same; Retry reads both again.
+  w.fails = 'it ran past 60000 ms'
+  await ui.press({ key: 'retry' })
+  expect((await ui.findAll({ type: 'Text' }))[1]?.text).toMatch(/^Longhaul could not check the sign-ins: it did not answer/)
+  expect(await buttons(ui)).toEqual(['retry', ...ROWS])
+  w.fails = null
+  w.status = done(JSON.stringify(STATUS))
+  w.noCheck = null
+  await ui.press({ key: 'retry' })
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect(await rows(ui)).toEqual(FULL_ROWS)
+  expect(w.runs.filter(r => r[0] !== 'status')).toEqual([])
+  await ui.unmount()
+})
+
+both('an older Longhaul with no --no-check: the one full read, as before, and nothing said of it', async ($, on, surface) => {
+  const w = world(on)
+  w.noCheck = done('', 2, 'usage: longhaul status [-h] [--json]\nlonghaul status: error: unrecognized arguments: --no-check\n')
+  w.slow.add('status')
+  // /accounts waits for that read then, as it always did: the pane is drawn meanwhile.
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  const said = $.command.run(TYPED)
+  const ui = await $.ui.mount(pane(surface))
+  let all = (await texts(ui)).join('\n')
+  expect(all).toMatch(/Reading Longhaul's accounts…/)
+  expect(all).not.toMatch(/unrecognized|older|update|could not/i)
+  await w.clock.advance(60_000)
+  expect((await said).text).toMatch(/pane is open/)
+  expect(w.quick.length).toBe(1)
+  expect(await buttons(ui)).toEqual(ROWS)
+  expect(await rows(ui)).toEqual(FULL_ROWS)
+  all = (await texts(ui)).join('\n')
+  expect(all).not.toMatch(/unrecognized|older|update Longhaul|could not read|checking…/i)
+  await ui.unmount()
+})
+
+both('a refresh keeps the last rows on screen, and a late full read never covers a newer one', async ($, on, surface) => {
+  const w = world(on)
+  const NEWER = { ...STATUS, accounts: ACCOUNTS.map(a => (a.name === 'work-2' ? { ...a, fallback: true } : a)) }
+  const FALLBACK = `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients · fallback)`
+  // Opened while a check hangs: the rows from the quick read, the first full read under way.
+  w.slow.add('status')
+  const { ui } = await opened($, w, surface)
+  expect(await rows(ui)).toEqual(QUICK_ROWS)
+  // An action meanwhile reads again, at once this time, and finds what it changed.
+  w.slow.delete('status')
+  w.status = done(JSON.stringify(NEWER))
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'fallback' })
+  expect(after(w)).toEqual([['fallback', 'work-2', 'on'], ['status', '--json']])
+  await ui.press({ key: 'back' })
+  expect(await rows(ui)).toEqual({ ...FULL_ROWS, 'row-work-2': FALLBACK })
+  // The first full read comes back late, with the record as it was: it is dropped.
+  await w.clock.advance(60_000)
+  expect(await rows(ui)).toEqual({ ...FULL_ROWS, 'row-work-2': FALLBACK })
+  // A refresh whose reads are both slow keeps the last record drawn, never "Reading…" nor "checking…".
+  w.slow.add('status')
+  w.slow.add('quick')
+  w.status = done(JSON.stringify(STATUS))
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'fallback' })
+  expect(await texts(ui)).toContain('Marking work-2 as a normal account…')
+  await ui.press({ key: 'back' })
+  expect(await rows(ui)).toEqual({ ...FULL_ROWS, 'row-work-2': FALLBACK })
+  expect((await texts(ui)).join('\n')).not.toMatch(/Reading Longhaul's accounts|checking…/)
+  // Both come back at the same moment: the full one stands, whichever is last.
+  await w.clock.advance(60_000)
+  expect(await rows(ui)).toEqual(FULL_ROWS)
+  // A quick read slower than its full one comes too late to be drawn.
+  w.slow.delete('status')
+  w.status = done(JSON.stringify(NEWER))
+  await open(ui, 'row-work-2')
+  await ui.press({ key: 'fallback' })
+  await ui.press({ key: 'back' })
+  expect(await rows(ui)).toEqual({ ...FULL_ROWS, 'row-work-2': FALLBACK })
+  await w.clock.advance(60_000)
+  expect(await rows(ui)).toEqual({ ...FULL_ROWS, 'row-work-2': FALLBACK })
+  expect(w.quick.length).toBe(4)
+  await ui.unmount()
+})
+
+both('a quick read left by a reload, its checks cut off, is read again', async ($, on, surface) => {
+  const w = world(on)
+  // What the module before the reload stored: the rows of a quick read, its full read gone with that module.
+  // Given under the store's own version, so the writes after it go through.
+  const QUICK = JSON.parse(unchecked(done(JSON.stringify(STATUS))).stdout)
+  let written = false
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.key === 'accountsRead') written = true
+    return next(e)
+  })
+  on('state.get', async (_: any, e: any, next: any) => {
+    if (e.key !== 'accountsRead' || written) return next(e)
+    const real = await next(e)
+    return { value: { version: 0, ...(real?.value ?? {}),
+      value: { shape: 'accounts-read-2', value: { status: QUICK, problem: null, update: false, lines: [] } } } }
+  })
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  const ui = await $.ui.mount(pane(surface))
+  await w.clock.settle()
+  expect(w.runs).toEqual([['status', '--json']])
+  expect(await rows(ui)).toEqual(FULL_ROWS)
   await ui.unmount()
 })
 

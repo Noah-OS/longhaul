@@ -28,7 +28,10 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // says otherwise); Activity's (the UX review's 4.3, M1) what Longhaul did by
 // itself today and why, from `activity --json`, this chat first, with
 // Earlier days for a week, then a month. Above the list, why this chat runs
-// on its account (status --json's "chat"). The pane draws `longhaul.py status --json` and runs
+// on its account (status --json's "chat"). The pane draws `longhaul.py
+// status --json`, first as `status --json --no-check` gives it, at once, as
+// it checks no sign-in, each sign-in "checking…" until the full read is in
+// (the UX review's M7), and runs
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
 // /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06); and
@@ -64,6 +67,8 @@ const MODES = ['ask', 'auto', 'never'] as const
 // element table answers every constructor whatever the surface draws.
 const TYPING = ['terminal', 'desktop', 'vscode']
 const STATUS_TIMEOUT = 60_000 // ms: it checks every account's sign-in
+const QUICK_TIMEOUT = 15_000 // ms: `status --json --no-check` checks none, and answers in about a second
+const CHECKING = 'checking…' // a sign-in while the quick read's rows wait for the full one
 const SIGN_IN_TIMEOUT = 600_000 // ms: a browser sign-in, the most process.run allows
 const POLL = 3000 // ms between looks for this chat's question
 const SHOWN = 10 // lines of a command's output shown
@@ -106,7 +111,8 @@ let busy = false // an action of this module runs: one at a time
 let answering = false // an answer runs: apart from the actions, as a question cannot wait for a sign-in
 let kicked = false // this module looked at what it found once, from a drawing
 let readOnce = false // this module has read the rows, or is reading them
-let reads: Promise<void> = Promise.resolve() // the reads, one after another
+let readSeq = 0 // the latest read of the rows: only it writes them, so an older one, back late, never covers it
+let writes: Promise<void> = Promise.resolve() // the rows' writes, one after another, in the order asked
 let looks: Promise<void> = Promise.resolve() // the looks at what is stuck, one after another
 let activityReads: Promise<void> = Promise.resolve() // the reads of what Longhaul did, one after another
 let polling = false // the 3 s look for a question runs
@@ -163,11 +169,13 @@ function folderProblem(path: string): string | null {
 // `status --json` read into what the pane draws: the record, or why there
 // is none in a few words, with the command's last lines for Details. The
 // record is taken whatever the exit code: an accounts.json it cannot read
-// ends status with 2 and the record still said, its problem in it.
-async function readStatus($: any): Promise<LonghaulAccountsRead> {
+// ends status with 2 and the record still said, its problem in it. `quick`:
+// `status --json --no-check`, the same record with no sign-in checked (M7).
+async function readStatus($: any, quick = false): Promise<LonghaulAccountsRead> {
   let ran: { exitCode: number; stdout: string; stderr: string }
   try {
-    ran = await $.process.run([...base($), 'status', '--json'], { timeoutMs: STATUS_TIMEOUT, ...(await chatEnv($)) })
+    ran = await $.process.run([...base($), 'status', '--json', ...(quick ? ['--no-check'] : [])],
+      { timeoutMs: quick ? QUICK_TIMEOUT : STATUS_TIMEOUT, ...(await chatEnv($)) })
   } catch (err: any) {
     return { status: null, problem: mask(`it did not answer (${err?.message || err})`), update: false, lines: [] }
   }
@@ -221,7 +229,7 @@ function clean(s: any): LonghaulStatus {
   return { accounts, listed: s.listed === true, here, chat,
     switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
     panel_switch: (MODES as readonly unknown[]).includes(s.panel_switch) ? s.panel_switch : null,
-    vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem) }
+    vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem), checked: s.checked !== false }
 }
 
 // `repair --json` read into what the Troubleshoot page draws: each finding
@@ -311,14 +319,36 @@ function lookActivity($: any, days: number, fresh = false): Promise<void> {
   return activityReads
 }
 
-// Reads the rows again, after any read already under way.
+// Reads the rows again (the UX review's M7): `status --json --no-check`,
+// which runs no claude and answers at once, beside the full `status
+// --json`, which checks each sign-in and waits up to 20 s on one that does
+// not answer. The quick record is drawn first, each sign-in "checking…",
+// unless the full one is in already; the full one replaces it. A full read
+// that fails after the quick one keeps the quick rows, the failure said and
+// each sign-in "could not check". A quick read that fails (a longhaul.py
+// older than --no-check refuses it) is passed over without a word: the full
+// read is then the one, as before. Until a record is in, the last one stays
+// drawn: a refresh never blanks the rows. Only the latest read writes, so a
+// full read of an older one, back late, never covers a newer one's rows.
+// Resolves once the rows are drawn: /accounts, Retry and the actions wait
+// for no sign-in check.
 function refresh($: any): Promise<void> {
   readOnce = true
-  reads = reads.then(async () => {
-    const got = await readStatus($)
-    await update($, lastRead, () => got)
-  }).catch(() => {})
-  return reads
+  const mine = ++readSeq
+  let full = false // this read's full answer is in: its quick one, if later, is not drawn
+  const write = (got: LonghaulAccountsRead, still = () => true): Promise<void> =>
+    (writes = writes.then(async () => {
+      if (mine === readSeq && still()) await update($, lastRead, () => got)
+    }).catch(() => {}))
+  const quick = readStatus($, true)
+  const whole = readStatus($).then(async got => {
+    full = true
+    if (got.status) return write(got)
+    const q = await quick
+    return write(q.status ? { ...q, problem: got.problem, update: got.update, lines: got.lines } : got)
+  })
+  const drawn = quick.then(q => (q.status ? write(q, () => !full) : whole))
+  return Promise.race([drawn, whole]).catch(() => {})
 }
 
 type Action = {
@@ -368,11 +398,14 @@ async function act($: any, a: Action): Promise<void> {
 // The first drawing of this module: an action another module (the one
 // before a reload) marked running is not known to have ended, so it is
 // said so; then the rows are read, unless this module has read them (the
-// pane /accounts opened: the command reads them). A drawing writes nothing
+// pane /accounts opened: the command reads them). The rows of a quick read
+// whose full read went with the module before are read again too, or their
+// sign-ins would say "checking…" for good. A drawing writes nothing
 // itself, so this runs on the clock, just after.
 function firstLook($: any, before: LonghaulAccountsRunning | null, have: LonghaulAccountsRead | null): void {
   const stale = before !== null && before.by !== SELF
-  if (kicked || !(stale || (have === null && !readOnce))) return
+  const cut = have !== null && have.status?.checked === false && have.problem === null
+  if (kicked || !(stale || ((have === null || cut) && !readOnce))) return
   kicked = true
   try {
     $.clock.after(0, () => {
@@ -794,6 +827,7 @@ type Ctx = {
   idle: boolean // no action runs: the actions are offered
   have: LonghaulAccountsRead | null // null: not read yet
   status: LonghaulStatus | null
+  checking: boolean // the quick read's rows, its full read under way: each unchecked sign-in "checking…"
   now: LonghaulAccountsRunning | null // this module's action, running
   last: LonghaulAccountsResult | null
   confirm: string | null
@@ -904,20 +938,29 @@ function unread(reason: string): string {
     + 'screen works again once this is fixed.'
 }
 
+// What it says when the full read, which checks the sign-ins, failed after
+// the quick one drew the rows (M7): the rows stand, each sign-in not checked.
+function unchecked(reason: string): string {
+  return `Longhaul could not check the sign-ins: ${mask(reason).replace(/[.\s]+$/, '')}.`
+}
+
 // Before the rows: still reading, or why they could not be read (the
-// record's own problem, or the read's), with Retry, the raw output behind
-// Details. A reason is drawn in normal weight, never dim (Q14).
+// record's own problem, or the read's), or why the sign-ins could not be
+// checked, with Retry, the raw output behind Details. A reason is drawn in
+// normal weight, never dim (Q14).
 function readPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   if (c.have === null) return <Text dimColor>Reading Longhaul's accounts…</Text>
-  if (c.status && !c.status.problem) return null
-  const raw = c.status ? [] : c.have.lines ?? []
+  if (c.status && !c.status.problem && !c.have.problem) return null
+  const rows = c.status !== null && !c.status.problem // the quick read's, kept: only the sign-ins failed
+  const raw = c.have.lines ?? []
   const open = c.details === 'read'
   return (
     <Box flexDirection="column">
       {c.have.update
         ? <Text color="error">{c.have.problem ?? ''}</Text>
-        : <Text color="error">{unread(c.status?.problem ?? c.have.problem ?? '')}</Text>}
+        : <Text color="error">{rows ? unchecked(c.have.problem ?? '')
+          : unread(c.status?.problem ?? c.have.problem ?? '')}</Text>}
       {c.have.update && <Text>{UPDATE}</Text>}
       {c.idle && (
         <Box flexDirection="row" gap={1}>
@@ -931,9 +974,11 @@ function readPart($: any, c: Ctx): any {
   )
 }
 
-// What the sign-in check found, in a word or two.
-function signedIn(a: LonghaulAccount): string {
-  if (a.signed_in === null) return 'could not check'
+// What the sign-in check found, in a word or two; for one not checked yet,
+// while the full read runs (`checking`, M7), "checking…" where it would say
+// "could not check": the buttons take both alike, as a null sign-in.
+function signedIn(a: LonghaulAccount, checking: boolean): string {
+  if (a.signed_in === null) return checking ? CHECKING : 'could not check'
   if (a.signed_in === false) return 'NOT signed in'
   if (a.as_expected === false) return 'signed in as someone else'
   return 'signed in'
@@ -955,10 +1000,10 @@ function roomNow(a: LonghaulAccount): boolean {
 
 // An account's line in the list: its plan, its sign-in unless that is
 // fine and the limit says more, then the limit, or room now and the use of
-// its open windows.
-function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boolean } {
+// its open windows. "checking…" is no warning: nothing is known wrong yet.
+function summary(a: LonghaulAccount, nowMs: number, checking: boolean): { text: string; warn: boolean } {
   const limited = typeof a.limited_until === 'number'
-  const sign = typeof a.sign_in_failed_at === 'number' ? 'sign-in failed' : signedIn(a)
+  const sign = typeof a.sign_in_failed_at === 'number' ? 'sign-in failed' : signedIn(a, checking)
   const parts = a.plan ? [mask(a.plan)] : []
   if (!(limited && sign === 'signed in')) parts.push(sign)
   if (limited) parts.push(limitText(a, nowMs))
@@ -967,7 +1012,7 @@ function summary(a: LonghaulAccount, nowMs: number): { text: string; warn: boole
     if (a.five_hour) parts.push(`5h ${Math.round(a.five_hour.used)}%`)
     if (a.week) parts.push(`week ${Math.round(a.week.used)}%`)
   }
-  return { text: parts.join(' · '), warn: limited || sign !== 'signed in' }
+  return { text: parts.join(' · '), warn: limited || (sign !== 'signed in' && sign !== CHECKING) }
 }
 
 // A list that holds / covers every folder, so "only in /" read as a narrow one
@@ -1008,7 +1053,7 @@ function itemsPart($: any, c: Ctx): any {
     const name = String(a.name)
     const key = NAME.test(name) && !keys.has(`row-${name}`) ? `row-${name}` : null
     if (key) keys.add(key)
-    const { text, warn } = summary(a, c.nowMs)
+    const { text, warn } = summary(a, c.nowMs, c.checking)
     items.push({ key, head: mask(name).padEnd(width), text, warn, extra: extras(a),
       open: key ? () => void go($, `account:${name}`, harmless(a)) : undefined })
   }
@@ -1302,7 +1347,8 @@ function accountPage($: any, c: Ctx): any {
   const name = c.page.slice('account:'.length)
   const a = c.status!.accounts.find(x => x.name === name)!
   const how = signInOf(a)
-  const check = a.signed_in === null && a.check_failed ? `could not check: ${mask(String(a.check_failed))}` : signedIn(a)
+  const check = a.signed_in === null && a.check_failed ? `could not check: ${mask(String(a.check_failed))}`
+    : signedIn(a, c.checking)
   const lines = [use('5-hour', a.five_hour, c.nowMs), use('week', a.week, c.nowMs)].filter(Boolean) as string[]
   return (
     <Box flexDirection="column">
@@ -1623,7 +1669,8 @@ export const register: Register = on => {
   // Opens the pane on its list and reads the rows; where it cannot be drawn, says why.
   on('command.run', { command: 'accounts' }, async $ => {
     startPolling($)
-    // The read starts first, so the pane's first drawing finds it under way and asks for no other.
+    // The read starts first, so the pane's first drawing finds it under way and asks for no other. It
+    // is waited for below until the rows are drawn, not for the sign-in checks (M7).
     const reading = refresh($)
     try { // as /mcp opens: on the list, the focus on its first line
       await update($, shown, () => 'list')
@@ -1677,9 +1724,10 @@ export const register: Register = on => {
     const mine = now && now.by === SELF ? now : null
     const canType = TYPING.includes(String(e.surface))
     const status = have?.status ?? null
-    const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
-      form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans,
-      details: open, trouble: found, activity: did, preview: dry, nowMs }
+    const checking = status?.checked === false && !have?.problem
+    const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, checking, now: mine,
+      last, confirm, form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w,
+      answer: ans, details: open, trouble: found, activity: did, preview: dry, nowMs }
     return drawPane($, c)
   })
 }
