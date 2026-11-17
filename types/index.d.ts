@@ -59,6 +59,10 @@ export type LonghaulStatus = {
   // can set apart from "switch". Optional: an older longhaul.py does not give it.
   panel_switch?: 'ask' | 'auto' | 'never' | null
   vscode: boolean | null
+  // Whether `longhaul panel pause` is in force: Claude runs alone in the
+  // VS Code panel's chats. Optional: an older longhaul.py does not give it,
+  // and the Troubleshoot page then offers both Pause and Resume.
+  panel_paused?: boolean | null
   problem: string | null
 }
 
@@ -70,7 +74,19 @@ export type LonghaulAccountsRead = {
 }
 
 // Which page the pane shows: the list, or one item's page.
-export type LonghaulAccountsPage = 'list' | 'add' | 'settings' | `account:${string}`
+export type LonghaulAccountsPage = 'list' | 'add' | 'settings' | 'troubleshoot' | `account:${string}`
+
+// One thing `longhaul.py repair --json` finds stuck or broken: its id (what
+// `repair --fix ID` takes), what is wrong and what its fix does, in plain
+// words, and whether there is a fix here.
+export type LonghaulRepairFinding = { id: string; what: string; fix: string; fixable: boolean }
+
+// The Troubleshoot page's last look: the findings, or why there are none
+// (update: this Longhaul is older than the pane and has no repair), with
+// the command's last lines, masked, for its Details.
+export type LonghaulAccountsTrouble = {
+  findings: LonghaulRepairFinding[] | null; problem: string | null; update: boolean; lines: string[]
+}
 
 // The action running now: which module started it (a reload makes a new
 // one), what it is, what the user should do meanwhile, the page it ran from.
@@ -122,7 +138,7 @@ declare module 'claude-code' {
       accountsRead: Shaped<LonghaulAccountsRead | null>
       accountsRunning: Shaped<LonghaulAccountsRunning | null>
       accountsResult: Shaped<LonghaulAccountsResult | null>
-      accountsConfirm: Shaped<string | null> // the account whose Remove waits for a yes
+      accountsConfirm: Shaped<string | null> // the account whose Remove waits for a yes, or fix:ID for a Fix
       accountsForm: Shaped<LonghaulAccountsForm>
       accountsFolder: Shaped<LonghaulAccountsFolder>
       accountsPage: Shaped<LonghaulAccountsPage>
@@ -131,7 +147,8 @@ declare module 'claude-code' {
       accountsWait: Shaped<LonghaulWait | null> // this chat's carry-on at a reset
       accountsAsked: Shaped<string | null> // the last question id the pane was opened for
       accountsAnswer: Shaped<LonghaulAccountsAnswer | null>
-      accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", or none
+      accountsDetails: Shaped<string | null> // whose Details are open: "result", "read", "trouble", or none
+      accountsTrouble: Shaped<LonghaulAccountsTrouble | null> // null: not looked yet, or looking again
     }
   }
 }

@@ -145,7 +145,7 @@ A chat you reopen (after a VS Code reload, or with its tab reopened) on an accou
 
 With no answer, nothing moves. If the chat carried on first (Claude Code's own wait, or a message from you), Longhaul sends nothing. While a question waits, the status entry says `question: /accounts`; while a carry-on waits, `carries on at 14:01 on Pro` (a minute after the reset, to be safe).
 
-Longhaul stays in each panel chat in every mode. To turn that off, run `longhaul panel pause` in a terminal. The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. `longhaul panel resume` turns Longhaul back on, and `longhaul panel` says which is in force. Each counts for the chats you open after it. Both write `"switch_mid_session"` in `~/.longhaul/vscode.json` and keep the file's other keys.
+Longhaul stays in each panel chat in every mode. To turn that off, run `longhaul panel pause` in a terminal, or press **Pause Longhaul in panel chats** on the **Troubleshoot** page of `/accounts`. The panel then runs Claude alone: at a limit there is no question, no carry-on and no move. `longhaul panel resume` (or **Resume Longhaul in panel chats**) turns Longhaul back on, and `longhaul panel` says which is in force. Each counts for the chats you open after it. Both write `"switch_mid_session"` in `~/.longhaul/vscode.json` and keep the file's other keys.
 
 A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own; `/accounts`, then `Settings`, says so.
 
@@ -163,7 +163,7 @@ A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own;
 
 ## 5. From the VS Code chat
 
-**With buttons:** type `/accounts`. It adds, signs in again and removes accounts, and in `Settings` sets switching, turns the VS Code panel on or off, and forgets the recorded limits ([More than one account](#4-more-than-one-account)). It runs Longhaul's own commands: no email, password or code goes through the chat. At a usage limit in `ask`, its question is where you answer.
+**With buttons:** type `/accounts`. It adds, signs in again and removes accounts; in `Settings` it sets switching, turns the VS Code panel on or off, and forgets the recorded limits; in `Troubleshoot` it fixes what is stuck and pauses Longhaul in panel chats ([More than one account](#4-more-than-one-account)). It runs Longhaul's own commands: no email, password or code goes through the chat. At a usage limit in `ask`, its question is where you answer.
 
 **In words:** ask in your own words, for example "add my work account", "turn on the panel" or "set switching to ask". `/longhaul:manage` shows the exact command and what it changes, and runs it only after your yes in the chat. From a chat it can:
 
@@ -222,7 +222,7 @@ To remove it: `longhaul uninstall --dry-run` lists what Longhaul put outside the
 - **A chat stopped because its sign-in failed.** In `/accounts`, open that account and press **Sign in**, or run `longhaul setup NAME --relogin` in a terminal; then send a message.
 - **A pop-up says a question waits, and nothing opened.** Type `/accounts`: the question is at the top.
 - **A chat open twice**, in a terminal and in the panel, writes the same conversation from two places: close one. Longhaul says so when it notices.
-- **Something seems stuck** (a chat that waits for nothing, a question no one can answer, an `accounts.json` that will not read): `longhaul repair --dry-run` lists what is stuck and what each fix does, and changes nothing; `longhaul repair` in a terminal asks before each fix, and `longhaul repair --fix ID` makes one alone (`--json` gives each one's id). No need to uninstall to start over. From 0.3.13 on, each change to the account list keeps the last good copy as `~/.longhaul/accounts.json.last-good`, which `repair` can put back.
+- **Something seems stuck** (a chat that waits for nothing, a question no one can answer, an `accounts.json` that will not read): `longhaul repair --dry-run` lists what is stuck and what each fix does, and changes nothing; `longhaul repair` in a terminal asks before each fix, and `longhaul repair --fix ID` makes one alone (`--json` gives each one's id). In `/accounts`, **Troubleshoot** lists the same, each with **Fix**, which asks first. No need to uninstall to start over. From 0.3.13 on, each change to the account list keeps the last good copy as `~/.longhaul/accounts.json.last-good`, which `repair` can put back.
 - **Anything else:** `/longhaul:doctor`, then the [issue tracker](https://github.com/Noah-OS/longhaul/issues).
 
 ## Know before you use it

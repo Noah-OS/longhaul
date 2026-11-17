@@ -24486,7 +24486,7 @@ class StatusJson(unittest.TestCase):
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
                     "preferred", "use_here", "reading_at"}
-    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "problem"}
+    KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -24567,9 +24567,10 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
-            "switch_problem": None, "panel_switch": "ask", "vscode": False, "problem": None})
+            "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
-                                       "vscode", "problem"], "the screen's order: panel_switch after switch_problem")
+                                       "vscode", "panel_paused", "problem"],
+                         "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17)")
         self.assertIn("longhaul status [--json]", longhaul.__doc__, "the Usage block names it")
 
     def test_emails_are_masked_and_never_shown_whole(self):
@@ -24895,6 +24896,22 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(modes(self.read(self.status(LONGHAUL_SWITCH="sometimes"))), (None, "never"))
         self.assertFalse((self.home / "longhaul.log").exists(), "the panel's log line for a bad mode is not written")
         self.assertEqual(set(self.files()) - set(before), {str(self.home / "config.json"), str(self.home / "vscode.json")})
+
+    def test_panel_paused_says_whether_longhaul_panel_pause_is_in_force(self):
+        # The Troubleshoot page's Pause or Resume button: true only with the
+        # JSON false that panel_mid_session() reads; it only reads.
+        self.write_accounts({"name": "personal-1"})
+        cases = {None: False, '{"switch_mid_session": false, "switch": "auto"}': True,
+                 '{"switch_mid_session": true}': False, '{"switch_mid_session": "false"}': False, "{not json": False}
+        for text, paused in cases.items():
+            with self.subTest(text=text):
+                if text is None:
+                    (self.home / "vscode.json").unlink(missing_ok=True)
+                else:
+                    (self.home / "vscode.json").write_text(text)
+                before = self.files()
+                self.assertIs(self.read(self.status())["panel_paused"], paused)
+                self.assertEqual(self.files(), before, "it only reads")
 
     def test_vscode_says_whether_its_settings_run_longhauls_wrapper(self):
         self.write_accounts({"name": "personal-1"})

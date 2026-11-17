@@ -2,23 +2,27 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LonghaulAccount, LonghaulAccountsAnswer, LonghaulAccountsFolder, LonghaulAccountsForm, LonghaulAccountsPage,
-  LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulQuestion, LonghaulStatus,
-  LonghaulWait } from '../types'
+  LonghaulAccountsRead, LonghaulAccountsResult, LonghaulAccountsRunning, LonghaulAccountsTrouble, LonghaulQuestion,
+  LonghaulRepairFinding, LonghaulStatus, LonghaulWait } from '../types'
 import { status as showStatus } from './display.ts'
 import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
 
 // Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
 // does (the owner, 2026-10-30: "a model showing up front of us and we can do
 // some action there"). First a short list, one line per account, then
-// "+ Add account" and "Settings"; the arrows move the focus, Enter opens an
-// item's page, Escape goes back, and from the list closes the pane. An
+// "+ Add account", "Settings" and "Troubleshoot"; the arrows move the focus,
+// Enter opens an item's page, Escape goes back, and from the list closes the pane. An
 // account's page has its details and its actions (Sign in again or Sign in,
 // Remove), then its folders, each with Remove, a field to add one and
 // Remove all folder limits… (the owner, 2026-11-05: "I can't edit the
 // accounts"; it asks first since the UX review's Q12), then
 // whether it is a fallback, with the button that turns it (2026-11-06); Add
 // account's page the form; Settings' page switching, the VS Code panel and
-// forgetting the limits. The pane draws `longhaul.py status --json` and runs
+// forgetting the limits; Troubleshoot's (the UX review's 4.4, M2) what
+// `repair --json` finds stuck, each with a Fix that asks first, and Longhaul
+// paused or resumed in the panel's chats (`panel pause|resume`), which
+// /longhaul:manage does not run (bin/longhaul refuses both until the owner
+// says otherwise). The pane draws `longhaul.py status --json` and runs
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
 // /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06); and
@@ -82,6 +86,8 @@ const question = atom({ plugin: 'longhaul', key: 'accountsQuestion' } as const, 
 const wait = atom({ plugin: 'longhaul', key: 'accountsWait' } as const, null, { shape: 'accounts-wait-1' })
 // Whose raw output shows, behind Details: the last result's, the failed read's, or none.
 const details = atom({ plugin: 'longhaul', key: 'accountsDetails' } as const, null, { shape: 'accounts-details-1' })
+// What the Troubleshoot page's last look at `repair --json` found.
+const trouble = atom({ plugin: 'longhaul', key: 'accountsTrouble' } as const, null, { shape: 'accounts-trouble-1' })
 
 // This module's own mark on what it runs: a reload loads a new module, with
 // a new mark, so an action marked by another one was cut off by the reload.
@@ -91,6 +97,7 @@ let answering = false // an answer runs: apart from the actions, as a question c
 let kicked = false // this module looked at what it found once, from a drawing
 let readOnce = false // this module has read the rows, or is reading them
 let reads: Promise<void> = Promise.resolve() // the reads, one after another
+let looks: Promise<void> = Promise.resolve() // the looks at what is stuck, one after another
 let polling = false // the 3 s look for a question runs
 let looking = false // one look at a time
 
@@ -190,7 +197,45 @@ function clean(s: any): LonghaulStatus {
   return { accounts, listed: s.listed === true, here,
     switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
     panel_switch: (MODES as readonly unknown[]).includes(s.panel_switch) ? s.panel_switch : null,
-    vscode: flag(s.vscode), problem: str(s.problem) }
+    vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem) }
+}
+
+// `repair --json` read into what the Troubleshoot page draws: each finding
+// with an id, what and fix as text (any other is left out), or why there
+// are none, with the command's last lines for Details.
+async function readTrouble($: any): Promise<LonghaulAccountsTrouble> {
+  let ran: { exitCode: number; stdout: string; stderr: string }
+  try {
+    ran = await $.process.run([...base($), 'repair', '--json'], { timeoutMs: STATUS_TIMEOUT })
+  } catch (err: any) {
+    return { findings: null, problem: mask(`it did not answer (${err?.message || err})`), update: false, lines: [] }
+  }
+  const said = tail(ran.stdout, ran.stderr)
+  // An older longhaul.py has no repair: argparse refuses it by name.
+  if (/unrecognized arguments:.*\brepair\b/.test(`${ran.stdout}\n${ran.stderr}`))
+    return { findings: null, problem: 'This Longhaul is older than this pane: it has no repair.', update: true, lines: said }
+  let rows: any = null
+  try { rows = JSON.parse(ran.stdout) } catch {}
+  if (ran.exitCode === 0 && Array.isArray(rows)) {
+    const findings: LonghaulRepairFinding[] = rows
+      .filter((f: any) => f && typeof f === 'object' && typeof f.id === 'string' && typeof f.what === 'string'
+        && typeof f.fix === 'string')
+      .map((f: any) => ({ id: f.id, what: mask(f.what), fix: mask(f.fix), fixable: f.fixable === true }))
+    return { findings, problem: null, update: false, lines: [] }
+  }
+  const problem = ran.exitCode !== 0 ? said.at(-1) ?? 'it stopped and said nothing' : 'its answer was not a list'
+  return { findings: null, problem, update: false, lines: said }
+}
+
+// Looks again at what is stuck, after any look already under way; `fresh`
+// clears the last look first, so the page says it is looking.
+function lookAgain($: any, fresh = false): Promise<void> {
+  looks = looks.then(async () => {
+    if (fresh) await update($, trouble, () => null)
+    const got = await readTrouble($)
+    await update($, trouble, () => got)
+  }).catch(() => {})
+  return looks
 }
 
 // Reads the rows again, after any read already under way.
@@ -240,6 +285,7 @@ async function act($: any, a: Action): Promise<void> {
     }
     await update($, result, () => end)
     await refresh($)
+    if ((await read($, shown)) === 'troubleshoot') await lookAgain($)
   } finally { // the mark goes before the next action may start, so it never clears that one's
     await update($, running, r => (r && r.by === SELF ? null : r)).catch(() => {})
     busy = false
@@ -429,6 +475,26 @@ async function clear($: any): Promise<void> {
     timeoutMs: STATUS_TIMEOUT })
 }
 
+// One finding's fix (`repair --fix ID --yes`), after the page's own second
+// yes: only one the last look listed with a fix here, under an id that is
+// never an option. VS Code's needs a reload after it.
+const ID = /^[a-z]+(:|$)/
+const LATER = 'A chat open now keeps what it started with until it is closed and opened again.'
+
+async function fixOne($: any, id: string): Promise<void> {
+  const f = busy ? null : (await read($, trouble))?.findings?.find(x => x.id === id)
+  if (!f || !f.fixable || !ID.test(id)) return
+  await act($, { label: `Fix: ${f.what.length > 120 ? `${f.what.slice(0, 120)}…` : f.what}`, doing: 'Fixing…',
+    argv: ['repair', '--fix', id, '--yes'], timeoutMs: STATUS_TIMEOUT, ...(id === 'vscode' ? { after: RELOAD } : {}) })
+}
+
+// Longhaul paused or resumed in the VS Code panel's chats (`panel pause|resume`).
+async function panel($: any, pause: boolean): Promise<void> {
+  await act($, { label: `${pause ? 'Pause' : 'Resume'} Longhaul in panel chats`,
+    doing: `${pause ? 'Pausing' : 'Resuming'} Longhaul in panel chats…`, argv: ['panel', pause ? 'pause' : 'resume'],
+    timeoutMs: STATUS_TIMEOUT, after: LATER })
+}
+
 async function retry($: any): Promise<void> {
   if (busy) return
   busy = true
@@ -452,7 +518,7 @@ function pageOf(asked: LonghaulAccountsPage, status: LonghaulStatus | null, canT
     const name = asked.slice('account:'.length)
     return NAME.test(name) && status.accounts.some(a => a.name === name) ? asked : 'list'
   }
-  return asked === 'add' || asked === 'settings' ? asked : 'list'
+  return asked === 'add' || asked === 'settings' || asked === 'troubleshoot' ? asked : 'list'
 }
 
 // The control an account's page opens with the focus on (the UX review's
@@ -489,6 +555,7 @@ async function go($: any, to: LonghaulAccountsPage, first: string): Promise<void
   await update($, confirming, () => null)
   await update($, shown, () => to)
   focusOn($, first)
+  if (to === 'troubleshoot') await lookAgain($, true)
 }
 
 // One step back: a Remove waiting for its yes is cancelled, a page goes
@@ -588,6 +655,7 @@ type Ctx = {
   wait: LonghaulWait | null
   answer: LonghaulAccountsAnswer | null
   details: string | null // whose Details are open
+  trouble: LonghaulAccountsTrouble | null // the Troubleshoot page's last look; null: looking
   nowMs: number // the clock, for times shown as longhaul.py shows them
 }
 
@@ -597,7 +665,7 @@ type Ctx = {
 function drawPane($: any, c: Ctx): any {
   const { Box } = c.E
   const body = c.page === 'list' ? listPage($, c) : c.page === 'add' ? addPage($, c)
-    : c.page === 'settings' ? settingsPage($, c) : accountPage($, c)
+    : c.page === 'settings' ? settingsPage($, c) : c.page === 'troubleshoot' ? troublePage($, c) : accountPage($, c)
   return (
     <Box flexDirection="column" gap={1}>
       {questionPart($, c)}
@@ -785,6 +853,8 @@ function itemsPart($: any, c: Ctx): any {
     const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
     items.push({ key: 'row-settings', head: `Settings (switching: ${s.switch ?? 'not known'} · VS Code panel: ${vs})`,
       text: '', warn: false, extra: '', open: () => void go($, 'settings', 'switch') })
+    items.push({ key: 'row-troubleshoot', head: `Troubleshoot${s.panel_paused === true ? ' (Longhaul paused in panel chats)' : ''}`,
+      text: '', warn: false, extra: '', open: () => void go($, 'troubleshoot', 'back') })
   }
   const pressable = items.filter(i => c.canType && i.key && i.open)
   const start = c.question ? null : (pressable.find(i => i.key === c.mark) ?? pressable[0])?.key ?? null
@@ -1111,6 +1181,8 @@ function settingsPage($: any, c: Ctx): any {
             {on !== false && <Button key="vscode-off" label="Turn off" onPress={() => void vscode($, false)} />}
           </Box>
         )}
+        {c.status!.panel_paused === true
+          && <Text>Longhaul is paused in panel chats: Claude runs alone there. Troubleshoot resumes it.</Text>}
       </Box>
       {c.idle && (
         <Box flexDirection="column">
@@ -1118,6 +1190,82 @@ function settingsPage($: any, c: Ctx): any {
           <Button key="clear" label={FORGET_ALL} onPress={() => void clear($)} />
         </Box>
       )}
+    </Box>
+  )
+}
+
+// Troubleshoot's page (the UX review's 4.4): what `repair --json` found,
+// each with what its fix does and, where there is one here, Fix, which asks
+// a second time as Remove does; "Nothing to repair." when it found none;
+// then Longhaul paused or resumed in the panel's chats, the pair offered
+// where the record does not say which is in force. Nothing runs until a
+// button is pressed, and no control while an action runs or a yes waits.
+const PAUSE_NOTE = 'Stops questions, carry-ons and moves in the panel chats opened after it.'
+const PAUSED = 'Longhaul is paused in panel chats: Claude runs alone there, with no question, carry-on or move at a limit.'
+
+function sentence(text: string): string {
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`
+}
+
+function troublePage($: any, c: Ctx): any {
+  const { Box, Text, Button } = c.E
+  const t = c.trouble
+  const offered = c.idle && !c.confirm
+  const paused = c.status!.panel_paused
+  const open = c.details === 'trouble'
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column">
+        <Text bold>Troubleshoot</Text>
+        <Text dimColor>Nothing changes until you press a button.</Text>
+      </Box>
+      {t === null && <Text dimColor>Looking for what is stuck…</Text>}
+      {t !== null && t.findings === null && (
+        <Box flexDirection="column">
+          <Text color="error">{t.update ? t.problem ?? ''
+            : `Longhaul could not look for what is stuck: ${mask(t.problem ?? '').replace(/[.\s]+$/, '')}.`}</Text>
+          {t.update && <Text>{UPDATE}</Text>}
+          {c.idle && (
+            <Box flexDirection="row" gap={1}>
+              <Button key="trouble-retry" label="Retry" onPress={() => void lookAgain($)} />
+              {t.lines.length > 1 && <Button key="trouble-details" label={open ? 'Hide details' : 'Details'} dimColor
+                onPress={() => void toggle($, 'trouble')} />}
+            </Box>
+          )}
+          {open && t.lines.map(line => <Text dimColor>{line}</Text>)}
+        </Box>
+      )}
+      {t?.findings && !t.findings.length && <Text>Nothing to repair.</Text>}
+      {(t?.findings ?? []).map((f, i) => (
+        <Box flexDirection="column">
+          <Text color="warning">{`⚠ ${f.what}.`}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Text>{`Fix: ${f.fix}.`}</Text>
+            {offered && f.fixable && ID.test(f.id)
+              && <Button key={`fix-${i}`} label="Fix" onPress={() => void ask($, `fix:${f.id}`, 'fix-no')} />}
+          </Box>
+          {c.idle && c.confirm === `fix:${f.id}` && (
+            <Box flexDirection="column">
+              <Text color="warning">{`Fix it? ${sentence(f.fix)}.`}</Text>
+              <Box flexDirection="row" gap={1}>
+                <Button key="fix-yes" label="Fix" variant="primary" onPress={() => void fixOne($, f.id)} />
+                <Button key="fix-no" label="Cancel" autoFocus onPress={() => void update($, confirming, () => null)} />
+              </Box>
+            </Box>
+          )}
+        </Box>
+      ))}
+      <Box flexDirection="column">
+        {paused === true && <Text>{PAUSED}</Text>}
+        {offered && paused !== true && (
+          <Box flexDirection="row" gap={1}>
+            <Button key="panel-pause" label="Pause Longhaul in panel chats" onPress={() => void panel($, true)} />
+            <Text dimColor>{PAUSE_NOTE}</Text>
+          </Box>
+        )}
+        {offered && paused !== false
+          && <Button key="panel-resume" label="Resume Longhaul in panel chats" onPress={() => void panel($, false)} />}
+      </Box>
     </Box>
   )
 }
@@ -1160,7 +1308,8 @@ function footPart($: any, c: Ctx): any {
   if (c.page === 'list') return keys
   // Back holds the ring on an account's page with nothing harmless above it (harmless()).
   const a = c.page.startsWith('account:') ? c.status?.accounts.find(x => `account:${x.name}` === c.page) : undefined
-  const ring = a !== undefined && harmless(a) === 'back' && c.idle && !asking(c, String(a.name))
+  const ring = (a !== undefined && harmless(a) === 'back' && c.idle && !asking(c, String(a.name)))
+    || (c.page === 'troubleshoot' && c.idle && !c.confirm)
   return (
     <Box flexDirection="column">
       <Button key="back" label="Back" dimColor onPress={() => void back($)} {...(ring ? { autoFocus: true } : {})} />
@@ -1236,9 +1385,9 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const E: any = $.ui.resolve(e)
-    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open] = await Promise.all([read($, lastRead),
+    const [have, now, last, confirm, typed, asked, mark, q, w, ans, dir, open, found] = await Promise.all([read($, lastRead),
       read($, running), read($, result), read($, confirming), read($, form), read($, shown), read($, marked),
-      read($, question), read($, wait), read($, answered), read($, folder), read($, details)])
+      read($, question), read($, wait), read($, answered), read($, folder), read($, details), read($, trouble)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     firstLook($, now, have)
@@ -1247,7 +1396,7 @@ export const register: Register = on => {
     const status = have?.status ?? null
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, now: mine, last, confirm,
       form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w, answer: ans,
-      details: open, nowMs }
+      details: open, trouble: found, nowMs }
     return drawPane($, c)
   })
 }

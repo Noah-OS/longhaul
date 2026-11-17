@@ -51,7 +51,8 @@ Something stuck (a wait or a question that never goes, a limit that is not
 a time, an accounts.json that will not read, the VS Code panel pointing at
 a Longhaul that is gone): offer this before any uninstall.
 - What is stuck, one line each with what its fix does (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul repair --dry-run`. Show it as it is.
-- The fixes do not run from here: tell the user to run `longhaul repair` in a terminal, which asks before each fix (`longhaul repair --yes` makes them all).
+- The fixes do not run from here: tell the user to run `longhaul repair` in a terminal, which asks before each fix (`longhaul repair --yes` makes them all; `longhaul repair --fix ID --yes` one alone), or to press **Fix** on the Troubleshoot page of `/accounts`, which asks too.
+- Longhaul off in the VS Code panel's chats, without an uninstall: this does not run from here either. Tell the user to run `longhaul panel pause` in a terminal, or press **Pause Longhaul in panel chats** on the Troubleshoot page of `/accounts`; `longhaul panel resume` turns it back on. Each counts for the chats opened after it.
 
 Uninstall:
 - What it would remove (reads): `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run`; with ~/.longhaul too: `${CLAUDE_PLUGIN_ROOT}/bin/longhaul uninstall --dry-run --purge`. Show it before asking.
@@ -64,7 +65,8 @@ alone), and starting a chat (`longhaul`, `-c`, `-r`: in VS Code the panel
 already runs the chat on the right account).
 
 With buttons: `/accounts`, typed by the user, does the account actions,
-switching, the VS Code panel and forgetting the limits in a pane, and is
+switching, the VS Code panel, forgetting the limits and the fixes of
+Troubleshoot in a pane, and is
 where the user answers the question at a usage limit. Tell the user of it
 when they would rather press than type; the rules above still hold for
 every command you run.

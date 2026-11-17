@@ -16878,9 +16878,11 @@ def status_json() -> int:
     # "switch" is the terminal's (switch_mode()); the panel takes "switch" in
     # vscode.json before config.json, so its own may differ, and the screen
     # says so. Never null: a value that is not a mode is never, as there.
+    # panel_paused: `longhaul panel pause` in force (panel_mid_session()), for
+    # the Troubleshoot page's Pause or Resume.
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
-             "problem": unreadable_text(problem) if problem else None}
+             "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped

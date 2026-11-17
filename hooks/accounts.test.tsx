@@ -32,8 +32,8 @@ const ACCOUNTS = [
     this_chat: false },
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
-  switch: 'ask', switch_problem: null, vscode: false, problem: null }
-const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-settings']
+  switch: 'ask', switch_problem: null, vscode: false, panel_paused: false, problem: null }
+const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-settings', 'row-troubleshoot']
 // What Remove asks, and Remove and delete its sign-in folder… asks then.
 const REMOVE_WORK_2 = "Remove work-2 from Longhaul's list? Its sign-in folder ~/.claude-work-2 stays, and its sign-in "
   + 'with it. Your project folders are never touched.'
@@ -61,7 +61,8 @@ type World = {
   files: Record<string, { text: string; at: number }> // LONGHAUL_HOME's files, by path
   alive: Set<number> // the pids `kill -0` finds
   status: Ran // what `status --json` answers
-  answer: Record<string, Ran> // what each other command answers, by its first word
+  // What each other command answers, by its first word: as it is, or from its arguments.
+  answer: Record<string, Ran | ((rest: string[]) => Ran)>
   slow: Set<string> // commands that answer only once the test moves the clock on
   placed: boolean
   clock: ReturnType<typeof mock.clock>
@@ -105,7 +106,8 @@ function world(on: any): World {
     w.runs.push(rest)
     w.timeouts.push(e.init?.timeoutMs)
     if (w.slow.has(rest[0]!)) await w.clock.sleep(60_000)
-    const ran = rest[0] === 'status' ? w.status : w.answer[rest[0]!] ?? done('Done.')
+    const said = w.answer[rest[0]!]
+    const ran = rest[0] === 'status' ? w.status : typeof said === 'function' ? said(rest) : said ?? done('Done.')
     return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return w
@@ -606,6 +608,184 @@ both("Settings' page names the VS Code panel's own mode when vscode.json sets it
   w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', panel_switch: 'ask' }))
   await ui.press({ key: 'clear' })
   expect(await texts(ui)).toContain('The VS Code panel uses ask (set in ~/.longhaul/vscode.json).')
+  await ui.unmount()
+})
+
+// What `repair --json` finds, as longhaul.py's repair_findings() words them.
+const FINDINGS = [
+  { id: 'limit:work-2', what: 'work-2: its recorded usage limit in state.json is not a time, which stops Longhaul '
+    + 'deciding where a chat runs', fix: 'forget it', fixable: true },
+  { id: `wait:${SID}`, what: `Chat ${SID.slice(0, 8)} waits to carry on on personal-1 at 14:01, and its relay is gone`,
+    fix: 'cancel the wait; nothing is sent', fixable: true },
+  { id: 'accounts', what: "accounts.json is not readable: not JSON (Expecting ',' delimiter at line 4 column 3); "
+    + 'Longhaul refuses to run chats on your accounts until it is fixed', fix: 'none here, as there is no good copy to '
+    + 'put back: fix it by hand at that line and column, or remove it', fixable: false },
+]
+const PAUSE_NOTE = 'Stops questions, carry-ons and moves in the panel chats opened after it.'
+const PAUSED = 'Longhaul is paused in panel chats: Claude runs alone there, with no question, carry-on or move at a limit.'
+
+// repair as longhaul.py answers it: --json lists what is left in `found`,
+// --fix takes one out of it and says Fixed.
+function repairs(w: World, found: any[]): void {
+  w.answer.repair = rest => {
+    if (rest[1] === '--json') return done(`${JSON.stringify(found)}\n`)
+    const i = found.findIndex(f => f.id === rest[2])
+    const f = found.splice(i, 1)[0]
+    return done(`To repair: ${f.what}. Fix: ${f.fix}.\nFixed.\n`)
+  }
+}
+
+both('Troubleshoot lists what repair --json finds; Fix asks first, then runs repair --fix ID --yes', async ($, on, surface) => {
+  const w = world(on)
+  repairs(w, [...FINDINGS])
+  const { ui } = await opened($, w, surface)
+  expect(after(w)).toEqual([]) // the list looks for nothing stuck
+  expect((await ui.find({ key: 'row-troubleshoot' }))?.text).toBe('  Troubleshoot')
+  await open(ui, 'row-troubleshoot')
+  expect(after(w)).toEqual([['repair', '--json']])
+  expect(await ringed(ui)).toEqual(['back']) // never on a Fix or Pause: Enter there would start one
+  const all = await texts(ui)
+  expect(all).toContain('Troubleshoot')
+  expect(all).toContain('Nothing changes until you press a button.')
+  for (const f of FINDINGS) expect(all).toContain(`⚠ ${f.what}.`)
+  expect(all).toContain('Fix: forget it.')
+  expect(all).toContain(`Fix: ${FINDINGS[2]!.fix}.`)
+  // A Fix for each one with a fix here, none for the other.
+  expect((await buttons(ui)).filter(k => k.startsWith('fix-'))).toEqual(['fix-0', 'fix-1'])
+  expect((await ui.find({ key: 'fix-0' }))?.text).toBe('Fix')
+  // Fix asks a second time, with the focus on its Cancel; Cancel runs nothing.
+  await ui.press({ key: 'fix-0' })
+  expect(after(w)).toEqual([['repair', '--json']])
+  expect(await texts(ui)).toContain('Fix it? Forget it.')
+  expect(await ringed(ui)).toEqual(['fix-no'])
+  expect(await ui.find({ key: 'fix-1' })).toBeUndefined() // one yes asked at a time
+  expect(await ui.find({ key: 'panel-pause' })).toBeUndefined()
+  await ui.press({ key: 'fix-no' })
+  expect(after(w)).toEqual([['repair', '--json']])
+  expect(await ui.find({ key: 'fix-yes' })).toBeUndefined()
+  await ui.press({ key: 'fix-0' })
+  await ui.press({ key: 'fix-yes' })
+  expect(after(w)).toEqual([['repair', '--json'], ['repair', '--fix', 'limit:work-2', '--yes'], ['status', '--json'],
+    ['repair', '--json']])
+  const now = await texts(ui)
+  expect(now.some(t => t.startsWith('✔ Fix: work-2: its recorded usage limit'))).toBe(true)
+  expect(now).toContain('Fixed.')
+  // Looked at again: the one fixed is gone, the others stay.
+  expect(now).not.toContain(`⚠ ${FINDINGS[0]!.what}.`)
+  expect(now).toContain(`⚠ ${FINDINGS[1]!.what}.`)
+  expect((await buttons(ui)).filter(k => k.startsWith('fix-'))).toEqual(['fix-0'])
+  // Back to its line on the list.
+  await ui.press({ key: 'back' })
+  expect((await ui.find({ key: 'row-troubleshoot' }))?.text).toBe('› Troubleshoot')
+  expect(await buttons(ui)).toEqual(ROWS)
+  await ui.unmount()
+})
+
+both('Troubleshoot with nothing stuck says so; Pause and Resume run panel pause and panel resume', async ($, on, surface) => {
+  const w = world(on)
+  w.answer.repair = done('[]\n')
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-troubleshoot')
+  expect(await texts(ui)).toContain('Nothing to repair.')
+  expect(await ui.find({ key: 'panel-resume' })).toBeUndefined() // not paused: only Pause
+  expect((await ui.find({ key: 'panel-pause' }))?.text).toBe('Pause Longhaul in panel chats')
+  expect(await texts(ui)).toContain(PAUSE_NOTE)
+  expect(await texts(ui)).not.toContain(PAUSED)
+  w.status = done(JSON.stringify({ ...STATUS, panel_paused: true }))
+  w.answer.panel = done('Paused: Claude runs alone in the VS Code panel chats opened from now on.\n')
+  await ui.press({ key: 'panel-pause' })
+  expect(after(w).slice(1)).toEqual([['panel', 'pause'], ['status', '--json'], ['repair', '--json']])
+  let all = await texts(ui)
+  expect(all.some(t => t.startsWith('✔ Pause Longhaul in panel chats'))).toBe(true)
+  expect(all).toContain('Paused: Claude runs alone in the VS Code panel chats opened from now on.')
+  expect(all).toContain('A chat open now keeps what it started with until it is closed and opened again.')
+  expect(all).toContain(PAUSED)
+  expect(await ui.find({ key: 'panel-pause' })).toBeUndefined()
+  expect((await ui.find({ key: 'panel-resume' }))?.text).toBe('Resume Longhaul in panel chats')
+  // The list and Settings say it while it lasts.
+  await ui.press({ key: 'back' })
+  expect((await ui.find({ key: 'row-troubleshoot' }))?.text).toBe('› Troubleshoot (Longhaul paused in panel chats)')
+  await open(ui, 'row-settings')
+  expect(await texts(ui)).toContain('Longhaul is paused in panel chats: Claude runs alone there. Troubleshoot resumes it.')
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-troubleshoot')
+  w.status = done(JSON.stringify(STATUS))
+  w.answer.panel = done('Resumed: Longhaul stays in the VS Code panel chats opened from now on.\n')
+  await ui.press({ key: 'panel-resume' })
+  expect(w.runs.slice(-3)).toEqual([['panel', 'resume'], ['status', '--json'], ['repair', '--json']])
+  all = await texts(ui)
+  expect(all.some(t => t.startsWith('✔ Resume Longhaul in panel chats'))).toBe(true)
+  expect(all).not.toContain(PAUSED)
+  expect(await ui.find({ key: 'panel-pause' })).toBeDefined()
+  // An older Longhaul, whose status does not say: both are offered.
+  w.status = done(JSON.stringify({ ...STATUS, panel_paused: undefined }))
+  await ui.press({ key: 'panel-pause' })
+  expect(await ui.find({ key: 'panel-pause' })).toBeDefined()
+  expect(await ui.find({ key: 'panel-resume' })).toBeDefined()
+  await ui.unmount()
+})
+
+both('a Fix refused shows why with the finding still there; a fix for VS Code says to reload it', async ($, on, surface) => {
+  const w = world(on)
+  const VSCODE = { id: 'vscode', what: "VS Code's Claude panel points at ~/old/longhaul-vscode, a Longhaul that is not "
+    + 'there any more', fix: "point it at this Longhaul (~/new/longhaul-vscode), a copy of VS Code's settings kept; then "
+    + 'reload VS Code', fixable: true }
+  const found = [FINDINGS[0]!, VSCODE]
+  w.answer.repair = rest => (rest[1] === '--json' ? done(JSON.stringify(found))
+    : rest[2] === 'vscode' ? (found.splice(1, 1), done('Fixed.\n'))
+    : done(`To repair: ${FINDINGS[0]!.what}. Fix: forget it.\n`, 1,
+      "Not fixed: work-2's recorded limit changed meanwhile, so it was left as it is.\n"))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-troubleshoot')
+  await ui.press({ key: 'fix-0' })
+  await ui.press({ key: 'fix-yes' })
+  let all = await texts(ui)
+  expect(all.some(t => t.startsWith('✘ Fix: work-2'))).toBe(true)
+  expect(all).toContain("Not fixed: work-2's recorded limit changed meanwhile, so it was left as it is.")
+  expect(all).toContain(`⚠ ${FINDINGS[0]!.what}.`)
+  expect(await ui.find({ key: 'fix-0' })).toBeDefined()
+  await ui.press({ key: 'fix-1' })
+  expect(await texts(ui)).toContain("Fix it? Point it at this Longhaul (~/new/longhaul-vscode), a copy of VS Code's "
+    + 'settings kept; then reload VS Code.')
+  await ui.press({ key: 'fix-yes' })
+  expect(w.runs.at(-3)).toEqual(['repair', '--fix', 'vscode', '--yes'])
+  all = await texts(ui)
+  expect(all).toContain(RELOAD)
+  expect(all).not.toContain(`⚠ ${VSCODE.what}.`)
+  await ui.unmount()
+})
+
+both('a look for what is stuck that fails says why, with Retry; an older Longhaul says to update', async ($, on, surface) => {
+  const w = world(on)
+  w.answer.repair = done('', 2, 'usage: longhaul [-h]\nlonghaul: error: unrecognized arguments: repair --json\n')
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-troubleshoot')
+  let all = await texts(ui)
+  expect(all).toContain('This Longhaul is older than this pane: it has no repair.')
+  expect(all.some(t => t.startsWith('To update Longhaul:'))).toBe(true)
+  expect(await ui.find({ key: 'panel-pause' })).toBeDefined() // the pause is a command of its own
+  w.answer.repair = done('', 1, 'Traceback (most recent call last):\nPermissionError: [Errno 13] Permission denied\n')
+  await ui.press({ key: 'trouble-retry' })
+  expect(w.runs.at(-1)).toEqual(['repair', '--json'])
+  all = await texts(ui)
+  expect(all).toContain('Longhaul could not look for what is stuck: PermissionError: [Errno 13] Permission denied.')
+  expect(await ui.find({ key: 'trouble-details' })).toBeDefined()
+  await ui.press({ key: 'trouble-details' })
+  expect(await texts(ui)).toContain('Traceback (most recent call last):')
+  w.answer.repair = done('not json\n')
+  await ui.press({ key: 'trouble-retry' })
+  all = await texts(ui)
+  expect(all).toContain('Longhaul could not look for what is stuck: its answer was not a list.')
+  for (const t of all) expect(t).not.toMatch(/\brows?\b|exit code/i)
+  // A finding that is not one is left out; an id that is not one gets no Fix.
+  w.answer.repair = done(JSON.stringify([null, 'x', { id: '--yes', what: 'odd', fix: 'none', fixable: true },
+    { ...FINDINGS[0], what: 7 }, FINDINGS[1]]))
+  await ui.press({ key: 'trouble-retry' })
+  all = await texts(ui)
+  expect(all).toContain('⚠ odd.')
+  expect(all).toContain(`⚠ ${FINDINGS[1]!.what}.`)
+  expect(all.filter(t => t.startsWith('⚠ ')).length).toBe(2)
+  expect((await buttons(ui)).filter(k => k.startsWith('fix-'))).toEqual(['fix-1'])
   await ui.unmount()
 })
 
