@@ -21,7 +21,7 @@
   <a href="https://github.com/Noah-OS/longhaul/wiki"><b>Wiki</b></a>
 </p>
 
-**Longhaul** is a Claude Code plugin for long sessions and for more than one account. At 200,000 tokens of context it has Claude save a checkpoint, then compacts the chat, so a long session stops carrying its whole history into every request. With more than one of your own Claude subscriptions, at a usage limit it asks, then moves the chat to another one or carries it on by itself when the limit resets. It shows where a conversation's tokens went. Every measurement of its features is published, the ones that showed no gain included: the checkpoint helps Claude recall a little more after a compaction, and was not shown to make the work after it better ([Measured](#measured)). It is a terminal command too, in one Python file, standard library only, and what it keeps stays on your machine.
+**Longhaul** is a Claude Code plugin for long sessions and for more than one account. At 400,000 tokens of context it has Claude save a checkpoint, then compacts the chat, so a long session stops carrying its whole history into every request. With more than one of your own Claude subscriptions, at a usage limit it asks, then moves the chat to another one or carries it on by itself when the limit resets. It shows where a conversation's tokens went. Every measurement of its features is published, the ones that showed no gain included: the checkpoint helps Claude recall a little more after a compaction, and was not shown to make the work after it better ([Measured](#measured)). It is a terminal command too, in one Python file, standard library only, and what it keeps stays on your machine.
 
 This page is the guide: install it, check it, use it day to day, and set up the parts you want. The detail is in the [wiki](https://github.com/Noah-OS/longhaul/wiki).
 
@@ -83,7 +83,7 @@ Once the plugin is loaded, most of it works by itself.
 | | What it does |
 |---|---|
 | **[Context guard](https://github.com/Noah-OS/longhaul/wiki/Context-Guard)**<br><sub>On, advice only</sub> | Tells Claude when a whole `Read` or bare `cat` would put a file over 20,000 bytes into the context, or a file it already read and that has not changed since. Advice by default (`LONGHAUL_GUARD=block` denies instead). It also tells a subagent whose Bash call could outlast its 5-minute prompt cache to run it in the background and check back. |
-| **The context reminder and the compaction** | At 200,000 tokens of context Claude is asked to save a checkpoint at its next stopping point; once it has, Longhaul compacts the chat at the end of that turn (`LONGHAUL_AUTO_COMPACT=off` turns that off), and the checkpoint comes back. A subagent whose own context passes 150,000 tokens is told to finish its step and report what is done and what is left (`LONGHAUL_SUBAGENT_AT` sets the size; `off` turns it off). |
+| **The context reminder and the compaction** | At 400,000 tokens of context Claude is asked to save a checkpoint at its next stopping point; once it has, Longhaul compacts the chat at the end of that turn (`LONGHAUL_AUTO_COMPACT=off` turns that off), and the checkpoint comes back. A subagent whose own context passes 150,000 tokens is told to finish its step and report what is done and what is left (`LONGHAUL_SUBAGENT_AT` sets the size; `off` turns it off). |
 | **Auto Model**<br><sub>On, a guide</sub> | At each start Claude gets a short guide for choosing each subagent's model by how hard its job is, and every pick is logged. `longhaul models off` turns it off; `longhaul models cap sonnet` lowers a call above Sonnet. Its effect on cost and quality is not measured yet. |
 | **Output filter**<br><sub>Off</sub> | Shortens a long `Bash` output where nothing is lost (`LONGHAUL_FILTERS=lossless`), or more (`on`). Off by default: in a week of shadow measuring it would have cut 0.35% of Bash output (`lossless`) or 1.24% (`on`), not worth a hook on every long output. `shadow` measures without changing anything. |
 | **[Code index](https://github.com/Noah-OS/longhaul/wiki/Code-Index)**<br><sub>On</sub> | Where CodeGraph is installed and the repository has no map, builds one in the background, and tells Claude when an index exists. `LONGHAUL_INDEX=all` adds Trail-Code; `LONGHAUL_INDEX=off` turns it off. Longhaul installs nothing. For a lesson a session should not repeat, one line in the project's `CLAUDE.md` worked as well as Trail-Code's saved lesson, for less ([measured](https://github.com/Noah-OS/longhaul/wiki/Code-Index)). |
@@ -200,7 +200,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | Setting | Default | What it changes |
 |---|---|---|
 | `LONGHAUL_GUARD` | `warn` | `block` denies the reads it flags; `off` does nothing |
-| `LONGHAUL_CHECKPOINT_AT` | `200000` | tokens of context at which Claude is asked to save; `off` |
+| `LONGHAUL_CHECKPOINT_AT` | `400000` (`200000` in Codex) | tokens of context at which Claude is asked to save; `off` |
 | `LONGHAUL_AUTO_COMPACT` | on | `off`: no compaction after a save |
 | `LONGHAUL_SUBAGENT_AT` | `150000` | a subagent's own context at which it is told to report back; `off` |
 | `LONGHAUL_FILTERS` | `off` | `shadow` (measures only), `lossless` or `on` |
