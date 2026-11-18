@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""longhaul - see where a Claude Code session's tokens go, and stop the waste:
-`inspect` reports a conversation's usage, `guard` warns about or blocks the
-tool calls that waste the most context, `checkpoint` puts the model's own
-state back after a compaction, `statusline` shows the allowance and a newer
-Longhaul when one is out. Carrying one conversation across your own
-subscriptions is the advanced feature below, off unless you turn it on.
+"""Longhaul: a Claude Code plugin for long chats and more than one account.
+At 400,000 tokens of context it has Claude save a checkpoint, then it
+compacts the chat. At a usage limit it asks, then moves the chat to another
+of your accounts, or carries it on when the limit resets. It shows where a
+chat's tokens went.
 
 Why this exists: with two Claude subscriptions (say Max and Pro), when
 one hit its session or weekly limit the work stopped until the reset, often
@@ -102,8 +101,15 @@ Usage:
   longhaul --switch MODE        ask (the default): ask here before moving the
                           conversation to another account; auto: move at a
                           limit, and early when one is nearly full; never:
-                          wait for the reset (or set LONGHAUL_SWITCH)
+                          wait for the reset (or set LONGHAUL_SWITCH); wait:
+                          the same as never
   longhaul -- --model opus      anything after -- goes to claude on every launch
+  longhaul help [COMMAND|hooks|all]
+                          one screen of the commands you type, as -h prints
+                          it; COMMAND: that command's entries here (start:
+                          the ones above, for a launch); hooks: the commands
+                          the plugin's hooks run, which you need not; all:
+                          this whole list
   longhaul add                  a new account, guided: it asks for each part and
                           explains it, then signs it in (in a terminal)
   longhaul add NAME EMAIL [--dir DIR] [--repo PATH]... [--fallback]
@@ -173,7 +179,8 @@ Usage:
                           (LONGHAUL_SWITCH, else ~/.longhaul/config.json, else
                           ask); with one, saved in config.json for the terminal
                           and the VS Code panel, as the guided add saves it;
-                          LONGHAUL_SWITCH and --switch still win over it
+                          LONGHAUL_SWITCH and --switch still win over it.
+                          wait: the same as never, and saved as never
   longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]
                           Auto Model, subagents' models: guide (the default)
                           gives the main conversation a short guide at each
@@ -209,6 +216,8 @@ Usage:
                           it writes ~/.local/bin/longhaul, a launcher that runs
                           the newest Longhaul Claude Code has installed; run
                           from a checkout of your own, it links there instead
+  longhaul login NAME           the same as `longhaul setup NAME --relogin`: NAME
+                          signed in again in the browser, even if it is now
   longhaul status [--json [--no-check]]
                           accounts, sign-ins, limits, links; --json: the
                           accounts, their usage and this folder's as one JSON
@@ -1844,6 +1853,20 @@ SWITCH_MODES = {
     "auto": "longhaul moves a conversation to another account at a limit, and early when one is nearly full",
     "never": "longhaul waits for the reset and never moves a conversation to another account",
 }
+# "wait" is "never" by another word (the UX review of 2026-11-11, M6):
+# "never" reads as "never carry on", when it waits for the reset and
+# carries on there. Every reader takes it, and what is stored is "never",
+# since config.json and vscode.json are read by older copies of Longhaul
+# and by the pane, which know the three words alone.
+SWITCH_ALIASES = {"wait": "never"}
+SWITCH_WORDS = [*SWITCH_MODES, *SWITCH_ALIASES]
+
+
+def switch_word(value):
+    """`value` with an alias read as its mode ("wait" is "never"), and
+    anything else as it is, for its reader to judge; argparse's type for
+    each --switch and for `longhaul switch`."""
+    return SWITCH_ALIASES.get(value, value) if isinstance(value, str) else value
 
 
 def decide_move(mode: str, consent: bool, can_ask: bool) -> str:
@@ -1868,14 +1891,14 @@ def config_switch():
     """The switching mode the guided `longhaul add` saved in config.json
     (one answer for the terminal and the panel), or None."""
     found = read_json(CONFIG)
-    mode = found.get("switch") if isinstance(found, dict) else None
+    mode = switch_word(found.get("switch")) if isinstance(found, dict) else None
     return mode if isinstance(mode, str) and mode in SWITCH_MODES else None
 
 
 def switch_mode(flag: str | None = None) -> str:
-    """--switch, then LONGHAUL_SWITCH, then config.json's "switch", then "ask".
-    ValueError for anything else."""
-    mode = flag or os.environ.get("LONGHAUL_SWITCH") or config_switch() or "ask"
+    """--switch, then LONGHAUL_SWITCH, then config.json's "switch", then "ask",
+    "wait" read as "never". ValueError for anything else."""
+    mode = switch_word(flag or os.environ.get("LONGHAUL_SWITCH") or config_switch() or "ask")
     if mode not in SWITCH_MODES:
         raise ValueError(f"LONGHAUL_SWITCH is {mode!r}, which is not a switching mode. "
                          "Set it to ask, auto or never, or unset it; longhaul has not started Claude.")
@@ -13312,13 +13335,14 @@ def panel_switch_source() -> tuple:
     """(the panel's switching as written, where it is written): "env"
     for LONGHAUL_SWITCH in this process's environment, then "vscode" for
     "switch" in vscode.json, then "config" for config.json's, then
-    "default" for ask. It reads only, and logs nothing: status --json and
-    the relay's notifications ask it too."""
+    "default" for ask; "wait" as "never", the word the pane knows. It
+    reads only, and logs nothing: status --json and the relay's
+    notifications ask it too."""
     if os.environ.get("LONGHAUL_SWITCH"):
-        return os.environ["LONGHAUL_SWITCH"], "env"
+        return switch_word(os.environ["LONGHAUL_SWITCH"]), "env"
     key = vscode_config().get("switch")
     if key:
-        return key, "vscode"
+        return switch_word(key), "vscode"
     return (config_switch(), "config") if config_switch() else ("ask", "default")
 
 
@@ -13707,9 +13731,10 @@ def pipe(argv: list[str]) -> int:
     p.add_argument("--swap", action="store_true",
                    help="this driver accepts a move to another account at a limit; the session moves only "
                         "when --switch (or LONGHAUL_SWITCH) is also auto")
-    p.add_argument("--switch", choices=list(SWITCH_MODES),
+    p.add_argument("--switch", choices=SWITCH_WORDS, type=switch_word,
                    help="what to do at a limit. auto: move the session (needs --swap). ask (the default) or "
-                        "never: keep it on its account, since no one can be asked here. Overrides LONGHAUL_SWITCH")
+                        "never: keep it on its account, since no one can be asked here; wait: the same as never. "
+                        "Overrides LONGHAUL_SWITCH")
     p.add_argument("--no-git-sign-in", action="store_true",
                    help="hand claude no GitHub or git sign-in from this environment")
     opts = p.parse_args(argv)
@@ -16114,7 +16139,8 @@ def guided_switching() -> None:
     if problem or len(accounts or []) < 2:
         return
     if os.environ.get("LONGHAUL_SWITCH"):
-        say(f"Switching at a usage limit: {os.environ['LONGHAUL_SWITCH']}, from LONGHAUL_SWITCH in this shell.")
+        say(f"Switching at a usage limit: {switch_word(os.environ['LONGHAUL_SWITCH'])}, from LONGHAUL_SWITCH in this "
+            "shell.")
         return
     if config_switch():
         say(f"Switching at a usage limit: {config_switch()} (in {home_path(str(CONFIG))}).")
@@ -16176,7 +16202,7 @@ def switch_panel_note() -> str:
         return " " + PANEL_ALONE.format(file=file)
     odd = panel_mid_session_odd()
     note = f" The VS Code panel stays in each chat ({odd})." if odd else ""
-    key = vscode_config().get("switch")
+    key = switch_word(vscode_config().get("switch"))
     if key:
         used = key if isinstance(key, str) and key in SWITCH_MODES else "never"
         note += f" The VS Code panel uses {used}, from the key switch in {file}, which wins there."
@@ -16452,7 +16478,7 @@ def say_still_running(acct: dict) -> None:
         return
     if not running:
         return
-    panel = vscode_config().get("switch")  # what panel_switch_in_force() reads, but this process's environment
+    panel = switch_word(vscode_config().get("switch"))  # as panel_switch_in_force(), but this process's environment
     panel = panel if isinstance(panel, str) and panel in SWITCH_MODES else saved_switch()
     each = ", ".join(f"pid {c['pid']} ({'a VS Code tab' if c.get('panel') else 'a terminal chat'}, "
                      f"{panel if c.get('panel') else saved_switch()}) in "
@@ -17318,7 +17344,7 @@ def status(opts) -> int:
         tail = PANEL_ALONE.format(file=home_path(str(VSCODE_CONFIG)))
     else:
         # From the files only: this terminal's LONGHAUL_SWITCH may not be the panel's.
-        key = vscode_config().get("switch")
+        key = switch_word(vscode_config().get("switch"))
         shown = (f"{key} (from vscode.json)" if isinstance(key, str) and key in SWITCH_MODES
                  else f"{config_switch()} (saved in {home_path(str(CONFIG))})" if not key and config_switch()
                  else "ask (the default)" if not key else f"never ({key!r} in vscode.json is not a mode)")
@@ -20396,17 +20422,152 @@ def setup_line(data: dict):
     return setup_said(version, working, fix)
 
 
+# `longhaul -h` and `longhaul help` (the UX review of 2026-11-11, §3.5 and
+# M6): -h printed the whole Usage block, 362 lines that opened with an old
+# pitch and named the commands only the plugin's hooks run. Now -h is one
+# screen of the commands a person types, and `help` gives the rest from the
+# Usage block, parsed and never copied, so the two cannot drift: the block
+# stays the one source of the long text.
+
+# The commands the plugin's hooks, Longhaul's pane or another program run,
+# and a person need not: `help hooks` lists their entries, and the screen
+# names none. checkpoint and statusline are theirs only bare
+# (HELP_HOOK_FORMS): `checkpoint save` is the skill's, and `statusline
+# install` a person's.
+HELP_HOOKS = ("guard", "reminder", "account-check", "session-end", "filter", "autocompact-note", "precompact",
+              "stop-failure", "quota-note", "advisor-hook", "advisor-result", "advisor-note", "models-hook", "answer",
+              "pipe", "wrap")
+HELP_HOOK_FORMS = ("longhaul checkpoint", "longhaul statusline")
+HELP_HOOKS_SAID = "The plugin's hooks, its pane and other programs run these; you need not."
+
+# The screen after the docstring's first paragraph: the commands a person
+# types, by what they are for, one line each with their most common
+# options; at most 50 lines of 80 columns in all (a test holds it there).
+# Each command here has its entries in the Usage block, which `help
+# COMMAND` prints, and a test checks that too.
+HELP_GROUPS = (
+    ("Start Claude here, with Remote Control on", (
+        ("longhaul", "a new chat"),
+        ("longhaul -c | -r [ID]", "continue the latest chat, or resume one"),
+        ("longhaul --account NAME", "start on that account"),
+        ("longhaul --switch MODE", "this launch only: ask, auto or wait"),
+        ("longhaul -- ARGS", "ARGS go to claude, as in -- --model opus"))),
+    ("Accounts", (
+        ("longhaul add", "add an account, guided, then sign it in"),
+        ("longhaul login NAME", "sign NAME in again"),
+        ("longhaul status", "the accounts, their sign-ins and limits"),
+        ("longhaul use NAME", "this chat runs on NAME from now on"),
+        ("longhaul folders NAME", "the folders NAME runs only in: --add PATH"),
+        ("longhaul fallback NAME on", "NAME only when no other account has room"),
+        ("longhaul allow ID", "let a refused chat's prompts through"),
+        ("longhaul remove NAME", "NAME off the list; its sign-in folder kept"))),
+    ("At a limit", (
+        ("longhaul switch ask|auto|wait", "ask first, move by itself, or stay and wait"),
+        ("longhaul clear [NAME]", "forget a recorded limit that is over"))),
+    ("See what happened", (
+        ("longhaul activity", "what Longhaul did by itself, and why"),
+        ("longhaul inspect [ID]", "where a chat's tokens went"),
+        ("longhaul usage", "each account's allowance, and work per task"))),
+    ("Fix", (
+        ("longhaul doctor", "what is set up, and what to do next"),
+        ("longhaul repair", "fix what is stuck in Longhaul's records"))),
+    ("Set up", (
+        ("longhaul setup", "sign the accounts in; set up this command"),
+        ("longhaul statusline install", "Longhaul's status line in Claude Code"),
+        ("longhaul vscode on|off", "VS Code's Claude panel on your accounts"),
+        ("longhaul panel pause|resume", "Longhaul in the panel's chats: paused, on"),
+        ("longhaul models", "the models subagents use (Auto Model)"),
+        ("longhaul update [on|off]", "the versions, and Claude Code's auto-update"),
+        ("longhaul uninstall", "remove what Longhaul set up"))),
+    ("More", (
+        ("longhaul help COMMAND", "a command in full (start: the launch)"),
+        ("longhaul help hooks", "what the plugin's hooks run; you need not"),
+        ("longhaul help all", "every command and option"))),
+)
+
+
+def help_screen() -> str:
+    """What -h, --help and a bare `longhaul help` print: the docstring's
+    first paragraph, what Longhaul is, then HELP_GROUPS."""
+    width = max(len(sig) for _, rows in HELP_GROUPS for sig, _ in rows)
+    groups = ["\n".join([title] + [f"  {sig.ljust(width)}  {what}" for sig, what in rows])
+              for title, rows in HELP_GROUPS]
+    return "\n\n".join([__doc__.split("\n\n")[0], *groups]) + "\n"
+
+
+def usage_block() -> str:
+    """The docstring's Usage block, from its "Usage:" line to the end."""
+    return __doc__[__doc__.index("Usage:"):]
+
+
+def usage_entries() -> list:
+    """The Usage block's entries in its order, as (names, signature, text).
+    An entry starts on a line two spaces in, and the lines further in carry
+    it on. Its signature is that line up to two spaces; its names are the
+    word after each `longhaul` in it: "folders"; "stop-failure" and
+    "quota-note" for the line that names both; "-c" and "-r" for one of the
+    launch's, "" for bare `longhaul`; and "log" for "(log)"."""
+    entries = []
+    for line in usage_block().splitlines(keepends=True)[1:]:
+        if line.startswith("  ") and not line.startswith("   "):
+            sig = re.split(r"\s{2,}", line.strip())[0]
+            words = [part.split() for part in sig.split(" | ")]
+            names = [w[1] if len(w) > 1 else "" for w in words if w[:1] == ["longhaul"]]
+            if sig.startswith("(") and sig.endswith(")"):
+                names = [sig[1:-1]]
+            entries.append((names, sig, [line]))
+        elif entries:
+            entries[-1][2].append(line)
+    return [(names, sig, "".join(lines)) for names, sig, lines in entries]
+
+
+def help_cmd(args: list) -> int:
+    """`longhaul help [COMMAND|hooks|all]`: with nothing (or -h), the screen
+    -h prints; all: the Usage block as it is; hooks: the entries of the
+    commands the hooks run, under one line that says so; start: the
+    launch's (bare `longhaul` and its options); a command: its entries.
+    Anything else is one line naming `longhaul help`, exit 2."""
+    if not args or (len(args) == 1 and args[0] in ("-h", "--help")):
+        sys.stdout.write(help_screen())
+        return 0
+    if len(args) > 1:
+        print("longhaul: help takes one word, a command, hooks or all; `longhaul help` lists the commands.",
+              file=sys.stderr)
+        return 2
+    word = args[0]
+    if word == "all":
+        sys.stdout.write(usage_block())
+        return 0
+    entries = usage_entries()
+    if word == "hooks":
+        found = [text for names, sig, text in entries if sig in HELP_HOOK_FORMS or set(names) & set(HELP_HOOKS)]
+    elif word == "start":
+        found = [text for names, _, text in entries if names and all(n == "" or n.startswith("-") for n in names)]
+    else:
+        found = [text for names, _, text in entries if word and word in names]
+    if not found:
+        print(f'longhaul: no command "{word}"; `longhaul help` lists the commands.', file=sys.stderr)
+        return 2
+    if word == "hooks":
+        print(HELP_HOOKS_SAID)
+    sys.stdout.write("".join(found))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "pipe":  # another program drives claude through longhaul
         return pipe(argv[1:])
     if argv and argv[0] == "wrap":  # what longhaul_vscode.py runs, here for tests and by hand
         return wrap(argv[1:])
+    if argv and argv[0] == "help":  # its words are its own, read by help_cmd(), not argparse's
+        return help_cmd(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
                             "add", "remove", "folders", "fallback", "advisor", "advisor-hook", "advisor-result",
                             "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
-                            "models-hook", "allow", "switch", "answer", "use", "repair", "panel", "activity"):
+                            "models-hook", "allow", "switch", "answer", "use", "repair", "panel", "activity",
+                            "login"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -20531,10 +20692,11 @@ def main(argv: list[str]) -> int:
                                 "or trial: the mode; cap MODEL or cap off: the cap where the guide is given; "
                                 "TYPE MODEL: an agent type's model in the table (haiku, sonnet, opus, fable or keep)")
         if cmd == "switch":
-            p.add_argument("mode", nargs="?", choices=list(SWITCH_MODES),
+            p.add_argument("mode", nargs="?", choices=SWITCH_WORDS, type=switch_word,
                            help="ask, auto or never: saved in config.json, for the terminal and the VS Code panel "
                                 "(default: show the mode in force and where it comes from: LONGHAUL_SWITCH, else "
-                                "config.json, else ask); LONGHAUL_SWITCH and --switch still win over it")
+                                "config.json, else ask); LONGHAUL_SWITCH and --switch still win over it. wait: the "
+                                "same as never, and saved as never")
         if cmd == "vscode":
             p.add_argument("action", nargs="?", choices=["on", "off"], default="on",
                            help="on (the default): VS Code's Claude panel uses your Longhaul accounts; off: its own sign-in again")
@@ -20590,10 +20752,14 @@ def main(argv: list[str]) -> int:
         if cmd == "setup":
             p.add_argument("account", nargs="?", help="only this account (default: each one not signed in)")
             p.add_argument("--relogin", action="store_true", help="sign in again even if signed in")
+        if cmd == "login":  # setup NAME --relogin by a shorter name (the UX review of 2026-11-11, M6)
+            p.add_argument("account", metavar="NAME", help="the account to sign in again, in the browser, even if "
+                                                           "it is signed in: the same as setup NAME --relogin")
+            p.set_defaults(relogin=True)
         opts = p.parse_args(rest)
-        return {"setup": setup, "status": status, "clear": clear, "statusline": statusline, "usage": usage,
-                "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add, "remove": remove,
-                "folders": folders, "fallback": fallback_cmd, "vscode": vscode, "models": models,
+        return {"setup": setup, "login": setup, "status": status, "clear": clear, "statusline": statusline,
+                "usage": usage, "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add,
+                "remove": remove, "folders": folders, "fallback": fallback_cmd, "vscode": vscode, "models": models,
                 "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
@@ -20606,22 +20772,25 @@ def main(argv: list[str]) -> int:
     if "--" in argv:
         cut = argv.index("--")
         argv, extra = argv[:cut], argv[cut + 1:]
-    p = argparse.ArgumentParser(prog="longhaul", description=__doc__.split("\n\n")[0],
-                                # The subcommands are dispatched above, not by argparse, so -h
-                                # would not list them without the docstring's Usage block.
-                                epilog=__doc__[__doc__.index("Usage:"):],
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    # The subcommands are dispatched above, not by argparse, so its own -h
+    # would list the launch's options alone: -h is help_screen() instead,
+    # one screen of the commands a person types (the UX review's M6).
+    p = argparse.ArgumentParser(prog="longhaul", add_help=False)
+    p.add_argument("-h", "--help", action="store_true", help="the commands, on one screen")
     p.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the latest conversation here")
     p.add_argument("-r", "--resume", nargs="?", const="", default=None, help="resume a conversation (no ID: pick)")
     p.add_argument("--account", help="the account to start on")
     p.add_argument("--name", help="the session's name on the phone (default: the folder)")
     p.add_argument("--no-rc", dest="rc", action="store_false", help="no Remote Control")
     p.add_argument("--first", metavar="FILE", help="the first message, sent on the first launch only")
-    p.add_argument("--switch", choices=list(SWITCH_MODES),
+    p.add_argument("--switch", choices=SWITCH_WORDS, type=switch_word,
                    help="ask (the default): ask here before moving a conversation to another account; "
                         "auto: move at a limit, and early when one is nearly full; "
-                        "never: wait for the reset. With no flag, LONGHAUL_SWITCH is used")
+                        "never: wait for the reset; wait: the same as never. With no flag, LONGHAUL_SWITCH is used")
     opts = p.parse_args(argv)
+    if opts.help:
+        sys.stdout.write(help_screen())
+        return 0
     opts.extra = extra
     return run(opts)
 

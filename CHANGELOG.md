@@ -4,12 +4,19 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## Unreleased
 
+Help that fits one screen, `/accounts` that shows its accounts at once, and two shorter words.
+
 ### Added
 
+- **`longhaul help [COMMAND|hooks|all]`.** `help COMMAND` prints that command's entries from the full list of commands, `help start` the options of a plain `longhaul`, `help hooks` the commands the plugin's hooks run (you need not run them), and `help all` the whole list, as `-h` printed it before.
+- **`longhaul login NAME`**: the same as `longhaul setup NAME --relogin`.
+- **`wait`**, another word for the switching mode `never`, wherever a mode is given: `longhaul switch wait`, `--switch wait`, `LONGHAUL_SWITCH=wait` and `longhaul pipe --switch wait`. It is saved as `never`, the word older copies of Longhaul and `/accounts` read.
 - **`longhaul status --json --no-check`** gives the same object at once, with no sign-in checked: each account's `signed_in` and `as_expected` are null, and `"checked"` is false (true in the full form). It starts no `claude`, so it never waits on an account that does not answer. Plain `status` is unchanged.
 
 ### Changed
 
+- **`longhaul -h` fits one screen**: 49 lines, none wider than 80 columns. It says what Longhaul does, then lists the commands a person types, one line each, grouped: start Claude here, accounts, at a limit, see what happened, fix, set up. Before, it printed all 362 lines of the full list, which opened with an old description and named the commands only the plugin's hooks run.
+- **From a chat**, `longhaul help` in each of its forms, `longhaul login NAME` and `longhaul switch wait` run, as `-h`, `setup NAME --relogin` and `switch never` do.
 - **`/accounts` shows its accounts at once.** It used to say "Reading Longhaul's accounts…" until every sign-in was checked: a few seconds, and 20 seconds when one account did not answer. Now the list comes first, each sign-in "checking…", and the sign-ins fill in when the checks are done. If the checks fail, the list stays and says why, each sign-in "could not check". After a change, its result shows once the list is read again, without waiting for the checks, and the list never goes blank while it is read.
 
 ## 0.3.17 - 2026-11-17

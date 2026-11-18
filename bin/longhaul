@@ -35,7 +35,11 @@
 # fixes are the user's middle step before an uninstall, each on its own
 # yes). `activity` only reads Longhaul's own log, and `panel pause` and
 # `panel resume` undo each other, so both run from here (the owner's yes
-# of 2026-11-17). A user of the VS Code panel may have no terminal open, and
+# of 2026-11-17). `help`, in each of its forms, only prints, as -h does;
+# `login NAME` is `setup NAME --relogin` by a shorter name, let through as
+# that is, and `switch wait` is `switch never` by another word, saved as
+# never (M6 of the UX review of 2026-11-11). A user of the VS Code panel
+# may have no terminal open, and
 # the /longhaul:manage skill shows each command and what it changes and
 # runs it only after the user's yes in the chat (the panel can approve
 # Bash by itself, so Claude Code's own prompt is not enough); where a
@@ -61,7 +65,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 here=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, remove NAME, use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes, repair --dry-run|--json, activity, panel [status|pause|resume] and -h"
+runs="inspect, usage, status, doctor, advisor status, checkpoint save, allow, add NAME EMAIL, setup NAME, login NAME, remove NAME, use NAME [--chat ID], folders NAME [--add|--remove|--prefer|--no-prefer PATH]... [--anywhere], models, switch, vscode on|off, statusline install|uninstall, update, clear [NAME], uninstall --dry-run|--yes, repair --dry-run|--json, activity, panel [status|pause|resume], help and -h"
 # A setup command, $1, in a form its case does not allow: the forms that
 # do run, $2, and why the rest does not, $3, when that needs saying.
 only() {
@@ -92,8 +96,9 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 case "$1" in
-  # activity only reads Longhaul's own log (the owner's yes of 2026-11-17).
-  inspect|usage|status|allow|models|activity|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
+  # activity only reads Longhaul's own log (the owner's yes of 2026-11-17);
+  # help, with any word after it, only prints, as -h does.
+  inspect|usage|status|allow|models|activity|help|-h|--help) exec python3 "$here/longhaul.py" "$@" ;;
   doctor)
     # The checklist only reads (ps and lsof of the user's own chats among
     # it); the skill's rule names it alone, so nothing may follow it.
@@ -120,6 +125,10 @@ case "$1" in
     # One account, by its NAME: with none, setup signs in every account not signed in.
     if plain "$2" && { [ $# -eq 2 ] || [ "$#:$3" = "3:--relogin" ]; }; then exec python3 "$here/longhaul.py" "$@"; fi
     only setup "\`setup NAME [--relogin]\`" "with no NAME it signs in every account at once" ;;
+  login)
+    # setup NAME --relogin by a shorter name: one account, by its NAME, as there.
+    if plain "$2" && [ $# -eq 2 ]; then exec python3 "$here/longhaul.py" "$@"; fi
+    only login "\`login NAME\`" ;;
   remove)
     # Never with the folder: that deletion is the user's own, in a terminal or /accounts.
     if plain "$2" && [ $# -eq 2 ]; then exec python3 "$here/longhaul.py" "$@"; fi
@@ -137,8 +146,8 @@ case "$1" in
     fi
     only folders "\`folders NAME\`, \`folders NAME --add PATH\`, \`--remove PATH\`, \`--prefer PATH\` or \`--no-prefer PATH\` (repeated), or \`folders NAME --anywhere\`" ;;
   switch)
-    case "$#:$2" in 1:|2:ask|2:auto|2:never) exec python3 "$here/longhaul.py" "$@" ;; esac
-    only switch "\`switch [ask|auto|never]\`" ;;
+    case "$#:$2" in 1:|2:ask|2:auto|2:never|2:wait) exec python3 "$here/longhaul.py" "$@" ;; esac
+    only switch "\`switch [ask|auto|never|wait]\`" ;;
   vscode)
     # On asks before it edits VS Code's settings, in a terminal; off asks nothing.
     case "$#:$2:$3" in 3:on:--yes|2:off:) exec python3 "$here/longhaul.py" "$@" ;; esac
