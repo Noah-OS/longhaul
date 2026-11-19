@@ -4,11 +4,12 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## Unreleased
 
-Easier to read at 80 columns, in a low-contrast theme and with a screen reader.
+Easier to read at 80 columns, in a low-contrast theme and with a screen reader; an icon, and CI green again.
 
 ### Added
 
 - **`LONGHAUL_PLAIN=1`** draws words where Longhaul draws marks, for a screen reader, which reads ✔ as "check mark" and · as "middle dot". `/accounts` puts OK, Failed or Warning first in place of ✔ ✘ ⚠, puts `, ` between a row's parts, names the keys in words and leaves out the `›` on the focused line (the focus ring still shows it). `longhaul doctor` prints OK:, Failed: and Warning: in place of its marks. The status line and the VS Code panel's status entry use `, ` and "moves to" in place of `·` and `→`. `longhaul help plain` says the same.
+- **An icon**, `.claude-plugin/icon.png` (1024 px, drawn from `.github/assets/longhaul-icon.svg`): the context rising, a compaction, the checkpoint coming back, on the road. Claude Code's plugin check now asks for one.
 
 ### Changed
 
@@ -16,6 +17,7 @@ Easier to read at 80 columns, in a low-contrast theme and with a screen reader.
 - **Facts in `/accounts` are no longer dim.** Where an account may run, its email, its sign-in folder and the "Here, in ~/x: … may be used." line were drawn dim, which is hard to read in many themes. They are in normal weight now. Dim is kept for hints: the keys, a sign-in still "checking…", progress lines and notes beside a button.
 - **Masked emails read `y…@example.com`**, in `longhaul status --json` and `/accounts`, in place of `y•••@example.com`, which a screen reader read as "y bullet bullet bullet". As before, only the first character and the domain are shown.
 - **`longhaul doctor` on a terminal that cannot show ✔** now prints the same words as with `LONGHAUL_PLAIN=1` (OK:, Failed:, Warning:), in place of `ok`, `XX` and `!!`.
+- **The README banner** says what Longhaul does now: it saves a checkpoint, then compacts at 400k tokens; moves a chat to another of your accounts at a limit; and shows where the tokens went.
 
 ## 0.3.18 - 2026-11-18
 
