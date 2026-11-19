@@ -2,6 +2,21 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+Easier to read at 80 columns, in a low-contrast theme and with a screen reader.
+
+### Added
+
+- **`LONGHAUL_PLAIN=1`** draws words where Longhaul draws marks, for a screen reader, which reads ✔ as "check mark" and · as "middle dot". `/accounts` puts OK, Failed or Warning first in place of ✔ ✘ ⚠, puts `, ` between a row's parts, names the keys in words and leaves out the `›` on the focused line (the focus ring still shows it). `longhaul doctor` prints OK:, Failed: and Warning: in place of its marks. The status line and the VS Code panel's status entry use `, ` and "moves to" in place of `·` and `→`. `longhaul help plain` says the same.
+
+### Changed
+
+- **`/accounts` rows fit 80 columns.** A row with every part filled ran to about 110 columns and wrapped in the middle of a phrase. Now where the account may run, its fallback mark and "this chat" are on a line of their own under its row; a long row breaks between its parts, never inside one, and follows the pane's width. Folders too long to name there are counted ("only in 3 folders"); the account's page still names each one. On an account's page, the fix for Use for this chat sits under its reason.
+- **Facts in `/accounts` are no longer dim.** Where an account may run, its email, its sign-in folder and the "Here, in ~/x: … may be used." line were drawn dim, which is hard to read in many themes. They are in normal weight now. Dim is kept for hints: the keys, a sign-in still "checking…", progress lines and notes beside a button.
+- **Masked emails read `y…@example.com`**, in `longhaul status --json` and `/accounts`, in place of `y•••@example.com`, which a screen reader read as "y bullet bullet bullet". As before, only the first character and the domain are shown.
+- **`longhaul doctor` on a terminal that cannot show ✔** now prints the same words as with `LONGHAUL_PLAIN=1` (OK:, Failed:, Warning:), in place of `ok`, `XX` and `!!`.
+
 ## 0.3.18 - 2026-11-18
 
 Help that fits one screen, `/accounts` that shows its accounts at once, and two shorter words.
