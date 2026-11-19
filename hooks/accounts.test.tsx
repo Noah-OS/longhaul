@@ -1306,6 +1306,37 @@ both('a read that fails says why in normal weight, that chats still run, with Re
   await ui.unmount()
 })
 
+// M8 (the UX review's §3.7): dim, low contrast in many themes, is for hints
+// alone. Where an account may run, its email, its sign-in folder and the
+// "Here" line answer "why", so they are in normal weight; the keys, a
+// sign-in still "checking…" and the notes beside a button stay dim.
+both('the facts are in normal weight, and dim is for hints: the keys, checking…, a note', async ($, on, surface) => {
+  const w = world(on)
+  w.slow.add('status') // the quick read's rows, each sign-in checking…
+  const { ui } = await opened($, w, surface)
+  // Whether each Text drawn with exactly this text is dim, the innermost (a Text
+  // holding a dim word is drawn as that word); at least one is drawn.
+  const dim = async (text: string) => {
+    const found = (await ui.findAll({ type: 'Text' })).filter((t: any) => t.text === text
+      && !t.children.some((k: any) => k && typeof k === 'object' && k.type === 'Text'))
+    expect(found.length).toBeGreaterThan(0)
+    return found.map((t: any) => t.props.dimColor === true)
+  }
+  expect(await dim(`${UNDER}only in ~/work, ~/clients`)).toEqual([false])
+  expect(await dim(`${UNDER}this chat`)).toEqual([false])
+  expect(await dim(`${UNDER}used nowhere`)).toEqual([false])
+  expect(await dim('Here, in ~/code/x: personal-1, team-4 may be used.')).toEqual([false])
+  expect(await dim('checking…')).toEqual([true, true, true, true]) // each row's sign-in, not known yet
+  if (surface === 'terminal') expect(await dim('↑ ↓ to move · Enter to open · Esc to close')).toEqual([true])
+  await w.clock.advance(60_000)
+  await open(ui, 'row-work-2')
+  for (const fact of ['may be used only in ~/work, ~/clients', 'b•••@example.com', 'sign-in folder ~/.claude-work-2'])
+    expect(await dim(fact)).toEqual([false])
+  expect(await dim('If it is still full, the next reply meets the limit and Longhaul records it again.')).toEqual([true])
+  if (surface === 'terminal') expect(await dim('Esc to go back')).toEqual([true])
+  await ui.unmount()
+})
+
 both('no "rows" and no "exit code" in what the pane says', async ($, on, surface) => {
   const w = world(on)
   const seen: string[] = []

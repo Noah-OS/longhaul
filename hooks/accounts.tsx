@@ -985,6 +985,15 @@ function signedIn(a: LonghaulAccount, checking: boolean): string {
   return 'signed in'
 }
 
+// A line with a sign-in still "checking…" in it, that word dim (M8): a
+// state not known yet, where the rest of the line is what is known.
+function unknown(c: Ctx, line: string): any {
+  const at = line.indexOf(CHECKING)
+  if (at < 0) return line
+  const { Text } = c.E
+  return [line.slice(0, at), <Text dimColor>{CHECKING}</Text>, line.slice(at + CHECKING.length)].filter(Boolean)
+}
+
 // Its recorded limit with how far off its end is and, when Longhaul has a
 // reading, when that was (the UX review's Q6, §4.7 row 1): "limit until Fri
 // 02:00 (in 2 d 4 h), seen Tue 23:10". A reading tells "lifted" from "not
@@ -1126,12 +1135,12 @@ function itemsPart($: any, c: Ctx): any {
       {items.map(i => {
         const lead = `${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`
         const color = i.warn ? 'warning' : undefined
-        const text = i.lines.length ? <Text color={color}>{i.lines[0]}</Text> : null
+        const text = i.lines.length ? <Text color={color}>{unknown(c, i.lines[0]!)}</Text> : null
         const first = c.canType && i.key && i.open
           ? <Button key={i.key} plain onPress={i.open} {...(i.key === start ? { autoFocus: true } : {})}>{lead}{text}</Button>
           : <Box flexDirection="row"><Text>{lead}</Text>{text}</Box>
-        const under = [...i.lines.slice(1).map(l => <Text color={color}>{`${pad}${l}`}</Text>),
-          ...i.more.map(l => <Text dimColor>{`${pad}${l}`}</Text>)]
+        const under = [...i.lines.slice(1).map(l => <Text color={color}>{unknown(c, `${pad}${l}`)}</Text>),
+          ...i.more.map(l => <Text>{`${pad}${l}`}</Text>)]
         return under.length ? <Box flexDirection="column">{first}{under}</Box> : first
       })}
     </Box>
@@ -1143,7 +1152,7 @@ function herePart($: any, c: Ctx): any {
   const here = c.status?.here
   if (!here) return null
   const may = here.may_use.length ? here.may_use.join(', ') : 'no account'
-  return <Text dimColor>{mask(`Here, in ${here.folder}: ${may} may be used.`)}</Text>
+  return <Text>{mask(`Here, in ${here.folder}: ${may} may be used.`)}</Text>
 }
 
 // The phone draws no field: it shows the list, and says where to manage it.
@@ -1237,7 +1246,7 @@ function previewLines(c: Ctx, name: string, kind: LonghaulAccountsPreview['kind'
   const p = previewOf(c, name, [kind])
   if (!p) return null
   return [...p.lines.map(line => <Text>{line}</Text>),
-    p.unread ? <Text dimColor>{`What it would ${what} could not be read: ${p.unread}`}</Text> : null]
+    p.unread ? <Text>{`What it would ${what} could not be read: ${p.unread}`}</Text> : null]
 }
 
 // A folder added or taken off (`folders NAME --add|--remove PATH`): what it
@@ -1401,16 +1410,17 @@ function accountPage($: any, c: Ctx): any {
   return (
     <Box flexDirection="column">
       <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
-      <Text>{[a.plan && mask(a.plan), check].filter(Boolean).join(' · ')}</Text>
+      <Text>{unknown(c, [a.plan && mask(a.plan), check].filter(Boolean).join(SEP))}</Text>
       {typeof a.limited_until === 'number' && <Text color="warning">{limitText(a, c.nowMs)}</Text>}
       {roomNow(a) && <Text>{`room now, seen ${clock(a.reading_at!, c.nowMs)}`}</Text>}
       {lines.map(line => <Text>{line}</Text>)}
       {typeof a.sign_in_failed_at === 'number' && (
         <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`}</Text>
       )}
-      <Text dimColor>{where(a)}</Text>
-      {a.email && <Text dimColor>{mask(String(a.email))}</Text>}
-      {a.folder && <Text dimColor>{mask(`sign-in folder ${a.folder}`)}</Text>}
+      {/* Facts, in normal weight: dim is for hints (M8). */}
+      <Text>{where(a)}</Text>
+      {a.email && <Text>{mask(String(a.email))}</Text>}
+      {a.folder && <Text>{mask(`sign-in folder ${a.folder}`)}</Text>}
       {useRow($, c, a)}
       {c.idle && !asking(c, name) && (
         <Box flexDirection="row" gap={1}>
