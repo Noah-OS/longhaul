@@ -119,9 +119,11 @@ let polling = false // the 3 s look for a question runs
 let looking = false // one look at a time
 
 // Every email in a text masked: its local part's first character, then
-// "•••", the domain kept. A masked one stays as it is.
+// "…", the domain kept (y…@example.com: one character, which a screen
+// reader reads as a pause, where "•••" was read "bullet" three times; M8).
+// A masked one stays as it is.
 function mask(text: string): string {
-  return text.replace(/([^\s@<>()[\]{},;:"'`])[^\s@<>()[\]{},;:"'`]*@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)/g, '$1•••@$2')
+  return text.replace(/([^\s@<>()[\]{},;:"'`])[^\s@<>()[\]{},;:"'`]*@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)/g, '$1…@$2')
 }
 
 // A command's output as the pane shows it: stdout then stderr, colour codes

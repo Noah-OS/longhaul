@@ -25229,7 +25229,7 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(out.stdout.count("\n"), 1, "one line, the object")
         self.assertEqual(self.files(), before, "it writes nothing, not even the log")
         self.assertEqual(found["accounts"][0], {
-            "name": "personal-1", "email": "f•••@example.com", "signed_in": True, "as_expected": True,
+            "name": "personal-1", "email": "f…@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
             "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None})
@@ -25265,13 +25265,26 @@ class StatusJson(unittest.TestCase):
         out = self.status()
         found = self.by_name(self.read(out))
         self.assertEqual({n: a["email"] for n, a in found.items()},
-                         {"personal-1": "f•••@example.com", "max": "a•••@example.com", "work": "W•••@Example.com",
-                          "other": "m•••@example.com", "plain": None})
+                         {"personal-1": "f…@example.com", "max": "a…@example.com", "work": "W…@Example.com",
+                          "other": "m…@example.com", "plain": None})
         for email in ("first@example.com", "a@example.com", "Work.Team@Example.com", "work.team@example.com",
                       "mine@example.com", "stranger@example.com", "plain@example.com", "first", "Work.Team", "stranger"):
             self.assertNotIn(email, out.stdout)
-        self.assertIn("•", out.stdout, "one character, not \\u2022 (ensure_ascii=False)")
-        self.assertNotIn("\\u2022", out.stdout)
+        # M8: one "…" (U+2026), which a screen reader reads as one pause, where "•••" was read "bullet" three
+        # times; as written, not escaped (ensure_ascii=False). No more of the address than before: its first
+        # character, then the domain.
+        self.assertIn("…", out.stdout, "one character, not \\u2026 (ensure_ascii=False)")
+        self.assertNotIn("\\u2026", out.stdout)
+        self.assertNotIn("•", out.stdout)
+        self.assertEqual(longhaul.masked_email(" first.last@example.com "), "f…@example.com")
+        self.assertEqual(longhaul.masked_email("no-at-sign"), "n…")
+        self.assertEqual(longhaul.masked_email("odd@name@example.com"), "o…@example.com", "the last @ is the domain's")
+        for nothing in (None, "", "  ", 7):
+            self.assertIsNone(longhaul.masked_email(nothing))
+        # A stdout that cannot take "…" gets the same object, escaped.
+        ascii_out = self.status(PYTHONIOENCODING="ascii")
+        self.assertEqual(self.by_name(self.read(ascii_out)), found)
+        self.assertIn("\\u2026", ascii_out.stdout)
         log = self.home / "longhaul.log"
         self.assertFalse(log.exists() and "@" in log.read_text(), "nothing private in the log")
 

@@ -17370,12 +17370,14 @@ def status(opts) -> int:
 
 def masked_email(email):
     """An email as the screen shows it: the local part's first character,
-    then •••, then @ and the domain whole (f•••@example.com); without an @,
-    the first character and •••. None for no email."""
+    then …, then @ and the domain whole (f…@example.com); without an @,
+    the first character and …. None for no email. One "…" (U+2026), which
+    a screen reader reads as a pause, where "•••" was read "bullet" three
+    times (the UX review's §3.7, M8); no more of the address than before."""
     if not isinstance(email, str) or not email.strip():
         return None
     local, at, domain = email.strip().rpartition("@")
-    return f"{local[:1]}•••@{domain}" if at else email.strip()[:1] + "•••"
+    return f"{local[:1]}…@{domain}" if at else email.strip()[:1] + "…"
 
 
 def status_window(reading, key: str, now: float):
@@ -17586,7 +17588,7 @@ def status_json(check: bool = True) -> int:
              "checked": check}
     try:
         print(json.dumps(found, ensure_ascii=False))
-    except UnicodeEncodeError:  # a stdout that cannot take • (PYTHONIOENCODING=ascii): the same object, escaped
+    except UnicodeEncodeError:  # a stdout that cannot take … (PYTHONIOENCODING=ascii): the same object, escaped
         print(json.dumps(found))
     return 2 if problem else 0
 

@@ -18,13 +18,13 @@ const RELOAD = 'Reload VS Code: Cmd+Shift+P, Developer: Reload Window.'
 const OPEN = { id: PANE_ID, title: 'Longhaul accounts', focus: true, closeOnEscape: true }
 
 const ACCOUNTS = [
-  { name: 'personal-1', email: 'a•••@example.com', signed_in: true, as_expected: true, check_failed: null, plan: 'max',
+  { name: 'personal-1', email: 'a…@example.com', signed_in: true, as_expected: true, check_failed: null, plan: 'max',
     limited_until: null, five_hour: { used: 40, resets_at: AT + 2 * HOUR }, week: { used: 12, resets_at: AT + 50 * HOUR },
     only_in: [], fallback: false, folder: '~/.claude-personal-1', this_chat: true },
-  { name: 'work-2', email: 'b•••@example.com', signed_in: false, as_expected: null, check_failed: null, plan: 'pro',
+  { name: 'work-2', email: 'b…@example.com', signed_in: false, as_expected: null, check_failed: null, plan: 'pro',
     limited_until: AT + 3 * HOUR, five_hour: null, week: null, only_in: ['~/work', '~/clients'], fallback: false,
     folder: '~/.claude-work-2', this_chat: false },
-  { name: 'spare-3', email: 'c•••@example.com', signed_in: true, as_expected: false, check_failed: null, plan: null,
+  { name: 'spare-3', email: 'c…@example.com', signed_in: true, as_expected: false, check_failed: null, plan: null,
     limited_until: null, five_hour: null, week: null, only_in: null, fallback: false, folder: '~/.claude-spare-3',
     this_chat: false },
   { name: 'team-4', email: null, signed_in: null, as_expected: null, check_failed: 'the check timed out', plan: null,
@@ -350,19 +350,19 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
 // to about 110 columns and wrapped inside a phrase. Long names, three
 // folders, a limit with its time and when it was seen, a sign-in gone wrong.
 const LONG = [
-  { name: 'personal-account', email: 'p•••@example.com', signed_in: true, as_expected: true, check_failed: null,
+  { name: 'personal-account', email: 'p…@example.com', signed_in: true, as_expected: true, check_failed: null,
     plan: 'max', limited_until: null, reading_at: AT - 600, five_hour: { used: 40, resets_at: AT + 2 * HOUR },
     week: { used: 12, resets_at: AT + 50 * HOUR }, only_in: [], fallback: false, use_here: 'this_chat',
     folder: '~/.claude-personal-account', this_chat: true },
-  { name: 'acme-client-work', email: 'a•••@example.com', signed_in: false, as_expected: null, check_failed: null,
+  { name: 'acme-client-work', email: 'a…@example.com', signed_in: false, as_expected: null, check_failed: null,
     plan: 'pro', limited_until: AT + 52 * HOUR, reading_at: AT - 13 * HOUR, five_hour: null, week: null,
     only_in: ['~/clients/acme-api', '~/clients/acme-web', '~/clients/acme-docs'], fallback: true, use_here: 'limited',
     folder: '~/.claude-acme-client-work', this_chat: false },
-  { name: 'globex-consult', email: 'g•••@example.com', signed_in: true, as_expected: false, check_failed: null,
+  { name: 'globex-consult', email: 'g…@example.com', signed_in: true, as_expected: false, check_failed: null,
     plan: 'team', limited_until: AT + 5 * HOUR, reading_at: AT - HOUR, five_hour: { used: 100, resets_at: AT + 5 * HOUR },
     week: { used: 64, resets_at: AT + 90 * HOUR }, only_in: ['~/clients/globex-app', '~/clients/globex-data'],
     fallback: false, use_here: 'not_allowed', folder: '~/.claude-globex-consult', this_chat: false },
-  { name: 'spare-account', email: 's•••@example.com', signed_in: true, as_expected: true, check_failed: null,
+  { name: 'spare-account', email: 's…@example.com', signed_in: true, as_expected: true, check_failed: null,
     sign_in_failed_at: AT - 2 * HOUR, plan: 'max', limited_until: null, reading_at: AT - 300,
     five_hour: { used: 100, resets_at: AT + HOUR }, week: { used: 95, resets_at: AT + 30 * HOUR }, only_in: [],
     fallback: false, use_here: 'ok', folder: '~/.claude-spare-account', this_chat: false },
@@ -434,7 +434,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   await open(ui, 'row-personal-1')
   let all = await texts(ui)
   for (const t of ['personal-1 (this chat)', 'max · signed in', `5-hour 40%, resets ${clock(AT + 2 * HOUR)}`,
-                   `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used in any folder no other account reserves', 'a•••@example.com',
+                   `week 12%, resets ${clock(AT + 50 * HOUR)}`, 'may be used in any folder no other account reserves', 'a…@example.com',
                    'sign-in folder ~/.claude-personal-1'])
     expect(all).toContain(t)
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'fallback', 'back'])
@@ -446,7 +446,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   await open(ui, 'row-work-2')
   all = await texts(ui)
   for (const t of ['pro · NOT signed in', `limit until ${clock(AT + 3 * HOUR)} (in 3 h)`,
-                   'may be used only in ~/work, ~/clients', 'b•••@example.com'])
+                   'may be used only in ~/work, ~/clients', 'b…@example.com'])
     expect(all).toContain(t)
   await ui.press({ key: 'back' })
   expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^› work-2/)
@@ -454,7 +454,7 @@ both("an account's page: its details, masked email, folder, and its actions; Bac
   all = await texts(ui)
   expect(all).toContain('signed in as someone else')
   expect(all).toContain('may be used nowhere')
-  expect(all).toContain('c•••@example.com')
+  expect(all).toContain('c…@example.com')
   await ui.press({ key: 'back' })
   await open(ui, 'row-team-4')
   expect(await texts(ui)).toContain('could not check: the check timed out')
@@ -1123,7 +1123,7 @@ both('Activity with nothing to show says so; a read that fails says why, with Re
     await open(ui, 'row-activity')
     all = await texts(ui)
     expect(all.filter(t => /odd|recorded limit/.test(t))).toEqual([])
-    expect(all.some(t => t.includes('s•••@example.com') && !t.includes('someone@'))).toBe(true)
+    expect(all.some(t => t.includes('s…@example.com') && !t.includes('someone@'))).toBe(true)
     await ui.press({ key: 'back' })
     w.answer.activity = done('', 2, 'usage: longhaul [-h]\nlonghaul: error: unrecognized arguments: activity --json --days 1\n')
     await open(ui, 'row-activity')
@@ -1171,16 +1171,18 @@ both("the last action's output: its last ten lines, stdout and stderr, every ema
   await open(ui, 'row-personal-1')
   await ui.press({ key: 'signin-personal-1' })
   // The reason, its last line, shows at once; the rest behind Details.
-  expect(await texts(ui)).toContain('should be s•••@example.com, not <o•••@example.com>')
+  expect(await texts(ui)).toContain('should be s…@example.com, not <o…@example.com>')
   expect(await texts(ui)).not.toContain('line 7')
   await ui.press({ key: 'details' })
   const shown = await texts(ui)
   expect(shown.some(t => t.startsWith('✘') && /personal-1/.test(t))).toBe(true)
-  expect(shown).toContain('signed in as f•••@example.com')
-  expect(shown).toContain('should be s•••@example.com, not <o•••@example.com>')
+  expect(shown).toContain('signed in as f…@example.com')
+  expect(shown).toContain('should be s…@example.com, not <o…@example.com>')
   expect(shown).toContain('line 7')
   expect(shown).not.toContain('line 6')
   expect(shown.join('\n')).not.toMatch(/first\.last|second@|other\+tag/)
+  // M8: one "…" for the rest of the local part, read as a pause, where "•••" was read "bullet" three times.
+  expect(shown.join('\n')).not.toMatch(/•/)
   await ui.unmount()
 })
 
@@ -1330,7 +1332,7 @@ both('the facts are in normal weight, and dim is for hints: the keys, checking�
   if (surface === 'terminal') expect(await dim('↑ ↓ to move · Enter to open · Esc to close')).toEqual([true])
   await w.clock.advance(60_000)
   await open(ui, 'row-work-2')
-  for (const fact of ['may be used only in ~/work, ~/clients', 'b•••@example.com', 'sign-in folder ~/.claude-work-2'])
+  for (const fact of ['may be used only in ~/work, ~/clients', 'b…@example.com', 'sign-in folder ~/.claude-work-2'])
     expect(await dim(fact)).toEqual([false])
   expect(await dim('If it is still full, the next reply meets the limit and Longhaul records it again.')).toEqual([true])
   if (surface === 'terminal') expect(await dim('Esc to go back')).toEqual([true])
@@ -1843,11 +1845,11 @@ both('a folders change its dry run refuses shows why and asks nothing; a typed e
   w.answer.folders = dryOr(() => PREVIEW)
   await ui.input({ key: 'folder-path', text: '/srv/first.last@example.com' })
   await ui.press({ key: 'folder-add' })
-  expect(await texts(ui)).toContain("Add /•••@example.com to work-2's folders?")
+  expect(await texts(ui)).toContain("Add /…@example.com to work-2's folders?")
   await ui.press({ key: 'folders-yes' })
   expect(after(w).slice(-2)).toEqual([['folders', 'work-2', '--add', '/srv/first.last@example.com'], ['status', '--json']])
   all = await texts(ui)
-  expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /•••@example.com: work-2'))).toBe(true)
+  expect(all.some(t => t.startsWith('✔') && t.includes('Add folder /…@example.com: work-2'))).toBe(true)
   expect(all.join('\n')).not.toMatch(/first\.last/)
   await ui.unmount()
 })

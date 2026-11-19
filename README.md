@@ -115,7 +115,7 @@ Longhaul can run your chats across several of your own Claude subscriptions. Eac
 - `Activity`: what Longhaul did by itself today, and why, this chat first (see [Day to day](#3-day-to-day));
 - `Settings`: switching, the VS Code panel on or off, and forgetting the recorded limits.
 
-Use the arrow keys to move and Enter to open a line. Escape, or **Back**, goes back to the list; Escape on the list closes it. An account's page shows its 5-hour and week use, its folder and its email, masked (`y•••@example.com`). On the phone, `/accounts` shows the list only. In a terminal, `longhaul status` lists the accounts too.
+Use the arrow keys to move and Enter to open a line. Escape, or **Back**, goes back to the list; Escape on the list closes it. An account's page shows its 5-hour and week use, its folder and its email, masked (`y…@example.com`). On the phone, `/accounts` shows the list only. In a terminal, `longhaul status` lists the accounts too.
 
 **Add an account.** In `/accounts`: open `+ Add account`, type the name and the email (and, if you want, the folders it may be used in), then press **Add account**. Or in a terminal:
 
