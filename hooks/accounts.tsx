@@ -893,7 +893,8 @@ function questionPart($: any, c: Ctx): any {
       {runs && <Text dimColor>Answering…</Text>}
       {mine && mine.ok !== null && (
         <Text color={mine.ok ? 'success' : 'error'}>
-          {`${markOf(c, mine.ok ? 'ok' : 'failed')} ${mine.lines.join(' ') || (mine.ok ? 'Answered.' : 'It was not answered.')}`}
+          {`${markOf(c, mine.ok ? 'ok' : 'failed')} `
+            + `${mine.lines.join(' ') || (mine.ok ? 'Answered.' : 'It was not answered.')}`}
         </Text>
       )}
     </Box>
@@ -1066,10 +1067,10 @@ function markOf(c: Ctx, kind: keyof typeof MARKS): string {
 function flow(start: number, phrases: string[][], width: number, indent: number, sep: string): string[] {
   const lines: string[] = []
   let line = '', at = start
-  const put = (part: string, sep: string) => {
-    if (line && at + sep.length + part.length > width) { lines.push(line); line = ''; at = indent }
-    at += (line ? sep.length : 0) + part.length
-    line += line ? sep + part : part
+  const put = (part: string, join: string) => {
+    if (line && at + join.length + part.length > width) { lines.push(line); line = ''; at = indent }
+    at += (line ? join.length : 0) + part.length
+    line += line ? join + part : part
   }
   for (const parts of phrases) {
     const whole = parts.join(', ')
@@ -1217,8 +1218,9 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
         </Box>
       ))}
       {kept.length > 0 && (
-        <Text color="warning">{mask(`${markOf(c, 'warning')} ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} every folder, so ${name} is `
-          + `used nowhere until a folder is added here (or / is removed from ${kept.length > 1 ? 'theirs' : `${kept[0]}'s`}).`)}</Text>
+        <Text color="warning">{mask(`${markOf(c, 'warning')} ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} `
+          + `every folder, so ${name} is used nowhere until a folder is added here (or / is removed from `
+          + `${kept.length > 1 ? 'theirs' : `${kept[0]}'s`}).`)}</Text>
       )}
       {offered && a.only_in !== null && <Input key="folder-path" label="Add a folder: " placeholder="~/work"
         value={typed.path} onInput={keepFolder($, name)} onSubmit={keepFolder($, name)} autoFocus />}
@@ -1678,9 +1680,10 @@ function runningPart($: any, c: Ctx): any {
 }
 
 // The last action's end, on the page it ran from: ✔ or ✘ (? when not
-// known; plain, OK, Failed or Not known), then its output's last line, the command's own word (a failure's
-// reason, or what a forget let carry on), in normal weight, never dim (the
-// UX review's Q14); the rest of its output behind Details; what next.
+// known; plain, OK, Failed or Not known), then its output's last line, the
+// command's own word (a failure's reason, or what a forget let carry on),
+// in normal weight, never dim (the UX review's Q14); the rest of its output
+// behind Details; what next.
 function resultPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   if (!c.last || !c.canType || !c.idle || c.last.page !== c.page) return null
