@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## Unreleased
+## 0.3.19 - 2026-11-19
 
 Easier to read at 80 columns, in a low-contrast theme and with a screen reader; an icon, and CI green again.
 

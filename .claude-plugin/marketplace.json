@@ -9,13 +9,13 @@
       "name": "longhaul",
       "source": "./",
       "description": "Long Claude Code sessions and several accounts: a checkpoint, then a compaction at 400k tokens; a chat moved to another of your accounts at a usage limit; where the tokens went. Every feature measured in public, the misses included.",
-      "version": "0.3.18"
+      "version": "0.3.19"
     },
     {
       "name": "longhaul-advisor",
       "source": "./plugins/longhaul-advisor",
       "description": "Longhaul's Advisor experiment: the /longhaul-advisor:advise skill and the read-only advisor agent it consults. Needs the longhaul plugin, whose hook checks, caps and traces every consultation. Off unless the owner enables the experiment.",
-      "version": "0.3.18"
+      "version": "0.3.19"
     }
   ]
 }
