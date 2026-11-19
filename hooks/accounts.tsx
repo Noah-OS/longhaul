@@ -843,6 +843,7 @@ type Ctx = {
   activity: LonghaulAccountsActivity | null // the Activity page's last read; null: reading
   preview: LonghaulAccountsPreview | null // what the open question's dry run said
   nowMs: number // the clock, for times shown as longhaul.py shows them
+  columns: number // the widest a list row is laid out: ROW_MAX, or the pane's body where narrower
 }
 
 // The pane, top to bottom: the question, the page, what runs, the last
@@ -988,9 +989,14 @@ function signedIn(a: LonghaulAccount, checking: boolean): string {
 // reading, when that was (the UX review's Q6, §4.7 row 1): "limit until Fri
 // 02:00 (in 2 d 4 h), seen Tue 23:10". A reading tells "lifted" from "not
 // known": with no limit recorded and no window full, "room now" (row 2).
+// Its two parts apart, for a list row too narrow for both on one line.
+function limitParts(a: LonghaulAccount, nowMs: number): string[] {
+  return [`limit until ${clock(a.limited_until!, nowMs)} (${inTime(a.limited_until!, nowMs)})`,
+    ...(typeof a.reading_at === 'number' ? [`seen ${clock(a.reading_at, nowMs)}`] : [])]
+}
+
 function limitText(a: LonghaulAccount, nowMs: number): string {
-  const seen = typeof a.reading_at === 'number' ? `, seen ${clock(a.reading_at, nowMs)}` : ''
-  return `limit until ${clock(a.limited_until!, nowMs)} (${inTime(a.limited_until!, nowMs)})${seen}`
+  return limitParts(a, nowMs).join(', ')
 }
 
 function roomNow(a: LonghaulAccount): boolean {
@@ -1001,33 +1007,69 @@ function roomNow(a: LonghaulAccount): boolean {
 // An account's line in the list: its plan, its sign-in unless that is
 // fine and the limit says more, then the limit, or room now and the use of
 // its open windows. "checking…" is no warning: nothing is known wrong yet.
-function summary(a: LonghaulAccount, nowMs: number, checking: boolean): { text: string; warn: boolean } {
+// Each phrase is a list of parts, joined by ", " and kept on one line where
+// a line can hold them all (flow()).
+function summary(a: LonghaulAccount, nowMs: number, checking: boolean): { phrases: string[][]; warn: boolean } {
   const limited = typeof a.limited_until === 'number'
   const sign = typeof a.sign_in_failed_at === 'number' ? 'sign-in failed' : signedIn(a, checking)
-  const parts = a.plan ? [mask(a.plan)] : []
-  if (!(limited && sign === 'signed in')) parts.push(sign)
-  if (limited) parts.push(limitText(a, nowMs))
+  const phrases = a.plan ? [[mask(a.plan)]] : []
+  if (!(limited && sign === 'signed in')) phrases.push([sign])
+  if (limited) phrases.push(limitParts(a, nowMs))
   else {
-    if (roomNow(a)) parts.push('room now')
-    if (a.five_hour) parts.push(`5h ${Math.round(a.five_hour.used)}%`)
-    if (a.week) parts.push(`week ${Math.round(a.week.used)}%`)
+    if (roomNow(a)) phrases.push(['room now'])
+    if (a.five_hour) phrases.push([`5h ${Math.round(a.five_hour.used)}%`])
+    if (a.week) phrases.push([`week ${Math.round(a.week.used)}%`])
   }
-  return { text: parts.join(' · '), warn: limited || (sign !== 'signed in' && sign !== CHECKING) }
+  return { phrases, warn: limited || (sign !== 'signed in' && sign !== CHECKING) }
 }
 
 // A list that holds / covers every folder, so "only in /" read as a narrow one
 // (2026-11-06); the same words as longhaul.py's EVERYWHERE_BY_ROOT.
 const EVERYWHERE = 'everywhere (its folders include /)'
 
-// What the line adds in brackets: this chat's account, where it is kept to;
-// used nowhere, too, for one with no list that others keep out of every
-// folder; and fallback, for one used only when the others have no room.
-function extras(a: LonghaulAccount): string {
-  const said = [a.this_chat ? 'this chat' : '',
-    a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
-      : a.only_in.includes('/') ? EVERYWHERE : a.only_in.length ? `only in ${a.only_in.join(', ')}` : '',
-    a.fallback === true ? 'fallback' : ''].filter(Boolean)
-  return said.length ? mask(`   (${said.join(' · ')})`) : ''
+// The widest a list row is laid out (the UX review's §3.7 and M8): 80
+// columns, or the pane's body where that is narrower. A row with every part
+// filled ran to about 110 columns, and the terminal wrapped it inside a phrase.
+const ROW_MAX = 80
+const SEP = ' · '
+
+// A list row's text laid out in `width` columns, its first line starting
+// at column `start` (after the mark and the name), each line after it at
+// `indent`, under the first's text: the phrases joined by SEP, a new line
+// where the next would pass the width. A phrase's parts stay on one line
+// where a line can hold them, and break between them where none can; a
+// line never breaks inside a part. The lines' text, without the columns before it.
+function flow(start: number, phrases: string[][], width: number, indent: number): string[] {
+  const lines: string[] = []
+  let line = '', at = start
+  const put = (part: string, sep: string) => {
+    if (line && at + sep.length + part.length > width) { lines.push(line); line = ''; at = indent }
+    at += (line ? sep.length : 0) + part.length
+    line += line ? sep + part : part
+  }
+  for (const parts of phrases) {
+    const whole = parts.join(', ')
+    if (indent + whole.length <= width) put(whole, SEP)
+    else parts.forEach((part, i) => put(part, i ? ', ' : SEP))
+  }
+  if (line) lines.push(line)
+  return lines
+}
+
+// The line under an account's text: this chat's account, its role, and
+// where it may run. Fallback, for one used only when the others have no
+// room; used nowhere, too, for one with no list that others keep out of
+// every folder. Its folders by name where the line can hold them in `room`
+// columns, else by their number: its page names them.
+function extras(a: LonghaulAccount, room: number): string[] {
+  const where = (named: boolean) => (a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
+    : a.only_in.includes('/') ? EVERYWHERE : !a.only_in.length ? ''
+    : named ? `only in ${a.only_in.join(', ')}`
+    : `only in ${a.only_in.length} folder${a.only_in.length > 1 ? 's' : ''}`)
+  const said = (named: boolean) => [a.this_chat ? 'this chat' : '', a.fallback === true ? 'fallback' : '', where(named)]
+    .filter(Boolean).map(part => mask(part))
+  const named = said(true)
+  return named.join(SEP).length <= room ? named : said(false)
 }
 
 // What both Remove confirmations end with: the account's sign-in folder is
@@ -1047,45 +1089,50 @@ function itemsPart($: any, c: Ctx): any {
   if (!c.status) return null
   const s = c.status
   const width = Math.min(24, Math.max(0, ...s.accounts.map(a => mask(String(a.name)).length)))
+  const indent = 2 + width + 2 // under the text: the mark and a space, the names, two spaces
   const keys = new Set<string>()
-  const items: { key: string | null; head: string; text: string; warn: boolean; extra: string; open?: () => void }[] = []
+  const items: { key: string | null; head: string; lines: string[]; warn: boolean; more: string[]; open?: () => void }[] = []
   for (const a of s.accounts) {
     const name = String(a.name)
     const key = NAME.test(name) && !keys.has(`row-${name}`) ? `row-${name}` : null
     if (key) keys.add(key)
-    const { text, warn } = summary(a, c.nowMs, c.checking)
-    items.push({ key, head: mask(name).padEnd(width), text, warn, extra: extras(a),
+    const head = `${mask(name).padEnd(width)}  `
+    const { phrases, warn } = summary(a, c.nowMs, c.checking)
+    const more = extras(a, c.columns - indent)
+    items.push({ key, head, lines: flow(2 + head.length, phrases, c.columns, indent), warn,
+      more: more.length ? flow(indent, more.map(part => [part]), c.columns, indent) : [],
       open: key ? () => void go($, `account:${name}`, harmless(a)) : undefined })
   }
   if (c.canType) {
-    items.push({ key: 'row-add', head: '+ Add account', text: '', warn: false, extra: '',
-      open: () => void go($, 'add', 'add-name') })
-    items.push({ key: 'row-activity', head: 'Activity: what Longhaul did, and why', text: '', warn: false, extra: '',
-      open: () => void go($, 'activity', 'back') })
+    const item = (key: string, head: string, open: () => void) => ({ key, head, lines: [], warn: false, more: [], open })
+    items.push(item('row-add', '+ Add account', () => void go($, 'add', 'add-name')))
+    items.push(item('row-activity', 'Activity: what Longhaul did, and why', () => void go($, 'activity', 'back')))
     const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
-    items.push({ key: 'row-settings', head: `Settings (switching: ${s.switch ?? 'not known'} · VS Code panel: ${vs})`,
-      text: '', warn: false, extra: '', open: () => void go($, 'settings', 'switch') })
-    items.push({ key: 'row-troubleshoot', head: `Troubleshoot${s.panel_paused === true ? ' (Longhaul paused in panel chats)' : ''}`,
-      text: '', warn: false, extra: '', open: () => void go($, 'troubleshoot', 'back') })
+    items.push(item('row-settings', `Settings (switching: ${s.switch ?? 'not known'}${SEP}VS Code panel: ${vs})`,
+      () => void go($, 'settings', 'switch')))
+    items.push(item('row-troubleshoot', `Troubleshoot${s.panel_paused === true ? ' (Longhaul paused in panel chats)' : ''}`,
+      () => void go($, 'troubleshoot', 'back')))
   }
   const pressable = items.filter(i => c.canType && i.key && i.open)
   const start = c.question ? null : (pressable.find(i => i.key === c.mark) ?? pressable[0])?.key ?? null
+  const pad = ' '.repeat(indent)
+  // A row is its first line, the one Enter opens and the focus ring shows,
+  // then the lines under it: the rest of its text, then where it may run.
   return (
     <Box flexDirection="column">
       {!s.accounts.length && (
         !s.problem && <Text>{s.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
       )}
       {items.map(i => {
-        const parts = [`${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`, i.text ? '  ' : '']
-        const text = i.text ? <Text color={i.warn ? 'warning' : undefined}>{i.text}</Text> : null
-        const extra = i.extra ? <Text dimColor>{i.extra}</Text> : null
-        if (c.canType && i.key && i.open)
-          return (
-            <Button key={i.key} plain onPress={i.open} {...(i.key === start ? { autoFocus: true } : {})}>
-              {parts.join('')}{text}{extra}
-            </Button>
-          )
-        return <Box flexDirection="row"><Text>{parts.join('')}</Text>{text}{extra}</Box>
+        const lead = `${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`
+        const color = i.warn ? 'warning' : undefined
+        const text = i.lines.length ? <Text color={color}>{i.lines[0]}</Text> : null
+        const first = c.canType && i.key && i.open
+          ? <Button key={i.key} plain onPress={i.open} {...(i.key === start ? { autoFocus: true } : {})}>{lead}{text}</Button>
+          : <Box flexDirection="row"><Text>{lead}</Text>{text}</Box>
+        const under = [...i.lines.slice(1).map(l => <Text color={color}>{`${pad}${l}`}</Text>),
+          ...i.more.map(l => <Text dimColor>{`${pad}${l}`}</Text>)]
+        return under.length ? <Box flexDirection="column">{first}{under}</Box> : first
       })}
     </Box>
   )
@@ -1332,8 +1379,9 @@ function useRow($: any, c: Ctx, a: LonghaulAccount): any {
       ? <Button key={`use-add-${name}`} label={mask(`Add ${here.folder} to its folders`)}
         onPress={() => void addHere($, name)} />
     : null
+  // The fix under the reason: side by side they ran past 80 columns (M8).
   return (
-    <Box flexDirection="row" gap={1}>
+    <Box flexDirection="column">
       <Text>{notHere(a, here)}</Text>
       {fix}
     </Box>
@@ -1725,9 +1773,11 @@ export const register: Register = on => {
     const canType = TYPING.includes(String(e.surface))
     const status = have?.status ?? null
     const checking = status?.checked === false && !have?.problem
+    const body = Number((e as any).props?.bodyColumns)
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, checking, now: mine,
       last, confirm, form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w,
-      answer: ans, details: open, trouble: found, activity: did, preview: dry, nowMs }
+      answer: ans, details: open, trouble: found, activity: did, preview: dry, nowMs,
+      columns: Number.isInteger(body) && body >= 20 ? Math.min(ROW_MAX, body) : ROW_MAX }
     return drawPane($, c)
   })
 }

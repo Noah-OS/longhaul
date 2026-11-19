@@ -33,6 +33,8 @@ const ACCOUNTS = [
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, panel_paused: false, problem: null }
+// Under a list row's text (M8): the mark and a space, the 10 of personal-1, two spaces.
+const UNDER = ' '.repeat(14)
 const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-activity', 'row-settings',
   'row-troubleshoot']
 // What Remove asks, and Remove and delete its sign-in folder… asks then:
@@ -185,19 +187,74 @@ function write(w: World, path: string, value: unknown | null): void {
   else w.files[path] = { text: JSON.stringify(value), at: (w.files[path]?.at ?? 0) + 1 }
 }
 
-// The pane as the engine asks for it, on the surface a test names.
-function pane(surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+// The pane as the engine asks for it, on the surface a test names, its
+// body `columns` across: 80 unless a test says, the width the list's rows
+// are laid out for (M8).
+function pane(surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', columns = 80) {
   return { plugin: 'longhaul', component: 'Pane', requestId: PANE_ID, surface,
-    props: { title: 'Longhaul accounts', isFocused: true, bodyColumns: 60, placement: 'dock',
+    props: { title: 'Longhaul accounts', isFocused: true, bodyColumns: columns, placement: 'dock',
       scroll: { offset: 0, bodyRows: 40 }, view: {} } } as const
 }
 
 // A session on that surface, /accounts typed, and the pane it opened.
-async function opened($: any, w: World, surface: 'terminal' | 'vscode') {
+async function opened($: any, w: World, surface: 'terminal' | 'vscode', columns = 80) {
   await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
   const said = await $.command.run(TYPED)
-  const ui = await $.ui.mount(pane(surface))
+  const ui = await $.ui.mount(pane(surface, columns))
   return { said, ui }
+}
+
+// The pane as a terminal lays it out, line by line, as far as these tests
+// need (M8, the UX review's §3.7 "Width"): the kit checks the tree, never a
+// surface's paint, so the columns are counted here. A column Box stacks its
+// children, gap lines between; a row Box sets them side by side, gap
+// spaces between; a Text, or a plain Button, is its text; another Button is
+// its label as the terminal draws it, "[ Remove ]"; an Input its label and text.
+function laid(node: any): string[] {
+  if (typeof node === 'string') return node.split('\n')
+  if (!node || typeof node !== 'object') return []
+  const kids: any[] = Array.isArray(node.children) ? node.children.flat(Infinity) : []
+  const text = (n: any): string => (typeof n === 'string' ? n : Array.isArray(n?.children)
+    ? n.children.flat(Infinity).map(text).join('') : '')
+  if (node.type === 'Text') return text(node).split('\n')
+  if (node.type === 'Button')
+    return [node.props?.plain ? (kids.length ? text(node) : String(node.props?.label ?? ''))
+      : `[ ${String(node.props?.label ?? text(node))} ]`]
+  if (node.type === 'Input') return [`${node.props?.label ?? ''}${node.props?.value || node.props?.placeholder || ''}`]
+  const parts = kids.map(laid).filter(l => l.length)
+  const gap = Number(node.props?.gap ?? 0)
+  if (node.props?.flexDirection === 'row') {
+    const widths = parts.map(l => Math.max(...l.map(s => s.length)))
+    const tall = Math.max(0, ...parts.map(l => l.length))
+    return Array.from({ length: tall }, (_, i) => parts.map((l, j) => (l[i] ?? '').padEnd(widths[j]!))
+      .join(' '.repeat(gap)).trimEnd())
+  }
+  return parts.flatMap((l, i) => (i && gap ? [...Array<string>(gap).fill(''), ...l] : l))
+}
+
+// Every element of the drawn tree, outermost first.
+function nodes(node: any): any[] {
+  if (!node || typeof node !== 'object') return []
+  const kids: any[] = Array.isArray(node.children) ? node.children.flat(Infinity) : []
+  return [node, ...kids.flatMap(nodes)]
+}
+
+// A list row as drawn, its lines joined by newlines: its Button's line,
+// then the lines under it (the row's Box, whose first child is the Button).
+async function rowOf(ui: any, key: string): Promise<string | undefined> {
+  const all = nodes(await ui.drawn())
+  const box = all.find(n => n.type === 'Box' && n.children?.[0]?.type === 'Button' && n.children[0].props?.key === key)
+  const button = all.find(n => n.type === 'Button' && n.props?.key === key)
+  return box ? laid(box).join('\n') : button ? laid(button).join('\n') : undefined
+}
+
+// The lines of the pane wider than `columns`: every line, or the rows of
+// controls alone (each Box set out as a row), where the text around them is prose.
+async function over(ui: any, columns: number, rowsOnly = false): Promise<string[]> {
+  const tree = await ui.drawn()
+  const lines = rowsOnly ? nodes(tree).filter(n => n.type === 'Box' && n.props?.flexDirection === 'row').flatMap(laid)
+    : laid(tree)
+  return lines.filter(l => l.length > columns)
 }
 
 // Every text the pane shows, a list line's whole text among them.
@@ -269,11 +326,12 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
   const w = world(on)
   const { ui } = await opened($, w, surface)
   expect(await buttons(ui)).toEqual(ROWS)
-  const row = async (key: string) => (await ui.find({ key }))?.text
-  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · 5h 40% · week 12%   (this chat)')
-  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   `
-    + '(only in ~/work, ~/clients)')
-  expect(await row('row-spare-3')).toBe('  spare-3     signed in as someone else   (used nowhere)')
+  const row = (key: string) => rowOf(ui, key)
+  // Where it may run, and its role, on a line of their own under its text (M8).
+  expect(await row('row-personal-1')).toBe(`  personal-1  max · signed in · 5h 40% · week 12%\n${UNDER}this chat`)
+  expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n`
+    + `${UNDER}only in ~/work, ~/clients`)
+  expect(await row('row-spare-3')).toBe(`  spare-3     signed in as someone else\n${UNDER}used nowhere`)
   expect(await row('row-team-4')).toBe('  team-4      could not check')
   expect(await row('row-add')).toBe('  + Add account')
   expect(await row('row-activity')).toBe('  Activity: what Longhaul did, and why')
@@ -287,6 +345,74 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
   expect(all.join('\n')).not.toMatch(/@/)
   await ui.unmount()
 })
+
+// M8, the UX review's §3.7 "Width": a list row with every part filled ran
+// to about 110 columns and wrapped inside a phrase. Long names, three
+// folders, a limit with its time and when it was seen, a sign-in gone wrong.
+const LONG = [
+  { name: 'personal-account', email: 'p•••@example.com', signed_in: true, as_expected: true, check_failed: null,
+    plan: 'max', limited_until: null, reading_at: AT - 600, five_hour: { used: 40, resets_at: AT + 2 * HOUR },
+    week: { used: 12, resets_at: AT + 50 * HOUR }, only_in: [], fallback: false, use_here: 'this_chat',
+    folder: '~/.claude-personal-account', this_chat: true },
+  { name: 'acme-client-work', email: 'a•••@example.com', signed_in: false, as_expected: null, check_failed: null,
+    plan: 'pro', limited_until: AT + 52 * HOUR, reading_at: AT - 13 * HOUR, five_hour: null, week: null,
+    only_in: ['~/clients/acme-api', '~/clients/acme-web', '~/clients/acme-docs'], fallback: true, use_here: 'limited',
+    folder: '~/.claude-acme-client-work', this_chat: false },
+  { name: 'globex-consult', email: 'g•••@example.com', signed_in: true, as_expected: false, check_failed: null,
+    plan: 'team', limited_until: AT + 5 * HOUR, reading_at: AT - HOUR, five_hour: { used: 100, resets_at: AT + 5 * HOUR },
+    week: { used: 64, resets_at: AT + 90 * HOUR }, only_in: ['~/clients/globex-app', '~/clients/globex-data'],
+    fallback: false, use_here: 'not_allowed', folder: '~/.claude-globex-consult', this_chat: false },
+  { name: 'spare-account', email: 's•••@example.com', signed_in: true, as_expected: true, check_failed: null,
+    sign_in_failed_at: AT - 2 * HOUR, plan: 'max', limited_until: null, reading_at: AT - 300,
+    five_hour: { used: 100, resets_at: AT + HOUR }, week: { used: 95, resets_at: AT + 30 * HOUR }, only_in: [],
+    fallback: false, use_here: 'ok', folder: '~/.claude-spare-account', this_chat: false },
+]
+const LONG_STATUS = { ...STATUS, accounts: LONG, here: { folder: '~/code/longhaul', may_use: ['personal-account', 'spare-account'] } }
+const PAD = ' '.repeat(20) // under a row's text: the mark, a space, the 16 of the longest name, two spaces
+
+for (const columns of [80, 60])
+  both(`each list row fits a pane ${columns} columns across, broken only between its phrases`, async ($, on, surface) => {
+    const w = world(on)
+    w.status = done(JSON.stringify(LONG_STATUS))
+    const { ui } = await opened($, w, surface, columns)
+    const rows = await Promise.all((await buttons(ui)).map(key => rowOf(ui, key)))
+    expect(rows.flatMap(r => (r ?? '').split('\n')).filter(l => l.length > columns)).toEqual([])
+    if (columns === 80) expect(await over(ui, 80)).toEqual([]) // and every other line of the list
+    // Where it may run and its role on a line of their own, under its text; three folders too many to
+    // name, by their number (its page names them).
+    const limit = `limit until ${clock(AT + 52 * HOUR)} (in 2 d 4 h)`, seen = `seen ${clock(AT - 13 * HOUR)}`
+    expect(await rowOf(ui, 'row-acme-client-work')).toBe(columns === 80
+      ? [`  acme-client-work  pro · NOT signed in`, `${PAD}${limit}, ${seen}`, `${PAD}fallback · only in 3 folders`].join('\n')
+      : [`  acme-client-work  pro · NOT signed in`, `${PAD}${limit}`, `${PAD}${seen}`, `${PAD}fallback · only in 3 folders`]
+        .join('\n'))
+    expect(await rowOf(ui, 'row-globex-consult')).toBe([`  globex-consult    team · signed in as someone else`,
+      `${PAD}limit until ${clock(AT + 5 * HOUR)} (in 5 h), seen ${clock(AT - HOUR)}`,
+      `${PAD}${columns === 80 ? 'only in ~/clients/globex-app, ~/clients/globex-data' : 'only in 2 folders'}`].join('\n'))
+    expect(await rowOf(ui, 'row-personal-account')).toBe(columns === 80
+      ? `  personal-account  max · signed in · room now · 5h 40% · week 12%\n${PAD}this chat`
+      : `  personal-account  max · signed in · room now · 5h 40%\n${PAD}week 12%\n${PAD}this chat`)
+    // The account page keeps the folders whole, and its rows of buttons fit 80 columns: its actions,
+    // Remove's question, the delete's, and Remove all folder limits'.
+    for (const a of LONG) {
+      await open(ui, `row-${a.name}`)
+      if (columns === 80) expect(await over(ui, 80, true)).toEqual([])
+      for (const path of a.only_in) expect(await texts(ui)).toContain(`  ${path}`)
+      if (columns === 80) {
+        await ui.press({ key: `remove-${a.name}` })
+        expect(await over(ui, 80, true)).toEqual([])
+        await ui.press({ key: 'remove-folder' })
+        expect(await over(ui, 80, true)).toEqual([])
+        await ui.press({ key: 'remove-no' })
+        if (a.only_in.length) {
+          await ui.press({ key: 'folder-anywhere' })
+          expect(await over(ui, 80, true)).toEqual([])
+          await ui.press({ key: 'anywhere-no' })
+        }
+      }
+      await ui.press({ key: 'back' })
+    }
+    await ui.unmount()
+  })
 
 both('the focus starts on the first line, and the › mark follows the ring', async ($, on, surface) => {
   const w = world(on)
@@ -1071,11 +1197,11 @@ both('a limit says how far off it ends and when it was seen; a reading with no l
     { ...ACCOUNTS[0], name: 'odd-7', this_chat: false, reading_at: 'yesterday' },
     { ...ACCOUNTS[0], name: 'old-8', this_chat: false }] }))
   const { ui } = await opened($, w, surface)
-  const row = async (key: string) => (await ui.find({ key }))?.text
-  expect(await row('row-personal-1')).toBe('  personal-1  max · signed in · room now · 5h 40% · week 12%   (this chat)')
+  const row = (key: string) => rowOf(ui, key)
+  expect(await row('row-personal-1')).toBe(`  personal-1  max · signed in · room now · 5h 40% · week 12%\n${UNDER}this chat`)
   expect(await row('row-work-2')).toBe(`  work-2      pro · NOT signed in · limit until ${clock(AT + 40 * 60)} (in 40 min), `
-    + `seen ${clock(seen)}   (only in ~/work, ~/clients)`)
-  expect(await row('row-week-5')).toMatch(new RegExp(`pro · limit until ${clock(AT + 52 * HOUR)} \\(in 2 d 4 h\\)   `))
+    + `seen ${clock(seen)}\n${UNDER}only in ~/work, ~/clients`)
+  expect(await row('row-week-5')).toMatch(new RegExp(`pro · limit until ${clock(AT + 52 * HOUR)} \\(in 2 d 4 h\\)\n`))
   expect(await row('row-full-6')).toMatch(/max · signed in · 5h 100% · week 12%$/) // a full window: no room now
   expect(await row('row-odd-7')).toMatch(/max · signed in · 5h 40% · week 12%$/) // not a time: not known
   expect(await row('row-old-8')).toMatch(/max · signed in · 5h 40% · week 12%$/) // an older Longhaul
@@ -1208,23 +1334,23 @@ both('no "rows" and no "exit code" in what the pane says', async ($, on, surface
 // for an account that does not answer, comes back.
 
 const QUICK_ROWS = {
-  'row-personal-1': '  personal-1  checking… · 5h 40% · week 12%   (this chat)',
-  'row-work-2': `  work-2      checking… · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
-  'row-spare-3': '  spare-3     checking…   (used nowhere)',
+  'row-personal-1': `  personal-1  checking… · 5h 40% · week 12%\n${UNDER}this chat`,
+  'row-work-2': `  work-2      checking… · limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n${UNDER}only in ~/work, ~/clients`,
+  'row-spare-3': `  spare-3     checking…\n${UNDER}used nowhere`,
   'row-team-4': '  team-4      checking…',
 }
 const FULL_ROWS = {
-  'row-personal-1': '  personal-1  max · signed in · 5h 40% · week 12%   (this chat)',
-  'row-work-2': `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
-  'row-spare-3': '  spare-3     signed in as someone else   (used nowhere)',
+  'row-personal-1': `  personal-1  max · signed in · 5h 40% · week 12%\n${UNDER}this chat`,
+  'row-work-2': `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n${UNDER}only in ~/work, ~/clients`,
+  'row-spare-3': `  spare-3     signed in as someone else\n${UNDER}used nowhere`,
   'row-team-4': '  team-4      could not check',
 }
 
-// Each account's line, by its key, the focus ring's › left out.
+// Each account's row, by its key, its lines joined by newlines, the focus ring's › left out.
 async function rows(ui: any): Promise<Record<string, string | undefined>> {
   const found: Record<string, string | undefined> = {}
   for (const key of ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4'])
-    found[key] = (await ui.find({ key }))?.text?.replace(/^›/, ' ')
+    found[key] = (await rowOf(ui, key))?.replace(/^›/, ' ')
   return found
 }
 
@@ -1268,9 +1394,9 @@ both('a full read that fails after the quick one keeps the rows, says so, and ea
   const first = (await ui.findAll({ type: 'Text' }))[1] // after the title, where a failed read shows
   expect(first?.text).toBe('Longhaul could not check the sign-ins: ValueError: something broke.')
   expect(first?.props.color).toBe('error')
-  expect(await rows(ui)).toEqual({ 'row-personal-1': '  personal-1  could not check · 5h 40% · week 12%   (this chat)',
-    'row-work-2': `  work-2      could not check · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients)`,
-    'row-spare-3': '  spare-3     could not check   (used nowhere)', 'row-team-4': '  team-4      could not check' })
+  expect(await rows(ui)).toEqual({ 'row-personal-1': `  personal-1  could not check · 5h 40% · week 12%\n${UNDER}this chat`,
+    'row-work-2': `  work-2      could not check · limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n${UNDER}only in ~/work, ~/clients`,
+    'row-spare-3': `  spare-3     could not check\n${UNDER}used nowhere`, 'row-team-4': '  team-4      could not check' })
   expect((await texts(ui)).join('\n')).not.toMatch(/checking…|could not read/)
   await ui.press({ key: 'read-details' })
   expect(await texts(ui)).toContain('Traceback (most recent call last):')
@@ -1313,7 +1439,8 @@ both('an older Longhaul with no --no-check: the one full read, as before, and no
 both('a refresh keeps the last rows on screen, and a late full read never covers a newer one', async ($, on, surface) => {
   const w = world(on)
   const NEWER = { ...STATUS, accounts: ACCOUNTS.map(a => (a.name === 'work-2' ? { ...a, fallback: true } : a)) }
-  const FALLBACK = `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)   (only in ~/work, ~/clients · fallback)`
+  const FALLBACK = `  work-2      pro · NOT signed in · limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n`
+    + `${UNDER}fallback · only in ~/work, ~/clients`
   // Opened while a check hangs: the rows from the quick read, the first full read under way.
   w.slow.add('status')
   const { ui } = await opened($, w, surface)
@@ -1427,7 +1554,7 @@ both('an account with no folder and times in decimals, and an odd record, are dr
   const odd = { name: 'odd-6', only_in: 'everywhere', five_hour: 'full', signed_in: 'yes', sign_in_failed_at: 'today' }
   w.status = done(JSON.stringify({ ...STATUS, accounts: [noFolder, odd, 7], here: 'x', switch: 'sometimes' }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-odd-6' }))?.text).toMatch(/^ {2}odd-6\s+could not check {3}\(used nowhere\)$/)
+  expect(await rowOf(ui, 'row-odd-6')).toMatch(/^ {2}odd-6 {2}could not check\n {9}used nowhere$/) // under the text of names of 5
   expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/switching: not known/)
   await open(ui, 'row-odd-5')
   let all = (await texts(ui)).join('\n')
@@ -1617,8 +1744,8 @@ both('an account kept out of every folder: its line says so, its page names who 
   const spare = { ...ACCOUNTS[0], name: 'spare-5', this_chat: false, only_in: [], kept_out_by: ['personal-1', 'personal-2'] }
   w.status = done(JSON.stringify({ ...STATUS, accounts: [keeper('personal-1'), keeper('personal-2'), spare] }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-spare-5' }))?.text).toMatch(/spare-5 .*\(used nowhere\)$/)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/\(everywhere \(its folders include \/\)\)$/)
+  expect(await rowOf(ui, 'row-spare-5')).toMatch(/spare-5 .*\n {14}used nowhere$/)
+  expect(await rowOf(ui, 'row-personal-1')).toMatch(/\n {14}everywhere \(its folders include \/\)$/)
   await open(ui, 'row-spare-5')
   const all = await texts(ui)
   expect(all).toContain('may be used nowhere for now')
@@ -1743,9 +1870,9 @@ both('a fallback: its line and page say so, and the button runs fallback NAME of
   const w = world(on)
   w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], fallback: true }, ...ACCOUNTS.slice(1)] }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text).toBe('  personal-1  max · signed in · 5h 40% · week 12%   '
-    + '(this chat · fallback)')
-  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/\(only in ~\/work, ~\/clients\)$/) // normal: no word
+  expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max · signed in · 5h 40% · week 12%\n`
+    + `${UNDER}this chat · fallback`)
+  expect(await rowOf(ui, 'row-work-2')).toMatch(/\n {14}only in ~\/work, ~\/clients$/) // normal: no word
   await open(ui, 'row-personal-1')
   expect(await texts(ui)).toContain('Fallback: used only when no other account allowed here has room')
   expect((await ui.find({ key: 'fallback' }))?.text).toBe('Use as a normal account')
@@ -1786,8 +1913,7 @@ both('an older Longhaul that does not say: no fallback line and no button', asyn
   const older = ACCOUNTS.map(({ fallback: _, ...a }) => a)
   w.status = done(JSON.stringify({ ...STATUS, accounts: older }))
   const { ui } = await opened($, w, surface)
-  expect((await ui.find({ key: 'row-personal-1' }))?.text)
-    .toBe('  personal-1  max · signed in · 5h 40% · week 12%   (this chat)')
+  expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max · signed in · 5h 40% · week 12%\n${UNDER}this chat`)
   await open(ui, 'row-personal-1')
   expect(await buttons(ui)).toEqual(['signin-personal-1', 'remove-personal-1', 'folder-add', 'back'])
   const all = await texts(ui)

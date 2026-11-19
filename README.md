@@ -110,7 +110,7 @@ Longhaul can run your chats across several of your own Claude subscriptions. Eac
 **See your accounts:** type `/accounts` in a chat, in the terminal or in the VS Code panel. It opens a list, as `/mcp` does:
 
 - above them, why this chat runs on its account, when Longhaul's log says (for example "This chat: work. Why: ~/clients prefers work, and it had room.");
-- one line per account: its plan, its sign-in, its week's use or its limit, and where it may be used;
+- a row per account: its plan, its sign-in, its week's use or its limit, then, on a line under it, where it may be used (its folders by name, or by their number where they do not fit 80 columns) and whether it is the fallback;
 - `+ Add account`;
 - `Activity`: what Longhaul did by itself today, and why, this chat first (see [Day to day](#3-day-to-day));
 - `Settings`: switching, the VS Code panel on or off, and forgetting the recorded limits.
