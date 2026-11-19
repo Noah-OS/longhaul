@@ -26917,8 +26917,12 @@ class StatuslineInstall(unittest.TestCase):
                  "the fallback": ("cat >/dev/null\necho longhaul\n", "`longhaul`"),
                  "hangs": ("exec sleep 5\n", "within")}
         for name, (body, why) in cases.items():
+            # Only the case that hangs waits out the limit; the others answer at
+            # once, but a loaded machine may take more than 0.5 s to start the
+            # script (a full suite failed so, 2026-11-19), so they get room.
+            limit = 0.5 if name == "hangs" else 5
             for exists in (True, False):
-                with self.subTest(name, exists=exists), mock.patch.object(longhaul, "STATUSLINE_TIMEOUT", 0.5):
+                with self.subTest(name, exists=exists), mock.patch.object(longhaul, "STATUSLINE_TIMEOUT", limit):
                     self.launcher(body)
                     self.path.unlink(missing_ok=True)
                     before = self.settings({"statusLine": self.THEIRS, "theme": "dark"}, mode=0o640) if exists else None
