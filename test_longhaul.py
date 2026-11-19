@@ -2297,6 +2297,23 @@ class StatusLineGrammar(unittest.TestCase):
                 self.assertEqual(ANSI.sub("", painted), case["line"])
                 self.assertTrue(painted.startswith(f"\033[1m{case['given']['account']}\033[0m"), painted)
 
+    def test_plain_follows_longhaul_plain_unless_the_state_says(self):
+        # M8: LONGHAUL_PLAIN=1 (PLAIN) draws the line with commas and words, no · or →; a state's own "plain"
+        # (the shared cases') wins, so both suites check the same lines whatever the setting.
+        normal = {"account": "personal", "five": {"used": 12, "resets": "14:00"}, "week": None, "ctx": 88000,
+                  "event": {"kind": "pending", "to": "work", "when": "turn"}, "update": None}
+        self.assertEqual(longhaul.status_line(normal), "personal · → work after this turn")
+        with mock.patch.object(longhaul, "PLAIN", True):
+            self.assertEqual(longhaul.status_line(normal), "personal, moves to work after this turn")
+            self.assertEqual(longhaul.status_line({**normal, "plain": False}), "personal · → work after this turn")
+            self.assertEqual(ANSI.sub("", longhaul.status_line(normal, paint=True)),
+                             "personal, moves to work after this turn")
+        self.assertTrue([c for c in status_cases() if c["given"].get("plain") is True], "the shared cases hold plain ones")
+        for case in status_cases():
+            if case["given"].get("plain") is True:
+                with self.subTest(case["state"]):
+                    self.assertNotRegex(case["line"], "[·→✔✘⚠›]")
+
     def test_a_state_it_cannot_read_still_names_the_account(self):
         for given in ({"account": "work"}, {"account": "work", "five": "x", "week": [], "ctx": "big", "event": 3},
                       {"account": "work", "five": {"used": None}, "event": {"kind": "question"}},
@@ -2368,6 +2385,10 @@ class StatusLineState(unittest.TestCase):
 
     def test_normal(self):
         self.assertEqual(self.line(), "work · 5h 12% · wk 40% · ctx 88k")
+
+    def test_normal_with_longhaul_plain(self):
+        with mock.patch.object(longhaul, "PLAIN", True):  # M8: LONGHAUL_PLAIN=1
+            self.assertEqual(self.line(), "work, 5h 12%, wk 40%, ctx 88k")
 
     def test_near_full_shows_the_reset(self):
         resets = self.now + 3600
@@ -11076,6 +11097,29 @@ class Settings(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual([l for l in out.stdout.splitlines() if l.startswith("Ignored")],
                          ["Ignored (not a number, or under its minimum; the default is in force): LONGHAUL_POLL_SECONDS"])
+
+    def test_longhaul_plain_is_read_once_as_the_other_settings_and_named_in_the_docs(self):
+        # M8 (the UX review's §3.7): words in place of the glyphs a screen reader reads aloud. 1 (any whole
+        # number from 1) turns it on; 0 or unset leaves it off; a word is a typo, said by status, never raised.
+        probe = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import longhaul; "
+                                       "print(longhaul.PLAIN)", str(HERE)]
+        for value, plain in (("1", "True"), ("2", "True"), ("0", "False"), ("", "False"), ("yes", "False")):
+            out = subprocess.run(probe, env={**self.env, "LONGHAUL_PLAIN": value}, capture_output=True, text=True,
+                                 timeout=30)
+            self.assertEqual(out.stdout.strip(), plain, (value, out.stderr))
+        status = [sys.executable, str(HERE / "longhaul.py"), "status"]
+        out = subprocess.run(status, env={**self.env, "LONGHAUL_PLAIN": "yes"}, capture_output=True, text=True,
+                             timeout=30)
+        self.assertIn("Ignored (not a number, or under its minimum; the default is in force): LONGHAUL_PLAIN",
+                      out.stdout)
+        out = subprocess.run(status, env={**self.env, "LONGHAUL_PLAIN": "1"}, capture_output=True, text=True,
+                             timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotRegex(out.stdout, "[✔✘⚠›·→•]", "status draws no glyph for a person")
+        self.assertIn("LONGHAUL_PLAIN=1", longhaul.__doc__, "the Usage block names it, beside LONGHAUL_LOG")
+        readme = (HERE / "README.md").read_text()
+        table = readme[readme.index("| Setting | Default | What it changes |"):readme.index("`longhaul models [guide")]
+        self.assertIn("| `LONGHAUL_PLAIN` |", table, "the README's table of switches names it")
 
     def test_pipe_says_in_the_log_which_settings_it_ignored(self):
         # Review, Sprint 4 (SF 3): only `status` named them; run, pipe and
@@ -26055,7 +26099,7 @@ class Help(unittest.TestCase):
         entries = self.entries()
         for command, count in (("folders", 3), ("remove", 2), ("inspect", 2), ("trial", 3), ("advisor", 3),
                                ("switch", 1), ("login", 1), ("help", 1), ("quota-note", 1), ("stop-failure", 1),
-                               ("-r", 2), ("log", 1)):
+                               ("-r", 2), ("log", 1), ("plain", 1)):
             out = self.longhaul("help", command)
             self.assertEqual((out.returncode, out.stderr), (0, ""), command)
             mine = [e for e in entries if e in out.stdout]
@@ -26094,7 +26138,7 @@ class Help(unittest.TestCase):
         for entry in self.entries():
             head = entry.split("\n")[0].strip()
             names = [part.split()[1] for part in head.split(" | ") if part.startswith("longhaul ")]
-            names += ["log"] if head.startswith("(log)") else []
+            names += [head[1:head.index(")")]] if head.startswith("(") else []  # (log), (plain)
             shown = reached + "".join(self.longhaul("help", name).stdout for name in names)
             self.assertIn(entry, shown, head)
 
@@ -29128,6 +29172,10 @@ class Doctor(unittest.TestCase):
         # The plain marks keep the headline's dot plain too.
         with mock.patch.object(sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="ascii")):
             self.assertEqual(longhaul.doctor_marks(), (longhaul.DOCTOR_PLAIN, "-"))
+        # LONGHAUL_PLAIN=1 (M8): the same table where the terminal has ✔, in words.
+        with mock.patch.object(longhaul, "PLAIN", True):
+            self.assertEqual(longhaul.doctor_marks(), (longhaul.DOCTOR_PLAIN, "-"))
+        self.assertEqual(longhaul.DOCTOR_PLAIN, {"ok": "OK:", "bad": "Failed:", "warn": "Warning:"})
 
     def test_a_check_that_raises_is_a_warning_and_the_rest_go_on(self):
         with mock.patch.object(longhaul, "doctor_vscode", side_effect=RuntimeError("x")), \
@@ -29160,6 +29208,16 @@ class Doctor(unittest.TestCase):
             # The first step ends the output (no compact instructions after it since 0.3.10).
             self.assertRegex(out.stdout.splitlines()[-1], r"^Next: ")
             self.assertFalse(home.exists(), "nothing written")
+        # M8: LONGHAUL_PLAIN=1 forces the plain marks on a terminal that has ✔: a word first on each line
+        # (OK, Failed, Warning), which a screen reader reads as it is, and no glyph anywhere.
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "doctor"], env={**env, "LONGHAUL_PLAIN": "1"},
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertEqual(lines[0], f"Longhaul {self.VERSION} - 1 to fix")
+        self.assertNotRegex(out.stdout, "[✔✘⚠›·→•]")
+        self.assertIn("  OK: Chats running now: none running", lines)
+        self.assertTrue(any(line.startswith(("  Failed: ", "  Warning: ")) for line in lines), lines)
         out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "-h"], env=env, capture_output=True, text=True,
                              timeout=60)
         self.assertIn("longhaul doctor", out.stdout, "the Usage block names it")

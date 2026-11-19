@@ -133,12 +133,12 @@ const TYPED = { command: 'accounts', args: '', origin: { kind: 'composer' },
 
 // The engine beneath the plugins, from memory: programs, files, panes, the
 // clock, and what display.ts asks at a session's start.
-function world(on: any): World {
+function world(on: any, env: Record<string, string> = {}): World {
   const w: World = { runs: [], timeouts: [], envs: [], quick: [], opened: [], closed: [], focused: [], toasts: [], files: {},
     alive: new Set([RELAY]), status: done(JSON.stringify(STATUS)), fails: null, noCheck: null,
     answer: { remove: dryOr(DELETE_DRY), folders: dryOr(() => PREVIEW) },
     slow: new Set(), placed: true, clock: mock.clock(on, { now: NOW }) }
-  mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home' })
+  mock.env(on, { LONGHAUL_HOME: HOME, HOME: '/scratch/home', ...env })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: SID }))
   on('command.register', (_: any, e: any) => ({ value: { command: e.name } }))
@@ -413,6 +413,59 @@ for (const columns of [80, 60])
     }
     await ui.unmount()
   })
+
+// M8 (the UX review's §3.7): LONGHAUL_PLAIN=1, for a screen reader, which
+// reads ✔ as "check mark", ⚠ as "warning sign", the › focus mark as "single
+// right-pointing angle quotation mark" and · as "middle dot". A word first
+// (OK, Failed, Warning), no glyph, ", " between a row's parts, no mark: the
+// focus ring alone shows where the focus is.
+const GLYPHS = /[✔✘⚠›·↑↓→]/
+both('LONGHAUL_PLAIN=1: words first, no glyph and no › mark, commas between the parts', async ($, on, surface) => {
+  const w = world(on, { LONGHAUL_PLAIN: '1' })
+  w.status = done(JSON.stringify({ ...STATUS, switch_problem: 'config.json says "sometimes", not a mode' }))
+  w.answer.fallback = done('', 1, 'longhaul no account called work-2\n')
+  w.answer.repair = done(JSON.stringify([{ id: 'wait:5ca8a797', what: 'a carry-on whose relay is gone', fix: 'remove it',
+    fixable: true }]))
+  w.answer.activity = done(JSON.stringify([{ time: AT - 600, chat: '5ca8a797', what: 'Moved to work-2',
+    why: 'personal-1 was at its limit' }]))
+  const { ui } = await opened($, w, surface)
+  const none = async () => expect((await texts(ui)).join('\n')).not.toMatch(GLYPHS)
+  expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max, signed in, 5h 40%, week 12%\n${UNDER}this chat`)
+  expect(await rowOf(ui, 'row-work-2')).toBe(`  work-2      pro, NOT signed in, limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n`
+    + `${UNDER}only in ~/work, ~/clients`)
+  expect((await ui.find({ key: 'row-settings' }))?.text).toBe('  Settings (switching: ask, VS Code panel: off)')
+  await ring($, 'row-work-2')
+  expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^ {2}work-2 /) // no mark: the ring shows it
+  expect((await texts(ui)).includes('Up and Down to move, Enter to open, Esc to close')).toBe(surface === 'terminal')
+  await none()
+  // An account's page, a failed action and one that worked, and a folder refused.
+  await open(ui, 'row-work-2')
+  expect(await texts(ui)).toContain('pro, NOT signed in')
+  await ui.press({ key: 'fallback' })
+  expect(await texts(ui)).toContain('Failed: Use as fallback: work-2')
+  await none()
+  w.answer.fallback = done('Done.\n')
+  await ui.press({ key: 'fallback' })
+  expect(await texts(ui)).toContain('OK: Use as fallback: work-2')
+  await ui.press({ key: 'folder-add' })
+  expect(await texts(ui)).toContain('Failed: Type a folder first, like ~/work.')
+  await none()
+  await ui.press({ key: 'back' })
+  // Settings' warning, Troubleshoot's finding, Activity's chat.
+  await open(ui, 'row-settings')
+  expect(await texts(ui)).toContain('Warning: config.json says "sometimes", not a mode')
+  await none()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-troubleshoot')
+  expect(await texts(ui)).toContain('Warning: a carry-on whose relay is gone.')
+  await none()
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-activity')
+  expect(await texts(ui)).toContain('What Longhaul did, today')
+  expect((await texts(ui)).some(t => t.includes('5ca8a797, Moved to work-2: personal-1 was at its limit.'))).toBe(true)
+  await none()
+  await ui.unmount()
+})
 
 both('the focus starts on the first line, and the › mark follows the ring', async ($, on, surface) => {
   const w = world(on)

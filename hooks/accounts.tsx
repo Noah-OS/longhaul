@@ -5,7 +5,7 @@ import type { LonghaulAccount, LonghaulAccountsActivity, LonghaulAccountsAnswer,
   LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsPreview, LonghaulAccountsRead, LonghaulAccountsResult,
   LonghaulAccountsRunning, LonghaulAccountsTrouble, LonghaulActivityEvent, LonghaulQuestion, LonghaulRepairFinding, LonghaulStatus,
   LonghaulWait } from '../types'
-import { status as showStatus } from './display.ts'
+import { plain as plainSetting, status as showStatus } from './display.ts'
 import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
 
 // Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
@@ -846,6 +846,8 @@ type Ctx = {
   preview: LonghaulAccountsPreview | null // what the open question's dry run said
   nowMs: number // the clock, for times shown as longhaul.py shows them
   columns: number // the widest a list row is laid out: ROW_MAX, or the pane's body where narrower
+  plain: boolean // LONGHAUL_PLAIN=1: words in place of the glyphs, no › mark (M8)
+  sep: string // between a row's parts: SEP, or PLAIN_SEP
 }
 
 // The pane, top to bottom: the question, the page, what runs, the last
@@ -891,7 +893,7 @@ function questionPart($: any, c: Ctx): any {
       {runs && <Text dimColor>Answering…</Text>}
       {mine && mine.ok !== null && (
         <Text color={mine.ok ? 'success' : 'error'}>
-          {`${mine.ok ? '✔' : '✘'} ${mine.lines.join(' ') || (mine.ok ? 'Answered.' : 'It was not answered.')}`}
+          {`${markOf(c, mine.ok ? 'ok' : 'failed')} ${mine.lines.join(' ') || (mine.ok ? 'Answered.' : 'It was not answered.')}`}
         </Text>
       )}
     </Box>
@@ -1044,13 +1046,24 @@ const EVERYWHERE = 'everywhere (its folders include /)'
 const ROW_MAX = 80
 const SEP = ' · '
 
+// What LONGHAUL_PLAIN=1 draws in words (the UX review's §3.7, M8): a line's
+// mark first, and ", " between a row's parts, as a screen reader reads ✔ as
+// "check mark", ✘ as "heavy ballot x", ⚠ as "warning sign" and · as "middle dot".
+const MARKS = { ok: '✔', failed: '✘', warning: '⚠', unknown: '?' } as const
+const WORDS = { ok: 'OK:', failed: 'Failed:', warning: 'Warning:', unknown: 'Not known:' } as const
+const PLAIN_SEP = ', '
+
+function markOf(c: Ctx, kind: keyof typeof MARKS): string {
+  return (c.plain ? WORDS : MARKS)[kind]
+}
+
 // A list row's text laid out in `width` columns, its first line starting
 // at column `start` (after the mark and the name), each line after it at
-// `indent`, under the first's text: the phrases joined by SEP, a new line
+// `indent`, under the first's text: the phrases joined by `sep`, a new line
 // where the next would pass the width. A phrase's parts stay on one line
 // where a line can hold them, and break between them where none can; a
 // line never breaks inside a part. The lines' text, without the columns before it.
-function flow(start: number, phrases: string[][], width: number, indent: number): string[] {
+function flow(start: number, phrases: string[][], width: number, indent: number, sep: string): string[] {
   const lines: string[] = []
   let line = '', at = start
   const put = (part: string, sep: string) => {
@@ -1060,8 +1073,8 @@ function flow(start: number, phrases: string[][], width: number, indent: number)
   }
   for (const parts of phrases) {
     const whole = parts.join(', ')
-    if (indent + whole.length <= width) put(whole, SEP)
-    else parts.forEach((part, i) => put(part, i ? ', ' : SEP))
+    if (indent + whole.length <= width) put(whole, sep)
+    else parts.forEach((part, i) => put(part, i ? ', ' : sep))
   }
   if (line) lines.push(line)
   return lines
@@ -1072,7 +1085,7 @@ function flow(start: number, phrases: string[][], width: number, indent: number)
 // room; used nowhere, too, for one with no list that others keep out of
 // every folder. Its folders by name where the line can hold them in `room`
 // columns, else by their number: its page names them.
-function extras(a: LonghaulAccount, room: number): string[] {
+function extras(a: LonghaulAccount, room: number, sep: string): string[] {
   const where = (named: boolean) => (a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
     : a.only_in.includes('/') ? EVERYWHERE : !a.only_in.length ? ''
     : named ? `only in ${a.only_in.join(', ')}`
@@ -1080,7 +1093,7 @@ function extras(a: LonghaulAccount, room: number): string[] {
   const said = (named: boolean) => [a.this_chat ? 'this chat' : '', a.fallback === true ? 'fallback' : '', where(named)]
     .filter(Boolean).map(part => mask(part))
   const named = said(true)
-  return named.join(SEP).length <= room ? named : said(false)
+  return named.join(sep).length <= room ? named : said(false)
 }
 
 // What both Remove confirmations end with: the account's sign-in folder is
@@ -1109,9 +1122,9 @@ function itemsPart($: any, c: Ctx): any {
     if (key) keys.add(key)
     const head = `${mask(name).padEnd(width)}  `
     const { phrases, warn } = summary(a, c.nowMs, c.checking)
-    const more = extras(a, c.columns - indent)
-    items.push({ key, head, lines: flow(2 + head.length, phrases, c.columns, indent), warn,
-      more: more.length ? flow(indent, more.map(part => [part]), c.columns, indent) : [],
+    const more = extras(a, c.columns - indent, c.sep)
+    items.push({ key, head, lines: flow(2 + head.length, phrases, c.columns, indent, c.sep), warn,
+      more: more.length ? flow(indent, more.map(part => [part]), c.columns, indent, c.sep) : [],
       open: key ? () => void go($, `account:${name}`, harmless(a)) : undefined })
   }
   if (c.canType) {
@@ -1119,7 +1132,7 @@ function itemsPart($: any, c: Ctx): any {
     items.push(item('row-add', '+ Add account', () => void go($, 'add', 'add-name')))
     items.push(item('row-activity', 'Activity: what Longhaul did, and why', () => void go($, 'activity', 'back')))
     const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
-    items.push(item('row-settings', `Settings (switching: ${s.switch ?? 'not known'}${SEP}VS Code panel: ${vs})`,
+    items.push(item('row-settings', `Settings (switching: ${s.switch ?? 'not known'}${c.sep}VS Code panel: ${vs})`,
       () => void go($, 'settings', 'switch')))
     items.push(item('row-troubleshoot', `Troubleshoot${s.panel_paused === true ? ' (Longhaul paused in panel chats)' : ''}`,
       () => void go($, 'troubleshoot', 'back')))
@@ -1135,7 +1148,8 @@ function itemsPart($: any, c: Ctx): any {
         !s.problem && <Text>{s.listed ? "Longhaul's list has no accounts." : 'Longhaul has no list of accounts yet.'}</Text>
       )}
       {items.map(i => {
-        const lead = `${c.mark === i.key && i.key ? '›' : ' '} ${i.head}`
+        // The › follows the ring, which may be faint; plain, it is left out, as a screen reader reads it aloud.
+        const lead = `${c.mark === i.key && i.key && !c.plain ? '›' : ' '} ${i.head}`
         const color = i.warn ? 'warning' : undefined
         const text = i.lines.length ? <Text color={color}>{unknown(c, i.lines[0]!)}</Text> : null
         const first = c.canType && i.key && i.open
@@ -1203,12 +1217,12 @@ function foldersPart($: any, c: Ctx, a: LonghaulAccount): any {
         </Box>
       ))}
       {kept.length > 0 && (
-        <Text color="warning">{mask(`⚠ ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} every folder, so ${name} is `
+        <Text color="warning">{mask(`${markOf(c, 'warning')} ${kept.join(', ')} keep${kept.length > 1 ? '' : 's'} every folder, so ${name} is `
           + `used nowhere until a folder is added here (or / is removed from ${kept.length > 1 ? 'theirs' : `${kept[0]}'s`}).`)}</Text>
       )}
       {offered && a.only_in !== null && <Input key="folder-path" label="Add a folder: " placeholder="~/work"
         value={typed.path} onInput={keepFolder($, name)} onSubmit={keepFolder($, name)} autoFocus />}
-      {offered && typed.problem && <Text color="error">{`✘ ${typed.problem}`}</Text>}
+      {offered && typed.problem && <Text color="error">{`${markOf(c, 'failed')} ${typed.problem}`}</Text>}
       {offered && (
         <Box flexDirection="row" gap={1}>
           {a.only_in !== null && <Button key="folder-add" label="Add folder" onPress={() => void addFolder($, name)} />}
@@ -1412,7 +1426,7 @@ function accountPage($: any, c: Ctx): any {
   return (
     <Box flexDirection="column">
       <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
-      <Text>{unknown(c, [a.plan && mask(a.plan), check].filter(Boolean).join(SEP))}</Text>
+      <Text>{unknown(c, [a.plan && mask(a.plan), check].filter(Boolean).join(c.sep))}</Text>
       {typeof a.limited_until === 'number' && <Text color="warning">{limitText(a, c.nowMs)}</Text>}
       {roomNow(a) && <Text>{`room now, seen ${clock(a.reading_at!, c.nowMs)}`}</Text>}
       {lines.map(line => <Text>{line}</Text>)}
@@ -1472,7 +1486,7 @@ function addPage($: any, c: Ctx): any {
         onInput={keep($, 'email')} onSubmit={keep($, 'email')} />}
       {c.idle && <Input key="add-only" label="Only in (optional, folders split by commas): " placeholder="~/work, ~/clients"
         value={c.form.only} onInput={keep($, 'only')} onSubmit={keep($, 'only')} />}
-      {c.idle && c.form.problem && <Text color="error">{`✘ ${c.form.problem}`}</Text>}
+      {c.idle && c.form.problem && <Text color="error">{`${markOf(c, 'failed')} ${c.form.problem}`}</Text>}
       {c.idle && <Button key="add" label="Add account" onPress={() => void add($)} />}
     </Box>
   )
@@ -1500,7 +1514,7 @@ function settingsPage($: any, c: Ctx): any {
         <Text dimColor>never: waits for the reset</Text>
         {mode && panel && panel !== mode
           && <Text key="panel-switch">{`The VS Code panel uses ${panel} (set in ~/.longhaul/vscode.json).`}</Text>}
-        {problem && <Text color="warning">{`⚠ ${mask(String(problem))}`}</Text>}
+        {problem && <Text color="warning">{`${markOf(c, 'warning')} ${mask(String(problem))}`}</Text>}
       </Box>
       <Box flexDirection="column">
         <Text>{`VS Code panel on Longhaul's accounts: ${on === true ? 'on' : on === false ? 'off' : 'not known'}`}</Text>
@@ -1567,7 +1581,7 @@ function troublePage($: any, c: Ctx): any {
       {t?.findings && !t.findings.length && <Text>Nothing to repair.</Text>}
       {(t?.findings ?? []).map((f, i) => (
         <Box flexDirection="column">
-          <Text color="warning">{`⚠ ${f.what}.`}</Text>
+          <Text color="warning">{`${markOf(c, 'warning')} ${f.what}.`}</Text>
           <Box flexDirection="row" gap={1}>
             <Text>{`Fix: ${f.fix}.`}</Text>
             {offered && f.fixable && ID.test(f.id)
@@ -1617,7 +1631,7 @@ function activityPage($: any, c: Ctx): any {
   const next = DAYS.find(d => d > a.days)
   const open = c.details === 'activity'
   const line = (e: LonghaulActivityEvent, named: boolean) =>
-    <Text>{`${clock(e.time, c.nowMs)}  ${named && e.chat ? `${e.chat} · ` : ''}${e.what}: ${e.why}.`}</Text>
+    <Text>{`${clock(e.time, c.nowMs)}  ${named && e.chat ? `${e.chat}${c.sep}` : ''}${e.what}: ${e.why}.`}</Text>
   const some = (list: LonghaulActivityEvent[], named: boolean) => [
     ...(list.length > SHOWN_EVENTS
       ? [<Text dimColor>{`…and ${list.length - SHOWN_EVENTS} earlier: the full log has them.`}</Text>] : []),
@@ -1627,7 +1641,7 @@ function activityPage($: any, c: Ctx): any {
   const others = a.chat ? events.filter(e => e.chat !== a.chat) : events
   return (
     <Box flexDirection="column" gap={1}>
-      <Text bold>{`What Longhaul did · ${when}`}</Text>
+      <Text bold>{`What Longhaul did${c.sep}${when}`}</Text>
       {a.events === null && (
         <Box flexDirection="column">
           <Text color="error">{a.update ? a.problem ?? ''
@@ -1664,7 +1678,7 @@ function runningPart($: any, c: Ctx): any {
 }
 
 // The last action's end, on the page it ran from: ✔ or ✘ (? when not
-// known), then its output's last line, the command's own word (a failure's
+// known; plain, OK, Failed or Not known), then its output's last line, the command's own word (a failure's
 // reason, or what a forget let carry on), in normal weight, never dim (the
 // UX review's Q14); the rest of its output behind Details; what next.
 function resultPart($: any, c: Ctx): any {
@@ -1675,7 +1689,7 @@ function resultPart($: any, c: Ctx): any {
   return (
     <Box flexDirection="column">
       <Text color={ok ? 'success' : ok === false ? 'error' : 'warning'}>
-        {`${ok ? '✔' : ok === false ? '✘' : '?'} ${label}${ok === null ? ': not known' : ''}`}
+        {`${markOf(c, ok ? 'ok' : ok === false ? 'failed' : 'unknown')} ${label}${ok === null && !c.plain ? ': not known' : ''}`}
       </Text>
       {lines.length > 0 && <Text>{lines.at(-1)}</Text>}
       {lines.length > 1 && <Button key="details" label={open ? 'Hide details' : 'Details'} dimColor
@@ -1692,7 +1706,8 @@ function footPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   if (!c.canType) return null
   const keys = c.surface === 'terminal'
-    ? <Text dimColor>{c.page === 'list' ? '↑ ↓ to move · Enter to open · Esc to close' : 'Esc to go back'}</Text> : null
+    ? <Text dimColor>{c.page !== 'list' ? 'Esc to go back' : c.plain ? 'Up and Down to move, Enter to open, Esc to close'
+      : '↑ ↓ to move · Enter to open · Esc to close'}</Text> : null
   if (c.page === 'list') return keys
   // Back holds the ring on an account's page with nothing harmless above it (harmless()).
   const a = c.page.startsWith('account:') ? c.status?.accounts.find(x => `account:${x.name}` === c.page) : undefined
@@ -1780,6 +1795,7 @@ export const register: Register = on => {
       read($, trouble), read($, activity), read($, preview)])
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
+    const flat = await plainSetting($)
     firstLook($, now, have)
     const mine = now && now.by === SELF ? now : null
     const canType = TYPING.includes(String(e.surface))
@@ -1789,7 +1805,8 @@ export const register: Register = on => {
     const c: Ctx = { E, surface: String(e.surface), canType, idle: mine === null, have, status, checking, now: mine,
       last, confirm, form: typed, folder: dir, page: pageOf(asked, status, canType), mark, question: q, wait: w,
       answer: ans, details: open, trouble: found, activity: did, preview: dry, nowMs,
-      columns: Number.isInteger(body) && body >= 20 ? Math.min(ROW_MAX, body) : ROW_MAX }
+      columns: Number.isInteger(body) && body >= 20 ? Math.min(ROW_MAX, body) : ROW_MAX, plain: flat,
+      sep: flat ? PLAIN_SEP : SEP }
     return drawPane($, c)
   })
 }

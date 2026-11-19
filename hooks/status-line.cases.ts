@@ -7,7 +7,9 @@
 // line says so. An event at a limit, a choice pending or a message stopped takes the place of the numbers.
 // given: account, as shown; five and week, {used (a share, rounded half up), resets (a time as clock() shows
 // it)} or null; ctx, the context in tokens (rounded half up to k) or null; event, null or {kind, ...}; update, a
-// newer release or null. The first eleven cases are the review's table, in its order and words.
+// newer release or null; plain, true for LONGHAUL_PLAIN=1 (M8: ", " for " · ", words for "→", which a screen
+// reader reads as "middle dot" and "rightwards arrow"), else left out. The first eleven cases are the review's table,
+// in its order and words.
 //
 // The array below is JSON as it is (test_longhaul.py parses it with json.loads(), from the "[" after "="), so
 // keep it so: double quotes, no comments, no trailing commas.
@@ -109,5 +111,39 @@ export const CASES: StatusLineCase[] = [
     {"state": "An event of a kind this copy does not know: the numbers, as with none",
      "given": {"account": "work", "five": {"used": 12, "resets": "14:00"}, "week": null,
                "ctx": 88000, "event": {"kind": "later"}, "update": null},
-     "line": "work · 5h 12% · ctx 88k"}
+     "line": "work · 5h 12% · ctx 88k"},
+
+    {"state": "Plain (LONGHAUL_PLAIN=1): commas for the dots",
+     "given": {"account": "work", "five": {"used": 12, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": null, "update": null, "plain": true},
+     "line": "work, 5h 12%, wk 40%, ctx 88k"},
+    {"state": "Plain, near full",
+     "given": {"account": "work", "five": {"used": 91, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": null, "update": null, "plain": true},
+     "line": "work, 5h 91% (14:00), wk 40%, ctx 88k"},
+    {"state": "Plain, at a limit, question open",
+     "given": {"account": "personal", "five": {"used": 100, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": {"kind": "question", "to": "work"}, "update": null, "plain": true},
+     "line": "personal at limit, move to work? /accounts"},
+    {"state": "Plain, at a limit, stopped",
+     "given": {"account": "personal", "five": {"used": 100, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": {"kind": "stopped", "until": "14:00"}, "update": null, "plain": true},
+     "line": "personal at limit until 14:00, stopped, /accounts"},
+    {"state": "Plain, a choice pending: words for the arrow",
+     "given": {"account": "personal", "five": {"used": 12, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": {"kind": "pending", "to": "work", "when": "turn"}, "update": null, "plain": true},
+     "line": "personal, moves to work after this turn"},
+    {"state": "Plain, a choice pending for a chat no relay runs",
+     "given": {"account": "personal", "five": {"used": 12, "resets": "14:00"}, "week": null,
+               "ctx": 88000, "event": {"kind": "pending", "to": "work", "when": "open"}, "update": null, "plain": true},
+     "line": "personal, moves to work at its next open"},
+    {"state": "Plain, a message stopped in a folder two accounts keep",
+     "given": {"account": "personal", "five": null, "week": null,
+               "ctx": null, "event": {"kind": "refused", "where": "~/clients", "by": ["work", "acme"]}, "update": null,
+               "plain": true},
+     "line": "personal, message stopped: ~/clients is work's or acme's, /accounts"},
+    {"state": "Plain, a newer release",
+     "given": {"account": "work", "five": {"used": 12, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": null, "update": "0.3.9", "plain": true},
+     "line": "work, 5h 12%, wk 40%, ctx 88k, update 0.3.9"}
 ]

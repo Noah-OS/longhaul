@@ -209,6 +209,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_API_RETRY` | on | `off`: no carry-on in the VS Code panel a minute after a turn stopped on an API server error |
 | `LONGHAUL_LOG` | routine lines left out | `debug`: every line, reminder checks below the threshold and short panel jobs included |
 | `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
+| `LONGHAUL_PLAIN` | off | `1`: words for a screen reader where Longhaul draws marks: OK, Failed and Warning first in place of ✔ ✘ ⚠, `, ` in place of ` · `, and no `›` on the focused line; in `/accounts`, `longhaul doctor`, `longhaul status` and the status line |
 
 `longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul help all` (`longhaul -h` shows the usual ones on one screen), or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).
 

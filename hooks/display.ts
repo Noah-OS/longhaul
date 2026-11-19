@@ -108,9 +108,11 @@ async function update($: any, lh: string): Promise<string | undefined> {
 // null; ctx, the context in tokens, or null; event, null or { kind:
 // 'question' (to, and at for a carry-on at a reset), 'waiting' (at, on),
 // 'stopped' (until), 'refused' (where, by), 'pending' (to, when: 'turn' or
-// 'open') or 'moved' (from, at) }; update, a newer release, or null. An
-// event at a limit, a choice pending or a message stopped takes the place of
-// the numbers; one it cannot read, or of a kind it does not know, is none.
+// 'open') or 'moved' (from, at) }; update, a newer release, or null; plain,
+// true for words in place of the glyphs (LONGHAUL_PLAIN=1, M8: ", " for
+// " · ", "moves to" for "→"). An event at a limit, a choice pending or a
+// message stopped takes the place of the numbers; one it cannot read, or of
+// a kind it does not know, is none.
 const RESET_AT = 70 // % of a window from which its reset is shown
 export const DEFAULT_NAME = 'default sign-in' // ~/.claude's own sign-in, "main" in the files (the review's Q11)
 
@@ -121,6 +123,7 @@ const obj = (v: unknown): Record<string, any> => (v && typeof v === 'object' && 
 
 export function line(state: unknown): string {
   const s = obj(state)
+  const plain = s.plain === true
   const name = text(s.account) ?? 'longhaul'
   const ev = obj(s.event)
   const kind = ev.kind, to = text(ev.to), at = text(ev.at)
@@ -137,7 +140,7 @@ export function line(state: unknown): string {
   else if (kind === 'refused' && text(ev.where) && owners.length && owners.length === by.length)
     parts = [name, `message stopped: ${ev.where} is ${owners.map(n => `${n}'s`).join(' or ')}`, '/accounts']
   else if (kind === 'pending' && to)
-    parts = [name, `→ ${to} ${ev.when === 'open' ? 'at its next open' : 'after this turn'}`]
+    parts = [name, `${plain ? 'moves to' : '→'} ${to} ${ev.when === 'open' ? 'at its next open' : 'after this turn'}`]
   if (!parts) {
     const from = text(ev.from)
     parts = [kind === 'moved' && from && at ? `${name} (moved from ${from} ${at})` : name]
@@ -155,7 +158,17 @@ export function line(state: unknown): string {
   }
   const update = text(s.update)
   if (update) parts.push(`update ${update}`)
-  return parts.join(' · ')
+  return parts.join(plain ? ', ' : ' · ')
+}
+
+// LONGHAUL_PLAIN (the UX review's §3.7, M8): words for a screen reader where
+// Longhaul draws glyphs. On as longhaul.py's setting() reads it, a whole
+// number of 1 or more; unset, 0 or a word is off.
+export async function plain($: any): Promise<boolean> {
+  try {
+    const raw = String((await $.env.get('LONGHAUL_PLAIN')) ?? '').trim()
+    return /^\+?\d+$/.test(raw) && Number(raw) >= 1
+  } catch { return false }
 }
 
 // The one event of this chat's line (line()'s event), the first that holds,
@@ -210,7 +223,7 @@ export async function status($: any): Promise<void> {
     const r = await reading($, lh, name)
     $.ui.status(line({ account: known ? name : DEFAULT_NAME, five: window(r?.five_hour, nowMs),
       week: window(r?.seven_day, nowMs), ctx: context ?? null, event: await event($, lh, sid, name, nowMs),
-      update: (await update($, lh)) ?? null }))
+      update: (await update($, lh)) ?? null, plain: await plain($) }))
   } catch {}
 }
 

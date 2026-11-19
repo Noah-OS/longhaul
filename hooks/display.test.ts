@@ -190,6 +190,19 @@ for (const c of CASES)
     expect(line(c.given)).toBe(c.line)
   })
 
+// M8: LONGHAUL_PLAIN=1, read as longhaul.py's setting() reads it, draws the
+// entry with commas and words, as the terminal's line; a word is not a number.
+test('LONGHAUL_PLAIN=1 draws the entry plain, as the terminal does', async ($, on) => {
+  const w = world(on, { LONGHAUL_PLAIN: '1' })
+  expect(await start($, w)).toBe('default sign-in, no usage reading yet, update 0.3.3')
+})
+
+for (const value of ['0', 'yes'])
+  test(`LONGHAUL_PLAIN=${value} leaves the entry as it is`, async ($, on) => {
+    const w = world(on, { LONGHAUL_PLAIN: value })
+    expect(await start($, w)).toBe(`${BARE} · update 0.3.3`)
+  })
+
 test('a state it cannot read still names the account', () => {
   for (const given of [{ account: 'work' }, { account: 'work', five: 'x', week: [], ctx: 'big', event: 3 },
                        { account: 'work', five: { used: null }, event: { kind: 'question' } },

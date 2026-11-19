@@ -430,6 +430,12 @@ Usage:
                           lines (a prompt's reminder check below the threshold,
                           a short panel job) unless LONGHAUL_LOG=debug, which
                           writes everything
+  (plain)                     LONGHAUL_PLAIN=1 draws words for a screen reader
+                          where Longhaul draws marks: OK, Failed and Warning
+                          first in place of the check, cross and warning signs,
+                          ", " in place of the middle dot, and no mark on the
+                          focused line; in /accounts, the doctor, the status
+                          line and the panel's status entry
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
                           a limit the session moves only with --swap and
@@ -546,6 +552,11 @@ RESET_MARGIN = setting("LONGHAUL_RESET_MARGIN", 60, float)
 # nothing ever trimmed it.
 LOG_MAX = setting("LONGHAUL_LOG_MAX_BYTES", 5 * 2**20, int)
 LEDGER_MAX = setting("LONGHAUL_LEDGER_MAX_BYTES", 10 * 2**20, int)
+# LONGHAUL_PLAIN=1 (the UX review's §3.7, M8): words where Longhaul draws a
+# glyph for a person, as a screen reader reads ✔ as "check mark" and · as
+# "middle dot": the doctor's marks as OK, Failed and Warning, and the status
+# line's · as a comma and its → in words. Any whole number from 1 turns it on.
+PLAIN = setting("LONGHAUL_PLAIN", 0, int) >= 1
 
 # Linked from the second account's folder into ~/.claude, so both accounts
 # share one history, memory and setup. Not the sign-in, the daemon, caches.
@@ -3583,9 +3594,12 @@ def status_line(state: dict, paint: bool = False) -> str:
     event at a limit, a choice pending or a message stopped takes the place
     of the numbers; one it cannot read, or of a kind it does not know, is
     none. `paint`: the account in bold and each share in green, yellow or
-    red, the terminal's look; the words are the same. Never raises on a
-    state's shape: the line runs at every update."""
+    red, the terminal's look; the words are the same. "plain": True for
+    words in place of the glyphs (", " for " · ", "moves to" for "→"),
+    as LONGHAUL_PLAIN=1 (PLAIN) sets where the state does not say. Never
+    raises on a state's shape: the line runs at every update."""
     s = state if isinstance(state, dict) else {}
+    plain = s["plain"] if isinstance(s.get("plain"), bool) else PLAIN
     name = s.get("account") if isinstance(s.get("account"), str) and s.get("account") else "longhaul"
     head = f"\033[1m{name}\033[0m" if paint else name
     ev = s.get("event") if isinstance(s.get("event"), dict) else {}
@@ -3609,7 +3623,8 @@ def status_line(state: dict, paint: bool = False) -> str:
         parts = [head, f"message stopped: {word('where')} is {' or '.join(n + chr(39) + 's' for n in owners)}",
                  "/accounts"]
     elif kind == "pending" and to:
-        parts = [head, f"→ {to} {'at its next open' if ev.get('when') == 'open' else 'after this turn'}"]
+        parts = [head, f"{'moves to' if plain else '→'} {to} "
+                       f"{'at its next open' if ev.get('when') == 'open' else 'after this turn'}"]
     if parts is None:
         moved = kind == "moved" and word("from") and at
         parts = [f"{head} (moved from {word('from')} {at})" if moved else head]
@@ -3632,7 +3647,7 @@ def status_line(state: dict, paint: bool = False) -> str:
     update = s.get("update")
     if isinstance(update, str) and update:
         parts.append(f"update {update}")
-    return " · ".join(parts)
+    return (", " if plain else " · ").join(parts)
 
 
 def status_name(name: str, entry: dict) -> str:
@@ -18710,7 +18725,10 @@ def uninstall(opts) -> int:
 # run, so the hook stays well inside its timeout.
 
 DOCTOR_MARKS = {"ok": "✔", "bad": "✘", "warn": "⚠"}
-DOCTOR_PLAIN = {"ok": "ok", "bad": "XX", "warn": "!!"}  # for a terminal whose encoding has no ✔
+# For a terminal whose encoding has no ✔, and with LONGHAUL_PLAIN=1 (M8): a
+# word first, which a screen reader reads as it is, where it read "heavy
+# ballot x" for ✘ (the UX review's §3.7).
+DOCTOR_PLAIN = {"ok": "OK:", "bad": "Failed:", "warn": "Warning:"}
 DOCTOR_RANK = {"ok": 0, "warn": 1, "bad": 2}
 # Each line's name and the function that checks it, by name: looked up at
 # call time, so a test can stand in for one.
@@ -20327,7 +20345,9 @@ def doctor_next(checks: list):
 
 def doctor_marks() -> tuple:
     """The marks and the headline's dot, plain for a terminal whose
-    encoding has no ✔ or ·."""
+    encoding has no ✔ or ·, and with LONGHAUL_PLAIN=1 (PLAIN)."""
+    if PLAIN:
+        return DOCTOR_PLAIN, "-"
     try:
         ("".join(DOCTOR_MARKS.values()) + "·").encode(sys.stdout.encoding or "utf-8")
     except (UnicodeEncodeError, LookupError):
@@ -20508,7 +20528,8 @@ def usage_entries() -> list:
     it on. Its signature is that line up to two spaces; its names are the
     word after each `longhaul` in it: "folders"; "stop-failure" and
     "quota-note" for the line that names both; "-c" and "-r" for one of the
-    launch's, "" for bare `longhaul`; and "log" for "(log)"."""
+    launch's, "" for bare `longhaul`; and the word in brackets for a setting's
+    own entry: "log" for "(log)", "plain" for "(plain)"."""
     entries = []
     for line in usage_block().splitlines(keepends=True)[1:]:
         if line.startswith("  ") and not line.startswith("   "):
