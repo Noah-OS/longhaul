@@ -45,7 +45,7 @@ async function newLines($: any): Promise<string[]> {
     seen = size
     if (!take) return []
     const ran = await $.process.run(['tail', '-c', String(take), path])
-    const text = typeof ran?.stdout === 'string' ? ran.stdout : ''
+    const text: string = typeof ran?.stdout === 'string' ? ran.stdout : ''
     const lines = text.split('\n').filter(Boolean)
     if (!first) return lines
     const since = (await $.clock.now()) - RECENT

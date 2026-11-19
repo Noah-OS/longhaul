@@ -1,6 +1,9 @@
 import type { Register } from 'claude-code'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { register as accounts } from './accounts.tsx'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { register as autocompact } from './autocompact.ts'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { register as display } from './display.ts'
 
 // Longhaul's one hooks module: Claude Code takes one per plugin (hooks.json

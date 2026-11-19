@@ -1,5 +1,6 @@
 import type { Register } from 'claude-code'
 
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { CHAT, clock, found, running } from './question.ts'
 
 // Longhaul's display inside Claude Code (the owner, 2026-10-23): VS Code's
@@ -271,7 +272,7 @@ async function popUps($: any, lines: string[]): Promise<void> {
     else if ((m = body.match(/^checkpoint for \S+ carried into (\S+) after clear/)) && m[1] === sid)
       $.ui.toast('Longhaul: your checkpoint from before /clear is back.', { timeoutMs: 8000 })
     else if ((m = body.match(/^reminder: (\S+) reminded at [\d,]+ tokens \(the context is ([\d,]+)\)/)) && m[1] === sid)
-      $.ui.toast(`Longhaul: the context is ${Math.round(Number(m[2].replace(/,/g, '')) / 1000)}k tokens; `
+      $.ui.toast(`Longhaul: the context is ${Math.round(Number(m[2]!.replace(/,/g, '')) / 1000)}k tokens; `
                  + 'the model will save a checkpoint at its next stopping point.', { timeoutMs: 10000 })
     else if ((m = body.match(/^(\S+) hit its (.+?) limit \(resets ([^)]+)\); the panel chat carries on with (\S+?)\.$/)) && m[4] === name)
       $.ui.toast(`Longhaul: ${m[1]} hit its ${m[2]} limit (resets ${m[3]}); this chat now runs on ${m[4]}.`, { timeoutMs: 12000 })
@@ -281,14 +282,14 @@ async function popUps($: any, lines: string[]): Promise<void> {
     // A subagent's line shows nothing: the main chat did not make that read.
     else if ((m = body.match(/^guard: (advised on|refused) a whole read of (.+) \(([\d,]+) bytes\) in (\S+)( \(a subagent\))?$/)) && m[4] === sid && !m[5])
       $.ui.toast(m[1] === 'refused'
-        ? `Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`
-        : `Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps the context small.`,
+        ? `Longhaul: refused a whole read of ${base(m[2]!)} (${kb(m[3]!)} KB); Claude reads a part instead.`
+        : `Longhaul: told Claude ${base(m[2]!)} is ${kb(m[3]!)} KB; reading only the part it needs keeps the context small.`,
         { timeoutMs: 8000 })
     else if ((m = body.match(/^guard: advised on a repeat read of (.+) in (\S+)( \(a subagent\))?$/)) && m[2] === sid && !m[3])
-      $.ui.toast(`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`, { timeoutMs: 8000 })
+      $.ui.toast(`Longhaul: told Claude ${base(m[1]!)} hasn't changed since it last read it.`, { timeoutMs: 8000 })
     else if ((m = body.match(/^account: refused a prompt in (\S+?): (.+?) is kept for (.+?); the chat runs on (.+)$/)) && m[1] === sid) {
       const at = stamp(line)
-      if (at !== null) refused = { sid, at, where: m[2], by: m[3].split(', ') }
+      if (at !== null) refused = { sid, at, where: m[2]!, by: m[3]!.split(', ') }
       $.ui.toast(`Longhaul stopped your message: ${m[2]} is reserved for ${m[3]}, and this chat is on ${m[4]}. Nothing was sent. Type /accounts to move it.`, { timeoutMs: 12000 })
     }
     // A newer Longhaul (said at a chat's start, once per version a day): a
@@ -311,7 +312,7 @@ async function popUps($: any, lines: string[]): Promise<void> {
     // Claude Code's own word that this chat stopped (its StopFailure and
     // Notification hooks, Sprint 10): the stops and the wait the user must act on.
     else if ((m = body.match(/^stop: (\S+) turn ended on an API error \((rate_limit|authentication_failed|billing_error|account_on_hold)\)$/)) && m[1] === sid)
-      $.ui.toast(STOPPED[m[2]], { timeoutMs: 12000 })
+      $.ui.toast(STOPPED[m[2]!], { timeoutMs: 12000 })
     else if ((m = body.match(/^quota: (\S+) waits for Enter: the usage limit reset while the computer slept$/)) && m[1] === sid)
       $.ui.toast('Longhaul: the usage limit reset while the computer slept. Press Enter in this chat to carry on.', { timeoutMs: 12000 })
     else if ((m = body.match(/^quota: Claude Code stopped waiting at a usage limit in (\S+)$/)) && m[1] === sid)

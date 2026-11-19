@@ -1,7 +1,10 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { line } from './display.ts'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { clock } from './question.ts'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { CASES } from './status-line.cases.ts'
 
 // hooks/display.ts's status entry, the panel's stand-in for the status line:
@@ -97,7 +100,7 @@ test('the same or an older release, or one compared as text, shows nothing', asy
 })
 
 for (const env of [{ LONGHAUL_UPDATE_CHECK: 'off' }, { LONGHAUL_UPDATE_CHECK: 'OFF' }, { LONGHAUL_UPDATE_CHECK: 'Off' },
-                   { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }])
+                   { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }] as Record<string, string>[])
   test(`the check turned off (${Object.entries(env)[0]!.join('=')}) shows nothing and reads no record`, async ($, on) => {
     const w = world(on, env)
     expect(await start($, w)).toBe(BARE)
@@ -219,7 +222,7 @@ const RESET = NOW / 1000 + 3600
 const READING = (five: number | null, week: number | null) => json({ at: NOW / 1000,
   ...(five === null ? {} : { five_hour: { used_percentage: five, resets_at: RESET } }),
   ...(week === null ? {} : { seven_day: { used_percentage: week, resets_at: RESET + 86400 } }) })
-const TURN = { answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: USAGE }
+const TURN = { answer: 'done', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer' as const, usage: USAGE }
 
 // A world on `on` (work or personal), no newer release, the context 88k, and
 // `five`% and `week`% read on that account; the entry after a turn.

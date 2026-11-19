@@ -5,7 +5,9 @@ import type { LonghaulAccount, LonghaulAccountsActivity, LonghaulAccountsAnswer,
   LonghaulAccountsForm, LonghaulAccountsPage, LonghaulAccountsPreview, LonghaulAccountsRead, LonghaulAccountsResult,
   LonghaulAccountsRunning, LonghaulAccountsTrouble, LonghaulActivityEvent, LonghaulQuestion, LonghaulRepairFinding, LonghaulStatus,
   LonghaulWait } from '../types'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { plain as plainSetting, status as showStatus } from './display.ts'
+// @ts-ignore TS5097: the engine loads this path as written, .ts and all
 import { answerArgs, asks, carries, clock, inTime, look, waits } from './question.ts'
 
 // Longhaul's accounts screen (S2): /accounts opens a pane that works as /mcp
