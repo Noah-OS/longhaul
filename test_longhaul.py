@@ -21473,10 +21473,10 @@ class Display(unittest.TestCase):
         self.assertEqual(re.match(old, lines["put back"]).groups(), (sid, "resume", "4214", "98444"))
         self.assertIn("/^checkpoint for (\\S+) put back after (\\S+) \\((\\d+) bytes, written (\\d+) s earlier\\)$/)) "
                       "&& m[1] === sid && Number(m[4]) >= 21600)", self.SOURCE, "this chat's, six hours or more")
-        for toast in ("`Longhaul: told Claude ${base(m[2])} is ${kb(m[3])} KB; reading only the part it needs keeps "
+        for toast in ("`Longhaul: told Claude ${base(m[2]!)} is ${kb(m[3]!)} KB; reading only the part it needs keeps "
                       "the context small.`",
-                      "`Longhaul: told Claude ${base(m[1])} hasn't changed since it last read it.`",
-                      "`Longhaul: refused a whole read of ${base(m[2])} (${kb(m[3])} KB); Claude reads a part instead.`",
+                      "`Longhaul: told Claude ${base(m[1]!)} hasn't changed since it last read it.`",
+                      "`Longhaul: refused a whole read of ${base(m[2]!)} (${kb(m[3]!)} KB); Claude reads a part instead.`",
                       "`Longhaul stopped your message: ${m[2]} is reserved for ${m[3]}, and this chat is on ${m[4]}. Nothing "
                       "was sent. Type /accounts to move it.`",
                       "`Longhaul: brought back a checkpoint from ${Math.round(Number(m[4]) / 3600)} h ago; it may be out "
@@ -21507,7 +21507,7 @@ class Display(unittest.TestCase):
         self.assertEqual(re.match(stop, lines["stop"]).groups(), (sid, "rate_limit"))
         self.assertEqual(re.match(stale, lines["stale"]).groups(), (sid,))
         self.assertEqual(re.match(disabled, lines["disabled"]).groups(), (sid,))
-        for toast in ("$.ui.toast(STOPPED[m[2]], { timeoutMs: 12000 })",
+        for toast in ("$.ui.toast(STOPPED[m[2]!], { timeoutMs: 12000 })",
                       "'Longhaul: the usage limit reset while the computer slept. Press Enter in this chat to carry on.'",
                       "'Longhaul: Claude Code stopped waiting at the usage limit and will not carry on by itself. Send a "
                       "message once it resets.'"):
