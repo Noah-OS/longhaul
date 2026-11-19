@@ -17,6 +17,7 @@
 !.claude-plugin/
 !.claude-plugin/plugin.json
 !.claude-plugin/marketplace.json
+!.claude-plugin/icon.png
 !hooks/
 !hooks/hooks.json
 !hooks/display.ts

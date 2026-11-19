@@ -2,6 +2,16 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+### Added
+
+- **An icon**, `.claude-plugin/icon.png` (1024 px, drawn from `.github/assets/longhaul-icon.svg`): the context rising, a compaction, the checkpoint coming back, on the road. Claude Code's plugin check now asks for one.
+
+### Changed
+
+- **The README banner** says what Longhaul does now: it saves a checkpoint, then compacts at 400k tokens; moves a chat to another of your accounts at a limit; and shows where the tokens went.
+
 ## 0.3.18 - 2026-11-18
 
 Help that fits one screen, `/accounts` that shows its accounts at once, and two shorter words.

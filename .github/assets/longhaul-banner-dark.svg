@@ -21,9 +21,9 @@
   <text x="68" y="184" class="sans" font-size="80" font-weight="800" letter-spacing="4" fill="#F0F6FC">LONGHAUL</text>
   <text x="72" y="232" class="sans" font-size="30" font-weight="600" fill="#D29922">Stay in context. Go the distance.</text>
   <text class="sans" font-size="18" fill="#9198A1">
-    <tspan x="72" y="280">See where the tokens go.</tspan>
-    <tspan x="72" y="306">Catch the reads that flood the context.</tspan>
-    <tspan x="72" y="332">Pick up where you left off after a compaction.</tspan>
+    <tspan x="72" y="280">Saves a checkpoint, then compacts at 400k tokens.</tspan>
+    <tspan x="72" y="306">Moves a chat to another of your accounts at a limit.</tspan>
+    <tspan x="72" y="332">Shows where the tokens went.</tspan>
   </text>
 
   <!-- One long session's context: a sketch, not a measurement -->
