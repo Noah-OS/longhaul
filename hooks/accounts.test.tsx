@@ -847,6 +847,7 @@ both('Add refuses a bad name, email or folder and runs nothing', async ($, on, s
   for (const [name, email, only, said] of [
     ['bad name!', 'new@example.com', '', /name/],
     ['-rf', 'new@example.com', '', /name/],
+    ['Main', 'new@example.com', '', /main is the name Longhaul keeps the default sign-in under/],
     ['work-5', 'nobody', '', /email/],
     ['work-5', 'new@example.com', '~/work, clients', /folder/],
   ] as const) {

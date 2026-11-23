@@ -2,6 +2,15 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+Small fixes to 0.3.21's one name for the default sign-in.
+
+### Fixed
+
+- **With one account in `auto`, the message sent into the chat after its reset named it "main"** and said "every account was at its limit" of one account. It now reads "The default sign-in account hit its session limit, so longhaul waited for it to reset and reopened this conversation on it.", as it does in `ask` and `never`. The VS Code panel's notification in `auto` says "default sign-in is at its limit; the panel chat carries on with it at 14:00." in place of "Every account is at its limit…". With two accounts or more, nothing changes.
+- **`longhaul add`, the guided `add` and `/accounts`' **+ Add account** refuse the name `main`**, which Longhaul's files keep the default sign-in (~/.claude) under since 0.3.21: a new account by that name would share its readings and its limit. A list that already holds a `main` keeps working as before.
+
 ## 0.3.21 - 2026-11-23
 
 One name for the default sign-in.

@@ -171,6 +171,8 @@ function checkAdd(f: LonghaulAccountsForm): { argv: string[] } | { problem: stri
   const folders = f.only.split(',').map(p => p.trim()).filter(Boolean)
   if (!NAME.test(name))
     return { problem: 'The name is 1 to 31 letters, digits, - or _, and starts with a letter or a digit.' }
+  // longhaul.py keeps the default sign-in (~/.claude) under "main", so add refuses it (RESERVED_NAME).
+  if (name.toLowerCase() === 'main') return { problem: 'main is the name Longhaul keeps the default sign-in under; choose another name.' }
   if (!/^[^\s@-][^\s@]*@[^\s@]+$/.test(email)) return { problem: 'The email needs an @, like name@example.com.' }
   const bad = folders.find(p => !(p.startsWith('/') || p.startsWith('~/')))
   if (bad !== undefined) return { problem: `Each folder in "only in" starts with / or ~/ (not ${bad}).` }

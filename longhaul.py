@@ -872,6 +872,10 @@ DEFAULT_RELOGIN = "sign in again with /login in Claude Code, or `claude auth log
 # list of accounts it can only have been the stand-in, so it is read as
 # DEFAULT_KEY there (key_of()); a listed account named Max is Max.
 LEGACY_KEY = "Max"
+# What add says to a new account named DEFAULT_KEY: Longhaul's files keep the
+# default sign-in's readings and limit under it, so the two would be one. A
+# list made before 0.3.22 may hold one; it keeps working as it did.
+RESERVED_NAME = f"{DEFAULT_KEY} is the name Longhaul keeps the {DEFAULT_LABEL} (~/.claude) under; choose another name"
 
 # load_accounts()'s one account when there is no accounts.json (one
 # subscription): ~/.claude, with no repositories.
@@ -3314,6 +3318,9 @@ def run(opts) -> int:
             every = "every account allowed here" if denied else "every account"
             # As people see them (label_of()): the default sign-in by that name, in what is said and sent.
             old_shown, new_shown = label_in(acct["name"], accounts), label_in(new, accounts)
+            # One account (one subscription, or a list of one): no "every account" to wait out, and no
+            # other to carry on with, so the carry-on says it waited for this one's reset (CARRY_ON_SAME).
+            sole = len(accounts) == 1
             msg = f"{old_shown} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])})."
             # The person at this terminal is the front end, so consent is
             # given. With every account at its limit there is nowhere to
@@ -3338,20 +3345,21 @@ def run(opts) -> int:
                         "reset first" if wait else
                         f"{acct['name']} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])}), and "
                         + ("switching is auto" if mode == "auto" else "you said yes"))
-                prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
-                    old=acct["name"], kind=w.limit["kind"], new=new, every=every)
+                prompt = (CARRY_ON_SAME if sole else CARRY_ON_AFTER_WAIT if wait else CARRY_ON).format(
+                    old=old_shown, kind=w.limit["kind"], new=new_shown, every=every)
                 if mode == "ask" and wait:  # the wait at the top of the loop says when
-                    msg = f"Carrying on with {new} at its reset: reopening this conversation there with a carry-on message."
-                    waiting = f"{new} resets first"
+                    msg = (f"Carrying on with {new_shown} at its reset: reopening this conversation there with a "
+                           "carry-on message.")
+                    waiting = f"{new_shown} resets first"
                 elif mode == "ask":  # the question has said the rest
-                    msg = f"Moving to {new}: reopening this conversation there with a carry-on message."
+                    msg = f"Moving to {new_shown}: reopening this conversation there with a carry-on message."
                 elif not wait:
-                    msg += f" Carrying on with {new}."
+                    msg += f" Carrying on with {new_shown}."
                 idx, stay = nxt, (new if mode != "auto" else None)
                 say(msg)
                 notify(msg)
             else:  # "ask" without a yes, or "never": the reset, on this account
-                prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
+                prompt = (CARRY_ON_AFTER_WAIT if wait and not sole else CARRY_ON_SAME).format(
                     old=old_shown, kind=w.limit["kind"], new=old_shown, every=every)
                 carry = (acct["name"], w.limit["kind"])
                 then = f"{old_shown} hit its {w.limit['kind']} limit, and it carried on there at its reset"
@@ -15286,8 +15294,11 @@ class Relay:
             log(f"wait: could not write {sid}'s wait ({e!r}); it carries on all the same")
         log(f"wait: {sid} carries on on {name} at {clock(self.carry['until'])} ({why})")
         if why == "auto":
-            notify(f"{self.every().capitalize()} is at its limit; the panel chat carries on with "
-                   f"{label_in(name, self.accounts)} at "
+            shown = label_in(name, self.accounts)
+            # One account has no "every account": it is the one at its limit, and the one carried on with.
+            notify(f"{shown} is at its limit; the panel chat carries on with it at {clock(self.carry['until'])}."
+                   if len(self.accounts) == 1 else
+                   f"{self.every().capitalize()} is at its limit; the panel chat carries on with {shown} at "
                    f"{clock(self.carry['until'])}.")
 
     def carry_on(self) -> None:
@@ -16190,6 +16201,9 @@ def add(opts) -> int:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,30}", name):
         say("a name is letters and digits (and - or _), up to 31 of them")
         return 2
+    if name.lower() == DEFAULT_KEY:
+        say(RESERVED_NAME)
+        return 2
     if "@" not in email:
         say(f"{email} does not look like an email")
         return 2
@@ -16300,6 +16314,8 @@ def guided_entry(accounts: list):
         taken = next((a["name"] for a in accounts if a["name"].lower() == name.lower()), None)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,30}", name):
             say("a name is letters and digits (and - or _), up to 31 of them")
+        elif name.lower() == DEFAULT_KEY:
+            say(RESERVED_NAME)
         elif taken:
             say(f"there is already an account called {taken}")
         else:

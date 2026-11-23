@@ -648,15 +648,40 @@ class Loop(unittest.TestCase):
         self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
         self.assertIn("default sign-in is at its limit, and with switching set to never the conversation stays on it",
                       out.stdout)
+        # One account has no "every account" to have waited out: it waited for this one's reset.
         self.assertTrue(calls[1]["args"][-1].startswith(
-            "The default sign-in account hit its session limit while every account was at its limit, so longhaul "
-            "waited for the default sign-in account to reset"), calls[1]["args"][-1])
+            "The default sign-in account hit its session limit, so longhaul waited for it to reset and reopened "
+            "this conversation on it."), calls[1]["args"][-1])
+        self.assertNotIn("every account", calls[1]["args"][-1])
         said = notes.read_text() if notes.exists() else ""
         self.assertIn("default sign-in is at its limit", said)
         for text in (out.stdout, said, calls[1]["args"][-1]):
             self.assertIsNone(RETIRED.search(text), text)
         self.assertIn("main", self.state()["limited_until"], "kept under the key the status line reads")
         self.assertNotIn("Max", self.state()["limited_until"])
+
+    def test_one_subscription_at_its_limit_in_auto_carries_on_by_the_default_sign_ins_name(self):
+        # In auto, the one account "moves" to itself at its reset: the carry-on
+        # sent into the chat and what is said named it by its key, "main", and
+        # said every account was at its limit, of one account (after 0.3.21).
+        (self.home / "accounts.json").unlink()
+        fake = self.tmp / "bin" / "osascript"
+        fake.parent.mkdir()
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$2" >> "$LONGHAUL_TEST_NOTES"\n')
+        fake.chmod(0o755)
+        notes = self.tmp / "notes.txt"
+        out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="auto",
+                                       LONGHAUL_NO_NOTIFY="", LONGHAUL_TEST_NOTES=str(notes),
+                                       PATH=f"{fake.parent}:{os.environ['PATH']}")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        sent = calls[1]["args"][-1]
+        self.assertTrue(sent.startswith(
+            "The default sign-in account hit its session limit, so longhaul waited for it to reset and reopened "
+            "this conversation on it."), sent)
+        said = notes.read_text() if notes.exists() else ""
+        for text in (out.stdout, said, sent):
+            self.assertIsNone(RETIRED.search(text), text)
+            self.assertNotIn("every account", text)
 
     def test_the_switch_flag_wins_over_the_environment(self):
         _, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], "--switch", "auto", LONGHAUL_SWITCH="never")
@@ -12434,6 +12459,7 @@ class Shim(unittest.TestCase):
         self.assertFalse((self.tmp / "vscode").exists(), "nor of VS Code's")
         # Each form that runs reaches longhaul itself: its own answer, never the shim's.
         for args, said in ((("add", "bad name!", "a@example.com"), "a name is letters and digits"),
+                           (("add", "Main", "a@example.com"), "main is the name Longhaul keeps the default sign-in"),
                            (("add", "A", "not-an-email", "--dir", "/x", "--repo", "/y", "--repo", "/z"),
                             "does not look like an email"),
                            (("setup", "Max"), "no account called Max"), (("setup", "Max", "--relogin"), "no account called Max"),
@@ -18672,6 +18698,26 @@ class PanelDefaultSignIn(StreamHarness):
         self.assertEqual([c["config"] for c in self.calls()], [None], "the same claude carries on")
         self.assertIn("main", json.loads((self.relay / "state.json").read_text())["limited_until"])
 
+    def test_in_auto_its_notification_names_the_one_account_not_every_account(self):
+        # With one account, auto has nothing to move to: it carries on with
+        # that account at its reset. The notification said "Every account is
+        # at its limit" of one account (after 0.3.21).
+        (self.relay / "accounts.json").unlink()
+        self.emails = {"default": "solo@example.com"}
+        self.plan(["limit", "reply"])
+        p = self.start(LONGHAUL_SWITCH="auto", FAKE_RESET_IN="2", LONGHAUL_RESET_MARGIN="0", **self.fake_notifications())
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        self.carry_on("The default sign-in account hit its session limit, so longhaul waited for it to reset")
+        notes = self.notified()
+        self.assertTrue(any(n.startswith("default sign-in is at its limit; the panel chat carries on with it at ")
+                            for n in notes), notes)
+        for text in notes:
+            self.assertIsNone(RETIRED.search(text), text)
+            self.assertNotIn("very account", text)
+        self.assertEqual([c["config"] for c in self.calls()], [None], "the same claude carries on")
+
 
 class KeepWorking(unittest.TestCase):
     """Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2): a
@@ -23119,10 +23165,13 @@ class Accounts(unittest.TestCase):
         (self.tmp / "orbit").mkdir()
         work = self.tmp / ".claude-work"
         self.emails[str(work)] = "work@example.com"
-        out = self.guided(["bad name!", "max", "Work", "not-an-email", "FIRST@example.com", "work@example.com", "",
+        out = self.guided(["bad name!", "main", "max", "Work", "not-an-email", "FIRST@example.com", "work@example.com", "",
                            "y", str(self.tmp / "orbit"), "relative/path", str(self.tmp / "zain"), "", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("a name is letters and digits", out.stdout)
+        # Longhaul's files keep the default sign-in under "main" (0.3.21): a new account by that name would share it.
+        self.assertIn("main is the name Longhaul keeps the default sign-in (~/.claude) under; choose another name",
+                      out.stdout)
         self.assertIn("there is already an account called max", out.stdout.lower())
         self.assertIn("does not look like an email", out.stdout)
         self.assertIn("is already the account Max", out.stdout)
