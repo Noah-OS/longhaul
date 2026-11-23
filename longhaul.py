@@ -177,8 +177,9 @@ Usage:
                           the switching mode at a usage limit (see --switch):
                           with none, the one in force and where it comes from
                           (LONGHAUL_SWITCH, else ~/.longhaul/config.json, else
-                          ask); with one, saved in config.json for the terminal
-                          and the VS Code panel, as the guided add saves it;
+                          ask), and what this chat does at a limit; with one,
+                          saved in config.json for the terminal and the VS
+                          Code panel, as the guided add saves it;
                           LONGHAUL_SWITCH and --switch still win over it.
                           wait: the same as never, and saved as never
   longhaul models [guide|on|off|trial | cap MODEL|off | TYPE MODEL]
@@ -224,9 +225,11 @@ Usage:
                           object, emails masked (exit 2: accounts.json could
                           not be read), for the accounts screen, with the chat
                           it runs in and why that chat is on its account (the
-                          log's latest reason); it only reads. --no-check: the
-                          same at once, with no sign-in checked (each null,
-                          and "checked": false), for the screen to draw first
+                          log's latest reason), where the switching mode comes
+                          from and what this chat does at a limit; it only
+                          reads. --no-check: the same at once, with no sign-in
+                          checked (each null, and "checked": false), for the
+                          screen to draw first
   longhaul doctor               what is set up and what to do next, one line each:
                           the plugin, the terminal command, Claude Code, updates,
                           the status line, the VS Code panel, the accounts, the
@@ -1372,6 +1375,83 @@ def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: di
     return "it had room, and it comes first in turn"
 
 
+def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: float | None = None):
+    """What a chat in the repository `top` on accounts[ours] would do at a
+    usage limit under `mode` (the UX review of 2026-11-11, §3.6: the mode
+    explained by its effect), in a sentence or two for status --json's
+    "at_limit" and `longhaul switch`. Where it would move is pick()'s
+    answer, given what the terminal gives it at a limit (run()): its
+    account at its limit, the accounts not allowed here skipped, the
+    readings, the folder; so the folder's rules, its first choice and a
+    fallback last are the move's own. That account's recorded limit, when
+    there is one ahead, is its reset; else its reset is not known yet, and
+    it counts as after every other's. Ask asks before a move, and with
+    every account at its limit offers the first reset once (K2); auto
+    moves, and early when nearly full while idle; never waits. No sign-in
+    is checked, so --no-check says the same. None when it cannot be told:
+    no chat account (`ours` None), no mode in force, or the chat's account
+    not allowed here, where its messages stop before any limit."""
+    if ours is None or mode not in SWITCH_MODES:
+        return None
+    now = time.time() if now is None else now
+    name, allowed = accounts[ours]["name"], eligible(accounts, top)
+    if name not in allowed:
+        return None
+    # A limit that is not a time is no limit here, so a hand-edited state.json never stops the sentence.
+    limited = {k: as_number(v) for k, v in dict_at(state, "limited_until").items() if as_number(v) is not None}
+    own = limited.get(name) if limited.get(name, 0) > now else None
+    at = f" at {clock(own)}" if own else ""
+    if len(accounts) == 1:
+        return f"At a limit, this chat waits for {name}'s reset{at}: Longhaul has no other account."
+    if allowed == [name]:
+        return f"At a limit, this chat waits for {name}'s reset{at}: no other account may be used in {home_path(top)}."
+    if mode == "never":
+        return f"At a limit, this chat waits for {name}'s reset{at} and carries on there."
+    nxt, until = pick(accounts, {**state, "limited_until": {**limited, name: own or math.inf}},
+                      (ours + 1) % len(accounts), skip={a["name"] for a in accounts} - set(allowed),
+                      seen=readings(accounts), top=top, now=now)
+    other = accounts[nxt]["name"]
+    if until is None:  # one with room
+        if mode == "auto":
+            return (f"At a limit, this chat moves to {other} by itself, and early when {name} is nearly full and "
+                    "the chat is idle.")
+        return f"At a limit, this chat asks you before moving to {other}. With no answer, it waits for {name}'s reset{at}."
+    full = f"every other account{' allowed here' if len(allowed) < len(accounts) else ''} is at its limit"
+    if own and (nxt == ours or mode == "auto"):  # who resets first is known
+        return f"At a limit, this chat waits for {other}'s reset at {clock(until)} and carries on there: {full}."
+    unless = "" if own else f", unless {name} resets first"
+    if mode == "auto":
+        return f"At a limit, this chat carries on with {other} at its reset, {clock(until)}{unless}: {full}."
+    return (f"At a limit, this chat asks you whether to carry on with {other} at its reset, {clock(until)}{unless}. "
+            f"With no answer, it waits for {name}'s reset{at}.")
+
+
+def chat_account(accounts: list[dict]):
+    """The index of the chat's account among `accounts`, as display.ts
+    finds it: the first whose folder is CLAUDE_CONFIG_DIR, by real path;
+    None when it is not set, or names no account's folder."""
+    chat = os.environ.get("CLAUDE_CONFIG_DIR")
+    mine = os.path.realpath(os.path.expanduser(chat)) if chat else None
+    return next((i for i, a in enumerate(accounts)
+                 if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
+
+
+def at_limit_here(mode):
+    """at_limit_text() for the chat this runs in (chat_account()) in this
+    folder, from the files, under `mode`: status --json's "at_limit", and
+    what `longhaul switch` adds. None with no list of accounts (one
+    sign-in: nowhere to move), one that cannot be read, or a folder that
+    is gone. It reads only."""
+    accounts, problem = read_accounts_file()
+    if problem or not accounts:
+        return None
+    try:
+        top = repository_of(os.getcwd())
+    except OSError:  # the folder it runs in was removed
+        return None
+    return at_limit_text(accounts, load_state(), chat_account(accounts), top, mode)
+
+
 def start_logged(sid, verb: str, name: str, where: str, why: str) -> None:
     """The start line (M1): chat `sid` (or "a new chat", whose id is not
     known yet) starts on, moves to or reopens on (`verb`) account `name`
@@ -1906,10 +1986,26 @@ def config_switch():
     return mode if isinstance(mode, str) and mode in SWITCH_MODES else None
 
 
+def switch_setting(flag: str | None = None) -> tuple:
+    """(the terminal's mode as written, where it comes from): --switch
+    ("--switch"), then LONGHAUL_SWITCH ("LONGHAUL_SWITCH"), then config.json's
+    "switch" ("config.json"), then ask ("default"); "wait" read as "never".
+    The one order switch_mode() decides by, and what status --json's
+    "switch_source" and `longhaul switch` name (the UX review of 2026-11-11,
+    §3.6), so the three cannot drift apart. It reads only; a value that is
+    not a mode is for switch_mode() to refuse."""
+    if flag:
+        return switch_word(flag), "--switch"
+    if os.environ.get("LONGHAUL_SWITCH"):
+        return switch_word(os.environ["LONGHAUL_SWITCH"]), "LONGHAUL_SWITCH"
+    saved = config_switch()
+    return (saved, "config.json") if saved else ("ask", "default")
+
+
 def switch_mode(flag: str | None = None) -> str:
     """--switch, then LONGHAUL_SWITCH, then config.json's "switch", then "ask",
-    "wait" read as "never". ValueError for anything else."""
-    mode = switch_word(flag or os.environ.get("LONGHAUL_SWITCH") or config_switch() or "ask")
+    "wait" read as "never" (switch_setting()). ValueError for anything else."""
+    mode = switch_setting(flag)[0]
     if mode not in SWITCH_MODES:
         raise ValueError(f"LONGHAUL_SWITCH is {mode!r}, which is not a switching mode. "
                          "Set it to ask, auto or never, or unset it; longhaul has not started Claude.")
@@ -13361,6 +13457,11 @@ def panel_switch_source() -> tuple:
     return (config_switch(), "config") if config_switch() else ("ask", "default")
 
 
+# panel_switch_source()'s word for each place, by the name a person sets it
+# with: status --json's "panel_switch_source", beside switch_setting()'s.
+PANEL_SWITCH_SOURCES = {"env": "LONGHAUL_SWITCH", "vscode": "vscode.json", "config": "config.json", "default": "default"}
+
+
 def panel_switch_in_force() -> str:
     """The panel's mode, as panel_switch_mode() decides it, with no log line."""
     value, _ = panel_switch_source()
@@ -16183,10 +16284,14 @@ def switch_cmd(opts) -> int:
         except ValueError as e:  # as status says it
             print(f"Switching: invalid. {e}")
             return 2
-        source = ("set by LONGHAUL_SWITCH" + (f", over {saved} saved in {where}" if saved else "") if env
-                  else f"saved in {where}" if saved else "the default")
+        source = {"LONGHAUL_SWITCH": "set by LONGHAUL_SWITCH" + (f", over {saved} saved in {where}" if saved else ""),
+                  "config.json": f"saved in {where}", "default": "the default"}[switch_setting()[1]]
         print(f"Switching: {mode} ({source}): {switch_said(mode)}. `longhaul switch ask|auto|never` saves another."
               + switch_panel_note())
+        # What it does for this chat here, as status --json's "at_limit" says it (the UX review's §3.6).
+        said = at_limit_here(mode)
+        if said:
+            print(said)
         return 0
     found = read_json(CONFIG)
     write_json(CONFIG, {**(found if isinstance(found, dict) else {}), "switch": opts.mode})
@@ -17565,12 +17670,7 @@ def status_json(check: bool = True) -> int:
     accounts, problem = load_accounts()
     accounts = accounts or []
     listed = bool(read_accounts_file()[0])  # False for the stand-in: one subscription, nothing listed
-    # This chat's account, as display.ts finds it: the first whose folder is
-    # CLAUDE_CONFIG_DIR, by real path; none when it is not set.
-    chat = os.environ.get("CLAUDE_CONFIG_DIR")
-    mine = os.path.realpath(os.path.expanduser(chat)) if chat else None
-    ours = next((i for i, a in enumerate(accounts)
-                 if mine and has_folder(a) and os.path.realpath(config_of(a)) == mine), None)
+    ours = chat_account(accounts)  # this chat's account, as display.ts finds it
     failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
     here = allowed_here = None
     if listed:
@@ -17594,13 +17694,18 @@ def status_json(check: bool = True) -> int:
     # the Troubleshoot page's Pause or Resume. chat: the chat this runs in,
     # and why it runs on its account (chat_why()). line: its status line (chat_line()).
     # checked: false for --no-check, whose sign-ins were not checked (M7).
+    # switch_source and panel_switch_source: where each mode in force comes
+    # from (switch_setting(), panel_switch_source()); at_limit: what this
+    # chat would do at a limit under "switch" (at_limit_here()), which checks
+    # no sign-in, so --no-check gives the same (the UX review's §3.6).
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
              "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None,
              "chat": chat_why(os.environ.get("CLAUDE_CODE_SESSION_ID"), accounts[ours]["name"] if ours is not None
                               else None),
              "line": chat_line(os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CLAUDE_CONFIG_DIR"), now),
-             "checked": check}
+             "checked": check, "switch_source": switch_setting()[1],
+             "panel_switch_source": PANEL_SWITCH_SOURCES[panel_switch_source()[1]], "at_limit": at_limit_here(mode)}
     try:
         print(json.dumps(found, ensure_ascii=False))
     except UnicodeEncodeError:  # a stdout that cannot take … (PYTHONIOENCODING=ascii): the same object, escaped

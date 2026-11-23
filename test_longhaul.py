@@ -25145,7 +25145,7 @@ class StatusJson(unittest.TestCase):
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
                     "preferred", "use_here", "reading_at"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
-            "chat", "line", "checked"}
+            "chat", "line", "checked", "switch_source", "panel_switch_source", "at_limit"}
 
     def setUp(self):
         # Resolved: the folder status runs in is os.getcwd(), a real path,
@@ -25288,12 +25288,17 @@ class StatusJson(unittest.TestCase):
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
             "listed": True, "here": {"folder": "~", "may_use": ["personal-1"]}, "switch": "ask",
             "switch_problem": None, "panel_switch": "ask", "vscode": False, "panel_paused": False, "problem": None,
-            "chat": None, "line": "default sign-in · no usage reading yet", "checked": True})
+            "chat": None, "line": "default sign-in · no usage reading yet", "checked": True,
+            "switch_source": "default", "panel_switch_source": "default", "at_limit": None})
         self.assertEqual(list(found), ["accounts", "listed", "here", "switch", "switch_problem", "panel_switch",
-                                       "vscode", "panel_paused", "problem", "chat", "line", "checked"],
+                                       "vscode", "panel_paused", "problem", "chat", "line", "checked",
+                                       "switch_source", "panel_switch_source", "at_limit"],
                          "the screen's order: panel_switch after switch_problem, panel_paused after vscode (2026-11-17), "
-                         "chat (M1), then line (M3), then checked (M7)")
+                         "chat (M1), then line (M3), then checked (M7), then where the modes come from and what this "
+                         "chat does at a limit (§3.6)")
         self.assertIn("longhaul status [--json [--no-check]]", longhaul.__doc__, "the Usage block names it")
+        usage = " ".join(longhaul.__doc__.split())
+        self.assertIn("where the switching mode comes from and what this chat does at a limit", usage)
 
     def test_emails_are_masked_and_never_shown_whole(self):
         # The screen tells the accounts apart; it never shows who they are.
@@ -25758,6 +25763,156 @@ class StatusJson(unittest.TestCase):
         self.assertFalse((self.home / "longhaul.log").exists(), "the panel's log line for a bad mode is not written")
         self.assertEqual(set(self.files()) - set(before), {str(self.home / "config.json"), str(self.home / "vscode.json")})
 
+    # The UX review of 2026-11-11, §3.6: to tell what happens at a limit a
+    # user had to hold three modes, four places a mode is set, the fallback
+    # marks and each folder's rules. switch_source and panel_switch_source
+    # name where each mode in force comes from; at_limit says, from the
+    # files, what this chat would do at a limit under the terminal's mode.
+
+    def test_switch_source_and_panel_switch_source_name_where_each_mode_comes_from(self):
+        self.write_accounts({"name": "personal-1"})
+        before = self.files()
+        sources = lambda found: (found["switch"], found["switch_source"], found["panel_switch"],
+                                 found["panel_switch_source"])
+        self.assertEqual(sources(self.read(self.status())), ("ask", "default", "ask", "default"))
+        (self.home / "config.json").write_text('{"switch": "sometimes"}')
+        self.assertEqual(sources(self.read(self.status())), ("ask", "default", "ask", "default"),
+                         "not a mode: the default, as for a launch")
+        (self.home / "config.json").write_text('{"switch": "auto"}')
+        self.assertEqual(sources(self.read(self.status())), ("auto", "config.json", "auto", "config.json"))
+        (self.home / "vscode.json").write_text('{"switch": "never"}')
+        self.assertEqual(sources(self.read(self.status())), ("auto", "config.json", "never", "vscode.json"))
+        self.assertEqual(sources(self.read(self.status(LONGHAUL_SWITCH="wait"))),
+                         ("never", "LONGHAUL_SWITCH", "never", "LONGHAUL_SWITCH"), "the environment wins in both")
+        found = self.read(self.status(LONGHAUL_SWITCH="sometimes"))
+        self.assertEqual((found["switch"], found["switch_source"]), (None, "LONGHAUL_SWITCH"), "its source, still said")
+        self.assertEqual(set(self.files()) - set(before), {str(self.home / "config.json"), str(self.home / "vscode.json")})
+
+    def at_limit(self, cwd=None, **env):
+        """at_limit for the chat on personal (unless env says another), from
+        the full read, which must be what --no-check says."""
+        env = {"CLAUDE_CONFIG_DIR": str(self.folder("personal")), **env}
+        full = self.read(self.status(cwd=cwd, **env))
+        quick = self.read(self.longhaul("status", "--json", "--no-check", cwd=cwd, **env))
+        self.assertEqual(quick["at_limit"], full["at_limit"], "the same with no sign-in checked")
+        return full["at_limit"]
+
+    def test_at_limit_says_what_this_chat_does_at_a_limit_in_each_mode(self):
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        before = self.files()
+        ask = "At a limit, this chat asks you before moving to work. With no answer, it waits for personal's reset."
+        auto = ("At a limit, this chat moves to work by itself, and early when personal is nearly full and the chat "
+                "is idle.")
+        wait = "At a limit, this chat waits for personal's reset and carries on there."
+        self.assertEqual(self.at_limit(), ask, "ask, the default")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="auto"), auto)
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="wait"), wait, "wait is never")
+        (self.home / "config.json").write_text('{"switch": "never"}')
+        self.assertEqual(self.at_limit(), wait, "the saved mode")
+        self.assertEqual(self.at_limit(CLAUDE_CONFIG_DIR=str(self.folder("work"))),
+                         "At a limit, this chat waits for work's reset and carries on there.", "the chat's own account")
+        # The panel's own mode is said apart (panel_switch): at_limit is the terminal's, as the Select sets it.
+        (self.home / "vscode.json").write_text('{"switch": "auto"}')
+        self.assertEqual(self.at_limit(), wait)
+        self.assertEqual(set(self.files()) - set(before), {str(self.home / "config.json"), str(self.home / "vscode.json")},
+                         "it only reads: no log line either")
+
+    def test_at_limit_moves_by_the_rules_a_move_uses(self):
+        # pick()'s rules, as at a real limit: a fallback last, a folder's first choice first, and only the
+        # accounts allowed in the folder.
+        (self.tmp / "x").mkdir()
+        (self.tmp / "clients").mkdir()
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "spare", "config_dir": str(self.folder("spare")), "fallback": True,
+                             "preferred": ["~/x"]},
+                            {"name": "work", "config_dir": str(self.folder("work"))},
+                            {"name": "acme", "config_dir": str(self.folder("acme")), "repositories": ["~/clients"]})
+        moves = lambda to: f"At a limit, this chat asks you before moving to {to}. With no answer, it waits for "
+        self.assertTrue(self.at_limit().startswith(moves("work")), "the fallback last; acme is kept for ~/clients")
+        self.assertTrue(self.at_limit(cwd=self.tmp / "x").startswith(moves("spare")), "~/x's first choice, fallback or not")
+        self.assertIsNone(self.at_limit(cwd=self.tmp / "clients"), "personal may not be used here: its messages stop")
+        self.assertEqual(self.at_limit(cwd=self.tmp / "clients", CLAUDE_CONFIG_DIR=str(self.folder("acme"))),
+                         "At a limit, this chat waits for acme's reset: no other account may be used in ~/clients.")
+        self.assertEqual(self.at_limit(cwd=self.tmp / "clients", CLAUDE_CONFIG_DIR=str(self.folder("acme")),
+                                       LONGHAUL_SWITCH="auto"),
+                         "At a limit, this chat waits for acme's reset: no other account may be used in ~/clients.",
+                         "in any mode")
+        # An account nearly full is passed over while another has room, as pick() passes it.
+        (self.home / "usage").mkdir()
+        (self.home / "usage" / "work.json").write_text(json.dumps({
+            "at": time.time(), "five_hour": {"used_percentage": 97, "resets_at": time.time() + 3600}}))
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"spare": time.time() + 600}}))
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))},
+                            {"name": "spare", "config_dir": str(self.folder("spare"))},
+                            {"name": "other", "config_dir": str(self.folder("other"))})
+        self.assertTrue(self.at_limit().startswith(moves("other")), "work nearly full, spare at its limit")
+
+    def test_at_limit_says_whose_reset_and_when_a_limit_is_recorded(self):
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        now = time.time()
+        p, w = now + 3 * 3600, now + 3600  # personal's recorded reset, work's
+        limits = lambda **found: (self.home / "state.json").write_text(json.dumps({"limited_until": found}))
+        limits(personal=p, work=now - 60)  # this chat at its limit now; work's past is no limit
+        self.assertEqual(self.at_limit(), "At a limit, this chat asks you before moving to work. With no answer, it "
+                                          f"waits for personal's reset at {longhaul.clock(p)}.")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="never"),
+                         f"At a limit, this chat waits for personal's reset at {longhaul.clock(p)} and carries on there.")
+        # Every other account at its limit too, and work resets first.
+        limits(personal=p, work=w)
+        self.assertEqual(self.at_limit(), "At a limit, this chat asks you whether to carry on with work at its reset, "
+                                          f"{longhaul.clock(w)}. With no answer, it waits for personal's reset at "
+                                          f"{longhaul.clock(p)}.")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="auto"),
+                         f"At a limit, this chat waits for work's reset at {longhaul.clock(w)} and carries on there: "
+                         "every other account is at its limit.")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="never"),
+                         f"At a limit, this chat waits for personal's reset at {longhaul.clock(p)} and carries on there.")
+        # This chat's account resets first: it waits for its own, in each mode.
+        limits(personal=w, work=p)
+        for mode in ("ask", "auto"):
+            self.assertEqual(self.at_limit(LONGHAUL_SWITCH=mode),
+                             f"At a limit, this chat waits for personal's reset at {longhaul.clock(w)} and carries on "
+                             "there: every other account is at its limit.", mode)
+        # No limit recorded for this chat's account: when it would reset is not known yet.
+        limits(work=w)
+        self.assertEqual(self.at_limit(), "At a limit, this chat asks you whether to carry on with work at its reset, "
+                                          f"{longhaul.clock(w)}, unless personal resets first. With no answer, it "
+                                          "waits for personal's reset.")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="auto"),
+                         f"At a limit, this chat carries on with work at its reset, {longhaul.clock(w)}, unless "
+                         "personal resets first: every other account is at its limit.")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="never"),
+                         "At a limit, this chat waits for personal's reset and carries on there.")
+        # In a folder with accounts kept out, "every other account allowed here".
+        (self.tmp / "x").mkdir()
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal")), "repositories": ["~/x"]},
+                            {"name": "work", "config_dir": str(self.folder("work")), "repositories": ["~/x"]},
+                            {"name": "spare", "config_dir": str(self.folder("spare"))})
+        self.assertEqual(self.at_limit(cwd=self.tmp / "x", LONGHAUL_SWITCH="auto"),
+                         f"At a limit, this chat carries on with work at its reset, {longhaul.clock(w)}, unless "
+                         "personal resets first: every other account allowed here is at its limit.")
+
+    def test_at_limit_is_null_where_it_cannot_be_known(self):
+        self.assertIsNone(self.at_limit(), "no list of accounts: one sign-in")
+        self.assertIsNone(self.at_limit(CLAUDE_CONFIG_DIR=str(self.default)), "the stand-in on the default sign-in")
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        found = self.read(self.status())
+        self.assertIsNone(found["at_limit"], "outside a chat: no account of its own")
+        self.assertIsNone(self.at_limit(CLAUDE_CONFIG_DIR=str(self.tmp / "elsewhere")), "a sign-in Longhaul does not list")
+        self.assertIsNone(self.at_limit(LONGHAUL_SWITCH="sometimes"), "no mode in force: Longhaul would not start")
+        for case, text in unreadable_accounts({"name": "personal", "config_dir": str(self.folder("personal"))}).items():
+            with self.subTest(case):
+                (self.home / "accounts.json").write_text(text)
+                found = self.read(self.status(CLAUDE_CONFIG_DIR=str(self.folder("personal"))), code=2)
+                self.assertIsNone(found["at_limit"])
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))})
+        self.assertEqual(self.at_limit(), "At a limit, this chat waits for personal's reset: Longhaul has no other "
+                                          "account.")
+
     def test_panel_paused_says_whether_longhaul_panel_pause_is_in_force(self):
         # The Troubleshoot page's Pause or Resume button: true only with the
         # JSON false that panel_mid_session() reads; it only reads.
@@ -25859,13 +26014,39 @@ class Switch(unittest.TestCase):
         self.config = self.home / "config.json"
         self.where = "~/home/config.json"  # LONGHAUL_HOME, shown from the scratch HOME
 
-    def switch(self, *args, **extra):
-        # No LONGHAUL_SWITCH unless a test gives one: the suite may run in a shell that sets it.
-        env = {k: v for k, v in os.environ.items() if k != "LONGHAUL_SWITCH"}
+    def switch(self, *args, command="switch", **extra):
+        # No LONGHAUL_SWITCH unless a test gives one: the suite may run in a shell that sets it. Nor the
+        # chat it may run in: CLAUDE_CONFIG_DIR names this chat's account (at_limit).
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS)}
         env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
-                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1", **extra)
-        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "switch", *args], env=env, capture_output=True,
-                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), **extra)
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), command, *args], env=env, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL, cwd=str(self.tmp))
+
+    def test_with_no_mode_it_says_what_this_chat_does_at_a_limit_as_status_does(self):
+        # The UX review of 2026-11-11, §3.6: the mode explained by its effect, in status --json's words.
+        self.home.mkdir()
+        (self.home / "accounts.json").write_text(json.dumps([
+            {"name": "personal", "config_dir": str(self.tmp / ".claude-personal")},
+            {"name": "work", "config_dir": str(self.tmp / ".claude-work")}]))
+        chat = {"CLAUDE_CONFIG_DIR": str(self.tmp / ".claude-personal")}
+        for env, said in (({}, "At a limit, this chat asks you before moving to work. With no answer, it waits for "
+                                "personal's reset."),
+                          ({"LONGHAUL_SWITCH": "never"}, "At a limit, this chat waits for personal's reset and carries "
+                                                         "on there.")):
+            out = self.switch(**chat, **env)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            lines = out.stdout.splitlines()
+            self.assertEqual(len(lines), 2, out.stdout)
+            self.assertTrue(lines[0].startswith("Switching: "), lines[0])
+            self.assertEqual(lines[1], said)
+            status = self.switch("--json", "--no-check", command="status", **chat, **env)
+            self.assertEqual(json.loads(status.stdout)["at_limit"], said, "the same sentence")
+        # Outside a chat there is no account of its own to say it of: the one line, as before.
+        self.assertEqual(len(self.switch().stdout.splitlines()), 1)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["accounts.json"], "nothing written")
 
     def test_with_no_mode_it_shows_the_one_in_force_and_where_it_comes_from_and_writes_nothing(self):
         out = self.switch()
@@ -25952,6 +26133,7 @@ class Switch(unittest.TestCase):
 
     def test_the_usage_block_and_its_help_name_it(self):
         self.assertIn("longhaul switch [ask|auto|never]", longhaul.__doc__)
+        self.assertIn("ask), and what this chat does at a limit;", " ".join(longhaul.__doc__.split()))
         out = self.switch("-h")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("usage: longhaul switch [-h] [{ask,auto,never,wait}]", out.stdout)
