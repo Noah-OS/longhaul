@@ -2,7 +2,7 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
-## Unreleased
+## 0.3.21 - 2026-11-23
 
 One name for the default sign-in.
 
