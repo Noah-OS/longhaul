@@ -1065,6 +1065,10 @@ both("Settings with no sentence for this chat explains each mode in a line, and 
   expect((await settingsLines(ui)).slice(2, 7)).toEqual(['At a limit: Ask me first', ...HINTS, ''])
   expect((await texts(ui)).filter(t => /^Now:|^Set here|^Not set|in the environment/.test(t))).toEqual([])
   expect(await over(ui, 80)).toEqual([])
+  // The sentence names accounts, and a name may look like an email: masked, as every text of the record is.
+  w.status = done(JSON.stringify({ ...STATUS, at_limit: 'At a limit, this chat asks you before moving to me@example.com.' }))
+  await ui.press({ key: 'clear' })
+  expect(await texts(ui)).toContain('Now: at a limit, this chat asks you before moving to m…@example.com.')
   await ui.unmount()
 })
 

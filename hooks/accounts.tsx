@@ -23,7 +23,8 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // would do, from its own command's --dry-run --json (the UX review's M4),
 // then whether it is a fallback, with the button that turns it (2026-11-06); Add
 // account's page the form; Settings' page what a chat does at a limit (and
-// what this one would do now), the VS Code panel and forgetting the limits; Troubleshoot's (the UX review's 4.4, M2) what
+// what this one would do now), the VS Code panel and forgetting the limits;
+// Troubleshoot's (the UX review's 4.4, M2) what
 // `repair --json` finds stuck, each with a Fix that asks first, and Longhaul
 // paused or resumed in the panel's chats (`panel pause|resume`), which
 // /longhaul:manage does not run (bin/longhaul refuses both until the owner
@@ -1563,8 +1564,9 @@ function settingsPage($: any, c: Ctx): any {
   const on = s.vscode
   const lines = (texts: string[], props: Record<string, unknown> = {}) =>
     texts.flatMap(text => prose(c, text)).map(line => <Text {...props}>{line}</Text>)
-  // A fact about this chat, in normal weight; "Now: at a limit, …" as the mockup reads.
-  const now = s.at_limit ? prose(c, s.at_limit.replace(/^At a limit\b/, 'at a limit'), 'Now: ') : null
+  // A fact about this chat, in normal weight; "Now: at a limit, …" as the mockup reads. Masked, as
+  // every text of the record is: it names accounts, and a name may look like an email.
+  const now = s.at_limit ? prose(c, mask(s.at_limit).replace(/^At a limit\b/, 'at a limit'), 'Now: ') : null
   return (
     <Box flexDirection="column" gap={1}>
       <Text bold>Settings</Text>
