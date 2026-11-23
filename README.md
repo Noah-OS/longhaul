@@ -54,7 +54,14 @@ The plugin loads in the next session, or after `/reload-plugins` in a running on
 1. `/longhaul:checkpoint`. Claude writes down the goal, the next step, the facts it found and the files it changed.
 2. `/clear`. Longhaul says "your checkpoint from before /clear is back" (in the same folder, up to 6 hours after the save). After a compaction it comes back the same way.
 3. Ask "where were we?". Claude answers from the checkpoint.
-4. `/longhaul:inspect` shows where this chat's tokens went.
+4. `/longhaul:inspect` shows where this chat's tokens went. The report starts with three lines in short, which Claude tells you in its own words; each number says where it came from, and ≈ marks an estimate. For a chat that read one file three times:
+
+   ```
+   In short [transcript, from the sections below; ≈ marks tokens estimated as characters / 4]
+     30 requests [counted]; context peak 129,002 tokens, compacted once: 412,000 -> 21,000 [measured]
+     Cache reads: 97% of the tokens [measured]; the most tool output: Read, ≈41,375 tokens [estimated]
+     Worth a look, Read again: /code/app/f1.py, 2 more times, ≈16,250 tokens [inferred]
+   ```
 
 **What is set up**, in any chat:
 
@@ -94,7 +101,7 @@ Once the plugin is loaded, most of it works by itself.
 | Command | When to use it |
 |---|---|
 | `/longhaul:checkpoint` | Before a compaction, at the end of a step, or before you stop. Claude writes the goal, the next action, your own words, the facts it found, the decisions and why, what failed and the files it changed; Longhaul puts it back after a compaction, a resume, or a `/clear` in the same folder within 6 hours. |
-| `/longhaul:inspect` | To see where a conversation's tokens went: requests and tokens by kind and model, subagents, context growth and compactions, what the cache cost, the largest tool outputs, searches, repeated reads, what the guard caught, and each hook's measured time. Every number says where it came from. |
+| `/longhaul:inspect` | To see where a conversation's tokens went: three lines in short first (what it was, where most of the tokens went, and the one finding worth a look), then requests and tokens by kind and model, subagents, context growth and compactions, what the cache cost, the largest tool outputs, searches, repeated reads, what the guard caught, and each hook's measured time. Every number says where it came from. |
 | `/longhaul:doctor` | To see what is set up and what to do next. |
 | `/accounts` | To see your accounts and manage them with buttons: see [More than one account](#4-more-than-one-account). |
 | `/longhaul:manage` | To set Longhaul up without a terminal, in your own words: see [From the VS Code chat](#5-from-the-vs-code-chat). |

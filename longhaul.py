@@ -238,9 +238,10 @@ Usage:
                           only reads (/longhaul:doctor runs it in a chat)
   longhaul usage [--days N]     each account's allowance; work per task and account
   longhaul inspect [ID|PATH] [--json]
-                          where one conversation's usage went (numbers only;
-                          default: the latest conversation in the ledger);
-                          --json gives one record per number, with its source
+                          where one conversation's usage went, three lines in
+                          short first (numbers only; default: the latest
+                          conversation in the ledger); --json gives one record
+                          per number, with its source, the short lines' last
   longhaul inspect --agent codex [ID|PATH] [--json]
                           the same for an OpenAI Codex chat, from its rollout
                           (CODEX_HOME/sessions; default: the newest one); a
@@ -6390,6 +6391,157 @@ def inspect_filter_lines(fl) -> list[str]:
             + (rows or ["  none"]))
 
 
+# The report's first block (the UX discovery of 2026-10-23, item 6: "three summary lines first"; a still of it
+# for the README, the UX review of 2026-11-11, §5.4): under the Conversation line, at most three lines of at
+# most SUMMARY_WIDTH columns, in tokens, from numbers the sections below hold, each part with its source in
+# brackets as their headings give it: what the conversation was, where most of its tokens went, and the one
+# finding with the most tokens, by the section that holds it. Nothing new is read for it.
+SUMMARY_WIDTH = 100
+SUMMARY_HEAD = "In short [transcript, from the sections below; ≈ marks tokens estimated as characters / 4]"
+SUMMARY_NONE = "  Worth a look: nothing stands out in the sections below"
+SUMMARY_KINDS = {"input": "Input", "cache_write": "Cache writes", "cache_read": "Cache reads", "output": "Output"}
+
+
+def summary_fit(*lines: str) -> str:
+    """The first line that fits in SUMMARY_WIDTH columns, the fullest
+    given first; the last, the shortest, if none does."""
+    return next((line for line in lines if len(line) <= SUMMARY_WIDTH), lines[-1])
+
+
+def summary_percent(part: int, whole: int) -> str:
+    """A share as a whole percent, rounded down: 100% only for all of it."""
+    return f"{100 * part // whole}%"
+
+
+def summary_findings(r: dict) -> list[dict]:
+    """What the block's "Worth a look" picks from, the most tokens first
+    (on a tie, in this order): each section's own numbers summed, in
+    tokens, with the section that holds them, how they were got (`tag`,
+    as the line says it; `source` and `confidence`, as a record does) and
+    what the line says of them, the fullest first. A section's characters
+    are ≈ characters / 4 tokens, as the report's other estimates, and the
+    guard's bytes bytes / 4. The subagents are a finding only when they
+    used more tokens than the main conversation: theirs are the API's
+    counts, the cache read again at each request, and would outrank any
+    output put in the context once. Left out: the repeated searches,
+    which have no size; the large cache writes, which hold the rebuilds;
+    the hooks' additions; and the output filter's replay, whose cuts were
+    never made, so no saving is measured. A finding of no tokens is none."""
+    found = []
+
+    def add(section, tokens, tag, says, scope, source="estimate", confidence="estimated"):
+        if tokens > 0:
+            found.append({"section": section, "tokens": tokens, "tag": tag, "says": says, "scope": scope,
+                          "source": source, "confidence": confidence})
+
+    def scope_of(rows):
+        scopes = {x["scope"] for x in rows}
+        return scopes.pop() if len(scopes) == 1 else "all"
+
+    def files(rows, n, word):
+        """The files of rows and their n times: the largest by its path, then by its name alone, then none."""
+        times = f"{n:,} {word}{'s' * (n != 1)}"
+        path = rows[0]["path"]
+        others = f" and {len(rows) - 1:,} more file{'s' * (len(rows) != 2)}" if len(rows) > 1 else ""
+        return ([f"{p}{others}, {times}" for p in dict.fromkeys((path, path.rsplit("/", 1)[-1] or path))]
+                + [f"{len(rows):,} file{'s' * (len(rows) != 1)}, {times}"])
+
+    for key, section, count, word in (("rereads", "Read again", "repeats", "more time"),
+                                      ("reread_after_compaction", "Read again after a compaction", "reads", "time")):
+        rows = r[key]
+        if rows:
+            tokens = sum(x["chars"] for x in rows) // 4
+            add(section, tokens, "inferred", [f"{say}, ≈{tokens:,} tokens"
+                                              for say in files(rows, sum(x[count] for x in rows), word)],
+                scope_of(rows))
+    s = r["search"]
+    if s["search_big"]:
+        tokens = round(s["search_big_share"] * s["search_chars"]) // 4
+        add("Search", tokens, "estimated", [f"{s['search_big']:,} result{'s' * (s['search_big'] != 1)} over "
+                                            f"{SEARCH_BIG:,} chars, ≈{tokens:,} tokens"], "all")
+    g = r["guard"]
+    if g:
+        n, tokens = sum(g[k] for k in GUARD_RULES), sum(g["bytes"][k] for k in GUARD_RULES) // 4
+        calls = f"{n:,} call{'s' * (n != 1)}"
+        add("Guard", tokens, "longhaul guard: bytes / 4",
+            [f"{calls} warned about or blocked, ≈{tokens:,} tokens", f"{calls}, ≈{tokens:,} tokens"], "all")
+    rows = r["cache_rebuilds"]
+    if rows:
+        tokens = sum(x["tokens"] for x in rows)
+        times = f"{len(rows):,} time{'s' * (len(rows) != 1)}"
+        add("Cache written again", tokens, "inferred", [f"{times}, {tokens:,} tokens"], scope_of(rows),
+            "transcript", "inferred")
+    main, subs = (sum(r["tokens"][scope].values()) for scope in ("main", "subagents"))
+    if subs > main:
+        share = f"{summary_percent(subs, main + subs)} of the tokens"
+        add("Subagents", subs, "measured", [f"{share}, {subs:,} of {main + subs:,}", f"{share}, {subs:,}"],
+            "subagents", "transcript", "measured")
+    return sorted(found, key=lambda f: -f["tokens"])
+
+
+def inspect_summary(r: dict) -> dict:
+    """The block's picks, from inspect_transcript()'s numbers: the token
+    kind with the most tokens, main and subagents together (None with no
+    token), and its share; the Tool calls row with the most output (None
+    with none of a token); and the finding with the most tokens (None with
+    none). inspect_lines() says them and inspect_records() gives them."""
+    total = {k: sum(r["tokens"][scope][k] for scope in r["tokens"]) for k, _ in TOKEN_KINDS}
+    whole = sum(total.values())
+    kind = max(total, key=total.get) if whole else None  # on a tie, the first in TOKEN_KINDS
+    tool = r["by_tool"][0] if r["by_tool"] and r["by_tool"][0]["chars"] >= 4 else None
+    findings = summary_findings(r)
+    return {"kind": kind, "tokens": total[kind] if kind else 0, "whole": whole,
+            "tool": tool, "finding": findings[0] if findings else None}
+
+
+def summary_lines(r: dict) -> list[str]:
+    """The In short block, its heading first: what the conversation was
+    (its requests, counted, and the main context's peak and compactions,
+    measured), where most of its tokens went (the largest kind's share,
+    measured, and the tool with the most output, ≈), and the finding with
+    the most tokens, by the section that holds it, or that none stands
+    out. Each line is the fullest that fits SUMMARY_WIDTH: the parts that
+    say least are left out first, and a long name is cut."""
+    pick, asked = inspect_summary(r), r["requests"]
+    n, subs = asked["main"] + asked["subagents"], asked["subagents"]
+    if not n:  # no response in the transcript: nothing to sum up, and no "0 requests"
+        return [SUMMARY_HEAD, "  No request yet [transcript, counted]"]
+    c, kept = r["context"], [k for k in r["compactions"] if k["scope"] == "main"]
+    context = (f"{'main ' if subs else ''}context peak {c['peak']:,} tokens" if c
+               else "no context size in the transcript")
+    if not kept:
+        compacted = ["not compacted"]
+    elif len(kept) == 1:
+        k = kept[0]
+        trigger = f" ({k['trigger']})" if k["trigger"] != "?" else ""
+        compacted = [f"compacted once{trigger}: {k['before']:,} -> {k['after']:,}",
+                     f"compacted once: {k['before']:,} -> {k['after']:,}", f"compacted once{trigger}", "compacted once"]
+    else:
+        triggers = collections.Counter(k["trigger"] for k in kept)
+        compacted = ([f"compacted {len(kept)} times ({', '.join(f'{m} {t}' for t, m in triggers.most_common())})"]
+                     if "?" not in triggers else []) + [f"compacted {len(kept)} times"]
+    split = [f", {subs:,} by subagents", ""] if subs else [""]
+    out = [SUMMARY_HEAD, summary_fit(*[f"  {n:,} request{'s' * (n != 1)}{s} [counted]; {context}, {comp} [measured]"
+                                       for s in split for comp in compacted])]
+    if pick["kind"]:
+        said = f"{SUMMARY_KINDS[pick['kind']]}: {summary_percent(pick['tokens'], pick['whole'])} of the"
+        shares = [f"  {said} {pick['whole']:,} tokens [measured]", f"  {said} tokens [measured]"]
+        lines, t = [], pick["tool"]
+        if t:
+            name, est = t["tool"] + (" in subagents" if t["scope"] != "main" else ""), t["chars"] // 4
+            short = f"{shares[1]}; most tool output: {{}}, ≈{est:,} [estimated]"
+            lines = [f"{share}; the most tool output: {name}, ≈{est:,} tokens [estimated]" for share in shares]
+            lines += [f"{shares[1]}; the most tool output: {name}, ≈{est:,} [estimated]", short.format(name)]
+            room = SUMMARY_WIDTH - len(short.format("..."))
+            if len(name) > room >= 8:  # a long name, an MCP tool's, cut to the room left, never the line
+                lines.append(short.format(name[:room] + "..."))
+        out.append(summary_fit(*lines, *shares))
+    f = pick["finding"]
+    out.append(summary_fit(*[f"  Worth a look, {f['section']}: {say} [{f['tag']}]" for say in f["says"]])
+               if f else SUMMARY_NONE)
+    return out
+
+
 def inspect_lines(r: dict) -> list[str]:
     """The report as text. Each heading names where its numbers came from."""
     def where(item):
@@ -6403,7 +6555,7 @@ def inspect_lines(r: dict) -> list[str]:
                    f"{t['output']:>12,}" for t in rows]) if rows else [indent + "none"]
 
     files = f", and {r['subagents']} subagent transcript{'s' * (r['subagents'] != 1)}" if r["subagents"] else ""
-    out = [f"Conversation {r['session']} ({home_path(r['path'])}{files})",
+    out = [f"Conversation {r['session']} ({home_path(r['path'])}{files})", *summary_lines(r),
            "Requests [transcript, counted]",
            f"  main {r['requests']['main']}, subagents {r['requests']['subagents']}"]
     if r["models"]:
@@ -6746,6 +6898,18 @@ def inspect_records(r: dict) -> list[dict]:
                 add("consultation_tokens", t[kind], "tokens", "subagents", "transcript", "measured", t["model"], kind)
     add("transcript_lines", r["lines"], "lines", "all", "transcript", "counted")
     add("unreadable_lines", r["unreadable"], "lines", "all", "transcript", "counted")
+    # The In short block's picks (inspect_summary()), last, one number each: the largest kind's share, the
+    # tool with the most output and the finding Worth a look names. Its other numbers are records above.
+    pick = inspect_summary(r)
+    if pick["kind"]:
+        add("summary_largest_kind_share", round(pick["tokens"] / pick["whole"], 4), "ratio", "all", "transcript",
+            "measured", pick["kind"])
+    if pick["tool"]:
+        t = pick["tool"]
+        add("summary_top_tool_tokens", t["chars"] // 4, "tokens", t["scope"], "estimate", "estimated", t["tool"])
+    if pick["finding"]:
+        f = pick["finding"]
+        add("summary_finding_tokens", f["tokens"], "tokens", f["scope"], f["source"], f["confidence"], f["section"])
     return out
 
 

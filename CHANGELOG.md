@@ -4,7 +4,23 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## Unreleased
 
-Small fixes to 0.3.21's one name for the default sign-in.
+`longhaul inspect` starts with three lines in short, and small fixes to 0.3.21's one name for the default sign-in.
+
+### Added
+
+- **`longhaul inspect` and `/longhaul:inspect` start with "In short"**, right under the Conversation line: three lines of 100 columns at most, in tokens. The first says what the conversation was: its requests, the main context's peak and its compactions. The second says where most of its tokens went: the largest kind's share and the tool with the most output. The third, "Worth a look", names the one finding with the most tokens and the section that holds it: a file read again, a read after a compaction, big search results, what the guard caught, the cache written again, or subagents that used more tokens than the main conversation. With none it says nothing stands out. Each part names its source as the headings do (counted, measured, estimated or inferred), and ≈ marks tokens estimated as characters / 4. It uses the report's own numbers, says no saving, and every section below it is as before. It draws no mark, so `LONGHAUL_PLAIN=1` shows it the same. For example:
+
+  ```
+  In short [transcript, from the sections below; ≈ marks tokens estimated as characters / 4]
+    30 requests [counted]; context peak 129,002 tokens, compacted once: 412,000 -> 21,000 [measured]
+    Cache reads: 97% of the tokens [measured]; the most tool output: Read, ≈41,375 tokens [estimated]
+    Worth a look, Read again: /code/app/f1.py, 2 more times, ≈16,250 tokens [inferred]
+  ```
+- **`longhaul inspect --json` ends with the block's picks**, one number each like every record: `summary_largest_kind_share` (its `item` the kind), `summary_top_tool_tokens` (the tool) and `summary_finding_tokens` (the section's name). The block's other numbers are records already.
+
+### Changed
+
+- **`/longhaul:inspect` has Claude lead with the In short lines in its own words**, each number as the report gives it and with its source, then offer the section "Worth a look" names, or any other. It no longer echoes the whole report: a section, or all of it, comes when you ask, unchanged.
 
 ### Fixed
 

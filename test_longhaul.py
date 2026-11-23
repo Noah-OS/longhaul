@@ -3741,10 +3741,10 @@ class Inspect(unittest.TestCase):
         return self.write([{**l, "isSidechain": True} for l in lines],
                           self.path.with_suffix("") / "subagents" / f"{name}.jsonl")
 
-    def cli(self, *args, cwd=None):
+    def cli(self, *args, cwd=None, **env):
         return subprocess.run([sys.executable, str(HERE / "longhaul.py"), "inspect", *args], capture_output=True,
                               text=True, cwd=cwd, env=dict(os.environ, LONGHAUL_HOME=str(self.relay),
-                                                           LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude)))
+                                                           LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), **env))
 
     def at(self, second, lines):
         """The lines, written at that second: subagents write alongside the main conversation."""
@@ -5146,6 +5146,232 @@ class Inspect(unittest.TestCase):
         got = {(x["metric"], x["scope"]): (x["value"], x["unit"]) for x in self.records("s1")}
         self.assertEqual(got[("cache_churn", "main")], (1, "requests"))
         self.assertEqual(got[("cache_churn_tokens", "main")], (20000, "tokens"))
+
+    # The In short block (the UX discovery of 2026-10-23, item 6: "three summary lines first"; the UX review of
+    # 2026-11-11, §5.4 item 2: a still of it for the README): at most three lines under the Conversation line,
+    # each 100 columns at most, from the sections' own numbers, each part named by its source.
+    SHORT = "In short [transcript, from the sections below; ≈ marks tokens estimated as characters / 4]"
+    NOTHING = "  Worth a look: nothing stands out in the sections below"
+
+    def short(self, out):
+        """The block's lines, under its heading, which comes right after the Conversation line."""
+        self.assertTrue(out[0].startswith("Conversation s1 ("), out[0])
+        self.assertEqual(out[1], self.SHORT)
+        rest = out[2:]
+        return rest[:next(i for i, line in enumerate(rest) if not line.startswith(" "))]
+
+    def sourced(self, block):
+        """Each part of a line that holds a number ends in its source, and an estimate (≈) is never one
+        called measured or counted."""
+        for line in block:
+            for part in line.split("; "):
+                if not re.search(r"\d", part):
+                    continue
+                tag = re.search(r"\[([^\]]+)\]$", part)
+                self.assertTrue(tag, part)
+                self.assertIn(tag.group(1), ("transcript, counted", "counted", "measured", "estimated", "inferred",
+                                             "longhaul guard: bytes / 4"), part)
+                if "≈" in part:
+                    self.assertIn(tag.group(1), ("estimated", "inferred", "longhaul guard: bytes / 4"), part)
+                if tag.group(1) in ("measured", "counted"):
+                    self.assertNotIn("≈", part)
+
+    def busy(self):
+        """The brief's run (2026-11-23): 12 Reads, one file read three times, 12 Greps and 6 Bash calls, 30
+        requests whose context grows from 42,002 to 129,002 tokens, then an auto compaction."""
+        sizes = [("f0", 60_000)] + [("f1", 32_500)] * 3 + [(f"f{i}", 1_000) for i in range(2, 10)]
+        calls = ([("Read", "x" * n, {"file_path": f"/code/app/{name}.py"}) for name, n in sizes]
+                 + [("Grep", "y" * 900, {"pattern": f"p{i}", "path": "/code/app"}) for i in range(12)]
+                 + [("Bash", "z" * 500, {"command": "make test"}) for _ in range(6)])
+        lines = []
+        for i, (name, output, args) in enumerate(calls):
+            lines += self.reply(self.call(f"t{i}", name, **args), inp=2, write=2000, read=40000 + 3000 * i, out=300)
+            lines.append({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": output}]}})
+        return lines + [self.compaction(pre=412_000, post=21_000)]
+
+    BUSY = ["  30 requests [counted]; context peak 129,002 tokens, compacted once: 412,000 -> 21,000 [measured]",
+            "  Cache reads: 97% of the tokens [measured]; the most tool output: Read, ≈41,375 tokens [estimated]",
+            "  Worth a look, Read again: /code/app/f1.py, 2 more times, ≈16,250 tokens [inferred]"]
+
+    def test_in_short_comes_right_after_the_conversation_line_in_three_lines_of_100_columns_at_most(self):
+        self.write(self.busy())
+        out = longhaul.inspect_lines(longhaul.inspect_transcript(self.path))
+        block = self.short(out)
+        self.assertEqual(block, self.BUSY)
+        self.assertLessEqual(len(block), 3)
+        self.assertLessEqual(max(map(len, [out[1]] + block)), 100)
+        self.assertEqual(out[2 + len(block)], "Requests [transcript, counted]", "every section follows, as before")
+        shown = self.cli("s1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(shown.stdout.splitlines()[1:2 + len(block)], [self.SHORT] + self.BUSY)
+        # The README's example is this run's block, as inspect prints it, in its list item's code block.
+        self.assertIn("\n".join("   " + line for line in [self.SHORT] + self.BUSY), (HERE / "README.md").read_text())
+
+    def test_in_short_numbers_are_the_sections_own(self):
+        self.write(self.busy())
+        r = longhaul.inspect_transcript(self.path)
+        out = longhaul.inspect_lines(r)
+        first, kinds, look = self.short(out)
+        # What it was: the requests, the main context's peak and its compaction, as their sections give them.
+        self.assertEqual(out[out.index("Requests [transcript, counted]") + 1], "  main 30, subagents 0")
+        self.assertTrue(first.startswith("  30 requests [counted]"), first)
+        self.assertIn("  first 42,002, peak 129,002, last 129,002 tokens", out)
+        self.assertIn("  compacted (auto): 412,000 -> 21,000 tokens", out)
+        self.assertIn("context peak 129,002 tokens, compacted once: 412,000 -> 21,000", first)
+        # Where most of it went: the largest kind's share of the Tokens table's total, and the Tool calls row
+        # with the most output, in ≈ tokens.
+        self.assertIn("  total               60        60,000     2,505,000       9,000", out)
+        self.assertEqual(100 * 2_505_000 // (60 + 60_000 + 2_505_000 + 9_000), 97)
+        self.assertTrue(kinds.startswith("  Cache reads: 97% of the tokens [measured]"), kinds)
+        self.assertEqual(out[out.index("Tool calls [transcript, counted]") + 1], "  Read: 12 calls, 165,500 chars")
+        self.assertIn("Read, ≈41,375 tokens [estimated]", kinds)
+        self.assertEqual(165_500 // 4, 41_375)
+        # Worth a look: the Read again row, its characters / 4.
+        head = ("Read again, with no edit or compaction in between [transcript, inferred: files changed through Bash "
+                "are not seen]")
+        self.assertEqual(out[out.index(head) + 1], "  /code/app/f1.py: 2 more times, 65,000 chars")
+        self.assertIn("/code/app/f1.py, 2 more times, ≈16,250 tokens", look)
+
+    def test_each_in_short_line_says_where_its_numbers_came_from(self):
+        self.write(self.busy())
+        block = self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path)))
+        self.sourced(block)
+        self.assertEqual([re.findall(r"\[([^\]]+)\]", line) for line in block],
+                         [["counted", "measured"], ["measured", "estimated"], ["inferred"]])
+
+    def test_worth_a_look_names_the_finding_with_the_most_tokens(self):
+        big = self.turn("t1", "Read", "x" * 40_000, file_path="/a.py") + self.turn("t2", "Read", "x" * 40_000,
+                                                                                  file_path="/a.py")
+        reread = "  Worth a look, Read again: /a.py, 1 more time, ≈10,000 tokens [inferred]"
+        cases = {
+            # A repeated read of 40,000 chars against one big search result of 8,000.
+            "repeated reads": (big + self.turn("t3", "Grep", "y" * 8_000, pattern="p", path="/app"), [], None, reread),
+            # Three big search results of 40,000 chars against a repeated read of 4,000.
+            "big search results": (self.turn("t1", "Read", "x" * 4_000, file_path="/a.py")
+                                   + self.turn("t2", "Read", "x" * 4_000, file_path="/a.py")
+                                   + sum((self.turn(f"g{i}", "Grep", "y" * 40_000, pattern=f"p{i}", path="/app")
+                                          for i in range(3)), []), [], None,
+                                   "  Worth a look, Search: 3 results over 5,000 chars, ≈30,000 tokens [estimated]"),
+            # The subagents used more tokens than the main conversation: the API's own counts.
+            "subagents": (big, self.reply(read=1_000_000), None,
+                          "  Worth a look, Subagents: 99% of the tokens, 1,000,012 of 1,000,036 [measured]"),
+            # Fewer than the main conversation's: no finding, though more tokens than the repeated read.
+            "subagents under half": (self.reply(read=500_000) + big, self.reply(read=100_000), None, reread),
+            # What the guard warned about or blocked: its bytes / 4.
+            "a guard catch": (big, [], {"fired": {"repeat": 2, "big": 1}, "bytes": {"repeat": 300_000, "big": 100_000},
+                                        "reads": {}},
+                              "  Worth a look, Guard: 3 calls warned about or blocked, ≈100,000 tokens "
+                              "[longhaul guard: bytes / 4]"),
+            # The cache written again: the API's count of what the second request wrote.
+            "the cache written again": (big + self.reply(write=50_000) + self.reply(write=50_000), [], None,
+                                        "  Worth a look, Cache written again: 1 time, 50,000 tokens [inferred]"),
+            "a read after a compaction": (
+                self.turn("t1", "Read", "x" * 80_000, file_path="/a.py") + [self.compaction()]
+                + self.turn("t2", "Read", "x" * 80_000, file_path="/a.py"), [], None,
+                "  Worth a look, Read again after a compaction: /a.py, 1 time, ≈20,000 tokens [inferred]")}
+        for name, (main, agent, guard, want) in cases.items():
+            with self.subTest(name):
+                shutil.rmtree(self.path.with_suffix(""), ignore_errors=True)
+                shutil.rmtree(self.relay / "guard", ignore_errors=True)
+                self.write(main)
+                if agent:
+                    self.agent(agent)
+                if guard:
+                    (self.relay / "guard").mkdir()
+                    (self.relay / "guard" / "s1.json").write_text(json.dumps(guard))
+                block = self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path)))
+                self.assertEqual(block[-1], want)
+                if name == "subagents":  # the requests by subagents, as the Requests section has them, and whose peak
+                    self.assertEqual(block[0], "  3 requests, 1 by subagents [counted]; main context peak 2 tokens, "
+                                               "not compacted [measured]")
+                self.assertLessEqual(len(block), 3)
+                self.assertLessEqual(max(map(len, block)), 100, block)
+                self.sourced(block)
+
+    def test_with_no_finding_worth_a_look_says_nothing_stands_out(self):
+        self.write(self.turn("t1", "Read", "x" * 400, file_path="/a.py") + self.turn("t2", "Read", "x" * 400,
+                                                                                    file_path="/b.py")
+                   + self.turn("t3", "Grep", "y" * 900, pattern="p", path="/app") + self.reply(read=50_000))
+        self.agent(self.reply(read=1_000))  # fewer tokens than the main conversation's: no finding
+        r = longhaul.inspect_transcript(self.path)
+        self.assertEqual((r["rereads"], r["search"]["search_big"], r["guard"], r["cache_rebuilds"]), ([], 0, None, []))
+        block = self.short(longhaul.inspect_lines(r))
+        self.assertEqual(block[-1], self.NOTHING)
+        self.assertEqual(len(block), 3)
+
+    def test_a_tiny_transcript_gives_a_sane_in_short_and_an_empty_one_none(self):
+        # No response: one line, never "0 requests".
+        self.write([{"type": "user", "message": {"role": "user", "content": "hi"}}])
+        self.assertEqual(self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path))),
+                         ["  No request yet [transcript, counted]"])
+        # One response: its numbers, and no share of nothing.
+        self.write(self.reply())
+        block = self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path)))
+        self.assertEqual(block, ["  1 request [counted]; context peak 2 tokens, not compacted [measured]",
+                                 "  Output: 83% of the 12 tokens [measured]", self.NOTHING])
+        self.sourced(block)
+        # A response whose usage holds no tokens: no division by zero, no line of shares.
+        self.write(self.reply(inp=0, out=0))
+        self.assertEqual(self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path))),
+                         ["  1 request [counted]; no context size in the transcript, not compacted [measured]",
+                          self.NOTHING])
+        # An empty file is still an error, not a report.
+        self.path.write_text("")
+        out = self.cli("s1")
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+
+    def test_in_short_lines_stay_within_100_columns_with_long_names_and_numbers(self):
+        deep = "/code/" + "deep/" * 40 + "f.py"
+        tool = "mcp__" + "x" * 70
+        self.write(self.turn("t1", "Read", "x" * 40_000, file_path=deep) + self.turn("t2", "Read", "x" * 40_000,
+                                                                                     file_path=deep)
+                   + self.turn("t3", tool, "y" * 90_000) + self.reply(read=987_654_321_000)
+                   + [self.compaction(pre=987_654_321, post=123_456_789)])
+        self.agent(self.reply(read=12_345))
+        block = self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path)))
+        self.assertLessEqual(max(map(len, block)), 100, block)
+        self.assertEqual(block[-1], "  Worth a look, Read again: f.py, 1 more time, ≈10,000 tokens [inferred]")
+        self.assertRegex(block[1], r"; most tool output: mcp__x{8,}\.\.\., ≈22,500 \[estimated\]$",
+                         "a long tool name is cut, not the line")
+        self.sourced(block)
+
+    def test_json_ends_with_the_in_short_picks_one_number_each(self):
+        self.write(self.busy())
+        records = self.records("s1")
+        picks = [r for r in records if r["metric"].startswith("summary_")]
+        self.assertEqual(records[-len(picks):], picks, "at the end")
+        self.assertEqual([(x["metric"], x["scope"], x["item"], x["value"], x["unit"], x["source"], x["confidence"])
+                          for x in picks], [
+            ("summary_largest_kind_share", "all", "cache_read", 0.9732, "ratio", "transcript", "measured"),
+            ("summary_top_tool_tokens", "main", "Read", 41_375, "tokens", "estimate", "estimated"),
+            ("summary_finding_tokens", "main", "Read again", 16_250, "tokens", "estimate", "estimated")])
+        for x in picks:
+            self.assertEqual(set(x), {"session", "metric", "scope", "item", "kind", "value", "unit", "source",
+                                      "confidence"}, x)
+            self.assertIsNone(x["kind"])
+        # The subagents' share is the API's count; with no finding, no record of one.
+        shutil.rmtree(self.path.with_suffix(""), ignore_errors=True)
+        self.write(self.reply())
+        self.agent(self.reply(read=1_000_000))
+        got = {x["metric"]: (x["scope"], x["item"], x["value"], x["source"], x["confidence"])
+               for x in self.records("s1") if x["metric"].startswith("summary_")}
+        self.assertEqual(got["summary_finding_tokens"], ("subagents", "Subagents", 1_000_012, "transcript", "measured"))
+        self.write(self.reply())
+        shutil.rmtree(self.path.with_suffix(""))
+        self.assertEqual([x["metric"] for x in self.records("s1") if x["metric"].startswith("summary_")],
+                         ["summary_largest_kind_share"])
+
+    def test_in_short_is_the_same_in_plain_mode_and_draws_no_mark(self):
+        # LONGHAUL_PLAIN=1 (M8): the block draws none of the marks a screen reader reads aloud as their names;
+        # ≈ is the report's own estimate sign, said in the heading.
+        self.write(self.busy())
+        plain, usual = self.cli("s1", LONGHAUL_PLAIN="1"), self.cli("s1", LONGHAUL_PLAIN="0")
+        self.assertEqual((plain.returncode, usual.returncode), (0, 0), plain.stderr + usual.stderr)
+        self.assertEqual(plain.stdout, usual.stdout)
+        block = self.short(plain.stdout.splitlines())
+        self.assertEqual(block, self.BUSY)
+        self.assertNotRegex("\n".join([self.SHORT] + block), "[✔✘⚠›·→•]")
 
 
 class CodexPackaging(unittest.TestCase):
@@ -13108,6 +13334,24 @@ class InspectSkill(unittest.TestCase):
         self.assertIn("the guard's record and the Advisor experiment's trace", " ".join(body.split()))
         requires_git(self)
         self.assertEqual(subprocess.run(["git", "check-ignore", "-q", "skills/inspect/SKILL.md"], cwd=HERE).returncode, 1)
+
+    def test_the_skill_leads_with_the_in_short_lines_in_the_models_own_words(self):
+        # The UX discovery of 2026-10-23, item 6: "the model summarises instead of echoing". The report's
+        # In short block first, told in the model's words with each number as it is and its source; a section,
+        # or the whole report, only when the user asks for it.
+        text = (HERE / "skills" / "inspect" / "SKILL.md").read_text()
+        head, body = text.split("---\n", 2)[1:]
+        flat = " ".join(body.split())
+        self.assertIn('Lead with the report\'s "In short" lines, in your own words', flat)
+        self.assertLess(flat.index('"In short"'), flat.index("code block"), "the summary first, the sections after")
+        self.assertIn("never changed or rounded", flat, "the numbers stay as the report gives them")
+        self.assertIn("and with its source", flat)
+        self.assertIn("Do not echo the whole report", flat)
+        self.assertIn("when the user asks for it", flat)
+        self.assertIn("names the section that holds the detail", flat)
+        self.assertIn("Never add a saving or a cause the report does not state.", flat)
+        self.assertIn("The report may name an install command; show it, take no install step.", flat)
+        self.assertIn("three lines in short first", head, "the description says so too")
 
 
 class AdviseSkill(unittest.TestCase):
