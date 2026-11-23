@@ -2374,3 +2374,56 @@ test('on the phone the question shows, and its answers work', async ($, on) => {
   expect(after(w)).toEqual([['answer', SID, 'q-0123456789ab', 'wait']])
   await ui.unmount()
 })
+
+// One subscription (no accounts.json): longhaul.py's stand-in for it,
+// keyed "main", is ~/.claude's own sign-in, which the pane calls the
+// default sign-in (the UX review's Q11). Its question and carry-on are
+// keyed as the files are.
+const ALONE = { name: 'main', email: null, signed_in: true, as_expected: true, check_failed: null, plan: 'pro',
+  limited_until: AT + 3 * HOUR, five_hour: null, week: null, only_in: [], kept_out_by: [], fallback: false,
+  folder: '~/.claude', this_chat: false, preferred: [], use_here: null, reading_at: AT - 60, label: 'default sign-in' }
+const SOLO = { ...STATUS, accounts: [ALONE], listed: false, here: null }
+
+both('one subscription is the default sign-in on its row, its page and its question', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify(SOLO))
+  write(w, QUESTION_FILE, { ...FIRST, from: 'main', to: 'main', to_resets_at: AT + 3 * HOUR })
+  const { ui } = await opened($, w, surface)
+  expect((await rowOf(ui, 'row-main'))!.slice(2).startsWith('default sign-in  pro')).toBe(true)
+  const asked = (await texts(ui)).find(t => /Carry on then\?/.test(t))
+  expect(asked).toBe(`default sign-in resets at ${clock(AT + 3 * HOUR)}. Carry on then?`)
+  await open(ui, 'row-main')
+  const said = await texts(ui)
+  expect(said).toContain('default sign-in (~/.claude)')
+  expect(said).toContain("Claude Code's own sign-in: Longhaul has no list of accounts yet. + Add account adds a second one.")
+  expect(said.some(t => /\b(Max|main)\b/.test(t))).toBe(false)
+  // Each of setup, remove, folders and fallback takes a listed account alone: none is offered. Its limit can be forgotten.
+  expect((await buttons(ui)).filter(k => /^(signin|remove|folder|fallback)/.test(k))).toEqual([])
+  await ui.press({ key: 'clear-main' })
+  expect(after(w)[0]).toEqual(['clear', 'main'])
+  await ui.unmount()
+})
+
+both('a row an older longhaul.py gave, with no label, is shown by its name', async ($, on, surface) => {
+  const w = world(on)
+  const { label: _gone, ...older } = ALONE
+  w.status = done(JSON.stringify({ ...SOLO, accounts: [{ ...older, name: 'Max' }] }))
+  const { ui } = await opened($, w, surface)
+  expect((await rowOf(ui, 'row-Max'))!.slice(2).startsWith('Max  pro')).toBe(true)
+  await open(ui, 'row-Max')
+  expect(await texts(ui)).toContain('Max')
+  await ui.unmount()
+})
+
+both('a listed account named Max or main is shown by its own name', async ($, on, surface) => {
+  const w = world(on)
+  const mine = [{ ...ACCOUNTS[0]!, name: 'Max', label: 'Max' }, { ...ACCOUNTS[1]!, name: 'main', label: 'main' }]
+  w.status = done(JSON.stringify({ ...STATUS, accounts: mine, here: { folder: '~/code/x', may_use: ['Max', 'main'] } }))
+  const { ui } = await opened($, w, surface)
+  expect((await rowOf(ui, 'row-Max'))!.slice(2).startsWith('Max   max')).toBe(true)
+  expect((await rowOf(ui, 'row-main'))!.slice(2).startsWith('main  pro')).toBe(true)
+  await open(ui, 'row-main')
+  expect(await texts(ui)).toContain('main')
+  expect(await buttons(ui)).toContain('remove-main')
+  await ui.unmount()
+})

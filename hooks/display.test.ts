@@ -340,6 +340,23 @@ test("the entry: the default sign-in", async ($, on) => {
   expect(w.statuses[w.statuses.length - 1]).toBe('Max · 5h 12% · ctx 88k')
 })
 
+test('the entry: a limit the default sign-in had under its old name, and a listed Max', async ($, on) => {
+  // The UX review's Q11: 0.3.20 recorded the one sign-in's limit under
+  // "Max", the stand-in's name then. With no list it is the default
+  // sign-in's; a listed Max is an account of its own.
+  const w = world(on)
+  w.release = json({ latest: '0.3.2' })
+  w.context = 88_000
+  const until = NOW / 1000 + 3600
+  write(w, `${HOME}/state.json`, { limited_until: { Max: until } })
+  await start($, w)
+  await $.turn.complete(TURN)
+  expect(w.statuses[w.statuses.length - 1]).toBe(`default sign-in at limit until ${clock(until, NOW)} · stopped · /accounts`)
+  write(w, `${HOME}/accounts.json`, [{ name: 'Max', config_dir: '~/.claude-max' }])
+  await $.turn.complete(TURN)
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · no usage reading yet · ctx 88k')
+})
+
 test('the entry: a newer release', async ($, on) => {
   const { w, entry } = await row($, on, 'work')
   w.release = json({ latest: '0.3.9' })

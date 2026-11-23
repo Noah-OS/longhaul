@@ -850,9 +850,90 @@ def in_text(seconds: float) -> str:
 
 # ------------------------------------------------------------- accounts
 
+# The default sign-in: ~/.claude's own sign-in, when no list of Longhaul's
+# names it (the UX review of 2026-11-11, §3.5, §4.8 and Q11). It went by
+# three names: "Max" (load_accounts()'s stand-in for a missing file, shown
+# even to someone on Pro), "main" (what the status line keyed its readings
+# by) and "default sign-in" (what the status line showed). Two keys for one
+# sign-in kept apart what should meet: `longhaul status` read Max.json while
+# the status line wrote main.json, and a limit the terminal recorded for
+# Max never reached the line. So it is keyed DEFAULT_KEY everywhere, in the
+# files (usage/, state.json, the log) and in commands (`longhaul clear
+# main`), as the status line always keyed it; and people see DEFAULT_LABEL,
+# whose space no account's name may hold (add's rule), so it is never
+# taken for one.
+DEFAULT_KEY = "main"
+DEFAULT_LABEL = "default sign-in"
+# Its sign-in is Claude Code's own: `longhaul setup` signs in only the
+# accounts on the list, so a failed one is signed in again there.
+DEFAULT_RELOGIN = "sign in again with /login in Claude Code, or `claude auth login` in a terminal"
+# The stand-in's name in Longhaul 0.3.20 and before: a recorded limit, a
+# chat's record or a log line written then may hold it. Where there is no
+# list of accounts it can only have been the stand-in, so it is read as
+# DEFAULT_KEY there (key_of()); a listed account named Max is Max.
+LEGACY_KEY = "Max"
+
 # load_accounts()'s one account when there is no accounts.json (one
 # subscription): ~/.claude, with no repositories.
-STAND_IN = {"name": "Max", "config_dir": None}
+STAND_IN = {"name": DEFAULT_KEY, "config_dir": None}
+
+
+def label_of(name, listed=...):
+    """What people see for the account a file or the log keys as `name`:
+    DEFAULT_LABEL for the default sign-in, which no list names (DEFAULT_KEY,
+    or LEGACY_KEY where there is no list at all); else the name. A listed
+    account named main or Max is itself. `listed`: the list as
+    read_accounts_file() gives it ([] for none, None for a file it cannot
+    read, whose names are not known); read here when not given."""
+    if listed is ...:
+        listed = read_accounts_file()[0]
+    if not isinstance(name, str) or any(a["name"] == name for a in listed or []):
+        return name
+    return DEFAULT_LABEL if name == DEFAULT_KEY or (name == LEGACY_KEY and listed == []) else name
+
+
+def label_in(name, accounts: list[dict]) -> str:
+    """label_of() among `accounts`, the list a terminal's longhaul or a
+    panel chat's relay holds (load_accounts()'s): its stand-in alone, with
+    no list on disk, is no list; else that list is the list."""
+    alone = (len(accounts) == 1 and accounts[0].get("name") == DEFAULT_KEY and not accounts[0].get("config_dir")
+             and read_accounts_file()[0] == [])
+    return label_of(name, [] if alone else accounts)
+
+
+def key_of(name, listed=...):
+    """The key a stored or typed account name stands for: DEFAULT_KEY for
+    LEGACY_KEY where there is no list of accounts (label_of()'s `listed`),
+    as the stand-in was named before; else the name as it is."""
+    if listed is ...:
+        listed = read_accounts_file()[0]
+    return DEFAULT_KEY if name == LEGACY_KEY and listed == [] else name
+
+
+def legacy_limits(limits: dict, listed=...) -> dict:
+    """state.json's limited_until with the default sign-in's limit recorded
+    under LEGACY_KEY, where there is no list, read as DEFAULT_KEY's too (the
+    later of the two), so a limit recorded before the rename is kept. The
+    old key stays: a panel chat's relay started before an update still
+    reads and forgets its own limit by it."""
+    old = as_number(limits.get(LEGACY_KEY))
+    if old is None:
+        return limits
+    if listed is ...:
+        listed = read_accounts_file()[0]
+    if listed != []:
+        return limits
+    limits[DEFAULT_KEY] = max(old, as_number(limits.get(DEFAULT_KEY)) or 0)
+    return limits
+
+
+def limit_keys(name: str, listed=...) -> list[str]:
+    """The keys `name`'s recorded limit may be under in state.json: the
+    default sign-in's under LEGACY_KEY too, where there is no list
+    (legacy_limits()), so forgetting it forgets both."""
+    if listed is ...:
+        listed = read_accounts_file()[0]
+    return [name, LEGACY_KEY] if name == DEFAULT_KEY and listed == [] else [name]
 
 
 def load_accounts() -> tuple:
@@ -960,17 +1041,18 @@ def update_state(change) -> dict:
     """load, change, write state.json under its lock: without it a relay
     and a terminal longhaul recording limits at once could each wipe the other's."""
     with locked("state"):
-        state = load_state()
+        state = load_state(raw=True)  # as written: legacy_limits() reads, and never writes, its key
         change(state)
         write_json(LONGHAUL_HOME / "state.json", state)
     return state
 
 
-def load_state() -> dict:
+def load_state(raw: bool = False) -> dict:
     """Never raises: run() reads it outside any try, so a state.json a crash
     or a hand left as a list, a string or junk is an empty state, said in
     one log line that names the file and never its content; the next write
-    replaces the file."""
+    replaces the file. Its limits are read as legacy_limits() reads them,
+    unless `raw`: update_state() writes back the keys as they were."""
     path = LONGHAUL_HOME / "state.json"
     state = read_json(path)
     if not isinstance(state, dict):
@@ -979,7 +1061,8 @@ def load_state() -> dict:
         state = {}
     elif "limited_until" in state and not isinstance(state["limited_until"], dict):
         log(f"limited_until in {home_path(str(path))} is not an object; no account is at a limit until the next write")
-    state["limited_until"] = dict_at(state, "limited_until")
+    limits = dict_at(state, "limited_until")
+    state["limited_until"] = limits if raw else legacy_limits(limits)
     return state
 
 
@@ -1494,6 +1577,8 @@ def last_account(sid: str | None, accounts: list[dict]) -> str | None:
         return None
     found = read_json(USAGE_DIR / "sessions" / f"{sid}.json")
     name = found.get("account") if isinstance(found, dict) else None
+    if name and not any(a.get("name") == name for a in accounts):
+        name = key_of(name)  # 0.3.20 noted the stand-in of no list as Max
     return name if name and any(a.get("name") == name for a in accounts) else None
 
 
@@ -2663,8 +2748,12 @@ def run(opts) -> int:
     live = LiveSettings(accounts, mode, None if getattr(opts, "switch", None) or os.environ.get("LONGHAUL_SWITCH")
                         else saved_switch, files_at_start, "terminal")
     names = [a["name"] for a in accounts]
+    if opts.account:  # `--account Max` named the stand-in of no list in 0.3.20, and still does
+        opts.account = key_of(opts.account)
     if opts.account and opts.account not in names:
-        say(f"no account called {opts.account}; the accounts are {', '.join(names)}")
+        say(f"no account called {opts.account}; " + (f"the accounts are {', '.join(names)}" if read_accounts_file()[0]
+                                                     else f"there is no list of accounts, only the {DEFAULT_LABEL} "
+                                                          "(~/.claude): `longhaul add NAME EMAIL` adds one"))
         return 2
     # An account restricted to other repositories is never used here: an
     # explicit --account that contradicts the policy fails loudly (Q1), and
@@ -2956,7 +3045,7 @@ def run(opts) -> int:
         elif chosen:
             pass  # said above
         elif stay:
-            say(f"{resume[:8]} last ran on {stay}; with switching set to {mode} it starts there "
+            say(f"{resume[:8]} last ran on {label_in(stay, accounts)}; with switching set to {mode} it starts there "
                 "(use --account to choose, --switch auto to let longhaul pick)")
         else:
             # Said here, not only logged: a short id several transcripts match
@@ -3001,15 +3090,15 @@ def run(opts) -> int:
                 reason = f"{stay} was at its limit until {clock(resets)}, and you said yes to {names[elsewhere]}"
                 idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
             elif resets + RESET_MARGIN > time.time():
-                what, waiting = waiting or (f"{stay} is at its limit, and with switching set to {mode} "
-                                            "the conversation stays on it (or start it with --account NAME)"), None
+                what, waiting = waiting or (f"{label_in(stay, accounts)} is at its limit, and with switching set to "
+                                            f"{mode} the conversation stays on it (or start it with --account NAME)"), None
                 lifted = limit_gone([stay])
                 if not wait_until(resets + RESET_MARGIN, what, lambda: bool(refresh()) or lifted()):
                     return 0
                 continue
             elif not signed_in_as_expected(accounts[names.index(stay)]):
-                say(f"{stay} is not signed in as expected, and with switching set to {mode} longhaul does not move "
-                    "the conversation by itself. Run `longhaul status`, then `longhaul setup`.")
+                say(f"{label_in(stay, accounts)} is not signed in as expected, and with switching set to {mode} "
+                    "longhaul does not move the conversation by itself. Run `longhaul status`, then `longhaul setup`.")
                 return 1
             else:
                 idx, until, chosen = names.index(stay), None, True
@@ -3022,7 +3111,7 @@ def run(opts) -> int:
                 # Said, not only picked: in the owner's live test (2026-10-26)
                 # `--account personal-2` at its weekly limit started on
                 # personal-1 with no word of why.
-                say(f"{names[i]} is at its limit until {clock(resets)}; picking an account")
+                say(f"{label_in(names[i], accounts)} is at its limit until {clock(resets)}; picking an account")
             elif signed_in_as_expected(accounts[i]):
                 idx, until, chosen = i, None, True
                 reason = "chosen with longhaul use" if names[i] == use_choice else "asked for with --account"
@@ -3057,7 +3146,8 @@ def run(opts) -> int:
         if left and acct["name"] != left[0]:
             # The carry-on was for the account waited for, which the chat no
             # longer stays on: it names the move instead.
-            prompt = CARRY_ON.format(old=left[0], kind=left[1], new=acct["name"])
+            prompt = CARRY_ON.format(old=label_in(left[0], accounts), kind=left[1],
+                                     new=label_in(acct["name"], accounts))
         left = None
         prepare(acct)
 
@@ -3222,7 +3312,9 @@ def run(opts) -> int:
                              seen=readings(accounts), top=top)
             new = accounts[nxt]["name"]
             every = "every account allowed here" if denied else "every account"
-            msg = f"{acct['name']} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])})."
+            # As people see them (label_of()): the default sign-in by that name, in what is said and sent.
+            old_shown, new_shown = label_in(acct["name"], accounts), label_in(new, accounts)
+            msg = f"{old_shown} hit its {w.limit['kind']} limit (resets {clock(w.limit['resets_at'])})."
             # The person at this terminal is the front end, so consent is
             # given. With every account at its limit there is nowhere to
             # move, so nothing is asked. An account signed in as someone
@@ -3260,9 +3352,9 @@ def run(opts) -> int:
                 notify(msg)
             else:  # "ask" without a yes, or "never": the reset, on this account
                 prompt = (CARRY_ON_AFTER_WAIT if wait else CARRY_ON_SAME).format(
-                    old=acct["name"], kind=w.limit["kind"], new=acct["name"], every=every)
+                    old=old_shown, kind=w.limit["kind"], new=old_shown, every=every)
                 carry = (acct["name"], w.limit["kind"])
-                then = f"{acct['name']} hit its {w.limit['kind']} limit, and it carried on there at its reset"
+                then = f"{old_shown} hit its {w.limit['kind']} limit, and it carried on there at its reset"
                 log(msg)  # the wait at the top of the loop says it, with the time
             if asked:  # the wait this question was about, for start_elsewhere(): asked once
                 asked_for = (stay, state["limited_until"].get(stay, 0))
@@ -3443,7 +3535,7 @@ def chat_label(on: list[dict], folder: str) -> str:
     if on:
         return on[0]["name"]
     if os.path.realpath(folder) == os.path.realpath(DEFAULT_CONFIG):
-        return "the default sign-in (~/.claude)"
+        return f"the {DEFAULT_LABEL} (~/.claude)"
     return f"an account Longhaul doesn't know ({home_path(folder)})"
 
 
@@ -3685,7 +3777,7 @@ def save_label(sid: str, label: str) -> None:
 # never colour alone; the update word last. hooks/status-line.cases.ts holds
 # the states and their lines, and both test suites check every one.
 STATUS_RESET_AT = 70  # % of a window from which its reset is shown
-STATUS_DEFAULT = "default sign-in"  # the line's name for ~/.claude's own sign-in, "main" (the review's Q11)
+STATUS_DEFAULT = DEFAULT_LABEL  # the line's name for ~/.claude's own sign-in, "main" in the files (the review's Q11)
 
 
 def half_up(value: float) -> int:
@@ -3765,8 +3857,8 @@ def status_name(name: str, entry: dict) -> str:
     """What the line calls the account a chat runs on (session_account()'s
     name and entry): STATUS_DEFAULT for "main", ~/.claude's own sign-in
     when no account of Longhaul's is on it, which no list names; else the
-    name."""
-    return STATUS_DEFAULT if name == "main" and "config_dir" not in entry else name
+    name, a listed account named main too (label_of())."""
+    return label_of(name, None if "unreadable" in entry else ...)
 
 
 def line_window(part):
@@ -3836,27 +3928,31 @@ def status_event(sid, name: str, record: dict, now: float):
     account (USES), after this turn when a relay took it, else at its next
     open; a move within STATUS_MOVED_FOR (the record's moved_from and
     moved_at, record_usage()'s). None for none, and for an id that is not a
-    plain one. Only reads."""
+    plain one. `name` is the key the files hold; each account the event
+    names is as people see it (label_of()), as the line's own is, so the
+    default sign-in is never another account "on" it. Only reads."""
     if not (isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)):
         return None
+    listed = read_accounts_file()[0]
     q = read_json(chat_file(QUESTIONS, sid))
     if isinstance(q, dict) and q.get("chat") == sid and isinstance(q.get("to"), str) and q["to"]:
         pid = q.get("relay_pid")
         if q.get("kind") in ("move", "first_reset") and isinstance(pid, int) and not isinstance(pid, bool) \
                 and pid > 0 and pid_alive(pid):
             if q["kind"] == "move":
-                return {"kind": "question", "to": q["to"]}
+                return {"kind": "question", "to": label_of(q["to"], listed)}
             at = next((v for v in (as_number(q.get(k)) for k in ("carries_on_at", "to_resets_at", "resets_at"))
                        if v is not None), None)
             if at is not None:
-                return {"kind": "question", "to": q["to"], "at": clock(at)}
+                return {"kind": "question", "to": label_of(q["to"], listed), "at": clock(at)}
     w = read_json(chat_file(WAITS, sid))
     until = as_number(w.get("until")) if isinstance(w, dict) else None
     if until is not None and w.get("chat") == sid and isinstance(w.get("account"), str) and w["account"] \
             and until + STATUS_WAIT_STALE >= now:
-        return {"kind": "waiting", "at": clock(until), "on": w["account"]}
+        return {"kind": "waiting", "at": clock(until), "on": label_of(w["account"], listed)}
     # state.json read as load_state() reads it, without its line about a junk file: this runs at every update.
-    limited = as_number(dict_at(read_json(LONGHAUL_HOME / "state.json"), "limited_until").get(name))
+    limits = legacy_limits(dict_at(read_json(LONGHAUL_HOME / "state.json"), "limited_until"), listed)
+    limited = as_number(limits.get(name))
     if limited is not None and limited > now:
         return {"kind": "stopped", "until": clock(limited)}
     refused = last_refusal(sid)
@@ -3865,15 +3961,15 @@ def status_event(sid, name: str, record: dict, now: float):
         return {"kind": "refused", "where": refused[1], "by": refused[2]}
     use = read_json(chat_file(USES, sid))
     chosen = choice_of(use, sid, now)
-    if chosen and chosen != name:
+    if chosen and key_of(chosen, listed) != name:
         pid = use.get("relay_pid")
         taken = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and pid_alive(pid)
-        return {"kind": "pending", "to": chosen, "when": "turn" if taken else "open"}
+        return {"kind": "pending", "to": label_of(chosen, listed), "when": "turn" if taken else "open"}
     moved_at, moved_from = as_number(record.get("moved_at")), record.get("moved_from")
     # No lower bound: "at" is rounded to a tenth of a second, so it may be a hair after `now`.
     if moved_at is not None and now - moved_at < STATUS_MOVED_FOR and isinstance(moved_from, str) \
             and moved_from and record.get("account") == name:
-        return {"kind": "moved", "from": moved_from, "at": clock(moved_at)}
+        return {"kind": "moved", "from": label_of(moved_from, listed), "at": clock(moved_at)}
     return None
 
 
@@ -3926,7 +4022,7 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
             # A reading on another account than the last one: the chat moved
             # (the line says so for STATUS_MOVED_FOR, status_event()); kept in
             # the record alone, while it stays there, never in the ledger.
-            before = last.get("account")
+            before = key_of(last.get("account"))  # 0.3.20 noted the default sign-in as Max: the same sign-in
             moved = ({"moved_from": before, "moved_at": row["at"]} if isinstance(before, str) and before
                      and before != acct else
                      {k: last[k] for k in ("moved_from", "moved_at") if k in last} if before == acct else {})
@@ -4302,7 +4398,9 @@ def usage(opts) -> int:
     if problem:  # said, and the readings listed as with no file: this only shows them
         print(unreadable_text(problem))
     print("Allowance (latest reading per account)")
-    for name in [a["name"] for a in accounts or [STAND_IN]] + ["main"]:
+    listed = read_accounts_file()[0]
+    # Each once: the stand-in of no list is DEFAULT_KEY, the status line's own key for ~/.claude.
+    for name in dict.fromkeys([a["name"] for a in accounts or [STAND_IN]] + [DEFAULT_KEY]):
         u = read_json(USAGE_DIR / f"{name}.json")
         if not u:
             continue
@@ -4314,7 +4412,7 @@ def usage(opts) -> int:
             elif part.get("used_percentage") is not None:
                 parts.append(f"{label} {part['used_percentage']}% (resets {clock(part['resets_at'])})")
         ago = int((now - u.get("at", now)) / 60)
-        print(f"  {name:<5} {'   '.join(parts)}   [read {ago} min ago]")
+        print(f"  {label_of(name, listed):<5} {'   '.join(parts)}   [read {ago} min ago]")
     codex = codex_usage_line(codex_reading(), now)  # Codex's, from its rollouts (X2)
     if codex:
         print(codex)
@@ -4331,10 +4429,11 @@ def usage(opts) -> int:
         span = f"{clock(t['first'])}–{dt.datetime.fromtimestamp(t['last']):%H:%M}"
         share = f"≈{t['five']}%" if t["five"] else "-"
         cost = f"${t['cost']:.2f}"
-        print(f"  {task_name(sid, labels):<42} {acct:<7} {cost:>8} {share:>9}   {span}")
+        print(f"  {task_name(sid, labels):<42} {label_of(acct, listed):<7} {cost:>8} {share:>9}   {span}")
     by_acct: dict = {}
     for (_, acct), t in totals.items():
-        by_acct[acct] = by_acct.get(acct, 0) + t["cost"]
+        shown_as = label_of(key_of(acct, listed), listed)
+        by_acct[shown_as] = by_acct.get(shown_as, 0) + t["cost"]
     print("  " + "   ".join(f"{a}: ${c:.2f}" for a, c in sorted(by_acct.items())))
     return 0
 
@@ -13754,7 +13853,8 @@ def wrap(argv: list[str]) -> int:
                 # The terminal says this and names --account, which the panel
                 # has not: without it the chat got Claude's own limit error and
                 # no word of why (review, Sprint 5).
-                notify(f"{accounts[idx]['name']} is at its limit until {clock(until)}; the chat stays on it "
+                notify(f"{label_in(accounts[idx]['name'], accounts)} is at its limit until {clock(until)}; the chat "
+                       "stays on it "
                        f"(switching is {mode})")
         if idx is None:
             idx, _ = choose_for_panel(accounts, binary, wrong=set(denied), top=top, reasons=reasons)
@@ -14437,7 +14537,8 @@ class Relay:
         here, limit = self.accounts[self.idx], self.watch.limit
         log(f"panel: a limit stop in {(self.watch.sid or '?')[:8]}'s file came from another process of the same chat, "
             f"not this panel's claude on {here['name']}: left alone (the chat is open twice?)")
-        notify(f"This chat seems open twice: another copy of it hit a limit. This panel's stays on {here['name']}; "
+        notify("This chat seems open twice: another copy of it hit a limit. This panel's stays on "
+               f"{label_in(here['name'], self.accounts)}; "
                "close the other copy (a terminal `claude --resume`?), as two copies write the same conversation.")
         if limit.get("uuid"):
             self.watch.handled.add(limit["uuid"])
@@ -14553,8 +14654,9 @@ class Relay:
             # The log line is the one it was (the display matches log lines);
             # schedule() logs the wait, and the notification says it.
             self.schedule(self.idx, limit["resets_at"], "never", limit, since)
-            stays = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
-                     f"switching is {self.mode}, so the chat stays on {here['name']}")
+            shown = label_in(here["name"], self.accounts)
+            stays = (f"{shown} hit its {limit['kind']} limit (resets {clock(limit['resets_at'])}); "
+                     f"switching is {self.mode}, so the chat stays on {shown}")
             then = f" and carries on there at {clock(self.carry['until'])}" if self.carry else ""
             fix = f". To let longhaul move it, {panel_switch_fix()}."
             log(f"panel: {stays}{fix}")
@@ -14871,23 +14973,25 @@ class Relay:
             log(f"question: could not ask in {sid} ({e!r}); the chat stays as it is")
             return
         self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt, "reopened": reopened}
+        # Said as people see them (label_in()); the log and the question keep the keys.
+        shown, there_shown = label_in(here["name"], self.accounts), label_in(there, self.accounts)
         if until:
             log(f"question: asked {sid} ({q['id']}) to carry on on {there} at {clock(until)} "
                 f"({self.every()} is at its limit)")
-            said = (f"{self.every().capitalize()} is at its limit. {there} resets first, at {clock(until)}. "
+            said = (f"{self.every().capitalize()} is at its limit. {there_shown} resets first, at {clock(until)}. "
                     "Carry on there then?")
         elif reopened:
             log(f"question: asked {sid} ({q['id']}) at its reopen to move from {here['name']} to {there} "
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)}); its messages wait for the answer")
-            said = (f"{here['name']} is at its {limit['kind']} limit until {clock(resets)}. "
-                    f"Move this reopened chat to {there}?")
+            said = (f"{shown} is at its {limit['kind']} limit until {clock(resets)}. "
+                    f"Move this reopened chat to {there_shown}?")
         else:
             log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} "
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
-            said = (f"{here['name']} hit its {limit['kind']} limit (resets {clock(resets)}). "
-                    f"Move this chat to {there} and carry on?")
+            said = (f"{shown} hit its {limit['kind']} limit (resets {clock(resets)}). "
+                    f"Move this chat to {there_shown} and carry on?")
         then = ("your messages wait for the answer, and with no answer nothing moves" if reopened and not until
-                else f"with no answer the chat stays on {here['name']}")
+                else f"with no answer the chat stays on {shown}")
         # The README's way, longhaul switch auto, unless another place wins over config.json (panel_switch_fix()).
         notify(f"{said} Answer in Longhaul's pane in the panel; {then}. To move without asking, {panel_switch_fix()}.")
 
@@ -15182,7 +15286,8 @@ class Relay:
             log(f"wait: could not write {sid}'s wait ({e!r}); it carries on all the same")
         log(f"wait: {sid} carries on on {name} at {clock(self.carry['until'])} ({why})")
         if why == "auto":
-            notify(f"{self.every().capitalize()} is at its limit; the panel chat carries on with {name} at "
+            notify(f"{self.every().capitalize()} is at its limit; the panel chat carries on with "
+                   f"{label_in(name, self.accounts)} at "
                    f"{clock(self.carry['until'])}.")
 
     def carry_on(self) -> None:
@@ -15235,9 +15340,10 @@ class Relay:
         if swap:
             self.switch(limit, to=to)
         elif to == self.idx:
-            self.say_to_claude(CARRY_ON_SAME.format(old=here["name"], kind=limit["kind"], new=name))
+            shown = label_in(name, self.accounts)  # the default sign-in by that name, in the chat and the notification
+            self.say_to_claude(CARRY_ON_SAME.format(old=shown, kind=limit["kind"], new=shown))
             log(f"wait: {sid} carried on on {name} ({why})")
-            notify(f"{name} has reset; the panel chat carries on with it.")
+            notify(f"{shown} has reset; the panel chat carries on with it.")
         elif self.move_to(to, CARRY_ON_AFTER_WAIT.format(old=here["name"], kind=limit["kind"], new=name,
                                                          every=self.every())):
             log(f"wait: {sid} carried on on {name}, moved from {here['name']} ({why})")
@@ -17422,7 +17528,8 @@ def status(opts) -> int:
     accounts, problem = load_accounts()
     if problem:  # said, no stand-in shown in the accounts' place, and the rest shown; exit 2
         print(unreadable_text(problem))
-    accounts_listed = bool(read_accounts_file()[0])  # the stand-in for no file has no rule to show
+    listed = read_accounts_file()[0]
+    accounts_listed = bool(listed)  # the stand-in for no file has no rule to show
     failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), sign_in_names())
     for acct in accounts or []:
         a = auth_status(acct)
@@ -17430,15 +17537,19 @@ def status(opts) -> int:
         limit = f"at its limit until {clock(until)}" if until > now else "available"
         who = (f"{a.get('email')} ({a.get('subscriptionType')})" if a.get("loggedIn")
                else f"could not check ({a.get('why')})" if a.get("unknown") else "NOT signed in")
-        print(f"{acct['name']:<6} {who:<44} {limit}   [{config_of(acct)}]")
+        print(f"{label_of(acct['name'], listed):<6} {who:<44} {limit}   [{config_of(acct)}]")
+        # The stand-in of no list is the only sign-in, so `clear` alone
+        # forgets its limit; its name is never shown (the UX review's Q11).
+        named = f" {acct['name']}" if accounts_listed else ""
         if until > now:
-            print(f"       reset before then? `longhaul clear {acct['name']}` forgets the recorded limit")
+            print(f"       reset before then? `longhaul clear{named}` forgets the recorded limit")
         want = acct.get("email")
         if want and (a.get("email") or "").lower() != want.lower():
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
         when = sign_in_failed_at(failed.get(acct["name"]), read_json(USAGE_DIR / f"{acct['name']}.json"))
         if when is not None:  # a chat's turn ended on it (the StopFailure hook), and no reply has come since
-            print(f"       its sign-in failed at {clock(when)}: run longhaul setup {acct['name']} --relogin")
+            print(f"       its sign-in failed at {clock(when)}: "
+                  + (f"run longhaul setup {acct['name']} --relogin" if accounts_listed else DEFAULT_RELOGIN))
         allowed = repositories_of(acct)
         if allowed is None:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
@@ -17577,7 +17688,7 @@ def status_checks(accounts: list[dict]) -> list:
 
 
 def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, failed: dict,
-                   accounts: list[dict], allowed_here: list | None = None) -> dict:
+                   accounts: list[dict], allowed_here: list | None = None, listed=...) -> dict:
     """One account's entry in the screen's object, from its auth_status()
     answer `a`. A check that could not say leaves signed_in and as_expected
     null, never false: that is not "signed out"; one not run (NOT_CHECKED,
@@ -17600,7 +17711,10 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     when its last usage reading was taken (the "at" record_usage() writes
     in USAGE_DIR), in epoch seconds, kept after the windows it read have
     reset; null for no reading, one that is not an object, or an "at" that
-    is not a number."""
+    is not a number. label (the UX review's Q11) is what a person reads for
+    it (label_of(), of `listed`, read_accounts_file()'s list): its name, or
+    "default sign-in" for the stand-in of no list, whose name stays the
+    key commands take; last, so the screen's order stands."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -17635,6 +17749,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "preferred": None if liked is None else [home_path(p) for p in liked],
         "use_here": use_here,
         "reading_at": as_number(reading.get("at")) if isinstance(reading, dict) else None,
+        "label": label_of(acct["name"], listed),
     }
 
 
@@ -17697,7 +17812,7 @@ def status_json(check: bool = True) -> int:
         except OSError:  # the folder it runs in was removed: no "here" to say
             pass
     checks = status_checks(accounts) if check else [NOT_CHECKED] * len(accounts)
-    rows = [status_account(acct, a, state, now, i == ours, failed, accounts, allowed_here)
+    rows = [status_account(acct, a, state, now, i == ours, failed, accounts, allowed_here, read_accounts_file()[0])
             for i, (acct, a) in enumerate(zip(accounts, checks))]
     try:
         mode, mode_problem = switch_mode(), None
@@ -17946,11 +18061,28 @@ ACTIVITY_PATTERNS = [(max(re.split(r"\{\w+\}", shape), key=len), activity_regex(
                      for shape, make, _ in ACTIVITY_LINES]
 
 
-def activity_event(text: str):
+def shown_names(text: str, listed=...) -> str:
+    """`text`, Longhaul's own words around account names, with each name
+    that keys the default sign-in (label_of(): DEFAULT_KEY, and LEGACY_KEY
+    where there is no list) as people see it. The log keys accounts by
+    name, as the files do, so the default sign-in is "main" there, and
+    "Max" in a line of 0.3.20's. A name is a whole run of a name's
+    characters; a part of a folder (after a /) is none."""
+    if listed is ...:
+        listed = read_accounts_file()[0]
+    keys = [k for k in (DEFAULT_KEY, LEGACY_KEY) if label_of(k, listed) == DEFAULT_LABEL]
+    if not keys:
+        return text
+    return re.sub(r"(?<![\w/.+-])(?:" + "|".join(keys) + r")(?![\w/+-])", DEFAULT_LABEL, text)
+
+
+def activity_event(text: str, listed=...):
     """The event a log line's text (its stamp taken off) makes: {"chat":
     its first 8 characters or None, "what", "why", "account"}; None for a
     line no shape takes. A value that is not text Longhaul writes (control
-    characters) is shown as shown() shows it."""
+    characters) is shown as shown() shows it. The default sign-in is named
+    so in what and why (shown_names(), of `listed`, read_accounts_file()'s
+    list); "account" is its key, the name the files and commands use."""
     for piece, pattern, make in ACTIVITY_PATTERNS:
         if piece not in text:
             continue
@@ -17960,8 +18092,12 @@ def activity_event(text: str):
         g = m.groupdict()
         chat = g.get("chat") or g.get("new")
         found = make(g)
-        return {"chat": None if chat in (None, "a new chat") else chat[:8], "what": shown(found["what"]),
-                "why": shown(found["why"]), "account": found["account"], "where": g.get("where")}
+        if listed is ...:
+            listed = read_accounts_file()[0]
+        account = key_of(found["account"], listed) if found["account"] is not None else None
+        return {"chat": None if chat in (None, "a new chat") else chat[:8],
+                "what": shown(shown_names(found["what"], listed)), "why": shown(shown_names(found["why"], listed)),
+                "account": account, "where": g.get("where")}
     return None
 
 
@@ -17992,7 +18128,7 @@ def activity_events(days: float | None = None, holding: str | None = None) -> li
     looked for before any is parsed."""
     log_file = LONGHAUL_HOME / "longhaul.log"
     first = (dt.date.today() - dt.timedelta(days=max(1, int(days)) - 1)).isoformat() if days else ""
-    found = []
+    found, listed = [], read_accounts_file()[0]  # read once: which name is the default sign-in's
     for path in (log_file.with_name(log_file.name + ".1"), log_file):
         for line in log_tail_lines(path):
             if line[:10] < first or (holding and holding not in line):
@@ -18000,7 +18136,7 @@ def activity_events(days: float | None = None, holding: str | None = None) -> li
             stamp = LOG_STAMP.match(line)
             if stamp is None:
                 continue
-            got = activity_event(line[stamp.end():])
+            got = activity_event(line[stamp.end():], listed)
             if got is None:
                 continue
             try:
@@ -18103,10 +18239,11 @@ def forget_limit(name: str, why: str, upto: float | None = None):
     found = []
 
     def forget(state):
-        until = as_number(state["limited_until"].get(name))
+        until = as_number(legacy_limits(dict(state["limited_until"])).get(name))  # under its 0.3.20 key too
         if until is None or until <= time.time() or (upto is not None and until > upto + KIND_SLACK):
             return
-        del state["limited_until"][name]
+        for key in limit_keys(name):  # the default sign-in's under its 0.3.20 name too, which would bring it back
+            state["limited_until"].pop(key, None)
         found.append(until)
     try:
         update_state(forget)
@@ -18169,21 +18306,29 @@ def clear(opts) -> int:
     within a few seconds because of it (carry_text(); Relay.tend_lifted()),
     or says none does (UX review Q7)."""
     name, now = getattr(opts, "name", None), time.time()
-    recorded = {n: u for n, u in load_state()["limited_until"].items() if (as_number(u) or 0) > now}
+    listed = read_accounts_file()[0]
+    # The default sign-in's limit under its 0.3.20 name too is one limit,
+    # under its key (legacy_limits()), forgotten under both (limit_keys()).
+    recorded = {n: u for n, u in load_state()["limited_until"].items()
+                if (as_number(u) or 0) > now and key_of(n, listed) == n}
     if name:
         accounts, _problem = load_accounts()
         names = [a["name"] for a in accounts or []] + [n for n in recorded]
-        match = next((n for n in names if n.lower() == name.lower()), None)
+        typed = key_of(name, listed)  # `clear Max` still forgets the default sign-in's, as before
+        match = next((n for n in names if n.lower() == typed.lower()), None)
         if match is None:
-            say(f"no account called {name}; the accounts are {', '.join(dict.fromkeys(names))}")
+            say(f"no account called {name}; the accounts are "
+                + ", ".join(dict.fromkeys(label_of(n, listed) for n in names)))
             return 2
+        shown = label_of(match, listed)
         if match not in recorded:
-            say(f"{match} has no recorded limit")
+            say(f"{shown} has no recorded limit")
             return 0
-        update_state(lambda state: state["limited_until"].pop(match, None))
+        keys = limit_keys(match, listed)
+        update_state(lambda state: [state["limited_until"].pop(k, None) for k in keys])
         log(f"clear: {match}'s recorded limit forgotten (it was until {clock(recorded[match])})")
-        say(f"forgot {match}'s recorded limit (it was until {clock(recorded[match])}); "
-            + carry_text([match], now, "it"))
+        say(f"forgot {shown}'s recorded limit (it was until {clock(recorded[match])}); "
+            + carry_text(keys, now, "it"))
         return 0
     update_state(lambda state: state.update(limited_until={}))
     if not recorded:
@@ -18191,7 +18336,9 @@ def clear(opts) -> int:
         return 0
     each = ", ".join(f"{n} (it was until {clock(u)})" for n, u in recorded.items())
     log(f"clear: the recorded limits forgotten: {each}")
-    say(f"forgot the recorded limits: {each}; " + carry_text(list(recorded), now, "it" if len(recorded) == 1 else "one"))
+    shown = ", ".join(f"{label_of(n, listed)} (it was until {clock(u)})" for n, u in recorded.items())
+    say(f"forgot the recorded limits: {shown}; "
+        + carry_text([k for n in recorded for k in limit_keys(n, listed)], now, "it" if len(recorded) == 1 else "one"))
     return 0
 
 
@@ -18344,8 +18491,8 @@ def repair_state(raw: bytes, now: float) -> list:
             log(f"repair: {name}'s recorded limit forgotten "
                 + "(it was not a time)")
             return None
-        found.append(repair_finding(f"limit:{name}", f"{name}: its recorded usage limit in state.json is not a time, "
-                                                     "which stops Longhaul deciding where a chat runs",
+        found.append(repair_finding(f"limit:{name}", f"{label_of(name)}: its recorded usage limit in state.json is not "
+                                                     "a time, which stops Longhaul deciding where a chat runs",
                                     "forget it", forget))
     return found
 
@@ -18414,11 +18561,12 @@ def repair_waits(now: float) -> list:
                                         "remove it", repair_files([(path, raw)], f"waits/{path.name}, not a wait, "
                                                                                  "removed")))
             continue
-        on = f"on {shown(account, 60)} at {clock(until)}"
+        on = f"on {shown(account, 60)} at {clock(until)}"  # the log's, keyed as the files are
+        said = f"on {shown(label_of(account), 60)} at {clock(until)}"  # what a person reads
         if until + WAIT_STALE < now:
-            what, why = f"Chat {sid[:8]}'s carry-on {on} is past, and no relay carried it on", "it was past"
+            what, why = f"Chat {sid[:8]}'s carry-on {said} is past, and no relay carried it on", "it was past"
         elif "relay_pid" in w and relay_ended(w["relay_pid"]):
-            what, why = f"Chat {sid[:8]} waits to carry on {on}, and its relay is gone", "its relay was gone"
+            what, why = f"Chat {sid[:8]} waits to carry on {said}, and its relay is gone", "its relay was gone"
         else:
             continue
         found.append(repair_finding(f"wait:{sid}", what, "cancel the wait; nothing is sent",
@@ -19236,9 +19384,9 @@ def doctor_accounts(quick: bool = False) -> dict:
         return doctor_result(unreadable_text(problem), mark="bad",
                              step=f"`longhaul repair` puts back its last good copy, or fix or remove {where}" if back
                              else f"fix or remove {where}")
-    if not accounts:
-        return doctor_result("one subscription, on ~/.claude (no accounts.json); `longhaul add` adds another",
-                             kind="skip")
+    if not accounts:  # the default sign-in, by that name (the UX review's Q11), and its folder
+        return doctor_result(f"one subscription: the {DEFAULT_LABEL} ({home_path(str(DEFAULT_CONFIG))}), with no "
+                             "accounts.json; `longhaul add` adds another", kind="skip")
     items = []
     for a in accounts:
         folder = home_path(str(config_of(a)))
@@ -19452,7 +19600,9 @@ def doctor_chats(processes=None) -> dict:
         value = chat.get("config_dir")
         folder = os.path.abspath(doctor_expand(value)) if value else str(DEFAULT_CONFIG)
         on = accounts_on(accounts, folder)
-        label = chat_label(on, folder) if accounts else home_path(folder)
+        # With no list, ~/.claude is the default sign-in, as chat_label() names it beside one.
+        label = (chat_label(on, folder) if accounts or os.path.realpath(folder) == os.path.realpath(DEFAULT_CONFIG)
+                 else home_path(folder))
         where = home_path(cwd) if isinstance(cwd, str) else "folder unknown"
         # Its own conversation when the record names it: with two chats in one
         # folder, -c could resume the other (2026-10-25).

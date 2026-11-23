@@ -65,6 +65,12 @@ const PANE = 'longhaul-accounts'
 const TITLE = 'Longhaul accounts'
 const OPEN = { id: PANE, title: TITLE, focus: true, closeOnEscape: true } as const
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$/ // what longhaul.py takes as a name, and never an option
+// ~/.claude's own sign-in when no list of Longhaul's names it (the UX
+// review's Q11), as longhaul.py's DEFAULT_LABEL: never a name, as it has a
+// space. Its key, the name each command takes, is "main", and was "Max"
+// in a 0.3.20 record.
+const DEFAULT_LABEL = 'default sign-in'
+const NO_LIST = "Claude Code's own sign-in: Longhaul has no list of accounts yet. + Add account adds a second one."
 const MODES = ['ask', 'auto', 'never'] as const
 // Each mode in the glossary's words (the UX review's §4.8), by the word
 // `longhaul switch` takes: what happens at a limit, where "never" read as
@@ -232,7 +238,8 @@ function clean(s: any): LonghaulStatus {
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
       ...(typeof a.use_here === 'string' ? { use_here: a.use_here } : {}),
       ...(Array.isArray(a.preferred) ? { preferred: strs(a.preferred) } : a.preferred === null ? { preferred: null } : {}),
-      reading_at: num(a.reading_at), folder: str(a.folder) ?? '', this_chat: a.this_chat === true }))
+      reading_at: num(a.reading_at), folder: str(a.folder) ?? '', this_chat: a.this_chat === true,
+      ...(typeof a.label === 'string' && a.label ? { label: a.label } : {}) }))
   const here = s.here && typeof s.here === 'object' && typeof s.here.folder === 'string'
     ? { folder: s.here.folder as string, may_use: strs(s.here.may_use) ?? [] } : null
   const chat = s.chat && typeof s.chat === 'object' && typeof s.chat.id === 'string'
@@ -245,6 +252,17 @@ function clean(s: any): LonghaulStatus {
     switch_source: (SOURCES as readonly unknown[]).includes(s.switch_source) ? s.switch_source : null,
     panel_switch_source: (PANEL_SOURCES as readonly unknown[]).includes(s.panel_switch_source) ? s.panel_switch_source : null,
     at_limit: str(s.at_limit) }
+}
+
+// What a person reads for an account the record or a question names (the
+// UX review's Q11): its row's label, the default sign-in for ~/.claude's
+// own sign-in when no list names it; the name for a row an older
+// longhaul.py gave, with no label, and for a name no row has. The name stays
+// the key each command takes.
+function shownName(s: LonghaulStatus | null | undefined, name: string): string {
+  const row = s?.accounts.find(a => a.name === name)
+  if (row) return row.label || name
+  return s && !s.listed && (name === 'main' || name === 'Max') ? DEFAULT_LABEL : name
 }
 
 // `repair --json` read into what the Troubleshoot page draws: each finding
@@ -557,8 +575,10 @@ const FORGET_ALL = 'Forget all recorded limits'
 const FORGET_ALL_NOTE = 'Use this when claude.ai shows room but Longhaul still waits.'
 
 async function clearOne($: any, name: string): Promise<void> {
-  if (busy || !(await known($, name))) return
-  await act($, { label: `Forget this limit: ${name}`, doing: `Forgetting ${name}'s recorded limit…`,
+  const a = busy ? null : await known($, name)
+  if (!a) return
+  const shown = a.label || name // the default sign-in by that name; `clear` takes its key
+  await act($, { label: `Forget this limit: ${shown}`, doing: `Forgetting ${shown}'s recorded limit…`,
     argv: ['clear', name], timeoutMs: STATUS_TIMEOUT })
 }
 
@@ -725,8 +745,8 @@ function pageOf(asked: LonghaulAccountsPage, status: LonghaulStatus | null, canT
 // minutes. Its folder field, where it has one (Enter there only keeps what
 // is typed), else Back. Never an action: Use, Sign in, a limit forgotten or
 // a folder changed all run at once, and Remove asks with its yes in reach.
-function harmless(a: LonghaulAccount): string {
-  return a.only_in !== null ? 'folder-path' : 'back'
+function harmless(a: LonghaulAccount, listed = true): string {
+  return listed && a.only_in !== null ? 'folder-path' : 'back' // no folder field off the list
 }
 
 // The list line each page is opened from, so going back puts the focus there.
@@ -820,7 +840,7 @@ async function poll($: any, byCommand = false): Promise<void> {
       await update($, askedFor, () => asked.id)
       if (!byCommand) {
         try { await $.ui.open(OPEN) } catch {}
-        try { $.ui.toast(mask(waits(asked)), { timeoutMs: 15000 }) } catch {}
+        try { $.ui.toast(mask(waits(named((await read($, lastRead))?.status, asked))), { timeoutMs: 15000 }) } catch {}
       }
     }
   } catch {} finally { looking = false }
@@ -890,7 +910,7 @@ function questionPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   const q = c.question
   if (!q) return null
-  const { says, labels } = asks(q, c.nowMs)
+  const { says, labels } = asks(named(c.status, q), c.nowMs)
   const mine = c.answer && c.answer.qid === q.id ? c.answer : null
   const runs = mine !== null && mine.ok === null && mine.by === SELF
   const offered = !runs && mine?.ok !== true
@@ -941,12 +961,20 @@ function whyPart($: any, c: Ctx): any {
   const { Text } = c.E
   const chat = c.status?.chat
   if (!chat || !chat.account || !chat.why) return null
-  return <Text>{mask(`This chat: ${chat.account}. Why: ${chat.why}.`)}</Text>
+  return <Text>{mask(`This chat: ${shownName(c.status, chat.account)}. Why: ${chat.why}.`)}</Text>
 }
 
 function waitPart($: any, c: Ctx): any {
   const { Text } = c.E
-  return c.wait ? <Text>{mask(`This chat ${carries(c.wait, c.nowMs)}.`)}</Text> : null
+  return c.wait
+    ? <Text>{mask(`This chat ${carries({ ...c.wait, account: shownName(c.status, c.wait.account) }, c.nowMs)}.`)}</Text>
+    : null
+}
+
+// The question with its accounts as a person reads them (shownName()); its
+// keys stay in the one the answer is checked against.
+function named(s: LonghaulStatus | null | undefined, q: LonghaulQuestion): LonghaulQuestion {
+  return { ...q, from: shownName(s, q.from), to: shownName(s, q.to) }
 }
 
 // What the pane says when Longhaul cannot read the accounts (the UX
@@ -1127,7 +1155,7 @@ function itemsPart($: any, c: Ctx): any {
   const { Box, Text, Button } = c.E
   if (!c.status) return null
   const s = c.status
-  const width = Math.min(24, Math.max(0, ...s.accounts.map(a => mask(String(a.name)).length)))
+  const width = Math.min(24, Math.max(0, ...s.accounts.map(a => mask(shownName(s, String(a.name))).length)))
   const indent = 2 + width + 2 // under the text: the mark and a space, the names, two spaces
   const keys = new Set<string>()
   const items: { key: string | null; head: string; lines: string[]; warn: boolean; more: string[]; open?: () => void }[] = []
@@ -1135,12 +1163,12 @@ function itemsPart($: any, c: Ctx): any {
     const name = String(a.name)
     const key = NAME.test(name) && !keys.has(`row-${name}`) ? `row-${name}` : null
     if (key) keys.add(key)
-    const head = `${mask(name).padEnd(width)}  `
+    const head = `${mask(shownName(s, name)).padEnd(width)}  `
     const { phrases, warn } = summary(a, c.nowMs, c.checking)
     const more = extras(a, c.columns - indent, c.sep)
     items.push({ key, head, lines: flow(2 + head.length, phrases, c.columns, indent, c.sep), warn,
       more: more.length ? flow(indent, more.map(part => [part]), c.columns, indent, c.sep) : [],
-      open: key ? () => void go($, `account:${name}`, harmless(a)) : undefined })
+      open: key ? () => void go($, `account:${name}`, harmless(a, s.listed)) : undefined })
   }
   if (c.canType) {
     const item = (key: string, head: string, open: () => void) => ({ key, head, lines: [], warn: false, more: [], open })
@@ -1439,15 +1467,21 @@ function accountPage($: any, c: Ctx): any {
   const check = a.signed_in === null && a.check_failed ? `could not check: ${mask(String(a.check_failed))}`
     : signedIn(a, c.checking)
   const lines = [use('5-hour', a.five_hour, c.nowMs), use('week', a.week, c.nowMs)].filter(Boolean) as string[]
+  // Not on a list (the stand-in for none): setup, remove, folders and
+  // fallback each take a listed account alone, so none is offered here.
+  const listed = c.status!.listed
+  const shown = shownName(c.status, name)
   return (
     <Box flexDirection="column">
-      <Text bold>{`${mask(name)}${a.this_chat ? ' (this chat)' : ''}`}</Text>
+      <Text bold>{`${mask(shown)}${shown !== name && a.folder ? ` (${mask(a.folder)})` : ''}`
+        + `${a.this_chat ? ' (this chat)' : ''}`}</Text>
       <Text>{unknown(c, [a.plan && mask(a.plan), check].filter(Boolean).join(c.sep))}</Text>
       {typeof a.limited_until === 'number' && <Text color="warning">{limitText(a, c.nowMs)}</Text>}
       {roomNow(a) && <Text>{`room now, seen ${clock(a.reading_at!, c.nowMs)}`}</Text>}
       {lines.map(line => <Text>{line}</Text>)}
       {typeof a.sign_in_failed_at === 'number' && (
-        <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`}</Text>
+        <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`
+          + (listed ? '' : ' Sign in again with /login in Claude Code.')}</Text>
       )}
       {/* Facts, in normal weight: dim is for hints (M8). */}
       <Text>{where(a)}</Text>
@@ -1458,9 +1492,9 @@ function accountPage($: any, c: Ctx): any {
         <Box flexDirection="row" gap={1}>
           {typeof a.limited_until === 'number' && a.use_here !== 'limited'
             && <Button key={`clear-${name}`} label={FORGET_ONE} onPress={() => void clearOne($, name)} />}
-          {a.use_here !== 'not_signed_in'
+          {listed && a.use_here !== 'not_signed_in'
             && <Button key={`signin-${name}`} label={how.label} onPress={() => void signIn($, name)} />}
-          <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void ask($, name, 'remove-no')} />
+          {listed && <Button key={`remove-${name}`} label="Remove" dimColor onPress={() => void ask($, name, 'remove-no')} />}
         </Box>
       )}
       {c.idle && !asking(c, name) && (typeof a.limited_until === 'number' || a.use_here === 'limited')
@@ -1478,9 +1512,10 @@ function accountPage($: any, c: Ctx): any {
         </Box>
       )}
       {c.idle && c.confirm === `delete:${name}` && deleteQuestion($, c, a)}
-      {preferredPart($, c, a)}
-      {foldersPart($, c, a)}
-      {fallbackPart($, c, a)}
+      {!listed && <Text>{NO_LIST}</Text>}
+      {listed && preferredPart($, c, a)}
+      {listed && foldersPart($, c, a)}
+      {listed && fallbackPart($, c, a)}
     </Box>
   )
 }
@@ -1776,7 +1811,8 @@ function footPart($: any, c: Ctx): any {
   if (c.page === 'list') return keys
   // Back holds the ring on an account's page with nothing harmless above it (harmless()).
   const a = c.page.startsWith('account:') ? c.status?.accounts.find(x => `account:${x.name}` === c.page) : undefined
-  const ring = (a !== undefined && harmless(a) === 'back' && c.idle && !asking(c, String(a.name)))
+  const ring = (a !== undefined && harmless(a, c.status?.listed !== false) === 'back' && c.idle
+    && !asking(c, String(a.name)))
     || (c.page === 'troubleshoot' && c.idle && !c.confirm) || c.page === 'activity'
   return (
     <Box flexDirection="column">

@@ -35,21 +35,38 @@ async function expand($: any, path: string): Promise<string> {
 // The account this chat runs on: the one whose folder is CLAUDE_CONFIG_DIR;
 // with none set, the one account with no folder of its own, as longhaul.py's
 // account_for_config() finds it; else main, ~/.claude's own sign-in, which
-// no list names (known: false), and which the line calls DEFAULT_NAME.
-async function account($: any, lh: string): Promise<{ name: string; known: boolean }> {
+// no list names (known: false), and which the line calls DEFAULT_NAME. With
+// the names on the list ([] for none: no file, or an empty one; null for a
+// file it cannot read), for shown().
+type Here = { name: string; known: boolean; names: string[] | null }
+async function account($: any, lh: string): Promise<Here> {
   const dir = ((await $.env.get('CLAUDE_CONFIG_DIR')) || '').replace(/\/+$/, '')
+  let names: string[] | null = []
   try {
-    const accounts = JSON.parse(await $.fs.read(`${lh}/accounts.json`))
-    if (Array.isArray(accounts) && dir) {
+    let text = ''
+    try { text = await $.fs.read(`${lh}/accounts.json`) } catch { return { name: 'main', known: false, names } }
+    names = null
+    const accounts = JSON.parse(text)
+    if (!Array.isArray(accounts)) return { name: 'main', known: false, names }
+    names = accounts.filter(a => a && typeof a.name === 'string').map(a => a.name as string)
+    if (dir) {
       for (const a of accounts)
         if (a && typeof a.name === 'string' && typeof a.config_dir === 'string'
-            && (await expand($, a.config_dir)).replace(/\/+$/, '') === dir) return { name: a.name, known: true }
-    } else if (Array.isArray(accounts)) {
+            && (await expand($, a.config_dir)).replace(/\/+$/, '') === dir) return { name: a.name, known: true, names }
+    } else {
       const mine = accounts.filter(a => a && typeof a.name === 'string' && !a.config_dir)
-      if (mine.length === 1) return { name: mine[0].name, known: true }
+      if (mine.length === 1) return { name: mine[0].name, known: true, names }
     }
   } catch {}
-  return { name: 'main', known: false }
+  return { name: 'main', known: false, names }
+}
+
+// What the line calls an account the files name, as longhaul.py's
+// label_of(): DEFAULT_NAME for ~/.claude's own sign-in, keyed "main" (and
+// "Max" by 0.3.20, where there is no list); a listed account is itself.
+function shown(name: string, names: string[] | null): string {
+  if (names?.includes(name)) return name
+  return name === 'main' || (name === 'Max' && names !== null && !names.length) ? DEFAULT_NAME : name
 }
 
 async function readJson($: any, path: string): Promise<unknown> {
@@ -181,15 +198,21 @@ export async function plain($: any): Promise<boolean> {
 // `longhaul use` choice of another account, after this turn when a relay
 // took it (its relay_pid runs), else at its next open; a move in the last
 // hour (the record's moved_from and moved_at). Null for none.
-async function event($: any, lh: string, sid: string, name: string, nowMs: number): Promise<Record<string, unknown> | null> {
+async function event($: any, lh: string, sid: string, name: string, nowMs: number,
+  names: string[] | null = []): Promise<Record<string, unknown> | null> {
   const nowS = nowMs / 1000
   const { asked, waiting } = found()
   if (asked) {
-    if (asked.kind === 'move') return { kind: 'question', to: asked.to }
-    return { kind: 'question', to: asked.to, at: clock(asked.carries_on_at ?? asked.to_resets_at ?? asked.resets_at, nowMs) }
+    if (asked.kind === 'move') return { kind: 'question', to: shown(asked.to, names) }
+    return { kind: 'question', to: shown(asked.to, names),
+      at: clock(asked.carries_on_at ?? asked.to_resets_at ?? asked.resets_at, nowMs) }
   }
-  if (waiting) return { kind: 'waiting', at: clock(waiting.until, nowMs), on: waiting.account }
-  const limited = num(obj(obj(await readJson($, `${lh}/state.json`)).limited_until)[name])
+  if (waiting) return { kind: 'waiting', at: clock(waiting.until, nowMs), on: shown(waiting.account, names) }
+  const limits = obj(obj(await readJson($, `${lh}/state.json`)).limited_until)
+  // The default sign-in's limit as 0.3.20 recorded it, under "Max", where there is no list (legacy_limits()).
+  const old = name === 'main' && names !== null && !names.length ? num(limits.Max) : null
+  const own = num(limits[name])
+  const limited = old === null ? own : Math.max(old, own ?? 0)
   if (limited !== null && limited > nowS) return { kind: 'stopped', until: clock(limited, nowMs) }
   if (!CHAT.test(sid)) return null
   const record = obj(await readJson($, `${lh}/usage/sessions/${sid}.json`))
@@ -201,11 +224,11 @@ async function event($: any, lh: string, sid: string, name: string, nowMs: numbe
   if (use.chat === sid && chosen && chosen !== name && at !== null && nowS - at < USE_DAYS * 86400) {
     const pid = use.relay_pid
     const taken = Number.isInteger(pid) && pid > 0 && (await running($, pid))
-    return { kind: 'pending', to: chosen, when: taken ? 'turn' : 'open' }
+    return { kind: 'pending', to: shown(chosen, names), when: taken ? 'turn' : 'open' }
   }
   const movedAt = num(record.moved_at), from = text(record.moved_from)
   if (movedAt !== null && nowS - movedAt < MOVED_FOR && from && record.account === name)
-    return { kind: 'moved', from, at: clock(movedAt, nowMs) }
+    return { kind: 'moved', from: shown(from, names), at: clock(movedAt, nowMs) }
   return null
 }
 
@@ -216,14 +239,14 @@ async function event($: any, lh: string, sid: string, name: string, nowMs: numbe
 export async function status($: any): Promise<void> {
   try {
     const lh = await home($)
-    const { name, known } = await account($, lh)
+    const { name, known, names } = await account($, lh)
     let nowMs = Date.now()
     try { nowMs = await $.clock.now() } catch {}
     let sid = ''
     try { sid = String(await $.session.id()) } catch {}
     const r = await reading($, lh, name)
     $.ui.status(line({ account: known ? name : DEFAULT_NAME, five: window(r?.five_hour, nowMs),
-      week: window(r?.seven_day, nowMs), ctx: context ?? null, event: await event($, lh, sid, name, nowMs),
+      week: window(r?.seven_day, nowMs), ctx: context ?? null, event: await event($, lh, sid, name, nowMs, names),
       update: (await update($, lh)) ?? null, plain: await plain($) }))
   } catch {}
 }

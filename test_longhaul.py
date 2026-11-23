@@ -631,6 +631,33 @@ class Loop(unittest.TestCase):
         self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
         self.assertNotIn("Move this chat", out.stdout)
 
+    def test_one_subscription_at_its_limit_is_the_default_sign_in_in_what_is_said_and_sent(self):
+        # The UX review's Q11: with no accounts.json the terminal, its
+        # notifications and the carry-on message said "Max", the stand-in's
+        # name, to someone on any plan. The limit is kept under "main", the
+        # key the status line reads it by.
+        (self.home / "accounts.json").unlink()
+        fake = self.tmp / "bin" / "osascript"
+        fake.parent.mkdir()
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$2" >> "$LONGHAUL_TEST_NOTES"\n')
+        fake.chmod(0o755)
+        notes = self.tmp / "notes.txt"
+        out, calls = self.run_longhaul([f"limit:{time.time() + 2}", "exit"], LONGHAUL_SWITCH="never",
+                                       LONGHAUL_NO_NOTIFY="", LONGHAUL_TEST_NOTES=str(notes),
+                                       PATH=f"{fake.parent}:{os.environ['PATH']}")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertIn("default sign-in is at its limit, and with switching set to never the conversation stays on it",
+                      out.stdout)
+        self.assertTrue(calls[1]["args"][-1].startswith(
+            "The default sign-in account hit its session limit while every account was at its limit, so longhaul "
+            "waited for the default sign-in account to reset"), calls[1]["args"][-1])
+        said = notes.read_text() if notes.exists() else ""
+        self.assertIn("default sign-in is at its limit", said)
+        for text in (out.stdout, said, calls[1]["args"][-1]):
+            self.assertIsNone(RETIRED.search(text), text)
+        self.assertIn("main", self.state()["limited_until"], "kept under the key the status line reads")
+        self.assertNotIn("Max", self.state()["limited_until"])
+
     def test_the_switch_flag_wins_over_the_environment(self):
         _, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], "--switch", "auto", LONGHAUL_SWITCH="never")
         self.assertEqual(calls[1]["config"], str(self.pro))
@@ -1925,7 +1952,7 @@ class Usage(unittest.TestCase):
                                      capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
                 self.assertEqual((out.returncode, out.stderr), (0, ""))
                 self.assertIn("accounts.json is not readable: ", out.stdout)
-                self.assertIn("main ", out.stdout, "the readings are still shown")
+                self.assertIn("  default sign-in 5h ", out.stdout, "the readings are still shown, by the line's name")
                 self.assertNotIn(secret, out.stdout + log.read_text())
 
     def test_a_compaction_writes_a_ledger_row_though_the_cost_stays(self):
@@ -12307,7 +12334,8 @@ class Shim(unittest.TestCase):
         out = self.chat("status", "--json", FAKE_EMAILS=json.dumps({"default": "solo@example.com"}))
         self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
         found = json.loads(out.stdout)
-        self.assertEqual([(a["name"], a["signed_in"], a["this_chat"]) for a in found["accounts"]], [("Max", True, True)])
+        self.assertEqual([(a["name"], a["label"], a["signed_in"], a["this_chat"]) for a in found["accounts"]],
+                         [("main", "default sign-in", True, True)], "the stand-in: keyed main, the default sign-in")
         self.assertNotIn("solo@example.com", out.stdout)
         self.assertFalse((self.tmp / "home").exists(), "nothing was written")
 
@@ -18614,6 +18642,37 @@ class PanelPreferred(StreamHarness):
         self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
 
 
+class PanelDefaultSignIn(StreamHarness):
+    """One subscription in the VS Code panel (no accounts.json): its chat
+    runs on the default sign-in, and the question at its limit, its
+    notifications and its carry-on name it so, never "Max" or "main" (the
+    UX review's Q11). PanelKeepWorking's helpers."""
+
+    wait_file = PanelKeepWorking.wait_file
+    answer = PanelKeepWorking.answer
+    carry_on = PanelKeepWorking.carry_on
+
+    def test_the_question_its_notification_and_the_carry_on_name_the_default_sign_in(self):
+        (self.relay / "accounts.json").unlink()
+        self.emails = {"default": "solo@example.com"}
+        self.plan(["limit", "reply"])
+        p = self.start(LONGHAUL_SWITCH="ask", FAKE_RESET_IN="2", LONGHAUL_RESET_MARGIN="0", **self.fake_notifications())
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        self.assertTrue(self.wait_for(self.result_for(self.user(p, "build it")))["is_error"])
+        q = self.wait_file("questions/sid-1.json")
+        self.assertEqual((q["kind"], q["from"], q["to"]), ("first_reset", "main", "main"), "keyed, as the files are")
+        notes = self.notified()
+        self.assertTrue(notes and "default sign-in" in notes[-1], notes)
+        self.answer(q, "yes")
+        self.carry_on("The default sign-in account hit its session limit")
+        notes = self.notified()
+        for text in notes:
+            self.assertIsNone(RETIRED.search(text), text)
+        self.assertEqual([c["config"] for c in self.calls()], [None], "the same claude carries on")
+        self.assertIn("main", json.loads((self.relay / "state.json").read_text())["limited_until"])
+
+
 class KeepWorking(unittest.TestCase):
     """Keep working (docs plans/2026-10-31-keep-working.md, K1 and K2): a
     panel chat's relay at a limit, driven in this process on a clock of the
@@ -19773,6 +19832,8 @@ class KeepWorking(unittest.TestCase):
         self.assertTrue(said.endswith("Pro has no recorded limit"), said)
 
     def test_clear_says_which_limits_it_forgot_or_that_there_were_none(self):
+        # Listed, as a person with a Max and a Pro has them: with no list, Max was the default sign-in's name (Q11).
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
         self.limited(Max=self.clock.at + 3600, Pro=self.clock.at - 5)
         code, said = self.forget()
         self.assertEqual(code, 0)
@@ -19814,6 +19875,8 @@ class KeepWorking(unittest.TestCase):
             self.assertNotIn(other, said)
 
     def test_clear_names_a_chat_whose_carry_on_waits_for_a_limit_it_forgot(self):
+        # Listed, as a person with a Max and a Pro has them: with no list, Max was the default sign-in's name (Q11).
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
         r = self.relay()
         self.stop(r)
         self.answer("sid-k", self.question()["id"], "wait")
@@ -23519,11 +23582,11 @@ class Accounts(unittest.TestCase):
                 self.assertTrue([l for l in lines if l.startswith("Claude Code ")], out.stdout)
                 self.assertTrue([l for l in lines if l.startswith("Switching: ")], out.stdout)
                 self.assertEqual(path.read_text(), text, "never written over")
-        # No file: the stand-in, one account on ~/.claude, as before.
+        # No file: the stand-in, one account on ~/.claude, as before: the default sign-in.
         path.unlink()
         out = self.longhaul("status")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertTrue(out.stdout.startswith("Max "), out.stdout)
+        self.assertTrue(out.stdout.startswith("default sign-in "), out.stdout)
         self.assertNotIn("not readable", out.stdout)
 
     def test_remove_and_setup_keep_another_accounts_repositories(self):
@@ -25143,7 +25206,7 @@ class StatusJson(unittest.TestCase):
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
-                    "preferred", "use_here", "reading_at"}
+                    "preferred", "use_here", "reading_at", "label"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
             "chat", "line", "checked", "switch_source", "panel_switch_source", "at_limit"}
 
@@ -25278,13 +25341,13 @@ class StatusJson(unittest.TestCase):
             "name": "personal-1", "email": "f…@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
-            "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None})
+            "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None, "label": "personal-1"})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
             "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here",
-            "reading_at"],
+            "reading_at", "label"],
             "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it; "
-            "preferred and use_here after them (2026-11-11), reading_at last (2026-11-13)")
+            "preferred and use_here after them (2026-11-11), reading_at (2026-11-13), then label last (Q11)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -25602,7 +25665,8 @@ class StatusJson(unittest.TestCase):
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
-                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None, "reading_at": None}])
+                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None, "reading_at": None,
+                    "label": "default sign-in"}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):
@@ -26040,6 +26104,148 @@ class StatusPreferred(unittest.TestCase):
         self.assertIn("       preferred in: ~/work, /srv/x", lines)
         self.assertIn(f"       {longhaul.PREFERRED_JUNK}; it is preferred nowhere", lines)
         self.assertEqual(sum("preferred" in line for line in lines), 2, "nothing for an account with none")
+
+
+# A whole word that would name the default sign-in by a retired name.
+RETIRED = re.compile(r"\b(Max|main)\b")
+
+
+class DefaultSignIn(unittest.TestCase):
+    """~/.claude's own sign-in, when no list of Longhaul's names it, is the
+    default sign-in on every screen (the UX review of 2026-11-11, Q11). It
+    was "Max" in `longhaul status` and /accounts, even to someone on Pro,
+    "main" in the files and "default sign-in" on the status line. Its key
+    is "main" everywhere now (DEFAULT_KEY), and "Max", the stand-in's key
+    before, is read as it where there is no list. StatusJson's scratch
+    setup and stand-in claude."""
+
+    setUp = StatusJson.setUp
+    folder = StatusJson.folder
+    write_accounts = StatusJson.write_accounts
+    status = StatusJson.status
+    longhaul = StatusJson.longhaul
+    read = StatusJson.read
+    by_name = StatusJson.by_name
+    ACCOUNT_KEYS, KEYS = StatusJson.ACCOUNT_KEYS, StatusJson.KEYS
+    SID = "5ca8a797-1111-4222-8333-444455556666"
+
+    def statusline(self, data: dict, **extra_env):
+        """`longhaul statusline` given `data` on stdin, as Claude Code runs it: the line, its colours dropped."""
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default), LONGHAUL_UPDATE_CHECK="off")
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        env.update(extra_env)
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), "statusline"], input=json.dumps(data),
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        return re.sub(r"\033\[[0-9;]*m", "", out.stdout.strip())
+
+    def test_status_json_gives_each_row_a_label_last_the_default_sign_in_for_the_stand_in(self):
+        self.emails = {"default": "solo@example.com"}
+        for flags in ((), ("--no-check",)):
+            with self.subTest(flags=flags):
+                found = self.read(self.longhaul("status", "--json", *flags))
+                [row] = found["accounts"]
+                self.assertEqual((row["name"], row["label"], row["folder"]), ("main", "default sign-in", "~/claude"),
+                                 "the name is the key commands take; the label is what a person reads")
+                self.assertEqual(list(row)[-1], "label", "a key added at the end of the row")
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        for flags in ((), ("--no-check",)):
+            found = self.read(self.longhaul("status", "--json", *flags))
+            self.assertEqual([(a["name"], a["label"]) for a in found["accounts"]],
+                             [("personal", "personal"), ("work", "work")], "a listed account's label is its name")
+
+    def test_plain_status_names_the_default_sign_in_with_its_folder_and_never_max_or_main(self):
+        self.emails = {"default": "solo@example.com"}
+        out = self.longhaul("status")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        first = out.stdout.splitlines()[0]
+        self.assertTrue(first.startswith("default sign-in "), first)
+        self.assertTrue(first.endswith(f"[{self.default}]"), "the folder, at the row's end as for every account")
+        self.assertIsNone(RETIRED.search(out.stdout), out.stdout)
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"main": time.time() + 3600}}))
+        out = self.longhaul("status")
+        lines = out.stdout.splitlines()
+        self.assertIn("at its limit until", lines[0])
+        self.assertIn("       reset before then? `longhaul clear` forgets the recorded limit", lines,
+                      "no name to type: with one sign-in, clear forgets its limit")
+        self.assertIsNone(RETIRED.search(out.stdout), out.stdout)
+
+    def test_a_listed_account_named_max_or_main_is_shown_by_its_own_name(self):
+        self.write_accounts({"name": "Max", "config_dir": None}, {"name": "main", "config_dir": str(self.folder("main"))})
+        self.emails = {"default": "max@example.com", str(self.folder("main")): "main@example.com"}
+        until = time.time() + 3600
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Max": until}}))
+        found = self.read(self.status(CLAUDE_CODE_SESSION_ID=self.SID))
+        self.assertEqual([(a["name"], a["label"], a["limited_until"]) for a in found["accounts"]],
+                         [("Max", "Max", until), ("main", "main", None)], "their own names, and their own limits")
+        self.assertEqual(found["line"], f"Max at limit until {longhaul.clock(until)} · stopped · /accounts",
+                         "the line of a chat on ~/.claude: Max's")
+        self.assertEqual(self.read(self.status(CLAUDE_CONFIG_DIR=str(self.folder("main"))))["line"],
+                         "main · no usage reading yet")
+        lines = self.longhaul("status").stdout.splitlines()
+        self.assertTrue(lines[0].startswith("Max "), lines)
+        self.assertTrue([line for line in lines if line.startswith("main ")], lines)
+        self.assertIn("       reset before then? `longhaul clear Max` forgets the recorded limit", lines)
+        self.assertNotIn(longhaul.DEFAULT_LABEL, "\n".join(lines[:4]), "no account here is the default sign-in")
+        listed = json.loads((self.home / "accounts.json").read_text())
+        self.assertEqual([longhaul.label_of(n, listed) for n in ("Max", "main")], ["Max", "main"])
+        self.assertEqual(longhaul.key_of("Max", listed), "Max")
+
+    def test_a_limit_recorded_as_max_before_this_release_shows_on_the_default_sign_in(self):
+        # Longhaul 0.3.20 recorded the stand-in's limit under "Max": an
+        # upgrade keeps it, on the row, the line and `longhaul status`.
+        until = time.time() + 3600
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Max": until}}))
+        found = self.read(self.status(CLAUDE_CODE_SESSION_ID=self.SID))
+        self.assertEqual(found["accounts"][0]["limited_until"], until)
+        self.assertEqual(found["line"], f"default sign-in at limit until {longhaul.clock(until)} · stopped · /accounts")
+        self.assertIn(f"at its limit until {longhaul.clock(until)}", self.longhaul("status").stdout.splitlines()[0])
+        # `longhaul clear Max` still forgets it, as `clear main` and `clear`
+        # do, and leaves neither key behind to bring it back.
+        for args in (("Max",), ("main",), ()):
+            with self.subTest(args=args):
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Max": until}}))
+                out = self.longhaul("clear", *args)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn("forgot", out.stdout)
+                self.assertIn(longhaul.DEFAULT_LABEL, out.stdout)
+                self.assertIsNone(RETIRED.search(out.stdout), out.stdout)
+                self.assertEqual(json.loads((self.home / "state.json").read_text())["limited_until"], {})
+        # With a list that names no Max, a limit under Max is no one's.
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Max": until}}))
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))})
+        self.assertEqual([a["limited_until"] for a in self.read(self.status())["accounts"]], [None])
+
+    def test_the_status_line_names_the_default_sign_in_and_its_events_by_that_name(self):
+        # Kept as it was: ~/.claude's own sign-in with no list is "default sign-in" on the line.
+        self.assertEqual(self.statusline({"session_id": self.SID}), "default sign-in · no usage reading yet")
+        sessions = self.home / "usage" / "sessions"
+        self.assertEqual(json.loads((sessions / f"{self.SID}.json").read_text())["account"], "main")
+        # A carry-on a relay of 0.3.20 left under "Max", or one under "main":
+        # the same sign-in, so no "on" names another.
+        until = time.time() + 3660
+        (self.home / "waits").mkdir()
+        for key in ("Max", "main"):
+            with self.subTest(key=key):
+                (self.home / "waits" / f"{self.SID}.json").write_text(json.dumps(
+                    {"chat": self.SID, "until": until, "account": key, "why": "never"}))
+                self.assertEqual(self.read(self.status(CLAUDE_CODE_SESSION_ID=self.SID))["line"],
+                                 f"default sign-in at limit · carries on {longhaul.clock(until)}")
+        (self.home / "waits" / f"{self.SID}.json").unlink()
+        # A record whose account the terminal noted as "Max" (0.3.20's
+        # launch end) is no move when the line next reads "main".
+        (sessions / f"{self.SID}.json").write_text(json.dumps({"at": time.time() - 60, "session": self.SID,
+                                                               "account": "Max", "cost": 0.1}))
+        line = self.statusline({"session_id": self.SID, "cost": {"total_cost_usd": 0.2},
+                                "rate_limits": {"five_hour": {"used_percentage": 12, "resets_at": time.time() + 3600}}})
+        self.assertEqual(line, "default sign-in · 5h 12%")
+        self.assertNotIn("moved_from", json.loads((sessions / f"{self.SID}.json").read_text()))
+        # And `longhaul status` shows that reading on the default sign-in's row, as the line does.
+        row = self.read(self.status())["accounts"][0]
+        self.assertEqual(row["five_hour"]["used"], 12)
 
 
 class Switch(unittest.TestCase):
@@ -27617,6 +27823,8 @@ class Repair(unittest.TestCase):
         self.assertEqual(self.run_cli(), (0, "Nothing to repair.\n"))
 
     def test_each_finding_is_one_line_saying_what_is_wrong_and_what_the_fix_does(self):
+        # Listed, as a person with a Max and a Pro has them: with no list, Max was the default sign-in's name (Q11).
+        self.write("accounts.json", [{"name": "Max"}, {"name": "Pro"}])
         self.state(Max="gone", Pro="soon")
         found = self.found()
         self.assertEqual([sorted(f) for f in found], [["fix", "fixable", "id", "what"]] * 2)
@@ -27699,6 +27907,8 @@ class Repair(unittest.TestCase):
                 "to_resets_at": None, "carries_on_at": int(self.now + 3660), "choices": ["move", "wait"]}
 
     def test_a_wait_whose_relay_is_gone_or_long_past_is_cancelled(self):
+        # Listed, as a person with a Max and a Pro has them: with no list, Max was the default sign-in's name (Q11).
+        self.write("accounts.json", [{"name": "Max"}, {"name": "Pro"}])
         dead, until = self.dead_pid(), int(self.now + 3600)
         gone = self.write("waits/aaaaaaaa-gone.json", {"chat": "aaaaaaaa-gone", "until": until, "account": "Max",
                                                        "why": "auto", "relay_pid": dead})
@@ -27846,6 +28056,8 @@ class Repair(unittest.TestCase):
             self.assertEqual(self.found(), [], value)
 
     def test_the_doctor_names_repair_where_it_would_fix_something(self):
+        # Listed, as a person with a Max and a Pro has them: with no list, Max was the default sign-in's name (Q11).
+        self.write("accounts.json", [{"name": "Max"}, {"name": "Pro"}])
         self.assertIsNone(longhaul.doctor_repair(), "nothing stuck: no line")
         self.state(Max=self.now - 60)
         self.assertIsNone(longhaul.doctor_repair(), "a limit whose time has passed changes nothing")
@@ -28437,6 +28649,32 @@ class Activity(unittest.TestCase):
                 code, out, err = self.run_cli(*args)
                 self.assertEqual((code, out), (2, ""))
                 self.assertIn(said, err)
+
+    def test_the_default_sign_in_is_named_so_whatever_the_log_keys_it_by(self):
+        # The UX review's Q11. The log keys the default sign-in "main", and
+        # 0.3.20's lines "Max", its stand-in's name then; with no list of
+        # accounts both are the default sign-in. A listed Max is Max.
+        s = self.SID
+        self.write_log(f"start: {s} starts on Max in ~/x: the only account",
+                       f"wait: {s} carries on on Max at 14:01 (never)",
+                       f"start: {s} reopens on main in ~/x: main hit its session limit, and it carried on there at "
+                       "its reset",
+                       "clear: the recorded limits forgotten: Max (it was until 14:00)",
+                       "limit: main's recorded limit (until 15:00) is forgotten: asked with longhaul clear")
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(w, y) for _, w, y in self.events()], [
+            ("Started on default sign-in", "the only account"),
+            ("Set a carry-on on default sign-in at 14:01", "switching is never"),
+            ("Reopened on default sign-in", "default sign-in hit its session limit, and it carried on there at its "
+                                            "reset"),
+            ("Forgot the recorded limits: default sign-in (it was until 14:00)", "asked with longhaul clear"),
+            ("Forgot default sign-in's recorded limit (it was until 15:00)", "asked with longhaul clear")])
+        self.assertIsNone(RETIRED.search(out), out)
+        (self.home / "accounts.json").write_text(json.dumps([{"name": "Max", "config_dir": None},
+                                                             {"name": "main", "config_dir": "~/.claude-main"}]))
+        self.assertEqual([w for _, w, _ in self.events()][:3],
+                         ["Started on Max", "Set a carry-on on Max at 14:01", "Reopened on main"])
 
     def test_the_usage_block_names_it_and_the_shim_runs_it(self):
         doc = longhaul.__doc__
@@ -29088,6 +29326,18 @@ class Doctor(unittest.TestCase):
         c = longhaul.doctor_chats(None)
         self.assertEqual((c["mark"], c["said"]), ("warn", "could not be listed (ps was not found, or did not answer)"))
 
+    def test_with_no_list_the_accounts_and_chats_lines_name_the_default_sign_in(self):
+        # The UX review's Q11: one sign-in, on ~/.claude, is the default sign-in, with its folder.
+        c = longhaul.doctor_accounts()
+        self.assertEqual(c["said"], "one subscription: the default sign-in (~/.claude), with no accounts.json; "
+                                    "`longhaul add` adds another")
+        notes = self.user / "notes"
+        notes.mkdir()
+        c = longhaul.doctor_chats([self.chat(201, notes), self.chat(202, notes, panel=True)])
+        self.assertEqual([text for _, text, _ in c["items"]],
+                         ["pid 201, ~/notes: a terminal chat on the default sign-in (~/.claude)",
+                          "pid 202, ~/notes: a VS Code tab on the default sign-in (~/.claude)"])
+
     def test_the_process_list_comes_from_ps_and_lsof_and_keeps_only_each_chats_config_folder(self):
         ext = "/x/.vscode/extensions/anthropic.claude-code-2.1.303-darwin-arm64/resources/native-binary/claude"
         rid = "abcd1234-0000-4000-8000-000000000000"
@@ -29629,6 +29879,64 @@ class Doctor(unittest.TestCase):
         self.write(self.home / "accounts.json", [{"name": "work", "config_dir": str(self.tmp / "gone")}])
         os.environ["LONGHAUL_GUARD"] = "warn"
         self.assertTrue(said().endswith(". 1 to fix: /longhaul:doctor."), said())
+
+
+class RetiredNames(unittest.TestCase):
+    """The retired names of the default sign-in (the UX review's Q11): with
+    no list of accounts, the first screens a new user sees, `longhaul
+    status`, `status --json` and the doctor, never call ~/.claude's own
+    sign-in "Max" or "main". The doctor's scratch setup; status runs as a
+    program on the same paths, with the stand-in claude."""
+
+    setUp = Doctor.setUp
+    write = Doctor.write
+    chat = Doctor.chat
+
+    def program(self, *args) -> str:
+        env = dict(os.environ, HOME=str(self.user), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.claude), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.user / ".claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_VSCODE_SETTINGS=str(self.vscode), FAKE_EMAILS=json.dumps({"default": "solo@example.com"}),
+                   PATH=self.path)
+        for k in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT", *Checkpoint.SESSION_VARS):
+            env.pop(k, None)
+        out = subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env, cwd=str(self.user),
+                             capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        return out.stdout
+
+    def texts(self, value, path=()):
+        """Each string in a JSON value with its path, but an account row's name: the key commands take."""
+        if isinstance(value, dict):
+            for k, v in value.items():
+                yield from self.texts(v, (*path, k))
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                yield from self.texts(v, (*path, i))
+        elif isinstance(value, str) and not (len(path) == 3 and path[0] == "accounts" and path[2] == "name"):
+            yield path, value
+
+    def test_no_first_screen_of_one_subscription_names_it_max_or_main(self):
+        until = time.time() + 3600
+        # A limit recorded by 0.3.20, under the old name, and a reading under the line's key.
+        self.write(self.home / "state.json", {"limited_until": {"Max": until}})
+        self.write(self.home / "usage" / "main.json", {"at": time.time(), "five_hour": {"used_percentage": 40,
+                                                                                         "resets_at": until}})
+        notes = self.user / "notes"
+        notes.mkdir()
+        screens = {"status": self.program("status")}
+        found = json.loads(self.program("status", "--json"))
+        quick = json.loads(self.program("status", "--json", "--no-check"))
+        self.assertEqual([a["label"] for a in found["accounts"] + quick["accounts"]], ["default sign-in"] * 2)
+        for name, record in (("status --json", found), ("status --json --no-check", quick)):
+            screens[name] = "\n".join(f"{'.'.join(map(str, p))}: {v}" for p, v in self.texts(record))
+        checks = longhaul.doctor_checks(processes=[self.chat(301, notes), self.chat(302, notes, panel=True)])
+        screens["doctor"] = "\n".join(longhaul.doctor_lines(checks))
+        self.assertIn("default sign-in", screens["status"])
+        self.assertIn("default sign-in (~/.claude)", screens["doctor"])
+        for name, text in screens.items():
+            with self.subTest(screen=name):
+                self.assertIsNone(RETIRED.search(text), f"{name}:\n{text}")
 
 
 class HookBudget(unittest.TestCase):

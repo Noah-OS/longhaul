@@ -2,6 +2,20 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+One name for the default sign-in.
+
+### Changed
+
+- **With one subscription, Claude Code's own sign-in is the default sign-in everywhere.** With no `~/.longhaul/accounts.json`, `longhaul status` and `/accounts` called it "Max", whatever your plan, the status line "default sign-in", and Longhaul's files "main". Now `/accounts` shows "default sign-in" on its line and "default sign-in (~/.claude)" on its page, and so do `longhaul status`, the doctor ("one subscription: the default sign-in (~/.claude)", and each chat running on it), `longhaul activity`, `longhaul usage`, the notifications and the terminal's lines at a limit, and the carry-on message after it. An account on your list named Max or main keeps its name.
+- **Its page in `/accounts` offers what works for it:** its limit can be forgotten, and it says how to add a second account. Sign in, Remove, its folders and the fallback mark are only for accounts on the list, and pressing them only failed. A failed sign-in says to use `/login` in Claude Code.
+- **`longhaul status --json`** gives each account a `"label"`, at the end of its row: what a person reads for it, "default sign-in" for the one sign-in with no list, else its name. `"name"` stays the name commands take: `main` for the default sign-in, the key the status line always kept its readings under. An older `/accounts` shows the name, as before.
+
+### Fixed
+
+- **`longhaul status` and `/accounts` show the default sign-in's use.** They read it under "Max" while the status line kept it under "main", so with one subscription the 5-hour and week use were never shown, and a limit the terminal recorded never reached the status line. Both are under "main" now. A limit recorded under "Max" by 0.3.20 is still read, and `longhaul clear Max` still forgets it; a resumed chat noted as "Max" no longer shows as "moved from Max".
+
 ## 0.3.20 - 2026-11-23
 
 What happens at a usage limit, said in plain words where you choose it.

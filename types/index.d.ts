@@ -46,6 +46,11 @@ export type LonghaulAccount = {
   reading_at?: number | null
   folder: string
   this_chat: boolean
+  // What a person reads for it (the UX review's Q11): its name, or "default
+  // sign-in" for ~/.claude's own sign-in when no list of Longhaul's names
+  // it, whose name stays the key each command takes. Optional: an older
+  // longhaul.py does not give it, and the pane then shows the name.
+  label?: string
 }
 
 // The whole answer of `longhaul.py status --json`.
