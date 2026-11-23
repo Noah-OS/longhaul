@@ -76,7 +76,22 @@ export type LonghaulStatus = {
   // the full one is in. Optional: an older longhaul.py, or a read stored
   // before it, checked them all.
   checked?: boolean
+  // Where "switch" comes from (the UX review's §3.6): LONGHAUL_SWITCH in
+  // the environment, ~/.longhaul/config.json, or neither, ask by default.
+  // Optional: an older longhaul.py does not give it, and Settings then says
+  // nothing of it.
+  switch_source?: LonghaulSwitchSource | null
+  // Where "panel_switch" comes from: as switch_source, or "switch" in
+  // ~/.longhaul/vscode.json. Optional, as switch_source.
+  panel_switch_source?: LonghaulSwitchSource | 'vscode.json' | null
+  // What this chat would do at a limit under "switch", in a sentence or
+  // two, as `longhaul switch` says it: null when it cannot be told (no
+  // list of accounts, no chat account). Optional: an older longhaul.py
+  // does not give it, and Settings then explains each mode in a line.
+  at_limit?: string | null
 }
+
+export type LonghaulSwitchSource = 'LONGHAUL_SWITCH' | 'config.json' | 'default'
 
 // This chat as `status --json` gives it: its short id, its account (null:
 // not one Longhaul knows), and the latest event that put it there, what,

@@ -33,6 +33,19 @@ const ACCOUNTS = [
 ]
 const STATUS = { accounts: ACCOUNTS, listed: true, here: { folder: '~/code/x', may_use: ['personal-1', 'team-4'] },
   switch: 'ask', switch_problem: null, vscode: false, panel_paused: false, problem: null }
+// What this chat does at a limit (status --json's at_limit, the UX review's
+// §3.6), as longhaul.py words it for each mode, from STATUS's accounts: in
+// ~/code/x, personal-1 may move only to team-4.
+const AT_LIMIT = {
+  ask: "At a limit, this chat asks you before moving to team-4. With no answer, it waits for personal-1's reset.",
+  auto: 'At a limit, this chat moves to team-4 by itself, and early when personal-1 is nearly full and the chat is idle.',
+  never: "At a limit, this chat waits for personal-1's reset and carries on there.",
+} as const
+// Settings' line on each mode where longhaul.py says nothing of this chat:
+// an older one, with no at_limit, or no chat account to say it of.
+const HINTS = ['Ask me first: a question at a limit; no answer moves nothing',
+  'Move automatically: at a limit, and early when nearly full while idle',
+  'Stay and wait: carries on with the same account at its reset']
 // Under a list row's text (M8): the mark and a space, the 10 of personal-1, two spaces.
 const UNDER = ' '.repeat(14)
 const ROWS = ['row-personal-1', 'row-work-2', 'row-spare-3', 'row-team-4', 'row-add', 'row-activity', 'row-settings',
@@ -209,7 +222,8 @@ async function opened($: any, w: World, surface: 'terminal' | 'vscode', columns 
 // surface's paint, so the columns are counted here. A column Box stacks its
 // children, gap lines between; a row Box sets them side by side, gap
 // spaces between; a Text, or a plain Button, is its text; another Button is
-// its label as the terminal draws it, "[ Remove ]"; an Input its label and text.
+// its label as the terminal draws it, "[ Remove ]"; an Input its label and
+// text; a Select its label and the chosen option's label, "At a limit: Ask me first".
 function laid(node: any): string[] {
   if (typeof node === 'string') return node.split('\n')
   if (!node || typeof node !== 'object') return []
@@ -221,6 +235,10 @@ function laid(node: any): string[] {
     return [node.props?.plain ? (kids.length ? text(node) : String(node.props?.label ?? ''))
       : `[ ${String(node.props?.label ?? text(node))} ]`]
   if (node.type === 'Input') return [`${node.props?.label ?? ''}${node.props?.value || node.props?.placeholder || ''}`]
+  if (node.type === 'Select') {
+    const options: any[] = Array.isArray(node.props?.options) ? node.props.options : []
+    return [`${node.props?.label ?? ''}${options.find(o => o?.value === node.props?.value)?.label ?? ''}`]
+  }
   const parts = kids.map(laid).filter(l => l.length)
   const gap = Number(node.props?.gap ?? 0)
   if (node.props?.flexDirection === 'row') {
@@ -335,7 +353,7 @@ both('the list: a line per account, + Add account, Settings, then where we are; 
   expect(await row('row-team-4')).toBe('  team-4      could not check')
   expect(await row('row-add')).toBe('  + Add account')
   expect(await row('row-activity')).toBe('  Activity: what Longhaul did, and why')
-  expect(await row('row-settings')).toBe('  Settings (switching: ask · VS Code panel: off)')
+  expect(await row('row-settings')).toBe('  Settings (at a limit: Ask me first · VS Code panel: off)')
   const all = await texts(ui)
   expect(all[0]).toBe('Longhaul accounts')
   expect(all).toContain('Here, in ~/code/x: personal-1, team-4 may be used.')
@@ -422,7 +440,8 @@ for (const columns of [80, 60])
 const GLYPHS = /[✔✘⚠›·↑↓→]/
 both('LONGHAUL_PLAIN=1: words first, no glyph and no › mark, commas between the parts', async ($, on, surface) => {
   const w = world(on, { LONGHAUL_PLAIN: '1' })
-  w.status = done(JSON.stringify({ ...STATUS, switch_problem: 'config.json says "sometimes", not a mode' }))
+  w.status = done(JSON.stringify({ ...STATUS, switch_problem: 'config.json says "sometimes", not a mode',
+    switch_source: 'LONGHAUL_SWITCH', panel_switch: 'never', panel_switch_source: 'vscode.json', at_limit: AT_LIMIT.ask }))
   w.answer.fallback = done('', 1, 'longhaul no account called work-2\n')
   w.answer.repair = done(JSON.stringify([{ id: 'wait:5ca8a797', what: 'a carry-on whose relay is gone', fix: 'remove it',
     fixable: true }]))
@@ -433,7 +452,7 @@ both('LONGHAUL_PLAIN=1: words first, no glyph and no › mark, commas between th
   expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max, signed in, 5h 40%, week 12%\n${UNDER}this chat`)
   expect(await rowOf(ui, 'row-work-2')).toBe(`  work-2      pro, NOT signed in, limit until ${clock(AT + 3 * HOUR)} (in 3 h)\n`
     + `${UNDER}only in ~/work, ~/clients`)
-  expect((await ui.find({ key: 'row-settings' }))?.text).toBe('  Settings (switching: ask, VS Code panel: off)')
+  expect((await ui.find({ key: 'row-settings' }))?.text).toBe('  Settings (at a limit: Ask me first, VS Code panel: off)')
   await ring($, 'row-work-2')
   expect((await ui.find({ key: 'row-work-2' }))?.text).toMatch(/^ {2}work-2 /) // no mark: the ring shows it
   expect((await texts(ui)).includes('Up and Down to move, Enter to open, Esc to close')).toBe(surface === 'terminal')
@@ -454,6 +473,9 @@ both('LONGHAUL_PLAIN=1: words first, no glyph and no › mark, commas between th
   // Settings' warning, Troubleshoot's finding, Activity's chat.
   await open(ui, 'row-settings')
   expect(await texts(ui)).toContain('Warning: config.json says "sometimes", not a mode')
+  expect(await texts(ui)).toContain('Now: at a limit, this chat asks you before moving to team-4. With no answer, it')
+  expect(await texts(ui)).toContain('LONGHAUL_SWITCH=ask in the environment wins over this choice.')
+  expect(await texts(ui)).toContain('In the VS Code panel: Stay and wait instead (set in ~/.longhaul/vscode.json).')
   await none()
   await ui.press({ key: 'back' })
   await open(ui, 'row-troubleshoot')
@@ -862,12 +884,16 @@ both('a good Add passes the name, the email and each folder as its own --repo, w
   await ui.unmount()
 })
 
-both("Settings' page: switching, the VS Code panel and forgetting the limits run their commands", async ($, on, surface) => {
+both("Settings' page: at a limit, the VS Code panel and forgetting the limits run their commands", async ($, on, surface) => {
   const w = world(on)
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-settings')
-  const all = (await texts(ui)).join('\n')
-  for (const line of [/ask: asks first/, /auto: moves by itself/, /never: waits for the reset/]) expect(all).toMatch(line)
+  // The glossary's words (the UX review's §4.8), each the word `longhaul switch` takes.
+  expect((await ui.find({ key: 'switch' }))?.props.label).toBe('At a limit: ')
+  expect((await ui.find({ key: 'switch' }))?.props.options).toEqual([{ value: 'ask', label: 'Ask me first' },
+    { value: 'auto', label: 'Move automatically' }, { value: 'never', label: 'Stay and wait' }])
+  // STATUS is an older longhaul.py's, with no at_limit: a line on each mode, as before.
+  for (const hint of HINTS) expect(await texts(ui)).toContain(hint)
   // Forget all recorded limits, with when to use it.
   expect((await ui.find({ key: 'clear' }))?.text).toBe('Forget all recorded limits')
   expect(await texts(ui)).toContain('Use this when claude.ai shows room but Longhaul still waits.')
@@ -892,13 +918,13 @@ both("Settings' page: switching, the VS Code panel and forgetting the limits run
   expect(await texts(ui)).toContain(RELOAD)
   // The list's Settings line says what the rows read last.
   await ui.press({ key: 'back' })
-  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/Settings \(switching: ask · VS Code panel: on\)$/)
+  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/Settings \(at a limit: Ask me first · VS Code panel: on\)$/)
   await ui.unmount()
 })
 
 both("Settings' page names the VS Code panel's own mode when vscode.json sets it apart", async ($, on, surface) => {
   const w = world(on)
-  const LINE = 'The VS Code panel uses never (set in ~/.longhaul/vscode.json).'
+  const LINE = 'In the VS Code panel: Stay and wait instead (set in ~/.longhaul/vscode.json).'
   w.status = done(JSON.stringify({ ...STATUS, panel_switch: 'never' }))
   const { ui } = await opened($, w, surface)
   await open(ui, 'row-settings')
@@ -913,11 +939,165 @@ both("Settings' page names the VS Code panel's own mode when vscode.json sets it
     w.status = done(JSON.stringify({ ...STATUS, ...more }))
     await ui.press({ key: 'clear' })
     expect(w.runs.at(-1)).toEqual(['status', '--json'])
-    expect((await texts(ui)).filter(t => t.startsWith('The VS Code panel uses'))).toEqual([])
+    expect((await texts(ui)).filter(t => t.startsWith('In the VS Code panel'))).toEqual([])
   }
   w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', panel_switch: 'ask' }))
   await ui.press({ key: 'clear' })
-  expect(await texts(ui)).toContain('The VS Code panel uses ask (set in ~/.longhaul/vscode.json).')
+  expect(await texts(ui)).toContain('In the VS Code panel: Ask me first instead (set in ~/.longhaul/vscode.json).')
+  // Where status --json names the panel's source, that one; the line broken to fit 80 columns.
+  w.status = done(JSON.stringify({ ...STATUS, switch: 'ask', panel_switch: 'auto', panel_switch_source: 'vscode.json' }))
+  await ui.press({ key: 'clear' })
+  expect(await texts(ui)).toContain('In the VS Code panel: Move automatically instead (set in')
+  expect(await texts(ui)).toContain('~/.longhaul/vscode.json).')
+  await ui.unmount()
+})
+
+// The UX review's §3.6: the mode explained by what it does for this chat now
+// (status --json's at_limit), and where it comes from, under the Select.
+
+// Settings' lines as a terminal lays them out (laid()), from its title to
+// Forget all recorded limits.
+async function settingsLines(ui: any): Promise<string[]> {
+  const lines = laid(await ui.drawn())
+  return lines.slice(lines.indexOf('Settings'), lines.indexOf('[ Forget all recorded limits ]') + 1)
+}
+
+const FORGET = ['', 'Use this when claude.ai shows room but Longhaul still waits.', '[ Forget all recorded limits ]']
+
+both('Settings says what this chat does at a limit now, and where the mode comes from', async ($, on, surface) => {
+  const w = world(on)
+  const now = (mode: keyof typeof AT_LIMIT, source: string) => ({ ...STATUS, switch: mode, switch_source: source,
+    panel_switch: mode, panel_switch_source: source, at_limit: AT_LIMIT[mode] })
+  w.status = done(JSON.stringify(now('ask', 'default')))
+  const { ui } = await opened($, w, surface)
+  expect(await rowOf(ui, 'row-settings')).toBe('  Settings (at a limit: Ask me first · VS Code panel: off)')
+  await open(ui, 'row-settings')
+  expect(await settingsLines(ui)).toEqual([
+    'Settings',
+    '',
+    'At a limit: Ask me first',
+    'Now: at a limit, this chat asks you before moving to team-4. With no answer, it',
+    "     waits for personal-1's reset.",
+    'Not set: Ask me first is the default.',
+    '',
+    "VS Code panel on Longhaul's accounts: off",
+    '[ Turn on ]',
+    ...FORGET])
+  expect(await over(ui, 80)).toEqual([])
+  // In normal weight: a fact about this chat, not a hint.
+  const said = (await ui.findAll({ type: 'Text' })).filter((t: any) => /^(Now: | {5}\S)/.test(t.text))
+  expect(said.map((t: any) => [t.text, t.props.dimColor ?? false])).toEqual([
+    ['Now: at a limit, this chat asks you before moving to team-4. With no answer, it', false],
+    ["     waits for personal-1's reset.", false]])
+  for (const hint of HINTS) expect(await texts(ui)).not.toContain(hint)
+  // A mode chosen: saved by `longhaul switch`, then read again, and said as it is now.
+  w.status = done(JSON.stringify(now('auto', 'config.json')))
+  await ui.select({ key: 'switch', value: 'auto' })
+  expect(after(w)).toEqual([['switch', 'auto'], ['status', '--json']])
+  expect(await settingsLines(ui)).toEqual([
+    'Settings',
+    '',
+    'At a limit: Move automatically',
+    'Now: at a limit, this chat moves to team-4 by itself, and early when personal-1',
+    '     is nearly full and the chat is idle.',
+    'Set here (saved in ~/.longhaul/config.json).',
+    '',
+    "VS Code panel on Longhaul's accounts: off",
+    '[ Turn on ]',
+    ...FORGET])
+  expect(await over(ui, 80)).toEqual([])
+  w.status = done(JSON.stringify(now('never', 'config.json')))
+  await ui.select({ key: 'switch', value: 'never' })
+  expect(after(w).slice(2)).toEqual([['switch', 'never'], ['status', '--json']])
+  expect((await settingsLines(ui)).slice(2, 5)).toEqual([
+    'At a limit: Stay and wait',
+    "Now: at a limit, this chat waits for personal-1's reset and carries on there.",
+    'Set here (saved in ~/.longhaul/config.json).'])
+  await ui.press({ key: 'back' })
+  expect(await rowOf(ui, 'row-settings')).toBe('› Settings (at a limit: Stay and wait · VS Code panel: off)')
+  await ui.unmount()
+})
+
+both('Settings says LONGHAUL_SWITCH wins over the choice, which is saved but not in force', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', switch_source: 'LONGHAUL_SWITCH', panel_switch: 'auto',
+    panel_switch_source: 'LONGHAUL_SWITCH', at_limit: AT_LIMIT.auto }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
+  expect(await settingsLines(ui)).toEqual([
+    'Settings',
+    '',
+    'At a limit: Move automatically',
+    'Now: at a limit, this chat moves to team-4 by itself, and early when personal-1',
+    '     is nearly full and the chat is idle.',
+    'LONGHAUL_SWITCH=auto in the environment wins over this choice.',
+    'A choice here is saved, but is not in force while it is set.',
+    '',
+    "VS Code panel on Longhaul's accounts: off",
+    '[ Turn on ]',
+    ...FORGET])
+  expect(await over(ui, 80)).toEqual([])
+  // A LONGHAUL_SWITCH that is not a mode: its problem says it, and no line repeats it.
+  w.status = done(JSON.stringify({ ...STATUS, switch: null, switch_source: 'LONGHAUL_SWITCH', at_limit: null,
+    switch_problem: "LONGHAUL_SWITCH is 'sometimes', which is not a switching mode. Set it to ask, auto or never, or "
+      + 'unset it; longhaul has not started Claude.' }))
+  await ui.press({ key: 'clear' })
+  const lines = await settingsLines(ui)
+  expect(lines.filter(l => l.startsWith('LONGHAUL_SWITCH='))).toEqual([])
+  expect(lines).toContain("⚠ LONGHAUL_SWITCH is 'sometimes', which is not a switching mode. Set it to ask,")
+  expect(await over(ui, 80)).toEqual([])
+  await ui.unmount()
+})
+
+both("Settings with no sentence for this chat explains each mode in a line, and an older Longhaul's record too", async ($, on, surface) => {
+  const w = world(on)
+  // No chat account to say it of (null): each mode in a line, and where it comes from.
+  w.status = done(JSON.stringify({ ...STATUS, switch_source: 'config.json', at_limit: null }))
+  const { ui } = await opened($, w, surface)
+  await open(ui, 'row-settings')
+  expect((await settingsLines(ui)).slice(2, 7)).toEqual(['At a limit: Ask me first', ...HINTS,
+    'Set here (saved in ~/.longhaul/config.json).'])
+  expect((await ui.findAll({ type: 'Text' })).filter((t: any) => HINTS.includes(t.text)).map((t: any) => t.props.dimColor))
+    .toEqual([true, true, true]) // hints, dim
+  // An older longhaul.py gives neither field: the same lines, with nothing on where the mode comes from.
+  w.status = done(JSON.stringify(STATUS))
+  await ui.press({ key: 'clear' })
+  expect((await settingsLines(ui)).slice(2, 7)).toEqual(['At a limit: Ask me first', ...HINTS, ''])
+  expect((await texts(ui)).filter(t => /^Now:|^Set here|^Not set|in the environment/.test(t))).toEqual([])
+  expect(await over(ui, 80)).toEqual([])
+  await ui.unmount()
+})
+
+both('Settings fits a pane 60 columns across, each line broken between words', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', switch_source: 'config.json', panel_switch: 'never',
+    panel_switch_source: 'vscode.json', panel_paused: true, at_limit: AT_LIMIT.auto }))
+  const { ui } = await opened($, w, surface, 60)
+  await open(ui, 'row-settings')
+  expect(await settingsLines(ui)).toEqual([
+    'Settings',
+    '',
+    'At a limit: Move automatically',
+    'Now: at a limit, this chat moves to team-4 by itself, and',
+    '     early when personal-1 is nearly full and the chat is',
+    '     idle.',
+    'Set here (saved in ~/.longhaul/config.json).',
+    'In the VS Code panel: Stay and wait instead (set in',
+    '~/.longhaul/vscode.json).',
+    '',
+    "VS Code panel on Longhaul's accounts: off",
+    '[ Turn on ]',
+    'Longhaul is paused in panel chats: Claude runs alone there.',
+    'Troubleshoot resumes it.',
+    ...FORGET])
+  expect(await over(ui, 60)).toEqual([])
+  w.status = done(JSON.stringify({ ...STATUS, switch: 'auto', switch_source: 'LONGHAUL_SWITCH', at_limit: AT_LIMIT.auto }))
+  await ui.press({ key: 'clear' })
+  expect((await settingsLines(ui)).slice(6, 9)).toEqual([
+    'LONGHAUL_SWITCH=auto in the environment wins over this',
+    'choice.',
+    'A choice here is saved, but is not in force while it is set.'])
+  expect(await over(ui, 60)).toEqual([])
   await ui.unmount()
 })
 
@@ -1016,7 +1196,9 @@ both('Troubleshoot with nothing stuck says so; Pause and Resume run panel pause 
   await ui.press({ key: 'back' })
   expect((await ui.find({ key: 'row-troubleshoot' }))?.text).toBe('› Troubleshoot (Longhaul paused in panel chats)')
   await open(ui, 'row-settings')
-  expect(await texts(ui)).toContain('Longhaul is paused in panel chats: Claude runs alone there. Troubleshoot resumes it.')
+  // A sentence a line, each within 80 columns.
+  expect(await texts(ui)).toContain('Longhaul is paused in panel chats: Claude runs alone there.')
+  expect(await texts(ui)).toContain('Troubleshoot resumes it.')
   await ui.press({ key: 'back' })
   await open(ui, 'row-troubleshoot')
   w.status = done(JSON.stringify(STATUS))
@@ -1641,7 +1823,7 @@ both('an account with no folder and times in decimals, and an odd record, are dr
   w.status = done(JSON.stringify({ ...STATUS, accounts: [noFolder, odd, 7], here: 'x', switch: 'sometimes' }))
   const { ui } = await opened($, w, surface)
   expect(await rowOf(ui, 'row-odd-6')).toMatch(/^ {2}odd-6 {2}could not check\n {9}used nowhere$/) // under the text of names of 5
-  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/switching: not known/)
+  expect((await ui.find({ key: 'row-settings' }))?.text).toMatch(/at a limit: not known/)
   await open(ui, 'row-odd-5')
   let all = (await texts(ui)).join('\n')
   expect(all).toContain("could not check: its config_dir is not a folder's path")

@@ -22,8 +22,8 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // them, and Remove and delete its sign-in folder…, showing first what it
 // would do, from its own command's --dry-run --json (the UX review's M4),
 // then whether it is a fallback, with the button that turns it (2026-11-06); Add
-// account's page the form; Settings' page switching, the VS Code panel and
-// forgetting the limits; Troubleshoot's (the UX review's 4.4, M2) what
+// account's page the form; Settings' page what a chat does at a limit (and
+// what this one would do now), the VS Code panel and forgetting the limits; Troubleshoot's (the UX review's 4.4, M2) what
 // `repair --json` finds stuck, each with a Fix that asks first, and Longhaul
 // paused or resumed in the panel's chats (`panel pause|resume`), which
 // /longhaul:manage does not run (bin/longhaul refuses both until the owner
@@ -65,6 +65,13 @@ const TITLE = 'Longhaul accounts'
 const OPEN = { id: PANE, title: TITLE, focus: true, closeOnEscape: true } as const
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$/ // what longhaul.py takes as a name, and never an option
 const MODES = ['ask', 'auto', 'never'] as const
+// Each mode in the glossary's words (the UX review's §4.8), by the word
+// `longhaul switch` takes: what happens at a limit, where "never" read as
+// "never carry on" and "auto" said nothing of the early move.
+const LABELS = { ask: 'Ask me first', auto: 'Move automatically', never: 'Stay and wait' } as const
+// Where status --json says a mode comes from (switch_source, panel_switch_source).
+const SOURCES = ['LONGHAUL_SWITCH', 'config.json', 'default'] as const
+const PANEL_SOURCES = [...SOURCES, 'vscode.json'] as const
 // The surfaces that draw Input and Select (the phone does not), by name: the
 // element table answers every constructor whatever the surface draws.
 const TYPING = ['terminal', 'desktop', 'vscode']
@@ -233,7 +240,10 @@ function clean(s: any): LonghaulStatus {
   return { accounts, listed: s.listed === true, here, chat,
     switch: (MODES as readonly unknown[]).includes(s.switch) ? s.switch : null, switch_problem: str(s.switch_problem),
     panel_switch: (MODES as readonly unknown[]).includes(s.panel_switch) ? s.panel_switch : null,
-    vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem), checked: s.checked !== false }
+    vscode: flag(s.vscode), panel_paused: flag(s.panel_paused), problem: str(s.problem), checked: s.checked !== false,
+    switch_source: (SOURCES as readonly unknown[]).includes(s.switch_source) ? s.switch_source : null,
+    panel_switch_source: (PANEL_SOURCES as readonly unknown[]).includes(s.panel_switch_source) ? s.panel_switch_source : null,
+    at_limit: str(s.at_limit) }
 }
 
 // `repair --json` read into what the Troubleshoot page draws: each finding
@@ -643,8 +653,9 @@ async function add($: any): Promise<void> {
 
 async function setSwitch($: any, mode: string): Promise<void> {
   const have = await read($, lastRead)
-  if (busy || !(MODES as readonly string[]).includes(mode) || have?.status?.switch === mode) return
-  await act($, { label: `Switching at a limit: ${mode}`, doing: `Setting switching to ${mode}…`, argv: ['switch', mode],
+  const label = labelOf(mode)
+  if (busy || label === null || have?.status?.switch === mode) return
+  await act($, { label: `At a limit: ${label}`, doing: `Saving the choice: ${label}…`, argv: ['switch', mode],
     timeoutMs: STATUS_TIMEOUT })
 }
 
@@ -1135,7 +1146,7 @@ function itemsPart($: any, c: Ctx): any {
     items.push(item('row-add', '+ Add account', () => void go($, 'add', 'add-name')))
     items.push(item('row-activity', 'Activity: what Longhaul did, and why', () => void go($, 'activity', 'back')))
     const vs = s.vscode === true ? 'on' : s.vscode === false ? 'off' : 'not known'
-    items.push(item('row-settings', `Settings (switching: ${s.switch ?? 'not known'}${c.sep}VS Code panel: ${vs})`,
+    items.push(item('row-settings', `Settings (at a limit: ${labelOf(s.switch) ?? 'not known'}${c.sep}VS Code panel: ${vs})`,
       () => void go($, 'settings', 'switch')))
     items.push(item('row-troubleshoot', `Troubleshoot${s.panel_paused === true ? ' (Longhaul paused in panel chats)' : ''}`,
       () => void go($, 'troubleshoot', 'back')))
@@ -1496,29 +1507,76 @@ function addPage($: any, c: Ctx): any {
   )
 }
 
-// Settings' page: switching at a limit, the VS Code panel, the recorded limits.
+// A mode's label (LABELS), or null for anything that is not a mode.
+function labelOf(mode: string | null | undefined): string | null {
+  return mode === 'ask' || mode === 'auto' || mode === 'never' ? LABELS[mode] : null
+}
+
+// Each mode in a line, dim, where longhaul.py says nothing of this chat at
+// a limit: an older one, with no at_limit, or no chat account to say it of.
+const HINTS = [`${LABELS.ask}: a question at a limit; no answer moves nothing`,
+  `${LABELS.auto}: at a limit, and early when nearly full while idle`,
+  `${LABELS.never}: carries on with the same account at its reset`] as const
+const CONFIG_JSON = '~/.longhaul/config.json'
+// Where the panel's own mode comes from, in its line (panel_switch_source);
+// vscode.json where an older longhaul.py does not say, the one way it differs.
+const PANEL_FROM = { 'vscode.json': 'set in ~/.longhaul/vscode.json', 'config.json': `saved in ${CONFIG_JSON}`,
+  LONGHAUL_SWITCH: 'set by LONGHAUL_SWITCH', default: 'the default' } as const
+
+// Prose laid out in the pane's columns, as a list row is (M8): broken
+// between words, `head` before the first line and each line after it under
+// the text after `head`. A sentence the terminal wrapped itself broke where it fell.
+function prose(c: Ctx, text: string, head = ''): string[] {
+  const pad = ' '.repeat(head.length)
+  return flow(head.length, text.split(' ').map(word => [word]), c.columns, head.length, ' ')
+    .map((line, i) => `${i ? pad : head}${line}`)
+}
+
+// Where the terminal's mode in force comes from, a sentence a line, for the
+// Select above: saved by it, the default, or LONGHAUL_SWITCH, which wins
+// over what it saves. Nothing where longhaul.py does not say, or the mode is
+// not one (its problem says why).
+function sourceLines(s: LonghaulStatus): string[] {
+  const label = labelOf(s.switch)
+  if (!label) return []
+  if (s.switch_source === 'config.json') return [`Set here (saved in ${CONFIG_JSON}).`]
+  if (s.switch_source === 'default') return [`Not set: ${LABELS.ask} is the default.`]
+  if (s.switch_source === 'LONGHAUL_SWITCH')
+    return [`LONGHAUL_SWITCH=${s.switch} in the environment wins over this choice.`,
+      'A choice here is saved, but is not in force while it is set.']
+  return []
+}
+
+// Settings' page: what a chat does at a limit, the VS Code panel, the
+// recorded limits. Under the Select, what this chat would do at a limit now,
+// from status --json's at_limit, and where the mode comes from (the UX
+// review's §3.6): the mode explained by its effect, not three words each.
 function settingsPage($: any, c: Ctx): any {
   const { Box, Text, Button, Select } = c.E
-  const mode = c.status!.switch
-  const problem = c.status!.switch_problem
+  const s = c.status!
+  const mode = s.switch
+  const problem = s.switch_problem
   // The panel's own mode: LONGHAUL_SWITCH, then "switch" in vscode.json,
   // then config.json's. With the same environment as "switch", it differs
   // only by vscode.json's key, which the Select above does not change.
-  const panel = c.status!.panel_switch
-  const on = c.status!.vscode
+  const panel = labelOf(s.panel_switch)
+  const on = s.vscode
+  const lines = (texts: string[], props: Record<string, unknown> = {}) =>
+    texts.flatMap(text => prose(c, text)).map(line => <Text {...props}>{line}</Text>)
+  // A fact about this chat, in normal weight; "Now: at a limit, …" as the mockup reads.
+  const now = s.at_limit ? prose(c, s.at_limit.replace(/^At a limit\b/, 'at a limit'), 'Now: ') : null
   return (
     <Box flexDirection="column" gap={1}>
       <Text bold>Settings</Text>
       <Box flexDirection="column">
-        {c.idle && <Select key="switch" label="Switching at a limit: " options={MODES.map(m => ({ value: m, label: m }))}
+        {c.idle && <Select key="switch" label="At a limit: " options={MODES.map(m => ({ value: m, label: LABELS[m] }))}
           {...(mode ? { value: mode } : {})} onSelect={(value: string) => void setSwitch($, value)} />}
-        {!c.idle && <Text>{`Switching at a limit: ${mode ?? 'not known'}`}</Text>}
-        <Text dimColor>ask: asks first</Text>
-        <Text dimColor>auto: moves by itself</Text>
-        <Text dimColor>never: waits for the reset</Text>
-        {mode && panel && panel !== mode
-          && <Text key="panel-switch">{`The VS Code panel uses ${panel} (set in ~/.longhaul/vscode.json).`}</Text>}
-        {problem && <Text color="warning">{`${markOf(c, 'warning')} ${mask(String(problem))}`}</Text>}
+        {!c.idle && <Text>{`At a limit: ${labelOf(mode) ?? 'not known'}`}</Text>}
+        {now ? now.map(line => <Text>{line}</Text>) : lines([...HINTS], { dimColor: true })}
+        {lines(sourceLines(s))}
+        {mode && panel && s.panel_switch !== mode && lines([`In the VS Code panel: ${panel} instead `
+          + `(${PANEL_FROM[s.panel_switch_source ?? 'vscode.json']}).`])}
+        {problem && lines([`${markOf(c, 'warning')} ${mask(String(problem))}`], { color: 'warning' })}
       </Box>
       <Box flexDirection="column">
         <Text>{`VS Code panel on Longhaul's accounts: ${on === true ? 'on' : on === false ? 'off' : 'not known'}`}</Text>
@@ -1528,12 +1586,12 @@ function settingsPage($: any, c: Ctx): any {
             {on !== false && <Button key="vscode-off" label="Turn off" onPress={() => void vscode($, false)} />}
           </Box>
         )}
-        {c.status!.panel_paused === true
-          && <Text>Longhaul is paused in panel chats: Claude runs alone there. Troubleshoot resumes it.</Text>}
+        {s.panel_paused === true
+          && lines(['Longhaul is paused in panel chats: Claude runs alone there.', 'Troubleshoot resumes it.'])}
       </Box>
       {c.idle && (
         <Box flexDirection="column">
-          <Text>{FORGET_ALL_NOTE}</Text>
+          {lines([FORGET_ALL_NOTE])}
           <Button key="clear" label={FORGET_ALL} onPress={() => void clear($)} />
         </Box>
       )}
