@@ -25180,7 +25180,9 @@ class StatusJson(unittest.TestCase):
                    LONGHAUL_DEFAULT_CONFIG_DIR=str(self.default), LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
                    LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), LONGHAUL_NO_NOTIFY="1",
                    LONGHAUL_VSCODE_SETTINGS=str(self.vscode), FAKE_EMAILS=json.dumps(self.emails))
-        for k in ("LONGHAUL_SWITCH", "LONGHAUL_AUTH_TIMEOUT", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS):
+        # CLAUDE_CODE_ENTRYPOINT too: the suite may run in a VS Code panel chat, which would make every run here one.
+        for k in ("LONGHAUL_SWITCH", "LONGHAUL_AUTH_TIMEOUT", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT",
+                  *Checkpoint.SESSION_VARS):
             env.pop(k, None)
         env.update(extra_env)
         return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=env,
@@ -25895,6 +25897,45 @@ class StatusJson(unittest.TestCase):
                          f"At a limit, this chat carries on with work at its reset, {longhaul.clock(w)}, unless "
                          "personal resets first: every other account allowed here is at its limit.")
 
+    def panel_on(self):
+        """VS Code's settings run Longhaul's wrapper, as `longhaul vscode on` leaves them (vscode_runs_longhaul())."""
+        (self.tmp / "bin").mkdir(exist_ok=True)
+        (self.tmp / "bin" / "longhaul-vscode").write_text("#!/bin/sh\n")
+        (self.tmp / "bin" / "longhaul-vscode").chmod(0o755)
+        self.vscode.parent.mkdir(exist_ok=True)
+        self.vscode.write_text(json.dumps({"claudeCode.claudeProcessWrapper": "~/bin/longhaul-vscode"}))
+
+    def test_at_limit_in_a_vs_code_panel_chat_is_under_the_panels_own_mode(self):
+        # The pane runs mostly in panel chats, whose mode is the panel's (panel_switch_in_force()): vscode.json's
+        # "switch" before config.json's. Its relay has no early move. With the panel not on Longhaul's accounts,
+        # or Longhaul paused there, Longhaul does nothing at that chat's limit, so the sentence claims nothing.
+        self.write_accounts({"name": "personal", "config_dir": str(self.folder("personal"))},
+                            {"name": "work", "config_dir": str(self.folder("work"))})
+        panel = {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}
+        ask = "At a limit, this chat asks you before moving to work. With no answer, it waits for personal's reset."
+        wait = "At a limit, this chat waits for personal's reset and carries on there."
+        (self.home / "config.json").write_text('{"switch": "ask"}')
+        (self.home / "vscode.json").write_text('{"switch": "never"}')
+        self.assertIsNone(self.at_limit(**panel), "the panel not on Longhaul's accounts: Longhaul runs no panel chat")
+        self.panel_on()
+        before = self.files()
+        found = self.read(self.status(CLAUDE_CONFIG_DIR=str(self.folder("personal")), **panel))
+        self.assertEqual((found["at_limit"], found["switch"], found["switch_source"], found["panel_switch"]),
+                         (wait, "ask", "config.json", "never"), "the panel's mode; switch_source stays the terminal's")
+        self.assertEqual(self.at_limit(**panel), wait, "--no-check the same")
+        self.assertEqual(self.at_limit(), ask, "a terminal chat: the terminal's mode, as before")
+        self.assertEqual(self.at_limit(CLAUDE_CODE_ENTRYPOINT="cli"), ask, "any other entry point is not the panel")
+        (self.home / "vscode.json").write_text('{"switch": "auto"}')
+        self.assertEqual(self.at_limit(**panel), "At a limit, this chat moves to work by itself.", "no early move there")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="auto"),
+                         "At a limit, this chat moves to work by itself, and early when personal is nearly full and the "
+                         "chat is idle.", "the terminal's supervisor moves early")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="never", **panel), wait, "LONGHAUL_SWITCH wins in the panel too")
+        (self.home / "vscode.json").write_text('{"switch": "auto", "switch_mid_session": false}')
+        self.assertIsNone(self.at_limit(**panel), "Longhaul paused in panel chats: Claude runs alone there")
+        self.assertEqual(self.at_limit(LONGHAUL_SWITCH="never"), wait, "a terminal chat is not paused")
+        self.assertEqual(set(self.files()) - set(before), set(), "it only reads")
+
     def test_at_limit_is_null_where_it_cannot_be_known(self):
         self.assertIsNone(self.at_limit(), "no list of accounts: one sign-in")
         self.assertIsNone(self.at_limit(CLAUDE_CONFIG_DIR=str(self.default)), "the stand-in on the default sign-in")
@@ -26018,7 +26059,7 @@ class Switch(unittest.TestCase):
         # No LONGHAUL_SWITCH unless a test gives one: the suite may run in a shell that sets it. Nor the
         # chat it may run in: CLAUDE_CONFIG_DIR names this chat's account (at_limit).
         env = {k: v for k, v in os.environ.items()
-               if k not in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS)}
+               if k not in ("LONGHAUL_SWITCH", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT", *Checkpoint.SESSION_VARS)}
         env.update(HOME=str(self.tmp), LONGHAUL_HOME=str(self.home), LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
                    LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"), LONGHAUL_NO_NOTIFY="1",
                    LONGHAUL_CLAUDE_BIN=str(HERE / "fake_stream.py"), **extra)
@@ -26047,6 +26088,24 @@ class Switch(unittest.TestCase):
         # Outside a chat there is no account of its own to say it of: the one line, as before.
         self.assertEqual(len(self.switch().stdout.splitlines()), 1)
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["accounts.json"], "nothing written")
+        # A VS Code panel chat: under the panel's own mode, which the line above names; nothing with the panel
+        # not on Longhaul's accounts, or paused.
+        panel = {**chat, "CLAUDE_CODE_ENTRYPOINT": "claude-vscode", "LONGHAUL_VSCODE_SETTINGS": str(self.tmp / "vs.json")}
+        (self.home / "vscode.json").write_text(json.dumps({"switch": "never"}))
+        self.assertEqual(len(self.switch(**panel).stdout.splitlines()), 1, "the panel not on Longhaul's accounts")
+        (self.tmp / "longhaul-vscode").write_text("#!/bin/sh\n")
+        (self.tmp / "longhaul-vscode").chmod(0o755)
+        (self.tmp / "vs.json").write_text(json.dumps({"claudeCode.claudeProcessWrapper": "~/longhaul-vscode"}))
+        lines = self.switch(**panel).stdout.splitlines()
+        self.assertIn("The VS Code panel uses never, from the key switch in ~/home/vscode.json", lines[0])
+        self.assertEqual(lines[1:], ["At a limit, this chat waits for personal's reset and carries on there."])
+        self.assertEqual(json.loads(self.switch("--json", "--no-check", command="status", **panel).stdout)["at_limit"],
+                         lines[1], "the same sentence")
+        self.assertEqual(self.switch(**chat).stdout.splitlines()[1:], ["At a limit, this chat asks you before moving to "
+                                                                       "work. With no answer, it waits for personal's "
+                                                                       "reset."], "a terminal chat: the terminal's")
+        (self.home / "vscode.json").write_text(json.dumps({"switch": "never", "switch_mid_session": False}))
+        self.assertEqual(len(self.switch(**panel).stdout.splitlines()), 1, "paused there")
 
     def test_with_no_mode_it_shows_the_one_in_force_and_where_it_comes_from_and_writes_nothing(self):
         out = self.switch()

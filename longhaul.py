@@ -1375,7 +1375,8 @@ def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: di
     return "it had room, and it comes first in turn"
 
 
-def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: float | None = None):
+def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: float | None = None,
+                  early: bool = True):
     """What a chat in the repository `top` on accounts[ours] would do at a
     usage limit under `mode` (the UX review of 2026-11-11, §3.6: the mode
     explained by its effect), in a sentence or two for status --json's
@@ -1387,7 +1388,9 @@ def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: 
     there is one ahead, is its reset; else its reset is not known yet, and
     it counts as after every other's. Ask asks before a move, and with
     every account at its limit offers the first reset once (K2); auto
-    moves, and early when nearly full while idle; never waits. No sign-in
+    moves, and with `early` (a terminal chat: its supervisor's
+    should_move(); the panel's relay has no early move) early when nearly
+    full while idle; never waits. No sign-in
     is checked, so --no-check says the same. None when it cannot be told:
     no chat account (`ours` None), no mode in force, or the chat's account
     not allowed here, where its messages stop before any limit."""
@@ -1413,8 +1416,8 @@ def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: 
     other = accounts[nxt]["name"]
     if until is None:  # one with room
         if mode == "auto":
-            return (f"At a limit, this chat moves to {other} by itself, and early when {name} is nearly full and "
-                    "the chat is idle.")
+            return (f"At a limit, this chat moves to {other} by itself"
+                    + (f", and early when {name} is nearly full and the chat is idle." if early else "."))
         return f"At a limit, this chat asks you before moving to {other}. With no answer, it waits for {name}'s reset{at}."
     full = f"every other account{' allowed here' if len(allowed) < len(accounts) else ''} is at its limit"
     if own and (nxt == ours or mode == "auto"):  # who resets first is known
@@ -1438,10 +1441,17 @@ def chat_account(accounts: list[dict]):
 
 def at_limit_here(mode):
     """at_limit_text() for the chat this runs in (chat_account()) in this
-    folder, from the files, under `mode`: status --json's "at_limit", and
-    what `longhaul switch` adds. None with no list of accounts (one
-    sign-in: nowhere to move), one that cannot be read, or a folder that
-    is gone. It reads only."""
+    folder, from the files, under the mode that governs that chat:
+    status --json's "at_limit", and what `longhaul switch` adds. `mode` is
+    the terminal's (switch_mode()), a terminal chat's. A VS Code panel
+    chat (CLAUDE_CODE_ENTRYPOINT=claude-vscode, which the pane's status
+    --json inherits from its chat) is the panel's relay's, which reads
+    vscode.json's "switch" first (panel_switch_in_force()) and has no
+    early move; with the panel not on Longhaul's accounts
+    (vscode_runs_longhaul()) or Longhaul paused there (panel_mid_session()),
+    Longhaul does nothing at its limit, so None: it claims nothing. None
+    too with no list of accounts (one sign-in: nowhere to move), one that
+    cannot be read, or a folder that is gone. It reads only."""
     accounts, problem = read_accounts_file()
     if problem or not accounts:
         return None
@@ -1449,7 +1459,12 @@ def at_limit_here(mode):
         top = repository_of(os.getcwd())
     except OSError:  # the folder it runs in was removed
         return None
-    return at_limit_text(accounts, load_state(), chat_account(accounts), top, mode)
+    panel = os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-vscode"
+    if panel:
+        if vscode_runs_longhaul() is not True or not panel_mid_session():
+            return None
+        mode = panel_switch_in_force()
+    return at_limit_text(accounts, load_state(), chat_account(accounts), top, mode, early=not panel)
 
 
 def start_logged(sid, verb: str, name: str, where: str, why: str) -> None:
@@ -16288,7 +16303,8 @@ def switch_cmd(opts) -> int:
                   "config.json": f"saved in {where}", "default": "the default"}[switch_setting()[1]]
         print(f"Switching: {mode} ({source}): {switch_said(mode)}. `longhaul switch ask|auto|never` saves another."
               + switch_panel_note())
-        # What it does for this chat here, as status --json's "at_limit" says it (the UX review's §3.6).
+        # What it does for this chat here, under that chat's own mode, as status --json's "at_limit" says it
+        # (the UX review's §3.6): in a panel chat the panel's, which the line above names where it differs.
         said = at_limit_here(mode)
         if said:
             print(said)
@@ -17696,8 +17712,9 @@ def status_json(check: bool = True) -> int:
     # checked: false for --no-check, whose sign-ins were not checked (M7).
     # switch_source and panel_switch_source: where each mode in force comes
     # from (switch_setting(), panel_switch_source()); at_limit: what this
-    # chat would do at a limit under "switch" (at_limit_here()), which checks
-    # no sign-in, so --no-check gives the same (the UX review's §3.6).
+    # chat would do at a limit under its own mode (at_limit_here()): "switch"
+    # in a terminal chat, the panel's in a panel chat. It checks no sign-in,
+    # so --no-check gives the same (the UX review's §3.6).
     found = {"accounts": rows, "listed": listed, "here": here, "switch": mode, "switch_problem": mode_problem,
              "panel_switch": panel_switch_in_force(), "vscode": vscode_runs_longhaul(),
              "panel_paused": not panel_mid_session(), "problem": unreadable_text(problem) if problem else None,
