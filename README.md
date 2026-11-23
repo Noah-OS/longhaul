@@ -113,7 +113,7 @@ Longhaul can run your chats across several of your own Claude subscriptions. Eac
 - a row per account: its plan, its sign-in, its week's use or its limit, then, on a line under it, where it may be used (its folders by name, or by their number where they do not fit 80 columns) and whether it is the fallback;
 - `+ Add account`;
 - `Activity`: what Longhaul did by itself today, and why, this chat first (see [Day to day](#3-day-to-day));
-- `Settings`: switching, the VS Code panel on or off, and forgetting the recorded limits.
+- `Settings`: what a chat does at a usage limit (**Ask me first**, **Move automatically** or **Stay and wait**), with what this chat would do now and where that choice is set; the VS Code panel on or off; and forgetting the recorded limits.
 
 Use the arrow keys to move and Enter to open a line. Escape, or **Back**, goes back to the list; Escape on the list closes it. An account's page shows its 5-hour and week use, its folder and its email, masked (`y…@example.com`). On the phone, `/accounts` shows the list only. In a terminal, `longhaul status` lists the accounts too.
 
@@ -135,9 +135,9 @@ Either way, the browser sign-in opens at once: sign in with that same email. Wha
 
 | Mode | At a limit |
 |---|---|
-| `ask` (the default) | Asks before it moves the chat to another account: in a terminal `longhaul`, in that terminal; in the VS Code panel, in `/accounts` (below). When every account is at its limit, it offers to carry on with the first one to reset. It never moves a chat early. |
-| `auto` | Moves the chat to an account with room, and early, while the chat is idle, when one is nearly full. When every account is at its limit, it carries on with the first one to reset, without asking. |
-| `never` | Waits for the reset, and carries on with the same account. |
+| `ask`, **Ask me first** in `/accounts` (the default) | Asks before it moves the chat to another account: in a terminal `longhaul`, in that terminal; in the VS Code panel, in `/accounts` (below). When every account is at its limit, it offers to carry on with the first one to reset. It never moves a chat early. |
+| `auto`, **Move automatically** | Moves the chat to an account with room, and early, while the chat is idle, when one is nearly full. When every account is at its limit, it carries on with the first one to reset, without asking. |
+| `never`, **Stay and wait** | Waits for the reset, and carries on with the same account. |
 
 **In the VS Code panel, in `ask`**, for example with two accounts named Max and Pro. There is nothing to set: Longhaul stays in each panel chat to ask and to carry on.
 

@@ -2,6 +2,19 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+What happens at a usage limit, said in plain words where you choose it.
+
+### Added
+
+- **`longhaul status --json` says what this chat does at a limit** (`"at_limit"`), in a sentence or two built from the files: the account it would move to, by the same rules a move uses (the folder's rules, its first choice, a fallback last), or that it waits, for whose reset and when, if a limit is recorded. For example: "At a limit, this chat asks you before moving to work. With no answer, it waits for personal's reset." It is `null` with only one sign-in, outside a chat, or when it cannot be told. `"switch_source"` says where the mode in force comes from (`LONGHAUL_SWITCH`, `config.json` or `default`), and `"panel_switch_source"` the VS Code panel's (`vscode.json` too). `--no-check` gives the same.
+- **`longhaul switch`**, with no mode, prints the same sentence under its line.
+
+### Changed
+
+- **`/accounts` Settings names the modes by what they do:** **Ask me first**, **Move automatically** and **Stay and wait**, in place of `ask`, `auto` and `never` (which `longhaul switch` still takes). The list's line reads "Settings (at a limit: Ask me first · …)". Under the choice, in place of three short dim lines, Settings says what this chat would do at a limit now ("Now: at a limit, this chat moves to work by itself, and early when personal is nearly full and the chat is idle.") and where the choice comes from: set there and saved in `~/.longhaul/config.json`, the default, or `LONGHAUL_SWITCH` in the environment, which wins over it. The VS Code panel's own mode, where it differs, is named with where it is set. Each line fits the pane's width, 80 columns at most. An older `longhaul.py` gets one line on each mode, as before.
+
 ## 0.3.19 - 2026-11-19
 
 Easier to read at 80 columns, in a low-contrast theme and with a screen reader; an icon, and CI green again.
