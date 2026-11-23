@@ -241,7 +241,7 @@ Usage:
                           where one conversation's usage went, three lines in
                           short first (numbers only; default: the latest
                           conversation in the ledger); --json gives one record
-                          per number, with its source, the short lines' last
+                          per number, with its source, the In short picks last
   longhaul inspect --agent codex [ID|PATH] [--json]
                           the same for an OpenAI Codex chat, from its rollout
                           (CODEX_HOME/sessions; default: the newest one); a
@@ -6524,17 +6524,20 @@ def summary_lines(r: dict) -> list[str]:
     out = [SUMMARY_HEAD, summary_fit(*[f"  {n:,} request{'s' * (n != 1)}{s} [counted]; {context}, {comp} [measured]"
                                        for s in split for comp in compacted])]
     if pick["kind"]:
-        said = f"{SUMMARY_KINDS[pick['kind']]}: {summary_percent(pick['tokens'], pick['whole'])} of the"
-        shares = [f"  {said} {pick['whole']:,} tokens [measured]", f"  {said} tokens [measured]"]
+        said = f"{SUMMARY_KINDS[pick['kind']]}: {summary_percent(pick['tokens'], pick['whole'])} of"
+        shares = [f"  {said} the {pick['whole']:,} tokens [measured]", f"  {said} the tokens [measured]"]
         lines, t = [], pick["tool"]
         if t:
-            name, est = t["tool"] + (" in subagents" if t["scope"] != "main" else ""), t["chars"] // 4
+            where, est = " in subagents" if t["scope"] != "main" else "", t["chars"] // 4
+            name = t["tool"] + where
             short = f"{shares[1]}; most tool output: {{}}, ≈{est:,} [estimated]"
+            tight = f"  {said} tokens [measured]; most tool output: {{}}, ≈{est:,} [estimated]"
             lines = [f"{share}; the most tool output: {name}, ≈{est:,} tokens [estimated]" for share in shares]
-            lines += [f"{shares[1]}; the most tool output: {name}, ≈{est:,} [estimated]", short.format(name)]
-            room = SUMMARY_WIDTH - len(short.format("..."))
-            if len(name) > room >= 8:  # a long name, an MCP tool's, cut to the room left, never the line
-                lines.append(short.format(name[:room] + "..."))
+            lines += [f"{shares[1]}; the most tool output: {name}, ≈{est:,} [estimated]", short.format(name),
+                      tight.format(name)]
+            room = SUMMARY_WIDTH - len(tight.format("..." + where))
+            if len(t["tool"]) > room >= 8:  # a long name, an MCP tool's, cut to the room left, never the line,
+                lines.append(tight.format(t["tool"][:room] + "..." + where))  # and never where it ran
         out.append(summary_fit(*lines, *shares))
     f = pick["finding"]
     out.append(summary_fit(*[f"  Worth a look, {f['section']}: {say} [{f['tag']}]" for say in f["says"]])

@@ -5336,6 +5336,17 @@ class Inspect(unittest.TestCase):
                          "a long tool name is cut, not the line")
         self.sourced(block)
 
+    def test_a_subagents_tool_keeps_its_whole_name_and_where_it_ran_before_any_cut(self):
+        # 2026-11-23, this chat's own report: "most tool output: Bash in su..., ≈1,833,911" cut a short name.
+        self.write(self.reply(read=987_654_321_000))
+        self.agent(self.turn("t1", "Bash", "z" * 7_335_644, command="make test"))
+        self.agent(self.turn("t2", "mcp__" + "x" * 70, "y" * 400), name="agent-b")
+        block = self.short(longhaul.inspect_lines(longhaul.inspect_transcript(self.path)))
+        self.assertLessEqual(max(map(len, block)), 100, block)
+        self.assertTrue(block[1].endswith("; most tool output: Bash in subagents, ≈1,833,911 [estimated]"), block[1])
+        self.assertNotIn("...", block[1])
+        self.sourced(block)
+
     def test_json_ends_with_the_in_short_picks_one_number_each(self):
         self.write(self.busy())
         records = self.records("s1")
