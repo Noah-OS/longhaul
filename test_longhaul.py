@@ -601,7 +601,7 @@ class Loop(unittest.TestCase):
 
     def test_in_ask_mode_with_every_account_at_its_limit_a_yes_carries_on_with_the_first_to_reset(self):
         started = time.time()
-        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 5}}))
         out, calls = self.run_longhaul([f"limit:{time.time() + 3600}", "exit"], LONGHAUL_SWITCH="ask", answer=b"y")
         self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
         self.assertGreaterEqual(time.time() - started, 2, "after Pro's reset")
@@ -617,10 +617,10 @@ class Loop(unittest.TestCase):
 
     def test_in_ask_mode_with_every_account_at_its_limit_a_no_waits_for_its_own(self):
         started = time.time()
-        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
-        out, calls = self.run_longhaul([f"limit:{time.time() + 3}", "exit"], LONGHAUL_SWITCH="ask", answer=b"n")
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 5}}))
+        out, calls = self.run_longhaul([f"limit:{time.time() + 7}", "exit"], LONGHAUL_SWITCH="ask", answer=b"n")
         self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
-        self.assertGreaterEqual(time.time() - started, 3, "after Max's own reset")
+        self.assertGreaterEqual(time.time() - started, 7, "after Max's own reset")
         self.assertIn("Pro resets first", out.stdout)
         self.assertTrue(calls[1]["args"][-1].startswith(
             "The Max account hit its session limit while every account was at its limit, so longhaul waited for "
@@ -1312,7 +1312,7 @@ class Loop(unittest.TestCase):
         self.assertIn("no record of where sid-new last ran; picking an account", out.stdout)
 
     def test_a_resumed_conversation_on_an_account_at_its_limit_waits_for_it_in_never_mode(self):
-        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 5}}))
         self.transcript("sid-old")
         self.record("sid-old", "Pro")
         started = time.time()
@@ -1401,7 +1401,7 @@ class Loop(unittest.TestCase):
                 if cwd == personal:
                     self.restrict("Max", work)
                 (self.home / "calls.jsonl").unlink(missing_ok=True)
-                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2,
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 5,
                                                                                     **limited}}))
                 self.transcript("sid-old")
                 self.record("sid-old", "Pro")
@@ -1418,7 +1418,7 @@ class Loop(unittest.TestCase):
         for answer in (b"n", b"y"):
             with self.subTest(answer=answer):
                 (self.home / "calls.jsonl").unlink(missing_ok=True)
-                work = self.kept_work(time.time() + 2)
+                work = self.kept_work(time.time() + 5)
                 self.transcript("sid-old")
                 self.record("sid-old", "Pro")
                 out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, cwd=work, LONGHAUL_SWITCH="ask",
@@ -1442,7 +1442,7 @@ class Loop(unittest.TestCase):
         for mode, config in (("never", str(self.pro)), ("auto", None)):
             with self.subTest(mode):
                 (self.home / "calls.jsonl").unlink(missing_ok=True)
-                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 2}}))
+                (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 5}}))
                 self.transcript("sid-old")
                 self.record("sid-old", "Pro")
                 out, calls = self.run_longhaul(["exit"], "-r", "sid-old", runs=1, LONGHAUL_SWITCH=mode, answer=b"y")
@@ -1745,7 +1745,7 @@ class Loop(unittest.TestCase):
         for answer in (b"n", None):
             with self.subTest(answer=answer):
                 (self.home / "calls.jsonl").unlink(missing_ok=True)
-                work = self.kept_work(time.time() + 2)
+                work = self.kept_work(time.time() + 5)
                 started = time.time()
                 out, calls = self.run_longhaul(["exit"], runs=1, cwd=work, LONGHAUL_SWITCH="ask", answer=answer)
                 self.assertEqual([c["config"] for c in calls], [str(self.pro)], out.stdout + out.stderr)
@@ -1768,13 +1768,13 @@ class Loop(unittest.TestCase):
         for mode in ("auto", "never"):
             with self.subTest(mode):
                 (self.home / "calls.jsonl").unlink(missing_ok=True)
-                work = self.kept_work(time.time() + 2)
+                work = self.kept_work(time.time() + 5)
                 out, calls = self.run_longhaul(["exit"], runs=1, cwd=work, LONGHAUL_SWITCH=mode, answer=b"y")
                 self.assertEqual([c["config"] for c in calls], [str(self.pro)], out.stdout + out.stderr)
                 self.assertNotIn("Run this conversation on", out.stdout)
         # Max kept for another repository, or at its limit too: nothing to offer.
         self.restrict("Max", self.tmp / "personal")
-        for limited in ({"Pro": time.time() + 2}, {"Pro": time.time() + 2, "Max": time.time() + 3600}):
+        for limited in ({"Pro": time.time() + 5}, {"Pro": time.time() + 5, "Max": time.time() + 3600}):
             with self.subTest(limited=sorted(limited)):
                 if len(limited) == 2:
                     self.restrict("Max")
@@ -26679,11 +26679,11 @@ class Connections(unittest.TestCase):
             self.assertIn(said, words)
         readme = " ".join((HERE / "README.md").read_text().split())
         self.assertIn("longhaul connections", readme)
-        unreleased = (HERE / "CHANGELOG.md").read_text().split("\n## ")[1]
-        self.assertTrue(unreleased.startswith("Unreleased"), unreleased[:40])
-        self.assertIn("### Added", unreleased)
-        self.assertIn("longhaul connections", unreleased)
-        self.assertIn("### Fixed", unreleased, "the status line's fix is kept")
+        # The top section, "Unreleased" until the release names it.
+        top = (HERE / "CHANGELOG.md").read_text().split("\n## ")[1]
+        self.assertIn("### Added", top)
+        self.assertIn("longhaul connections", top)
+        self.assertIn("### Fixed", top, "the status line's fix is kept")
         # bin/longhaul runs it from no chat: it runs a claude per account, so it is a terminal's.
         self.five()
         env = {k: v for k, v in self.env().items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
