@@ -21,7 +21,8 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // accounts"; it asks first since the UX review's Q12), each change of
 // them, and Remove and delete its sign-in folder…, showing first what it
 // would do, from its own command's --dry-run --json (the UX review's M4),
-// then whether it is a fallback, with the button that turns it (2026-11-06); Add
+// then whether it is a fallback, with the button that turns it (2026-11-06),
+// and its cap, with buttons for another (2026-11-24); Add
 // account's page the form; Settings' page what a chat does at a limit (and
 // what this one would do now), the VS Code panel and forgetting the limits;
 // Troubleshoot's (the UX review's 4.4, M2) what
@@ -38,7 +39,7 @@ import { answerArgs, asks, carries, clock, inTime, look, waits } from './questio
 // the same commands /longhaul:manage runs in words, by argv, never through a
 // shell: setup, add, remove, switch, vscode, clear; and folders, which
 // /longhaul:manage runs too since 0.3.8 (the owner, 2026-11-06); and
-// fallback, which it does not (bin/longhaul refuses it until the owner says
+// fallback and cap, which it does not (bin/longhaul refuses both until the owner says
 // otherwise). One at a time; the rows are read again when the pane opens and
 // after each.
 //
@@ -238,6 +239,10 @@ function clean(s: any): LonghaulStatus {
       check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
+      // Its cap and when it is free of it (2026-11-24), only when the record
+      // says: an older longhaul.py gives neither, and the page then shows no cap.
+      ...(a.cap === null || isCap(a.cap) ? { cap: a.cap as number | null } : {}),
+      ...('capped_until' in a ? { capped_until: num(a.capped_until) } : {}),
       ...(typeof a.use_here === 'string' ? { use_here: a.use_here } : {}),
       ...(Array.isArray(a.preferred) ? { preferred: strs(a.preferred) } : a.preferred === null ? { preferred: null } : {}),
       reading_at: num(a.reading_at), folder: str(a.folder) ?? '', this_chat: a.this_chat === true,
@@ -661,6 +666,18 @@ async function setFallback($: any, name: string, on: boolean): Promise<void> {
     argv: ['fallback', name, on ? 'on' : 'off'], timeoutMs: STATUS_TIMEOUT })
 }
 
+// Its cap set to another of the page's values (the owner, 2026-11-24: "I
+// only take 25% of this account"): `cap NAME 25|50|75|off`, null for off,
+// only from what the last read said, as setFallback(), so a press on a page
+// drawn before a change never sets what is set already.
+async function setCap($: any, name: string, cap: number | null): Promise<void> {
+  const a = busy ? null : await known($, name)
+  if (!a || !('cap' in a) || (a.cap ?? null) === cap || (cap !== null && !CAPS.includes(cap))) return
+  await act($, { label: `${capLabel(cap)}: ${name}`,
+    doing: cap === null ? `Removing ${name}'s cap…` : `Setting ${name}'s cap to ${cap}%…`,
+    argv: ['cap', name, cap === null ? 'off' : String(cap)], timeoutMs: STATUS_TIMEOUT })
+}
+
 async function add($: any): Promise<void> {
   if (busy) return
   const checked = checkAdd(await read($, form))
@@ -1057,8 +1074,9 @@ function limitText(a: LonghaulAccount, nowMs: number): string {
   return limitParts(a, nowMs).join(', ')
 }
 
+// Not for one at its cap (2026-11-24): no chat may use it until it is free.
 function roomNow(a: LonghaulAccount): boolean {
-  return typeof a.reading_at === 'number' && typeof a.limited_until !== 'number'
+  return typeof a.reading_at === 'number' && typeof a.limited_until !== 'number' && typeof a.capped_until !== 'number'
     && !((a.five_hour?.used ?? 0) >= 100 || (a.week?.used ?? 0) >= 100)
 }
 
@@ -1125,18 +1143,20 @@ function flow(start: number, phrases: string[][], width: number, indent: number,
   return lines
 }
 
-// The line under an account's text: this chat's account, its role, and
-// where it may run. Fallback, for one used only when the others have no
-// room; used nowhere, too, for one with no list that others keep out of
-// every folder. Its folders by name where the line can hold them in `room`
-// columns, else by their number: its page names them.
-function extras(a: LonghaulAccount, room: number, sep: string): string[] {
+// The line under an account's text: this chat's account, its role, while
+// it is at its cap until when (2026-11-24), and where it may run.
+// Fallback, for one used only when the others have no room; used nowhere,
+// too, for one with no list that others keep out of every folder. Its
+// folders by name where the line can hold them in `room` columns, else by
+// their number: its page names them.
+function extras(a: LonghaulAccount, room: number, sep: string, nowMs: number): string[] {
   const where = (named: boolean) => (a.only_in === null || a.kept_out_by?.length ? 'used nowhere'
     : a.only_in.includes('/') ? EVERYWHERE : !a.only_in.length ? ''
     : named ? `only in ${a.only_in.join(', ')}`
     : `only in ${a.only_in.length} folder${a.only_in.length > 1 ? 's' : ''}`)
-  const said = (named: boolean) => [a.this_chat ? 'this chat' : '', a.fallback === true ? 'fallback' : '', where(named)]
-    .filter(Boolean).map(part => mask(part))
+  const capped = typeof a.capped_until === 'number' ? `capped until ${clock(a.capped_until, nowMs)}` : ''
+  const said = (named: boolean) => [a.this_chat ? 'this chat' : '', a.fallback === true ? 'fallback' : '', capped,
+    where(named)].filter(Boolean).map(part => mask(part))
   const named = said(true)
   return named.join(sep).length <= room ? named : said(false)
 }
@@ -1147,6 +1167,20 @@ const UNTOUCHED = 'Your project folders are never touched.'
 
 // What a fallback is, on its page: longhaul.py's FALLBACK_RULE, "here".
 const FALLBACK = 'used only when no other account allowed here has room'
+
+// The caps an account's page offers (2026-11-24), each a button where it
+// is not the cap now, and none; `longhaul cap NAME PERCENT` sets any other.
+const CAPS: readonly number[] = [25, 50, 75]
+
+// A cap as longhaul.py's cap_of() takes it: a whole number from 1 to 99.
+function isCap(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 99
+}
+
+// What a cap's button says, and its result line: what the press does.
+function capLabel(cap: number | null): string {
+  return cap === null ? 'Remove the cap' : `Cap at ${cap}%`
+}
 
 // The list's lines. Each is a Button on a surface that draws fields, so the
 // arrows walk them and Enter opens the page; on the phone they are text. A
@@ -1167,7 +1201,7 @@ function itemsPart($: any, c: Ctx): any {
     if (key) keys.add(key)
     const head = `${mask(shownName(s, name)).padEnd(width)}  `
     const { phrases, warn } = summary(a, c.nowMs, c.checking)
-    const more = extras(a, c.columns - indent, c.sep)
+    const more = extras(a, c.columns - indent, c.sep, c.nowMs)
     items.push({ key, head, lines: flow(2 + head.length, phrases, c.columns, indent, c.sep), warn,
       more: more.length ? flow(indent, more.map(part => [part]), c.columns, indent, c.sep) : [],
       open: key ? () => void go($, `account:${name}`, harmless(a, s.listed)) : undefined })
@@ -1399,6 +1433,42 @@ function fallbackPart($: any, c: Ctx, a: LonghaulAccount): any {
   )
 }
 
+// Its cap (the owner, 2026-11-24): "Cap: 25% (now 18% of its week)", by
+// the open window used the most, as `longhaul cap` says it (cap_line());
+// "Cap: 25%, at it until Fri 02:00 (in 2 d 4 h), now 30% of its 5 hours"
+// while it is at it, as its limit's line says how far off; "Cap: none".
+// Then a button for each of 25, 50 and 75% and none that is not the cap
+// now, while nothing runs and no Remove waits for a yes. Nothing for a
+// record that does not say: an older longhaul.py has no `cap` to run.
+function capText(a: LonghaulAccount, nowMs: number): string {
+  const cap = a.cap ?? null
+  if (cap === null) return 'Cap: none'
+  const five = a.five_hour, week = a.week
+  const most = week && (!five || week.used > five.used) ? { used: week.used, words: 'week' }
+    : five ? { used: five.used, words: '5 hours' } : null
+  const stand = most ? `now ${Math.round(most.used)}% of its ${most.words}` : 'no usage reading yet'
+  return typeof a.capped_until === 'number'
+    ? `Cap: ${cap}%, at it until ${clock(a.capped_until, nowMs)} (${inTime(a.capped_until, nowMs)}), ${stand}`
+    : `Cap: ${cap}% (${stand})`
+}
+
+function capPart($: any, c: Ctx, a: LonghaulAccount): any {
+  const { Box, Text, Button } = c.E
+  if (!('cap' in a)) return null
+  const name = String(a.name), now = a.cap ?? null
+  const offered = ([...CAPS, null] as (number | null)[]).filter(v => v !== now)
+  return (
+    <Box flexDirection="column">
+      <Text color={typeof a.capped_until === 'number' ? 'warning' : undefined}>{capText(a, c.nowMs)}</Text>
+      {c.idle && !asking(c, name) && (
+        <Box flexDirection="row" gap={1}>
+          {offered.map(v => <Button key={`cap-${v ?? 'off'}`} label={capLabel(v)} onPress={() => void setCap($, name, v)} />)}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
 // What the folder field's typing keeps, for the account whose page it is on.
 function keepFolder($: any, name: string): (value: string) => void {
   return value => void update($, folder, () => ({ account: name, path: value, problem: null }))
@@ -1412,6 +1482,7 @@ function notHere(a: LonghaulAccount, here: LonghaulStatus['here']): string {
   switch (a.use_here) {
     case 'this_chat': return 'Use for this chat: this chat runs on it already.'
     case 'limited': return 'Use for this chat: not offered while it is at its limit.'
+    case 'capped': return 'Use for this chat: not offered while it is at its cap.'
     case 'not_signed_in': return 'Use for this chat: not offered until it is signed in with its email.'
     case 'not_allowed': {
       const kept = (a.kept_out_by ?? []).map(String)
@@ -1518,6 +1589,7 @@ function accountPage($: any, c: Ctx): any {
       {listed && preferredPart($, c, a)}
       {listed && foldersPart($, c, a)}
       {listed && fallbackPart($, c, a)}
+      {listed && capPart($, c, a)}
     </Box>
   )
 }

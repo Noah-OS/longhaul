@@ -165,6 +165,20 @@ Usage:
                           to a fallback, and a chat on one is not moved off it
                           when a normal account has room again. /accounts does
                           it with a button
+  longhaul cap [NAME [PERCENT|off]]
+                          how much of an account Longhaul uses: PERCENT, a
+                          whole number from 1 to 99, of each of its windows,
+                          the 5-hour one and the weekly one. An account at its
+                          cap is not used again until the window that reached
+                          it resets, as one at its limit is not: a chat on it
+                          leaves it once Claude is idle (auto), asks (ask) or
+                          waits for that reset (never), and with every account
+                          at its cap or its limit it waits for the first reset.
+                          off removes the cap; with NAME alone, or nothing, it
+                          only reads, and says where each account stands. The
+                          cap is checked from the status line's reading after
+                          each request, so a long turn can pass it by a little.
+                          /accounts does it with buttons
   longhaul use NAME [--chat ID] the chat this runs in, or chat ID (a short id
                           works), runs on NAME from now on: a VS Code panel
                           chat moves the next time Claude is idle in it, any
@@ -1304,6 +1318,121 @@ def is_fallback(acct: dict) -> bool:
     return acct.get("fallback") is True
 
 
+# An account's cap (the owner, 2026-11-24: "I want to set how much of each
+# account I use: e.g. I only take 25% of this account's usage"): "cap": 25
+# on an account in accounts.json, a whole number from 1 to 99, the share of
+# both its 5-hour and its weekly window Longhaul lets chats use. Strict, as
+# the owner chose it: an account with an open window at or over its cap, by
+# its latest usage reading, is treated exactly as one at its limit until
+# that window resets (capped()), by every place that picks an account
+# (blocked(), which pick() reads). Nothing is recorded in state.json: the
+# reading is the record, so raising or removing the cap frees the account
+# at once, `longhaul clear` has nothing to forget for it, and a reading
+# whose window has reset never caps. Absent is no cap, as every account had
+# before; any other value is none either, which status says (CAP_JUNK): a
+# cap only ever holds an account back, so a typo is no reason to stop one.
+CAP_JUNK = "its cap field is not a whole number from 1 to 99"
+CAP_WINDOWS = {"five_hour": "5 hours", "seven_day": "week"}  # each window as "its 5 hours", "its week"
+
+
+def cap_of(acct: dict):
+    """`acct`'s cap, a whole number from 1 to 99, or None: no "cap", or one
+    in another shape (a string, a float, true, 0, 100 or more)."""
+    cap = acct.get("cap") if isinstance(acct, dict) else None
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99 else None
+
+
+def capped(acct: dict, reading, now: float):
+    """When `acct` may be used again by its cap: of the windows of its
+    `reading` still open at `now` and at or over its cap, the reset of the
+    one that resets last, since each must reset before it is under its cap
+    (full_window() reads a limit so); None with no cap, no such window, or
+    a reading in another shape. A window whose reset has passed is not
+    open, so a stale reading never caps."""
+    cap = cap_of(acct)
+    if cap is None:
+        return None
+    found = None
+    for key in CAP_WINDOWS:
+        part = dict_at(reading, key)
+        resets, used = as_number(part.get("resets_at")), as_number(part.get("used_percentage"))
+        if resets is not None and used is not None and resets > now and used >= cap \
+                and (found is None or resets > found):
+            found = resets
+    return found
+
+
+def cap_limits(accounts: list[dict], seen: dict, now: float) -> dict:
+    """{name: until} for each of `accounts` at its cap by its reading in
+    `seen` (readings()'s), capped()'s answer."""
+    found = {}
+    for a in accounts:
+        until = capped(a, seen.get(a["name"]), now)
+        if until is not None:
+            found[a["name"]] = until
+    return found
+
+
+def blocked(accounts: list[dict], state: dict, seen: dict | None, now: float) -> dict:
+    """state.json's recorded limits with each account's cap merged in, the
+    later of the two where an account has both: {name: until}. What the
+    choosers read where they read limited_until, so an account at its cap
+    is passed over exactly as one at its limit is. A copy: nothing here
+    reaches state.json."""
+    limited = dict(dict_at(state, "limited_until"))
+    for name, until in cap_limits(accounts, seen or {}, now).items():
+        limited[name] = max(as_number(limited.get(name)) or 0, until)
+    return limited
+
+
+def with_caps(state: dict, accounts: list[dict], seen: dict | None, now: float) -> dict:
+    """`state` with its limited_until as blocked() gives it, for a caller
+    that reads limits from a state the way pick() does."""
+    return {**state, "limited_until": blocked(accounts, state, seen, now)}
+
+
+def cap_held(acct: dict, state: dict, reading, now: float):
+    """(until, cap) when `acct`'s cap is what keeps it unused now: at its
+    cap until `until`, and no recorded limit later than that; else None.
+    So "at its cap (25%) until 14:00" is said apart from "at its limit"."""
+    until = capped(acct, reading, now)
+    if until is None:
+        return None
+    limit = as_number(dict_at(state, "limited_until").get(acct["name"])) or 0
+    return (until, cap_of(acct)) if limit <= until else None
+
+
+def cap_words(cap) -> str:
+    """"at its cap (25%)": how every place names an account at its cap."""
+    return f"at its cap ({cap}%)"
+
+
+def cap_stand(reading, now: float):
+    """(used %, window in words) of the open window of `reading` used the
+    most, for "now 18% of its week"; None with no open window."""
+    best = None
+    for key, words in CAP_WINDOWS.items():
+        part = dict_at(reading, key)
+        resets, used = as_number(part.get("resets_at")), as_number(part.get("used_percentage"))
+        if resets is not None and used is not None and resets > now and (best is None or used > best[0]):
+            best = (used, words)
+    return best
+
+
+def cap_line(acct: dict, reading, now: float, shown: str | None = None) -> str:
+    """Where `acct` stands against its cap, as `longhaul cap` says it:
+    "work: no cap"; "work: cap 25% (now 18% of its week)"; "work: cap
+    25%, at it until Fri 02:00 (now 30% of its 5 hours)"; "(no usage
+    reading yet)" with none, or with no open window in it."""
+    name, cap = shown or acct["name"], cap_of(acct)
+    if cap is None:
+        return f"{name}: no cap ({CAP_JUNK})" if acct.get("cap") is not None else f"{name}: no cap"
+    stand = cap_stand(reading, now)
+    now_text = f"now {stand[0]:g}% of its {stand[1]}" if stand else "no usage reading yet"
+    until = capped(acct, reading, now)
+    return f"{name}: cap {cap}%, at it until {clock(until)} ({now_text})" if until else f"{name}: cap {cap}% ({now_text})"
+
+
 # A folder's preferred account (the owner, 2026-11-11: "...or tied to a
 # folder"): an optional "preferred": ["~/work/client", ...] on an account in
 # accounts.json, kept as written as "repositories" is; absent, null or []
@@ -1387,10 +1516,15 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     rules decide. Without `top`, or with no preference there, nothing else
     changes. A reopened chat in ask and never does not come here: it
     returns to the account it ran on.
+
+    An account at its cap (capped(), by its reading in `seen`) is one at
+    its limit here, until the window that reached the cap resets
+    (blocked()): never chosen while another has room, and with none, the
+    one free first is the answer, whether a limit or a cap holds it.
     """
     now = time.time() if now is None else now
     seen = seen or {}
-    limited = state.get("limited_until", {})
+    limited = blocked(accounts, state, seen, now)
     n = len(accounts)
     usable = [i for i in range(n) if accounts[i]["name"] not in skip]
     if not usable:
@@ -1433,14 +1567,16 @@ def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: di
     where = home_path(top) if top is not None else None
     allowed = eligible(accounts, top) if top is not None else [a["name"] for a in accounts]
     narrowed = where is not None and len(allowed) < n
+    caps = cap_limits(accounts, seen, now)  # each at its cap is at its limit here, said as its own (2026-11-24)
     if until:
         every = f"every account allowed in {where}" if narrowed else "every account"
-        return f"{every} was at its limit, and {name} resets first, at {clock(until)}"
+        held = "at its limit or its cap" if caps else "at its limit"
+        return f"{every} was {held}, and {name} resets first, at {clock(until)}"
     if narrowed and allowed == [name]:
         return f"the only account allowed in {where}"
     if n == 1:
         return "the only account"
-    limited = state.get("limited_until", {})
+    limited = blocked(accounts, state, seen, now)
     usable = [j for j in range(n) if accounts[j]["name"] not in skip]
     free = [j for j in usable if limited.get(accounts[j]["name"], 0) <= now]
     if top is not None and free and preferred_here(accounts, free, top, seen, now) == i:
@@ -1453,7 +1589,9 @@ def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: di
     full = [o for o in others if limited.get(o, 0) > now]
     if full and len(full) == len(others):
         one = len(full) == 1
-        return f"it had room, and {', '.join(full)} {'was' if one else 'were'} at {'its' if one else 'their'} limit"
+        held = (f"{'its' if one else 'their'} limit" if not any(o in caps for o in full)
+                else ("its cap" if one else "their caps") if all(o in caps for o in full) else "their limits or caps")
+        return f"it had room, and {', '.join(full)} {'was' if one else 'were'} at {held}"
     near = [o for o in others if o not in full and near_full(seen.get(o), now)]
     if near and not near_full(seen.get(name), now):
         return f"it had room, and {', '.join(near)} {'is' if len(near) == 1 else 'are'} nearly full"
@@ -1481,13 +1619,55 @@ def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: 
     full while idle; never waits. No sign-in
     is checked, so --no-check says the same. None when it cannot be told:
     no chat account (`ours` None), no mode in force, or the chat's account
-    not allowed here, where its messages stop before any limit."""
+    not allowed here, where its messages stop before any limit.
+
+    The chat's account at its cap (2026-11-24) is said first, in a sentence
+    of its own (cap_now_text()), before the one about a limit; an account
+    at its cap is no place to move to, as one at its limit is not."""
     if ours is None or mode not in SWITCH_MODES:
         return None
     now = time.time() if now is None else now
     name, allowed = accounts[ours]["name"], eligible(accounts, top)
     if name not in allowed:
         return None
+    seen = readings(accounts)
+    first = cap_now_text(accounts, state, ours, top, mode, seen, now, allowed)
+    said = at_limit_said(accounts, state, ours, top, mode, now, early, seen, allowed)
+    return f"{first} {said}" if first and said else said
+
+
+def cap_now_text(accounts: list[dict], state: dict, ours: int, top: str, mode: str, seen: dict, now: float,
+                 allowed: list) -> str | None:
+    """at_limit_text()'s first sentence for a chat whose account is at its
+    cap now (cap_held()): until when, and what the chat does under `mode`,
+    as the terminal's supervisor and the panel's relay do it: auto moves it
+    once Claude is idle, ask asks first and holds its next message for the
+    answer, never holds it for the reset; with no other account with room,
+    it waits for the first one free. None when its cap holds nothing now."""
+    acct = accounts[ours]
+    held = cap_held(acct, state, seen.get(acct["name"]), now)
+    if held is None:
+        return None
+    until, cap = held
+    head = f"{acct['name']} is {cap_words(cap)} until {clock(until)}:"
+    if mode == "never":
+        return f"{head} this chat's next message waits for that reset."
+    nxt, free = pick(accounts, {**state, "limited_until": {**dict_at(state, "limited_until"), acct["name"]: math.inf}},
+                     (ours + 1) % len(accounts), skip={a["name"] for a in accounts} - set(allowed), seen=seen,
+                     top=top, now=now)
+    if nxt is None or nxt == ours or free:
+        first = min(until, free) if free else until
+        return f"{head} no other account has room, so this chat's next message waits until {clock(first)}."
+    other = accounts[nxt]["name"]
+    if mode == "auto":
+        return f"{head} this chat moves to {other} once Claude is idle."
+    return f"{head} this chat asks you before moving to {other}, and its next message waits for the answer."
+
+
+def at_limit_said(accounts: list[dict], state: dict, ours: int, top: str, mode: str, now: float, early: bool,
+                  seen: dict, allowed: list) -> str:
+    """at_limit_text()'s sentence about a limit (its docstring says it)."""
+    name = accounts[ours]["name"]
     # A limit that is not a time is no limit here, so a hand-edited state.json never stops the sentence.
     limited = {k: as_number(v) for k, v in dict_at(state, "limited_until").items() if as_number(v) is not None}
     own = limited.get(name) if limited.get(name, 0) > now else None
@@ -1500,14 +1680,16 @@ def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: 
         return f"At a limit, this chat waits for {name}'s reset{at} and carries on there."
     nxt, until = pick(accounts, {**state, "limited_until": {**limited, name: own or math.inf}},
                       (ours + 1) % len(accounts), skip={a["name"] for a in accounts} - set(allowed),
-                      seen=readings(accounts), top=top, now=now)
+                      seen=seen, top=top, now=now)
     other = accounts[nxt]["name"]
     if until is None:  # one with room
         if mode == "auto":
             return (f"At a limit, this chat moves to {other} by itself"
                     + (f", and early when {name} is nearly full and the chat is idle." if early else "."))
         return f"At a limit, this chat asks you before moving to {other}. With no answer, it waits for {name}'s reset{at}."
-    full = f"every other account{' allowed here' if len(allowed) < len(accounts) else ''} is at its limit"
+    caps = set(cap_limits(accounts, seen, now)) & (set(allowed) - {name})  # those at their cap, said so (2026-11-24)
+    full = (f"every other account{' allowed here' if len(allowed) < len(accounts) else ''} is at its limit"
+            + (" or its cap" if caps else ""))
     if own and (nxt == ours or mode == "auto"):  # who resets first is known
         return f"At a limit, this chat waits for {other}'s reset at {clock(until)} and carries on there: {full}."
     unless = "" if own else f", unless {name} resets first"
@@ -1633,13 +1815,17 @@ def resumed_index(resumed: str | None, accounts: list[dict], mode: str, who: str
     chosen = take_choice(resumed, accounts, top, who)
     if chosen:
         idx = [a["name"] for a in accounts].index(chosen)
-        until = as_number(load_state()["limited_until"].get(chosen)) or 0
+        now, state = time.time(), load_state()
+        reading = read_json(USAGE_DIR / f"{chosen}.json")
+        until = as_number(blocked([accounts[idx]], state, {chosen: reading}, now).get(chosen)) or 0
+        held = cap_held(accounts[idx], state, reading, now)  # its cap holds it as a limit would (2026-11-24)
         if chosen in unmanaged:
             why = "is not managed"
         elif not signed_in_cached(accounts[idx], binary):
             why = "is not signed in as expected"
-        elif mode == "auto" and until > time.time():
-            why = f"is at its limit until {clock(until)}, and with switching set to auto longhaul picks"
+        elif mode == "auto" and until > now:
+            why = (f"is {cap_words(held[1]) if held else 'at its limit'} until {clock(until)}, and with switching "
+                   "set to auto longhaul picks")
         else:
             log(f"{who}: {resumed[:8]} starts on {chosen}, as `longhaul use` chose for it")
             if reasons is not None:  # why, for the start line (start_logged())
@@ -1950,6 +2136,17 @@ class Watch:
             return False
         return not self.agents_busy() and other_has_room()
 
+    def should_leave_cap(self, at_cap) -> bool:
+        """This account has reached its cap (`at_cap()`, 2026-11-24) and
+        Claude is idle: close it, for the run loop to move the chat or wait
+        for the reset by the mode, as at a limit, so no turn starts on it.
+        No IDLE_MOVE wait: the cap is strict, and the next message must not
+        start a turn here. Never while background agents work, since closing
+        Claude stops them."""
+        if self.status != "idle":
+            return False
+        return at_cap() and not self.agents_busy()
+
     def should_reconnect(self) -> bool:
         if not (self.rc_lost_at and time.time() - self.rc_lost_at >= RC_GRACE):
             return False
@@ -2210,13 +2407,24 @@ def terminal_fd():
         return None
 
 
-def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
+def ask_to_move(here: str, kind: str | None, resets_at: float, there: str, cap: int | None = None) -> str:
     """At a limit in "ask" mode: ask_here()'s answer to moving this
     conversation to `there`, asked until the reset; "no", unasked, for a
-    reset already past: no one could answer in time."""
+    reset already past: no one could answer in time. With `cap`, `here`
+    is at its cap (2026-11-24) until `resets_at`, not at a limit: the same
+    question in its words, and a no waits for that reset and reopens the
+    chat there, with no message, since nothing was cut off."""
     now = time.time()
     if resets_at <= now:  # no one could answer in time, so nothing is asked
         return "no"
+    if cap is not None:
+        return ask_here(f"{here} is {cap_words(cap)} until {clock(resets_at)} ({in_text(resets_at - now)}). "
+                        f"Move this chat to {there} now?",
+                        f"y move · n wait for {here} · q quit Longhaul",
+                        f"longhaul waits and reopens this chat on {here} at {clock(resets_at)}", resets_at,
+                        f"move to {there}", f"{here} is {cap_words(cap)}. Answer in longhaul's terminal: move to {there}?",
+                        f"No answer by the reset, so longhaul reopens this chat on {here}.",
+                        no_answer=f"No answer means wait, then reopen on {here}.")
     # UX review 4.7, row 15: shorter, every fact of the longer text kept.
     return ask_here(f"{here} hit its {kind} limit (resets {clock(resets_at)}, {in_text(resets_at - now)}). "
                     f"Move this chat to {there} now?",
@@ -2227,17 +2435,19 @@ def ask_to_move(here: str, kind: str, resets_at: float, there: str) -> str:
                     no_answer=f"No answer means wait, then carry on with {here}.")
 
 
-def ask_to_start(here: str, kind: str | None, resets_at: float, there: str) -> str:
+def ask_to_start(here: str, kind: str | None, resets_at: float, there: str, cap: int | None = None) -> str:
     """In "ask", before a conversation reopened on `here` waits for its
     limit to lift at `resets_at` (the ask-first plan of 2026-10-29: at a
     limit, ask first): ask_here()'s answer to starting it on `there`
     instead, asked until the reset; "no", unasked, for a reset already
     past. ask_to_move()'s question, for a conversation not yet running:
     nothing hit a limit just now, and nothing moves mid-turn. `kind`
-    ("weekly", "session") is named when the readings give it."""
+    ("weekly", "session") is named when the readings give it; `cap`, when
+    its cap holds it (2026-11-24), is named instead."""
     if resets_at <= time.time():  # no one could answer in time, so nothing is asked
         return "no"
-    limit, at = f"its {kind} limit" if kind else "its limit", clock(resets_at)
+    limit, at = (cap_words(cap)[3:] if cap is not None else f"its {kind} limit" if kind else "its limit",
+                 clock(resets_at))
     return ask_here(f"{here} is at {limit} until {at}. Start this conversation on {there} instead?",
                     f"y start on {there} · n wait for {here} · q quit Longhaul",
                     f"longhaul waits and carries on with {here} at {at}", resets_at,
@@ -2419,7 +2629,8 @@ def stop(proc: subprocess.Popen) -> None:
 
 
 def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
-              may_reconnect=lambda: True, claim=lambda sid: True, leave=lambda w: False) -> str:
+              may_reconnect=lambda: True, claim=lambda sid: True, leave=lambda w: False,
+              at_cap=lambda: False) -> str:
     while proc.poll() is None:
         try:
             proc.wait(timeout=POLL)
@@ -2443,6 +2654,9 @@ def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
                 # Reopening has not kept the link: leave it to Claude for
                 # this launch, and forget the loss, or it is asked at every poll.
                 w.rc, w.rc_seen, w.rc_lost_at = False, False, None
+            if w.should_leave_cap(at_cap):  # before the early move: a cap is the stricter of the two
+                stop(proc)
+                return "cap"
             if w.should_move(other_has_room):
                 stop(proc)
                 return "move"
@@ -3245,7 +3459,9 @@ def run(opts) -> int:
             wrong.add(names[i])
             skip.add(names[i])
         there = names[i]
-        answer = ask_to_start(stay, limit_kind(seen.get(stay), resets_at), resets_at, there)
+        held = cap_held(accounts[names.index(stay)], state, seen.get(stay), time.time())
+        answer = ask_to_start(stay, limit_kind(seen.get(stay), resets_at), resets_at, there,
+                              cap=held[1] if held else None)
         if answer != "yes":
             return "stop" if answer == "stop" else None
         if resume:  # now, not only at the launch's end: a terminal closed while Claude runs never gets there
@@ -3316,8 +3532,13 @@ def run(opts) -> int:
         elif stay and mode == "auto":  # auto saved since: pick() decides, as at a launch in auto
             stay = waiting = None
             left = carry
-        state = load_state()
         seen = readings(accounts)
+        # Each account at its cap is one at its limit for every decision of
+        # this round (blocked(), 2026-11-24): pick(), the account waited for,
+        # --account and the kept folder's offer. The copy is this round's:
+        # nothing of it is written, so a cap raised or removed counts at once.
+        recorded = load_state()
+        state = with_caps(recorded, accounts, seen, time.time())
         # Checked before every launch, not once: on 2026-10-15 a sign-in in
         # VS Code moved ~/.claude to the second account while longhaul waited for
         # a reset, and a check made only at start would have carried on as
@@ -3343,8 +3564,12 @@ def run(opts) -> int:
                 reason = f"{stay} was at its limit until {clock(resets)}, and you said yes to {names[elsewhere]}"
                 idx, until, chosen, stay, forced = elsewhere, None, True, names[elsewhere], None
             elif resets + RESET_MARGIN > time.time():
-                what, waiting = waiting or (f"{label_in(stay, accounts)} is at its limit, and with switching set to "
-                                            f"{mode} the conversation stays on it (or start it with --account NAME)"), None
+                held = cap_held(accounts[names.index(stay)], recorded, seen.get(stay), time.time())
+                what, waiting = waiting or (
+                    f"{label_in(stay, accounts)} is {cap_words(held[1])}, and with switching set to {mode} the "
+                    f"conversation stays on it (`longhaul cap {stay} off` lets it go on now)" if held else
+                    f"{label_in(stay, accounts)} is at its limit, and with switching set to "
+                    f"{mode} the conversation stays on it (or start it with --account NAME)"), None
                 lifted = limit_gone([stay])
                 if not wait_until(resets + RESET_MARGIN, what, lambda: bool(refresh()) or lifted()):
                     return 0
@@ -3364,7 +3589,9 @@ def run(opts) -> int:
                 # Said, not only picked: in the owner's live test (2026-10-26)
                 # `--account personal-2` at its weekly limit started on
                 # personal-1 with no word of why.
-                say(f"{label_in(names[i], accounts)} is at its limit until {clock(resets)}; picking an account")
+                held = cap_held(accounts[i], recorded, seen.get(names[i]), time.time())
+                say(f"{label_in(names[i], accounts)} is {cap_words(held[1]) if held else 'at its limit'} until "
+                    f"{clock(resets)}; picking an account")
             elif signed_in_as_expected(accounts[i]):
                 idx, until, chosen = i, None, True
                 reason = "chosen with longhaul use" if names[i] == use_choice else "asked for with --account"
@@ -3388,8 +3615,10 @@ def run(opts) -> int:
                 return stopped()
             if elsewhere is None:
                 which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
+                held = " or its cap" if cap_limits([a for a in accounts if a["name"] not in wrong], seen,
+                                                   time.time()) else ""
                 lifted = limit_gone(n for n in names if n not in wrong)
-                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit",
+                if not wait_until(until + RESET_MARGIN, f"{which} is at its limit{held}",
                                   lambda: bool(refresh()) or lifted()):
                     return 0
                 continue
@@ -3440,10 +3669,11 @@ def run(opts) -> int:
             # nearly full, not at its limit, and a fallback account is used
             # only when no normal one has room (the owner, 2026-11-06). So
             # pick() then finds a normal account with room for the move.
-            st, now = load_state(), time.time()
+            now = time.time()
             fresh = readings(accounts)
+            held = blocked(accounts, load_state(), fresh, now)  # one at its cap has no room either (2026-11-24)
             return any(a["name"] != here and a["name"] not in skip and not is_fallback(a)
-                       and st["limited_until"].get(a["name"], 0) <= now
+                       and held.get(a["name"], 0) <= now
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
         def claim(sid: str, here=acct["name"]) -> bool:
@@ -3486,8 +3716,20 @@ def run(opts) -> int:
             if mode != "auto" or w.status != "idle" or not w.status_since \
                     or time.time() - w.status_since < IDLE_MOVE or w.agents_busy():
                 return False
-            st, now = load_state(), time.time()
-            return any(a["name"] not in denied and st["limited_until"].get(a["name"], 0) <= now for a in accounts)
+            now = time.time()
+            held = blocked(accounts, load_state(), readings(accounts), now)
+            return any(a["name"] not in denied and held.get(a["name"], 0) <= now for a in accounts)
+
+        def at_cap(launched=acct) -> bool:
+            """Whether this launch's account is at its cap now (capped()), by
+            its latest reading and its cap in accounts.json as leave() last
+            re-read it (refresh()), so a cap raised or removed counts at once.
+            In every mode: the cap is strict (the owner, 2026-11-24), so in
+            ask and never too Claude is closed once idle, for the decision
+            below, as a limit stop closes it."""
+            found = find_account(launched, accounts)
+            return found is not None and capped(found, read_json(USAGE_DIR / f"{found['name']}.json"),
+                                                time.time()) is not None
 
         try:
             # The early move to an account with room happens in "auto" only:
@@ -3496,7 +3738,7 @@ def run(opts) -> int:
             # 2026-10-29: in "ask", ask at the limit and never early here).
             # The mode as it is now: a saved one is read again (refresh()).
             why = supervise(proc, w, lambda: mode == "auto" and other_has_room(), may_reconnect,
-                            claim=claim, leave=leave)
+                            claim=claim, leave=leave, at_cap=at_cap)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -3615,6 +3857,63 @@ def run(opts) -> int:
                 log(msg)  # the wait at the top of the loop says it, with the time
             if asked:  # the wait this question was about, for start_elsewhere(): asked once
                 asked_for = (stay, state["limited_until"].get(stay, 0))
+        elif why == "cap":
+            # The account reached its cap (the owner, 2026-11-24: strict) and
+            # Claude was idle, so supervise() closed it: as at a limit, by the
+            # mode, with two differences. Nothing was cut off, so no carry-on
+            # message goes, as after the early move; and nothing is recorded,
+            # since the reading keeps it at its cap until its window resets
+            # (the loop's top waits for that, in ask and never, as for a limit).
+            prompt = None
+            now, seen = time.time(), readings(accounts)
+            state = with_caps(load_state(), accounts, seen, now)
+            here = find_account(acct, accounts) or acct
+            held = cap_held(here, state, seen.get(here["name"]), now)
+            old_shown = label_in(acct["name"], accounts)
+            if held is None:  # raised, removed or reset meanwhile: it reopens where it was
+                then = f"{acct['name']}'s cap no longer held it"
+                log(f"terminal: {acct['name']} is no longer at its cap; the conversation reopens there")
+            else:
+                until, cap = held
+                at = f"{old_shown} is {cap_words(cap)} until {clock(until)}"
+                nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong, seen=seen, top=top)
+                new = accounts[nxt]["name"] if nxt is not None else acct["name"]
+                new_shown = label_in(new, accounts)
+                room = nxt is not None and nxt != idx and not wait
+                verdict = decide_move(mode, consent=True, can_ask=room and signed_in_as_expected(accounts[nxt]))
+                asked = verdict == "ask"
+                every = "every account allowed here" if denied else "every account"
+                if asked:
+                    answer = ask_to_move(acct["name"], None, until, new, cap=cap)
+                elif mode == "ask" and wait and nxt not in (None, idx) and wait < until \
+                        and signed_in_as_expected(accounts[nxt]):
+                    # As at a limit (K2): with no account free, another free first is offered once.
+                    answer, asked = ask_first_reset(acct["name"], new, wait, every), True
+                else:
+                    answer = "yes" if verdict == "move" and nxt is not None else "no"
+                if answer == "stop":
+                    return stopped()
+                if answer == "yes" and not wait:
+                    then = (f"{acct['name']} reached its cap ({cap}%), and "
+                            + ("switching is auto" if mode == "auto" else "you said yes"))
+                    msg = (f"{at}, so while {label} was idle longhaul moved it to {new_shown}." if mode == "auto"
+                           else f"Moving to {new_shown}: reopening this conversation there.")
+                    idx, stay = nxt, (new if mode != "auto" else None)
+                    say(msg)
+                    notify(msg)
+                elif answer == "yes":  # no account free now: the loop's top waits for the one free first
+                    then = f"{acct['name']} reached its cap ({cap}%) while {every} was at its limit or its cap"
+                    idx, stay = nxt, (new if mode != "auto" else None)
+                    if mode != "auto":
+                        waiting = f"{new_shown} is free first"
+                    msg = f"{at}, and {every} is at its limit or its cap: this chat goes on with {new_shown} when it is free."
+                    say(msg)
+                    notify(msg)
+                else:  # "ask" without a yes, or "never": that reset, on this account (the loop's top waits)
+                    then = f"{old_shown} reached its cap ({cap}%), and it reopened there at its window's reset"
+                    log(f"{at}; with switching set to {mode} the conversation waits for that reset")
+                if asked:  # the wait this question was about, for start_elsewhere(): asked once
+                    asked_for = (stay, state["limited_until"].get(stay, 0))
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
             # carry on, and your next message goes to the new account. Only
@@ -14439,7 +14738,8 @@ def pipe(argv: list[str]) -> int:
         if opts.account:
             # As `longhaul --account` does: that account while it is not at its
             # limit and is signed in as expected, else the one longhaul picks.
-            limited = load_state()["limited_until"].get(opts.account, 0) > time.time()
+            limited = blocked(accounts, load_state(), readings(accounts), time.time()).get(opts.account, 0) \
+                > time.time()  # at its cap too (2026-11-24)
             if not limited and opts.account not in unmanaged and signed_in_cached(accounts[start], CLAUDE):
                 idx = start
         reasons = ["asked for with --account"] if idx is not None else []  # for the start line (start_logged())
@@ -14599,6 +14899,11 @@ class Relay:
         self.turn_error = None
         self.server_error_at: float | None = None
         self.retry_streak = 0
+        # The cap (the owner, 2026-11-24): while this chat's account is at its
+        # cap, the panel's messages are held (held, a list) and cap_hold says
+        # for what: {"account", "cap", "until", "decided", "told", "recheck"}
+        # (tend_cap()); None when no cap holds them.
+        self.cap_hold: dict | None = None
 
     # -- the pipes
 
@@ -14830,6 +15135,7 @@ class Relay:
                     if no_limit_result(line):
                         self.end_hold("the turn ended with no limit stop")
                     self.turn_ended(line)
+                    self.hold_at_cap()  # note_cost() wrote the reading: past its cap, the next message waits
             try:
                 with self.out_lock:
                     out.write(line)
@@ -15115,6 +15421,8 @@ class Relay:
             self.use_accounts(self.live.accounts, sid)
         if changed:
             self.to_reconsider = True
+            if self.cap_hold is not None:  # a cap or an account changed, or the mode: tend_cap() decides again
+                self.cap_hold["decided"] = False
 
     def reconsider(self) -> None:
         """accounts.json or the mode changed while this chat waits at a
@@ -15130,6 +15438,8 @@ class Relay:
         you answered stays as you answered it, and nothing is done for a
         chat that has carried on since its limit."""
         q, c = self.question, self.carry
+        if q and self.question_for.get("cap") is not None:
+            return  # a cap's question: tend_cap() decides it again (refresh() marked it)
         auto = self.mode == "auto" and self.swap
         if not ((q and (auto or q["kind"] == "first_reset")) or (c and not q and auto and c["why"] != "answered")):
             return
@@ -15355,26 +15665,31 @@ class Relay:
         no question, a first_reset one (every account is at its limit, so a
         message meets one wherever it goes, and Claude Code keeps it in the
         conversation for the carry-on), or a question not a reopen's."""
-        if self.held is not None and not self.holds():
+        if self.held is not None and not self.holds() and self.cap_hold is None:  # a cap's hold is tend_cap()'s
             self.let_go_user()
 
-    def ask(self, limit: dict, since: float, state: dict | None = None, reopened: bool = False) -> None:
+    def ask(self, limit: dict, since: float, state: dict | None = None, reopened: bool = False,
+            cap: int | None = None) -> None:
         """Write this chat's question (QUESTIONS) and say it: "move" when an
         account other than this one has room now, "first_reset" when every
         account allowed here is at its limit, naming the one that resets
         first (this one, it may be). None for a chat with no id yet, or
         with no account signed in as expected: the log says why.
         `reopened`: asked at a reopen (ask_at_start()), which a move
-        answered and the notification's words tell apart."""
+        answered and the notification's words tell apart. `cap`: asked
+        because this chat's account is at its cap (tend_cap(), 2026-11-24):
+        a move question only, "cap" in its file and "limit" "cap"; with no
+        other account with room none is asked, and the caller holds."""
         here_idx, sid = self.idx, self.watch.sid
         here = self.accounts[here_idx]
         state = load_state() if state is None else state
         path = chat_file(QUESTIONS, sid)
         nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
                                       wrong=set(self.bad), top=self.top)
-        if path is None or nxt is None or (nxt == here_idx and not until):
+        if path is None or nxt is None or (nxt == here_idx and not until) or (cap is not None and until):
             why = ("the chat has no id yet" if path is None
                    else "no account allowed here is signed in as expected" if nxt is None
+                   else "no other account has room" if cap is not None
                    else f"{here['name']} has room again")
             log(f"question: none asked in {sid or 'a chat'}: {why}; the chat stays as it is")
             return
@@ -15390,15 +15705,22 @@ class Relay:
              "kind": "first_reset" if until else "move", "from": here["name"], "limit": limit["kind"],
              "resets_at": math.ceil(resets), "to": there, "to_resets_at": math.ceil(until) if until else None,
              "carries_on_at": carry_time(at), "choices": ["yes", "no"] if until else ["move", "wait"]}
+        if cap is not None:  # the pane words it for the cap (hooks/question.ts)
+            q["cap"] = cap
         try:
             write_private(path, q)
         except OSError as e:
             log(f"question: could not ask in {sid} ({e!r}); the chat stays as it is")
             return
-        self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt, "reopened": reopened}
+        self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt, "reopened": reopened,
+                                               "cap": cap}
         # Said as people see them (label_in()); the log and the question keep the keys.
         shown, there_shown = label_in(here["name"], self.accounts), label_in(there, self.accounts)
-        if until:
+        if cap is not None:
+            log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} ({here['name']} is "
+                f"{cap_words(cap)} until {clock(resets)}); its messages wait for the answer")
+            said = f"{shown} is {cap_words(cap)} until {clock(resets)}. Move this chat to {there_shown} now?"
+        elif until:
             log(f"question: asked {sid} ({q['id']}) to carry on on {there} at {clock(until)} "
                 f"({self.every()} is at its limit)")
             said = (f"{self.every().capitalize()} is at its limit. {there_shown} resets first, at {clock(until)}. "
@@ -15413,7 +15735,9 @@ class Relay:
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
             said = (f"{shown} hit its {limit['kind']} limit (resets {clock(resets)}). "
                     f"Move this chat to {there_shown} and carry on?")
-        then = ("your messages wait for the answer, and with no answer nothing moves" if reopened and not until
+        then = (f"your next message waits for the answer, and with no answer it goes on {shown} at that reset"
+                if cap is not None else
+                "your messages wait for the answer, and with no answer nothing moves" if reopened and not until
                 else f"with no answer the chat stays on {shown}")
         # The README's way, longhaul switch auto, unless another place wins over config.json (panel_switch_fix()).
         notify(f"{said} Answer in Longhaul's pane in the panel; {then}. To move without asking, {panel_switch_fix()}.")
@@ -15432,7 +15756,10 @@ class Relay:
             self.to_reconsider = False
             self.reconsider()
         self.tend_lifted()
-        if self.question:
+        self.tend_cap()
+        if self.question and self.question_for.get("cap") is not None:
+            self.read_answer()  # a cap's question: its reset and a cap changed are tend_cap()'s
+        elif self.question:
             if self.replied_at > self.question_for["since"]:
                 q, limit = self.question, self.question_for["limit"]
                 log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: the chat carried on on "
@@ -15505,13 +15832,162 @@ class Relay:
         if self.carry:
             log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} is cancelled: {name} was chosen")
             self.drop_carry()
-        limit = None if about.get("reopened") else about.get("limit")  # a reopen's question: nothing was cut off
+        # A reopen's question, or a cap's: nothing was cut off.
+        limit = None if about.get("reopened") or about.get("cap") is not None else about.get("limit")
         text = (CARRY_ON.format(old=here, kind=limit["kind"], new=name) if limit
                 else USE_CHOSEN.format(old=here, new=name))
         if self.move_to(nxt, text):
             note_session_account(sid, name)
             log(f"{self.who}: {sid} moved, while idle, from {here} to {name} (chosen with longhaul use)")
             notify(f"The panel chat moved to {name}, as you chose.")
+
+    # -- the cap (the owner, 2026-11-24: a strict cap)
+
+    def cap_now(self):
+        """(cap, until) while the account this chat runs on is at its cap by
+        its latest reading (capped(): the status line's, or this relay's own
+        from note_cost()); None when it is not."""
+        acct = self.running_on()
+        until = capped(acct, read_json(USAGE_DIR / f"{acct['name']}.json"), time.time())
+        return None if until is None else (cap_of(acct), until)
+
+    def hold_at_cap(self) -> None:
+        """At a turn's end (from_claude(), on claude's reader, right after the
+        result line wrote the reading) and at the chat's start: when its
+        account is at its cap, the panel's next messages are held from now
+        (hold_user()), before tend_cap() decides, so one typed straight after
+        the turn never starts a turn there. Not in longhaul pipe, whose
+        driver's consent is for moves at a limit, and not during a swap."""
+        if self.says or self.swapping:
+            return
+        found = self.cap_now()
+        if found is None:
+            return
+        with self.cond:
+            if self.held is None:
+                self.held = []
+            if self.cap_hold is None:
+                self.cap_hold = {"account": self.running_on()["name"], "cap": found[0], "until": found[1],
+                                 "decided": False, "told": False, "recheck": None}
+
+    def end_cap_hold(self, why: str | None) -> None:
+        """No cap holds this chat's messages now (`why`: its window reset,
+        the cap raised or removed, or the chat moved): a cap's question is
+        withdrawn, and the held messages go on, to the claude running, unless
+        a reopen's question still holds them."""
+        h, self.cap_hold = self.cap_hold, None
+        if h is None:
+            return
+        sid = (self.watch.sid if self.watch else None) or "a chat"
+        if self.question and self.question_for.get("cap") is not None:
+            log(f"question: {sid}'s question ({self.question['id']}) is withdrawn: {why}")
+            self.drop_question()
+        if why:
+            log(f"cap: {sid}'s messages are held no longer: {why}")
+        if self.held is not None and not self.holds():
+            self.let_go_user()
+
+    def tend_cap(self) -> None:
+        """Each round: the account this chat runs on at its cap (cap_now()),
+        as at a limit, between turns. Its messages are held from the moment
+        it is seen (hold_at_cap()); once Claude is idle, with no swap, rate
+        limit hold, background agent, limit question or carry-on under way,
+        the mode decides once (decide_cap()), and again after accounts.json
+        or the mode changed (refresh()) or when the account free first is
+        due. When the cap no longer holds (its window reset, the cap raised
+        or removed, the chat moved to another account), the hold ends and
+        the messages go on (end_cap_hold())."""
+        if self.says:
+            return
+        found = self.cap_now()
+        h = self.cap_hold
+        if found is None:
+            if h is not None:
+                name = self.running_on()["name"]
+                self.end_cap_hold(f"{name} is not at its cap now" if name == h.get("account")
+                                  else f"the chat runs on {name} now")
+            return
+        cap, until = found
+        if h is None or h.get("account") != self.running_on()["name"]:
+            self.cap_hold = None
+            self.hold_at_cap()
+            h = self.cap_hold
+            if h is None:
+                return
+        h.update(cap=cap, until=until)
+        if self.question and self.question_for.get("cap") is not None:
+            if h["decided"]:
+                return  # its answer is read in tend()
+            log(f"question: {self.question['chat']}'s question ({self.question['id']}) is withdrawn: accounts.json "
+                "or the mode changed, so it is decided again")
+            self.drop_question()
+        if self.question or self.carry:
+            return  # a limit's question or carry-on decides first
+        if h["decided"] and not (h["recheck"] and time.time() >= h["recheck"]):
+            return
+        if self.swapping or self.paused or self.watch.status != "idle" or self.watch.agents_busy():
+            return  # between turns only: a move would stop a turn or a background agent
+        self.decide_cap(cap, until)
+
+    def decide_cap(self, cap: int, until: float) -> None:
+        """decide_move()'s verdict for a chat at its cap: auto moves it to an
+        account with room (move_off_cap(), no carry-on); ask asks (ask(),
+        move now or wait for the reset); never, or no account with room, keeps
+        its messages held, until that reset, or in auto and ask until the
+        account free first, when this is decided again. Said once a hold."""
+        h, here_idx, sid = self.cap_hold, self.idx, self.watch.sid or "a chat"
+        here = self.accounts[here_idx]
+        h["decided"], h["recheck"] = True, None
+        verdict = decide_move(self.mode, consent=self.swap, can_ask=not self.says)
+        nxt, free = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), load_state(),
+                                     wrong=set(self.bad), top=self.top)
+        if nxt is not None and nxt != here_idx and not free:
+            if verdict == "move":
+                self.move_off_cap(nxt, cap, until, "switching is auto")
+                return
+            if verdict == "ask":
+                self.ask({"resets_at": until, "kind": "cap", "type": None}, time.time(), cap=cap)
+                if self.question:
+                    h["told"] = True  # the question said it
+                    return
+        when = until
+        if verdict != "stay" and nxt is not None and nxt != here_idx and free and free < until:
+            when = h["recheck"] = free  # another account is free first: decided again then
+        shown, name = label_in(here["name"], self.accounts), here["name"]
+        nowhere = "" if verdict == "stay" else ", and no other account has room"
+        log(f"cap: {sid} holds its next message: {name} is {cap_words(cap)} until {clock(until)}{nowhere}; "
+            f"it goes at {clock(when)} (switching is {self.mode})")
+        if not h["told"]:
+            h["told"] = True
+            notify(f"{shown} is {cap_words(cap)} until {clock(until)}{nowhere}, so this chat's next message waits "
+                   f"until {clock(when)}. To send it sooner: `longhaul cap {name} off` (or a higher cap), or move the "
+                   "chat in /accounts.")
+
+    def move_off_cap(self, to: int, cap: int, until: float, how: str) -> None:
+        """The chat moves off an account at its cap to accounts[to], while
+        idle (move_to() with no carry-on message: nothing was cut off, and the
+        held messages go there); the record moves too, so a reopen starts
+        there. An account that cannot take it now (unready()) is decided
+        again at the next round, never a move unasked."""
+        here, sid = self.accounts[self.idx], self.watch.sid or "a chat"
+        new = self.accounts[to]["name"]
+        problem = self.unready(to)
+        if problem:
+            log(f"cap: {sid} does not move to {new}: {problem}")
+            if self.cap_hold is not None:
+                self.cap_hold["decided"] = False
+            return
+        if not self.move_to(to, None):
+            if self.cap_hold is not None:
+                self.cap_hold["decided"] = False  # it stayed: decided again, with that account in bad
+            return
+        note_session_account(sid, new)
+        log(f"cap: {sid} moved, while idle, from {here['name']}, {cap_words(cap)} until {clock(until)}, to {new}")
+        start_logged(sid, "moves to", new, home_path(self.top or os.getcwd()),
+                     f"{here['name']} reached its cap ({cap}%), and {how}")
+        notify(f"{label_in(here['name'], self.accounts)} is {cap_words(cap)} until {clock(until)}; the panel chat "
+               f"moved to {label_in(new, self.accounts)} while it was idle.")
+        self.end_cap_hold(None)
 
     def lifted_by_reply(self, sid: str, limit: dict) -> None:
         """A reply came on this chat's account after its limit: the account
@@ -15545,13 +16021,16 @@ class Relay:
             return
         self.state_mark = mark
         q, c = self.question, self.carry
+        if q and self.question_for.get("cap") is not None:
+            q = None  # a cap's question waits for no recorded limit: tend_cap() looks after it
         if not (q or c):
             return
         about = self.question_for if q else self.carry_for
         now = time.time()
         if (q["carries_on_at"] if q else c["until"]) - now <= RESET_MARGIN or self.replied_at > about["since"]:
             return
-        limited = load_state()["limited_until"]
+        # An account at its cap has no room either (2026-11-24).
+        limited = blocked(self.accounts, load_state(), readings(self.accounts), now)
 
         def room(i) -> bool:
             return i is not None and (as_number(limited.get(self.accounts[i]["name"])) or 0) <= now
@@ -15656,6 +16135,14 @@ class Relay:
         self.drop_question()
         log(f"question: {q['chat']} answered {choice} ({q['id']})")
         limit, since, to = about["limit"], about["since"], about["to"]
+        if about.get("cap") is not None:  # a cap's question (tend_cap()): nothing was cut off
+            if choice == "move":
+                self.move_off_cap(to, about["cap"], limit["resets_at"], "you answered move")
+            elif self.cap_hold is not None:
+                self.cap_hold["decided"] = True  # wait: held until that reset, or a move or a cap change
+                log(f"cap: {q['chat']} waits for {q['from']}'s window to reset at {clock(limit['resets_at'])}, its "
+                    "next message held until then")
+            return
         if choice == "move" and about.get("reopened"):
             self.move_at_reopen(to, limit, since)
         elif choice == "move":
@@ -15744,6 +16231,9 @@ class Relay:
         until = load_state()["limited_until"].get(acct["name"], 0)
         if until > time.time():
             return f"it is at its limit again, until {clock(until)}"
+        at_cap = capped(acct, read_json(USAGE_DIR / f"{acct['name']}.json"), time.time())
+        if at_cap is not None:  # strict (2026-11-24): as at its limit
+            return f"it is {cap_words(cap_of(acct))}, until {clock(at_cap)}"
         if not signed_in_cached(acct, self.binary):
             return "it is not signed in as expected"
         return None
@@ -15845,6 +16335,9 @@ class Relay:
                 log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} at "
                     f"{clock(self.carry['until'])} is cancelled: the chat closed")
                 self.drop_carry()
+            if self.cap_hold is not None and self.held:
+                log(f"panel: {len(self.held)} message(s) held for {self.cap_hold.get('account')}'s cap in "
+                    f"{self.watch.sid if self.watch else 'a chat'} never reached Claude: the chat closed first")
         except Exception:
             pass
 
@@ -15866,6 +16359,7 @@ class Relay:
         self.watch.start_line = self.start_line
         if self.ask_first:
             self.watch.sid, self.held = resume_id(self.args), []
+        self.hold_at_cap()  # a chat reopened on an account at its cap: its first message waits too
 
     def loop(self) -> int:
         code = 1
@@ -16010,6 +16504,7 @@ class Relay:
             self.paused = True
             self.swapping = True
         self.swap_started = time.time()
+        went = False
         try:
             self.stop_child(self.child)
             self.switches += 1
@@ -16035,10 +16530,15 @@ class Relay:
                                   "parent_tool_use_id": None,
                                   "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
             self.watch = Watch(self.accounts[nxt], child.pid, started, False, offsets=marks, handled=handled)
+            went = True
             return True
         finally:
             self.swapping = False
-            self.let_go_user()  # queued while the lines are still held: they reach the claude now running
+            # Queued while the lines are still held: they reach the claude now
+            # running; not the claude of an account at its cap the chat stayed
+            # on, which tend_cap() keeps them from (2026-11-24).
+            if went or self.cap_hold is None:
+                self.let_go_user()
             self.end_swap()
 
     def on_signal(self, sig, _frame) -> None:
@@ -16246,6 +16746,10 @@ def use_cmd(opts) -> int:
     if until > time.time():
         return refuse(f"{name} is at its usage limit until {clock(until)}, so the chat stays where it is; if that "
                       f"limit is over already, `longhaul clear {name}` forgets it, then run this again")
+    at_cap = capped(acct, read_json(USAGE_DIR / f"{name}.json"), time.time())
+    if at_cap is not None:  # strict (2026-11-24): a chat moved there would only leave it again
+        return refuse(f"{name} is {cap_words(cap_of(acct))} until {clock(at_cap)}, so the chat stays where it is; "
+                      f"`longhaul cap {name} off`, or a higher cap, lets it be used now")
     if not signed_in_cached(acct, CLAUDE):
         return refuse(f"{name} is not signed in as expected, so the chat stays where it is: `longhaul setup {name} "
                       "--relogin` signs it in again")
@@ -17839,6 +18343,83 @@ def fallback_cmd(opts) -> int:
     return 0
 
 
+# What `longhaul cap` says under its list: what a cap is, and the two forms.
+CAP_RULE = ("A cap is a share of both the 5-hour and the weekly window: an account at its cap is not used until that "
+            "window resets. `longhaul cap NAME 25` sets one; `longhaul cap NAME off` removes it.")
+CAP_REFUSED = "{value!r} is not a cap: give a whole number from 1 to 99, or off"
+
+
+def cap_value(text: str):
+    """`longhaul cap NAME PERCENT`'s PERCENT read: a whole number from 1 to
+    99, a % after it allowed ("25%", as people write a share), else None."""
+    m = re.fullmatch(r"(\d{1,3})%?", text or "")
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 99 else None
+
+
+def cap_cmd(opts) -> int:
+    """`longhaul cap [NAME [PERCENT|off]]` (the owner, 2026-11-24: "I only
+    take 25% of this account's usage"): each account's cap, a share of both
+    its windows (cap_of()), and where each stands against it now, by its
+    last usage reading (cap_line()); with NAME, that account's alone; with
+    PERCENT, a whole number from 1 to 99, set as "cap": N, in its place when
+    the key is there, else last; off drops the key. Written as `longhaul
+    fallback` writes accounts.json, under the accounts lock, whole, the
+    other keys and the accounts' order kept, one log line per change; the
+    accounts screen's buttons run it. A value that is no cap is refused in
+    one line on stderr, exit 2, nothing written; so are an unknown NAME and a
+    file that cannot be read, said as `longhaul fallback` says them. With no
+    list of accounts there is only the default sign-in, which has no cap
+    and takes none: it is not an account of the list (STAND_IN)."""
+    now = time.time()
+    if opts.value is not None and opts.value != "off" and cap_value(opts.value) is None:
+        print(f"longhaul cap: {CAP_REFUSED.format(value=opts.value)}", file=sys.stderr)
+        return 2
+    if opts.name is None:  # it only reads: no lock, nothing written
+        accounts, problem = read_accounts_file()
+        if problem:
+            print(unreadable_text(problem))
+            return 2
+        if not accounts:
+            print(f"{DEFAULT_LABEL}: no cap (there is no list of accounts: `longhaul add` adds one, and each account "
+                  "on it may have a cap)")
+            return 0
+        for a in accounts:
+            print(cap_line(a, read_json(USAGE_DIR / f"{a['name']}.json"), now))
+        print(CAP_RULE)
+        return 0
+    if opts.value is None:
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem, tell=print)
+        if acct is None:
+            return 2
+        print(cap_line(acct, read_json(USAGE_DIR / f"{acct['name']}.json"), now))
+        return 0
+    cap = None if opts.value == "off" else cap_value(opts.value)
+    change = note = None
+    with locked("accounts"):
+        accounts, problem = read_accounts_file()
+        acct = folders_account(opts.name, accounts, problem)
+        if acct is None:
+            return 2
+        name, entry = acct["name"], acct
+        if cap is not None and cap_of(acct) != cap:  # 25.0 written by hand is no cap: set as 25
+            entry, change = {**acct, "cap": cap}, f"set {name}'s cap to {cap}%"
+        elif cap is None and "cap" in acct:
+            entry = {k: v for k, v in acct.items() if k != "cap"}  # the other keys, in their order
+            change = f"removed {name}'s cap"
+        else:
+            note = f"{name}'s cap is {cap}% already" if cap is not None else f"{name} has no cap already"
+        if change:
+            accounts[accounts.index(acct)] = entry
+            write_accounts(accounts)
+    if change:
+        say(change)
+    else:
+        show(note)
+    print(cap_line(entry, read_json(USAGE_DIR / f"{name}.json"), now))
+    return 0
+
+
 def folders_preferred(entry: dict, accounts: list[dict], prefers: list, unprefers: list, changes: list,
                       notes: list, tell=say, dry: bool = False):
     """`entry` with --no-prefer's folders taken off its "preferred", then
@@ -17966,7 +18547,10 @@ def status(opts) -> int:
     for acct in accounts or []:
         a = auth_status(acct)
         until = state["limited_until"].get(acct["name"], 0)
-        limit = f"at its limit until {clock(until)}" if until > now else "available"
+        reading = read_json(USAGE_DIR / f"{acct['name']}.json")
+        held = cap_held(acct, state, reading, now)  # at its cap, said apart from a limit (2026-11-24)
+        limit = (f"{cap_words(held[1])} until {clock(held[0])}" if held
+                 else f"at its limit until {clock(until)}" if until > now else "available")
         who = (f"{a.get('email')} ({a.get('subscriptionType')})" if a.get("loggedIn")
                else f"could not check ({a.get('why')})" if a.get("unknown") else "NOT signed in")
         print(f"{label_of(acct['name'], listed):<6} {who:<44} {limit}   [{config_of(acct)}]")
@@ -17978,7 +18562,7 @@ def status(opts) -> int:
         want = acct.get("email")
         if want and (a.get("email") or "").lower() != want.lower():
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
-        when = sign_in_failed_at(failed.get(acct["name"]), read_json(USAGE_DIR / f"{acct['name']}.json"))
+        when = sign_in_failed_at(failed.get(acct["name"]), reading)
         if when is not None:  # a chat's turn ended on it (the StopFailure hook), and no reply has come since
             print(f"       its sign-in failed at {clock(when)}: "
                   + (f"run longhaul setup {acct['name']} --relogin" if accounts_listed else DEFAULT_RELOGIN))
@@ -17995,6 +18579,14 @@ def status(opts) -> int:
             print("       anywhere")
         if is_fallback(acct):  # the owner, 2026-11-06: the work account, only when the others have no room
             print(f"       fallback: {FALLBACK_RULE.format(where='here')}")
+        cap = cap_of(acct)  # the owner, 2026-11-24: how much of it to use
+        if cap is not None:
+            stand = cap_stand(reading, now)
+            free = f"; `longhaul cap {acct['name']} off` or a higher cap lets it be used now" if held else ""
+            print(f"       cap: {cap}% of each window "
+                  f"({f'now {stand[0]:g}% of its {stand[1]}' if stand else 'no usage reading yet'}){free}")
+        elif acct.get("cap") is not None:
+            print(f"       {CAP_JUNK}; no cap is applied")
         liked = preferred_of(acct)  # the owner, 2026-11-11: an account tied to a folder
         if liked is None:
             print(f"       {PREFERRED_JUNK}; it is preferred nowhere")
@@ -18146,7 +18738,11 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     is not a number. label (the UX review's Q11) is what a person reads for
     it (label_of(), of `listed`, read_accounts_file()'s list): its name, or
     "default sign-in" for the stand-in of no list, whose name stays the
-    key commands take; last, so the screen's order stands."""
+    key commands take; last, so the screen's order stands. cap
+    (2026-11-24) is cap_of(), null for none; capped_until is when it is
+    free of its cap when it is at its cap now (capped()), else null; a cap
+    is no recorded limit, so limited_until never holds it, and use_here is
+    "capped" where `longhaul use` refuses it for that, after "limited"."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -18159,9 +18755,10 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     allowed, liked = repositories_of(acct), preferred_of(acct)
     as_expected = None if signed_in is None else signed_in and (want is None or got.lower() == want.lower())
     limited = until is not None and until > now
+    at_cap = capped(acct, reading, now)
     use_here = (None if allowed_here is None else "this_chat" if this_chat
                 else "not_allowed" if acct["name"] not in allowed_here else "limited" if limited
-                else "not_signed_in" if as_expected is False else "ok")
+                else "capped" if at_cap is not None else "not_signed_in" if as_expected is False else "ok")
     return {
         "name": acct["name"],
         "email": masked_email(acct.get("email")),
@@ -18176,6 +18773,8 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "only_in": None if allowed is None else [home_path(p) for p in allowed],
         "kept_out_by": kept_out_by(acct, accounts),
         "fallback": is_fallback(acct),
+        "cap": cap_of(acct),
+        "capped_until": at_cap,
         "folder": home_path(str(config_of(acct))) if has_folder(acct) else "",
         "this_chat": this_chat,
         "preferred": None if liked is None else [home_path(p) for p in liked],
@@ -19803,7 +20402,8 @@ def doctor_default_email():
 def doctor_accounts(quick: bool = False) -> dict:
     """7. The accounts: accounts.json readable, each account's folder
     there, the folders each is kept for, "(fallback)" after the name of
-    one used only when the others have no room (2026-11-06); and two
+    one used only when the others have no room (2026-11-06), "(cap 25%)"
+    after one with a cap, and until when it is at it (2026-11-24); and two
     accounts that sign in as one email (the default sign-in among them)
     are one subscription with one allowance, so a switch between them
     never helps (the owner's Mac, 2026-10-25). Names, never emails. Once
@@ -19820,10 +20420,16 @@ def doctor_accounts(quick: bool = False) -> dict:
     if not accounts:  # the default sign-in, by that name (the UX review's Q11), and its folder
         return doctor_result(f"one subscription: the {DEFAULT_LABEL} ({home_path(str(DEFAULT_CONFIG))}), with no "
                              "accounts.json; `longhaul add` adds another", kind="skip")
-    items = []
+    items, now = [], time.time()
     for a in accounts:
         folder = home_path(str(config_of(a)))
-        named = f"{a['name']} (fallback)" if is_fallback(a) else a["name"]  # used only when the others have no room
+        # "(fallback)": used only when the others have no room; "cap 25%": how much of it is used (2026-11-24),
+        # and until when it is at it, by its last reading.
+        marks = ["fallback"] if is_fallback(a) else []
+        if cap_of(a) is not None:
+            until = capped(a, read_json(USAGE_DIR / f"{a['name']}.json"), now)
+            marks.append(f"cap {cap_of(a)}%" + (f", at it until {clock(until)}" if until else ""))
+        named = f"{a['name']} ({', '.join(marks)})" if marks else a["name"]
         if not config_of(a).is_dir():
             items.append(("bad", f"{named}: {folder} is missing", f"`longhaul setup {a['name']}`"))
         elif repositories_of(a) is None:
@@ -21190,6 +21796,7 @@ HELP_GROUPS = (
         ("longhaul use NAME", "this chat runs on NAME from now on"),
         ("longhaul folders NAME", "the folders NAME runs only in: --add PATH"),
         ("longhaul fallback NAME on", "NAME only when no other account has room"),
+        ("longhaul cap NAME 25", "use at most 25% of NAME's 5-hour and week"),
         ("longhaul allow ID", "let a refused chat's prompts through"),
         ("longhaul remove NAME", "NAME off the list; its sign-in folder kept"))),
     ("At a limit", (
@@ -21294,7 +21901,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "help":  # its words are its own, read by help_cmd(), not argparse's
         return help_cmd(argv[1:])
     if argv and argv[0] in ("setup", "status", "clear", "statusline", "usage", "inspect", "guard", "checkpoint",
-                            "add", "remove", "folders", "fallback", "advisor", "advisor-hook", "advisor-result",
+                            "add", "remove", "folders", "fallback", "cap", "advisor", "advisor-hook", "advisor-result",
                             "advisor-note", "reminder", "account-check", "session-end", "autocompact-note",
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
@@ -21379,6 +21986,13 @@ def main(argv: list[str]) -> int:
             p.add_argument("action", nargs="?", choices=["on", "off"],
                            help="on: a fallback, used only when no other account allowed there has room; off: a "
                                 "normal account (with neither: whether it is one; it only reads)")
+        if cmd == "cap":
+            p.add_argument("name", nargs="?", metavar="NAME",
+                           help="the account (with neither: each account's cap and where it stands; it only reads)")
+            p.add_argument("value", nargs="?", metavar="PERCENT|off",
+                           help="a whole number from 1 to 99: the share of each of its windows, the 5-hour and the "
+                                "weekly one, that Longhaul uses before it treats the account as at its limit until "
+                                "that window resets; off: no cap (with neither: its cap and where it stands)")
         if cmd == "folders":
             p.add_argument("name", help="the account (with no option: where it may be used; it only reads)")
             p.add_argument("--add", action="append", metavar="PATH",
@@ -21491,8 +22105,8 @@ def main(argv: list[str]) -> int:
         opts = p.parse_args(rest)
         return {"setup": setup, "login": setup, "status": status, "clear": clear, "statusline": statusline,
                 "usage": usage, "inspect": inspect, "guard": guard, "checkpoint": checkpoint, "add": add,
-                "remove": remove, "folders": folders, "fallback": fallback_cmd, "vscode": vscode, "models": models,
-                "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
+                "remove": remove, "folders": folders, "fallback": fallback_cmd, "cap": cap_cmd, "vscode": vscode,
+                "models": models, "advisor": advisor, "advisor-hook": advisor_hook, "advisor-result": advisor_result,
                 "advisor-note": advisor_note, "reminder": reminder, "account-check": account_check,
                 "session-end": session_end, "autocompact-note": autocompact_note, "stop-failure": stop_failure,
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,

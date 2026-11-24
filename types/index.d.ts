@@ -31,10 +31,19 @@ export type LonghaulAccount = {
   // room (the owner, 2026-11-06). Optional: an older longhaul.py does not
   // give it, and the pane then offers no button for it.
   fallback?: boolean
+  // Its cap (the owner, 2026-11-24): the share of each of its windows, the
+  // 5-hour and the weekly one, that Longhaul uses, a whole number from 1 to
+  // 99; null for none. Optional: an older longhaul.py does not give it, and
+  // the pane then shows no cap line and offers no button for it.
+  cap?: number | null
+  // When it is free of its cap, while an open window is at or over it now
+  // (epoch seconds); null when it is not at its cap. A cap is no recorded
+  // limit: limited_until never holds it.
+  capped_until?: number | null
   // Whether `longhaul use NAME` would take this chat here (0.3.9): "ok",
-  // "this_chat", "not_allowed", "limited" or "not_signed_in"; null with no
-  // accounts list or folder. Optional: an older longhaul.py does not give
-  // it, and the pane then offers no button for it.
+  // "this_chat", "not_allowed", "limited", "capped" (at its cap, 2026-11-24)
+  // or "not_signed_in"; null with no accounts list or folder. Optional: an
+  // older longhaul.py does not give it, and the pane then offers no button for it.
   use_here?: string | null
   // The folders the account is preferred in (0.3.9); null for a value that
   // is not a list of paths.
@@ -187,6 +196,11 @@ export type LonghaulQuestion = {
   // When the answer that waits (yes, or wait) carries on: the reset plus a
   // margin, as the wait's until will be. Optional: an older relay does not write it.
   carries_on_at?: number | null
+  // A move question asked because `from` is at its cap (2026-11-24), not at
+  // a limit: the cap, and "limit" is "cap". Nothing was cut off: move moves
+  // with no carry-on, and wait holds the chat's next message until the
+  // reset. Optional: absent for a limit's question, and from an older relay.
+  cap?: number | null
   choices: string[] // move: move, wait; first_reset: yes, no
 }
 

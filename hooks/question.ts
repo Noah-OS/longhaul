@@ -64,8 +64,11 @@ export function cleanQuestion(v: any, chat: string): LonghaulQuestion | null {
   const toResets = num(v.to_resets_at)
   if (from === null || to === null || limit === null || resets === null || (kind === 'first_reset' && toResets === null))
     return null
+  // A move question asked at a cap (2026-11-24): its cap, a whole number
+  // from 1 to 99 as longhaul.py's cap_of() takes it; any other is a limit's.
+  const cap = kind === 'move' && Number.isInteger(v.cap) && v.cap >= 1 && v.cap <= 99 ? v.cap as number : null
   return { id: v.id, chat, relay_pid: pid, asked_at: num(v.asked_at) ?? 0, kind, from, limit, resets_at: resets, to,
-    to_resets_at: toResets, carries_on_at: num(v.carries_on_at), choices: [...choices] }
+    to_resets_at: toResets, carries_on_at: num(v.carries_on_at), ...(cap !== null ? { cap } : {}), choices: [...choices] }
 }
 
 export function cleanWait(v: any, chat: string, now: number): LonghaulWait | null {
@@ -148,8 +151,17 @@ export function inTime(seconds: number, nowMs: number): string {
 // is the minute the status entry and the pane show once it waits. A relay
 // older than that field: the reset, as before; a question with no time
 // (none above 0) waits "for the reset". The UX review's §4.7 row 11: each
-// label says what it does.
+// label says what it does. At a cap (2026-11-24) nothing was cut off: the
+// question names the cap and when the account is free of it, Move moves now
+// with no carry-on, and Wait holds the chat's next message until that reset,
+// in the relay's words (Relay.ask()).
 export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels: Record<string, string> } {
+  if (q.kind === 'move' && typeof q.cap === 'number') {
+    const at = clock(q.resets_at, nowMs)
+    return { says: q.resets_at > 0 ? `${q.from} is at its cap (${q.cap}%) until ${at}. Move this chat to ${q.to} now?`
+      : `${q.from} is at its cap (${q.cap}%). Move this chat to ${q.to} now?`,
+    labels: { move: 'Move now', wait: q.resets_at > 0 ? `Wait for the reset (${at})` : 'Wait for the reset' } }
+  }
   if (q.kind === 'move') {
     const goes = q.carries_on_at ?? q.resets_at
     return { says: `${q.from} hit its ${q.limit} limit (resets ${clock(q.resets_at, nowMs)}). `
@@ -166,6 +178,7 @@ export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels
 // The pop-up that says a question waits, for a pane that may not have opened.
 export function waits(q: LonghaulQuestion): string {
   const what = q.kind === 'first_reset' && q.to !== q.from ? 'every account is at its limit'
+    : q.kind === 'move' && typeof q.cap === 'number' ? `${q.from} is at its cap (${q.cap}%)`
     : `${q.from} hit its ${q.limit} limit`
   return `Longhaul: ${what}. A question waits: type /accounts if it did not open.`
 }

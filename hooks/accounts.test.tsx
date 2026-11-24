@@ -2194,6 +2194,121 @@ both('an older Longhaul that does not say: no fallback line and no button', asyn
   await ui.unmount()
 })
 
+// A cap per account (the owner, 2026-11-24: "I only take 25% of this
+// account"): the share of each of its windows Longhaul uses. Its page says
+// the cap and where it stands now, its row while it is at it until when,
+// and buttons run `longhaul.py cap NAME 25|50|75|off`, each where it is not
+// the cap now.
+
+both('a cap: its page says it and where it stands now, and each button runs cap NAME PERCENT or off', async ($, on, surface) => {
+  const w = world(on)
+  const accounts = [{ ...ACCOUNTS[0], cap: 50, capped_until: null }, { ...ACCOUNTS[1], cap: null, capped_until: null },
+    { ...ACCOUNTS[2], cap: 75, capped_until: null, five_hour: { used: 10, resets_at: AT + HOUR },
+      week: { used: 30, resets_at: AT + 50 * HOUR } },
+    { ...ACCOUNTS[3], cap: 30, capped_until: null }]
+  w.status = done(JSON.stringify({ ...STATUS, accounts }))
+  const { ui } = await opened($, w, surface)
+  // Under its cap, its row says nothing of it.
+  expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max · signed in · 5h 40% · week 12%\n${UNDER}this chat`)
+  await open(ui, 'row-personal-1')
+  // The open window used the most, named: 40% of its 5 hours, over 12% of its week.
+  expect(await texts(ui)).toContain('Cap: 50% (now 40% of its 5 hours)')
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual(['cap-25', 'cap-75', 'cap-off'])
+  expect((await ui.find({ key: 'cap-25' }))?.text).toBe('Cap at 25%')
+  expect((await ui.find({ key: 'cap-75' }))?.text).toBe('Cap at 75%')
+  expect((await ui.find({ key: 'cap-off' }))?.text).toBe('Remove the cap')
+  expect(await over(ui, 80, true)).toEqual([])
+  await ui.press({ key: 'cap-25' })
+  expect(after(w)).toEqual([['cap', 'personal-1', '25'], ['status', '--json']])
+  expect(w.timeouts.slice(1)).toEqual([60_000, 60_000])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Cap at 25%: personal-1'))).toBe(true)
+  await ui.press({ key: 'back' })
+  // No cap: none to remove.
+  await open(ui, 'row-work-2')
+  expect(await texts(ui)).toContain('Cap: none')
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual(['cap-25', 'cap-50', 'cap-75'])
+  await ui.press({ key: 'cap-50' })
+  expect(after(w).slice(2)).toEqual([['cap', 'work-2', '50'], ['status', '--json']])
+  await ui.press({ key: 'back' })
+  // Its week the more used; then a cap set in a terminal to none of the
+  // buttons' values, with no reading yet: every button is offered.
+  await open(ui, 'row-spare-3')
+  expect(await texts(ui)).toContain('Cap: 75% (now 30% of its week)')
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual(['cap-25', 'cap-50', 'cap-off'])
+  await ui.press({ key: 'back' })
+  await open(ui, 'row-team-4')
+  expect(await texts(ui)).toContain('Cap: 30% (no usage reading yet)')
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual(['cap-25', 'cap-50', 'cap-75', 'cap-off'])
+  await ui.press({ key: 'cap-off' })
+  expect(after(w).slice(4)).toEqual([['cap', 'team-4', 'off'], ['status', '--json']])
+  expect((await texts(ui)).some(t => t.startsWith('✔') && t.includes('Remove the cap: team-4'))).toBe(true)
+  // None while Remove waits for its yes.
+  await ui.press({ key: 'remove-team-4' })
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual([])
+  await ui.unmount()
+})
+
+both('at its cap: its row says until when, its page says so, with no room now and no Use for this chat', async ($, on, surface) => {
+  const w = world(on)
+  const until = AT + 3 * HOUR
+  const capped = { ...ACCOUNTS[3], signed_in: true, as_expected: true, check_failed: null, plan: 'pro', cap: 25,
+    capped_until: until, reading_at: AT - 60, five_hour: { used: 30, resets_at: until },
+    week: { used: 10, resets_at: AT + 50 * HOUR }, use_here: 'capped' }
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [...ACCOUNTS.slice(0, 3), capped] }))
+  const { ui } = await opened($, w, surface)
+  // Not "room now": no chat may use it until then. Said in words, on the line under its text.
+  expect(await rowOf(ui, 'row-team-4')).toBe(`  team-4      pro · signed in · 5h 30% · week 10%\n`
+    + `${UNDER}capped until ${clock(until)}`)
+  expect(await over(ui, 80)).toEqual([])
+  await open(ui, 'row-team-4')
+  const all = await texts(ui)
+  expect(all).toContain(`Cap: 25%, at it until ${clock(until)} (in 3 h), now 30% of its 5 hours`)
+  expect(all).toContain('Use for this chat: not offered while it is at its cap.')
+  expect(all.some(t => /room now/.test(t))).toBe(false)
+  expect(await ui.find({ key: 'use-team-4' })).toBeUndefined()
+  expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual(['cap-50', 'cap-75', 'cap-off'])
+  expect(await over(ui, 80, true)).toEqual([])
+  // Removing the cap frees it at once: the read after it finds it free, and Use is offered.
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [...ACCOUNTS.slice(0, 3),
+    { ...capped, cap: null, capped_until: null, use_here: 'ok' }] }))
+  await ui.press({ key: 'cap-off' })
+  expect(after(w)).toEqual([['cap', 'team-4', 'off'], ['status', '--json']])
+  expect(await texts(ui)).toContain('Cap: none')
+  expect(await ui.find({ key: 'use-team-4' })).toBeDefined()
+  await ui.press({ key: 'back' })
+  // Back on the list, its line has room now, and no word of a cap.
+  expect(await rowOf(ui, 'row-team-4')).toMatch(/^[› ] team-4 {6}pro · signed in · room now · 5h 30% · week 10%$/)
+  await ui.unmount()
+})
+
+both('LONGHAUL_PLAIN=1: a row at its cap says it with commas between the parts', async ($, on, surface) => {
+  const w = world(on, { LONGHAUL_PLAIN: '1' })
+  const until = AT + 2 * HOUR
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], cap: 25, capped_until: until },
+    ...ACCOUNTS.slice(1)] }))
+  const { ui } = await opened($, w, surface)
+  expect(await rowOf(ui, 'row-personal-1')).toBe(`  personal-1  max, signed in, 5h 40%, week 12%\n`
+    + `${UNDER}this chat, capped until ${clock(until)}`)
+  await open(ui, 'row-personal-1')
+  expect(await texts(ui)).toContain(`Cap: 25%, at it until ${clock(until)} (in 2 h), now 40% of its 5 hours`)
+  expect((await texts(ui)).join('\n')).not.toMatch(/[✔✘⚠›·↑↓→]/)
+  await ui.unmount()
+})
+
+both('an older Longhaul, or a cap written oddly: no cap line and no cap button', async ($, on, surface) => {
+  const w = world(on)
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], cap: '25' }, { ...ACCOUNTS[1], cap: 25.5 },
+    ...ACCOUNTS.slice(2)] }))
+  const { ui } = await opened($, w, surface)
+  for (const name of ['personal-1', 'work-2', 'spare-3']) {
+    await open(ui, `row-${name}`)
+    expect((await texts(ui)).some(t => /^Cap:/.test(t))).toBe(false)
+    expect((await buttons(ui)).filter(k => k.startsWith('cap-'))).toEqual([])
+    await ui.press({ key: 'back' })
+  }
+  await ui.unmount()
+})
+
 // The question (the keep-working plan's K1): asked by the relay in its
 // file, shown at the top of the pane while its relay runs, answered by
 // `longhaul.py answer CHAT QID CHOICE`.
@@ -2350,6 +2465,41 @@ both('every 3 s it looks: a new question opens the pane, with one pop-up per que
   expect(w.opened.length).toBe(2)
   expect(w.toasts.slice(1)).toEqual(['Longhaul: every account is at its limit. A question waits: type /accounts if it did not open.'])
   await ui.unmount()
+})
+
+// A cap's question (2026-11-24): asked by the relay when this chat's
+// account is at its cap, "cap" in its file and "limit" "cap". Nothing was
+// cut off: Move moves now, and Wait holds the next message until the reset.
+const CAP_QUESTION = { ...QUESTION, id: 'q-c0ffee123456', limit: 'cap', resets_at: AT + 3 * HOUR, cap: 25,
+  carries_on_at: AT + 3 * HOUR + 60 }
+
+both('a cap question: the cap and when it is free, Move now, and Wait for the reset', async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, CAP_QUESTION)
+  const { ui } = await opened($, w, surface)
+  const at = clock(AT + 3 * HOUR)
+  expect((await texts(ui))[0]).toBe(`personal-1 is at its cap (25%) until ${at}. Move this chat to work-2 now?`)
+  expect((await ui.find({ key: 'answer-move' }))?.text).toBe('Move now')
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe(`Wait for the reset (${at})`)
+  expect(await over(ui, 80, true)).toEqual([])
+  await ui.press({ key: 'answer-wait' })
+  expect(after(w)).toEqual([['answer', SID, 'q-c0ffee123456', 'wait']])
+  // The next one, answered Move.
+  write(w, QUESTION_FILE, { ...CAP_QUESTION, id: 'q-c0ffee654321' })
+  await w.clock.advance(3000)
+  await ui.press({ key: 'answer-move' })
+  expect(after(w).slice(-1)).toEqual([['answer', SID, 'q-c0ffee654321', 'move']])
+  await ui.unmount()
+})
+
+both('a cap question pops up in its own words', async ($, on, surface) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  await w.clock.advance(3000)
+  write(w, QUESTION_FILE, CAP_QUESTION)
+  await w.clock.advance(3000)
+  expect(w.opened).toEqual([OPEN])
+  expect(w.toasts).toEqual(['Longhaul: personal-1 is at its cap (25%). A question waits: type /accounts if it did not open.'])
 })
 
 both('a carry-on scheduled for a reset shows on the list until its file goes', async ($, on, surface) => {
