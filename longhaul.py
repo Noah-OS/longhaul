@@ -419,10 +419,13 @@ Usage:
                           limit: for the main conversation, each logs one line
                           and keeps the type and the time per session. A
                           failed sign-in also marks the chat's account in
-                          LONGHAUL_HOME/sign-in-failed.json, for status and
-                          /accounts. A server error is said in a notification,
-                          except in a panel chat whose Longhaul carries on
-                          after it (see vscode). They decide nothing
+                          LONGHAUL_HOME/sign-in-failed.json, for status,
+                          /accounts and every choice of an account, which
+                          passes it over while another can be used, until a
+                          reply on it or a sign-in. A server error is said in
+                          a notification, except in a panel chat whose
+                          Longhaul carries on after it (see vscode). They
+                          decide nothing
   longhaul trial start [--days N] [--kind models] | stop | status
                           the checkpoint habit's A/B (14 days unless set): while
                           it is on, each session's chain gets an arm by its id,
@@ -657,6 +660,14 @@ CARRY_ON_AFTER_WAIT = (
     "so longhaul waited for the {new} account to reset and reopened this conversation. "
     "Carry on from where you stopped. Background agents started before the stop "
     "have stopped; resume any that were still working."
+)
+# A turn ended on a refused sign-in (SIGN_IN_ERRORS, 2026-11-24) and longhaul
+# moved the chat to another account: the message that failed got no answer,
+# and Claude Code keeps it in the conversation, so this carries it on there.
+SIGN_IN_CARRY_ON = (
+    "The {old} account's sign-in was refused ({error}), so longhaul reopened this conversation "
+    "on the {new} account. Carry on from where you stopped: the last message got no answer. Background "
+    "agents started before the switch have stopped; resume any that were still working."
 )
 # `longhaul use NAME` moved a panel chat while it was idle (Relay.tend_use()):
 # nothing was cut off, so nothing is to be carried on, but the panel shows
@@ -1510,7 +1521,7 @@ def preferred_here(accounts: list[dict], free: list[int], top: str, seen: dict, 
 
 
 def pick(accounts: list[dict], state: dict, start: int, now: float | None = None, skip=(),
-         seen: dict | None = None, top: str | None = None):
+         seen: dict | None = None, top: str | None = None, refused=()):
     """The account to launch on.
 
     Among accounts not at a limit, a fallback account (is_fallback()) is
@@ -1544,6 +1555,15 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     its limit here, until the window that reached the cap resets
     (blocked()): never chosen while another has room, and with none, the
     one free first is the answer, whether a limit or a cap holds it.
+
+    An account in `refused` (sign_in_refused(): its sign-in failed in a
+    chat, and no reply has come on it since) is passed over while any
+    other not in `skip` is left, even one at its limit: waiting for a
+    reset beats a chat whose every message fails at once (2026-11-24: a
+    move at amie's limit sent three chats to personal-1, whose API
+    refused each turn with oauth_org_not_allowed). Only when every account
+    left is refused do these rules choose among them, since one may have
+    been signed in again since.
     """
     now = time.time() if now is None else now
     seen = seen or {}
@@ -1552,6 +1572,7 @@ def pick(accounts: list[dict], state: dict, start: int, now: float | None = None
     usable = [i for i in range(n) if accounts[i]["name"] not in skip]
     if not usable:
         return None, None
+    usable = [i for i in usable if accounts[i]["name"] not in refused] or usable
     free = [i for i in usable if limited.get(accounts[i]["name"], 0) <= now]
     liked = preferred_here(accounts, free, top, seen, now) if free and top is not None else None
     if liked is not None:
@@ -1577,13 +1598,15 @@ def preferred_folder(acct: dict, top: str) -> str:
 
 
 def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: dict | None = None,
-             top: str | None = None, now: float | None = None) -> str:
+             top: str | None = None, now: float | None = None, refused=()) -> str:
     """Why pick(), given the same, chose accounts[i] (with `until`, its
     answer when every account was at a limit), in a few words for the
     start line (start_logged()): the only one allowed in the folder, the
     one the folder prefers, the one with room while the others were at
-    their limits or nearly full, the one whose unused allowance runs out
-    first, or the next in turn. Names, folders and times only."""
+    their limits, nearly full or had their sign-in refused (`refused`,
+    2026-11-24), the one tried again when every one had, the one whose
+    unused allowance runs out first, or the next in turn. Names, folders
+    and times only."""
     now = time.time() if now is None else now
     seen = seen or {}
     name, n = accounts[i]["name"], len(accounts)
@@ -1591,35 +1614,45 @@ def pick_why(accounts: list[dict], state: dict, i: int, until, skip=(), seen: di
     allowed = eligible(accounts, top) if top is not None else [a["name"] for a in accounts]
     narrowed = where is not None and len(allowed) < n
     caps = cap_limits(accounts, seen, now)  # each at its cap is at its limit here, said as its own (2026-11-24)
+    usable = [j for j in range(n) if accounts[j]["name"] not in skip]
+    out = [accounts[j]["name"] for j in usable if j != i and accounts[j]["name"] in refused and name not in refused]
     if until:
         every = f"every account allowed in {where}" if narrowed else "every account"
         held = "at its limit or its cap" if caps else "at its limit"
+        if out:  # passed over, room or not: a wait beats a chat that fails at once
+            held += " or had its sign-in refused"
         return f"{every} was {held}, and {name} resets first, at {clock(until)}"
     if narrowed and allowed == [name]:
         return f"the only account allowed in {where}"
     if n == 1:
         return "the only account"
     limited = blocked(accounts, state, seen, now)
-    usable = [j for j in range(n) if accounts[j]["name"] not in skip]
-    free = [j for j in usable if limited.get(accounts[j]["name"], 0) <= now]
+    trusted = [j for j in usable if accounts[j]["name"] not in refused] or usable
+    free = [j for j in trusted if limited.get(accounts[j]["name"], 0) <= now]
     if top is not None and free and preferred_here(accounts, free, top, seen, now) == i:
         return f"{preferred_folder(accounts[i], top)} prefers {name}, and it had room"
     if len(usable) == 1:
         return f"the only account {'allowed here ' if narrowed else ''}signed in as expected"
+    if name in refused:  # pick() takes a refused one only when every one left is
+        return (f"every account {'allowed here ' if narrowed else ''}signed in as expected had its sign-in refused, "
+                f"so {name} is tried again")
     if is_fallback(accounts[i]):
-        return "a fallback, and no other account allowed here had room"
+        return "a fallback, and no other account allowed here had room" + (f" ({refused_words(out)})" if out else "")
     others = [accounts[j]["name"] for j in usable if j != i]
-    full = [o for o in others if limited.get(o, 0) > now]
-    if full and len(full) == len(others):
+    full = [o for o in others if o not in out and limited.get(o, 0) > now]
+    if (full or out) and len(full) + len(out) == len(others):
         one = len(full) == 1
         held = (f"{'its' if one else 'their'} limit" if not any(o in caps for o in full)
                 else ("its cap" if one else "their caps") if all(o in caps for o in full) else "their limits or caps")
-        return f"it had room, and {', '.join(full)} {'was' if one else 'were'} at {held}"
-    near = [o for o in others if o not in full and near_full(seen.get(o), now)]
+        said = f"{', '.join(full)} {'was' if one else 'were'} at {held}" if full else ""
+        if not out:
+            return f"it had room, and {said}"
+        return f"it had room, {said}, and {refused_words(out)}" if said else f"it had room, and {refused_words(out)}"
+    near = [o for o in others if o not in full and o not in out and near_full(seen.get(o), now)]
     if near and not near_full(seen.get(name), now):
         return f"it had room, and {', '.join(near)} {'is' if len(near) == 1 else 'are'} nearly full"
     mine = expires(seen.get(name), now)
-    if mine != float("inf") and any(expires(seen.get(o), now) > mine for o in others if o not in full):
+    if mine != float("inf") and any(expires(seen.get(o), now) > mine for o in others if o not in full and o not in out):
         return "it had room, and its unused allowance runs out first"
     return "it had room, and it comes first in turn"
 
@@ -1654,13 +1687,14 @@ def at_limit_text(accounts: list[dict], state: dict, ours, top: str, mode, now: 
     if name not in allowed:
         return None
     seen = readings(accounts)
-    first = cap_now_text(accounts, state, ours, top, mode, seen, now, allowed)
-    said = at_limit_said(accounts, state, ours, top, mode, now, early, seen, allowed)
+    refused = sign_in_refused(accounts, seen)  # passed over as pick() passes them over (2026-11-24)
+    first = cap_now_text(accounts, state, ours, top, mode, seen, now, allowed, refused)
+    said = at_limit_said(accounts, state, ours, top, mode, now, early, seen, allowed, refused)
     return f"{first} {said}" if first and said else said
 
 
 def cap_now_text(accounts: list[dict], state: dict, ours: int, top: str, mode: str, seen: dict, now: float,
-                 allowed: list) -> str | None:
+                 allowed: list, refused=()) -> str | None:
     """at_limit_text()'s first sentence for a chat whose account is at its
     cap now (cap_held()): until when, and what the chat does under `mode`,
     as the terminal's supervisor and the panel's relay do it: auto moves it
@@ -1677,7 +1711,7 @@ def cap_now_text(accounts: list[dict], state: dict, ours: int, top: str, mode: s
         return f"{head} this chat's next message waits for that reset."
     nxt, free = pick(accounts, {**state, "limited_until": {**dict_at(state, "limited_until"), acct["name"]: math.inf}},
                      (ours + 1) % len(accounts), skip={a["name"] for a in accounts} - set(allowed), seen=seen,
-                     top=top, now=now)
+                     top=top, now=now, refused=refused)
     if nxt is None or nxt == ours or free:
         first = min(until, free) if free else until
         return f"{head} no other account has room, so this chat's next message waits until {clock(first)}."
@@ -1688,7 +1722,7 @@ def cap_now_text(accounts: list[dict], state: dict, ours: int, top: str, mode: s
 
 
 def at_limit_said(accounts: list[dict], state: dict, ours: int, top: str, mode: str, now: float, early: bool,
-                  seen: dict, allowed: list) -> str:
+                  seen: dict, allowed: list, refused=()) -> str:
     """at_limit_text()'s sentence about a limit (its docstring says it)."""
     name = accounts[ours]["name"]
     # A limit that is not a time is no limit here, so a hand-edited state.json never stops the sentence.
@@ -1703,7 +1737,7 @@ def at_limit_said(accounts: list[dict], state: dict, ours: int, top: str, mode: 
         return f"At a limit, this chat waits for {name}'s reset{at} and carries on there."
     nxt, until = pick(accounts, {**state, "limited_until": {**limited, name: own or math.inf}},
                       (ours + 1) % len(accounts), skip={a["name"] for a in accounts} - set(allowed),
-                      seen=seen, top=top, now=now)
+                      seen=seen, top=top, now=now, refused=refused)
     other = accounts[nxt]["name"]
     if until is None:  # one with room
         if mode == "auto":
@@ -1712,7 +1746,10 @@ def at_limit_said(accounts: list[dict], state: dict, ours: int, top: str, mode: 
         return f"At a limit, this chat asks you before moving to {other}. With no answer, it waits for {name}'s reset{at}."
     caps = set(cap_limits(accounts, seen, now)) & (set(allowed) - {name})  # those at their cap, said so (2026-11-24)
     full = (f"every other account{' allowed here' if len(allowed) < len(accounts) else ''} is at its limit"
-            + (" or its cap" if caps else ""))
+            + (" or its cap" if caps else "")
+            # one with room passed over for its refused sign-in (2026-11-24)
+            + (" or has had its sign-in refused" if other not in refused and set(refused) & (set(allowed) - {name})
+               else ""))
     if own and (nxt == ours or mode == "auto"):  # who resets first is known
         return f"At a limit, this chat waits for {other}'s reset at {clock(until)} and carries on there: {full}."
     unless = "" if own else f", unless {name} resets first"
@@ -1991,6 +2028,11 @@ class Watch:
         # Claude Code said it ended its wait at the limit had without
         # continuing (L3): a busy status is no reason to hold off then.
         self.wait_ended = False
+        # A turn of this launch ended on a refused sign-in (SIGN_IN_ERRORS,
+        # its StopFailure row: {"error", "at"}), until should_leave_sign_in()
+        # looks at it; sign_in_left, the one it closed Claude for (2026-11-24).
+        self.sign_in: dict | None = None
+        self.sign_in_left: dict | None = None
         self.paths: dict[str, Path | None] = {}
         self.rc_seen = False
         self.rc_lost_at = None
@@ -2097,6 +2139,12 @@ class Watch:
         for row in stop_rows(kept.get(self.sid) if isinstance(kept, dict) else None):
             at, said = row["at"], self.STOP_ROWS.get((row["event"], row["type"]))
             seen = (self.sid, row["type"], at)  # a StopFailure and the ended wait can share a second
+            if row["event"] == "StopFailure" and row["type"] in SIGN_IN_ERRORS and at >= self.started \
+                    and seen not in self.stops_seen:
+                # A refused sign-in (2026-11-24): its own route, should_leave_sign_in().
+                self.stops_seen.add(seen)
+                self.sign_in = {"error": row["type"], "at": at}
+                continue
             if said is None or at < self.started or seen in self.stops_seen:
                 continue
             self.stops_seen.add(seen)
@@ -2169,6 +2217,22 @@ class Watch:
         if self.status != "idle":
             return False
         return at_cap() and not self.agents_busy()
+
+    def should_leave_sign_in(self, decide) -> bool:
+        """A turn of this launch ended on a refused sign-in (sign_in, the
+        StopFailure hook's row, 2026-11-24) and Claude is idle with no
+        background agent writing: `decide(found)`, once for that row, says
+        whether to close Claude for the run loop's move (sign_in_left then
+        names it). Every message on the account fails at once, so nothing
+        is lost by closing; the decider says why when it does not."""
+        found = self.sign_in
+        if not found or self.status != "idle" or self.agents_busy():
+            return False
+        self.sign_in = None
+        if decide(found):
+            self.sign_in_left = found
+            return True
+        return False
 
     def should_reconnect(self) -> bool:
         if not (self.rc_lost_at and time.time() - self.rc_lost_at >= RC_GRACE):
@@ -2458,6 +2522,26 @@ def ask_to_move(here: str, kind: str | None, resets_at: float, there: str, cap: 
                     no_answer=f"No answer means wait, then carry on with {here}.")
 
 
+# How long the terminal's question about a refused sign-in waits for an
+# answer: there is no reset to wait for, and no answer reopens the chat on
+# the account it was on, where nothing fails until a message is sent.
+SIGN_IN_ASK = 600  # seconds
+
+
+def ask_sign_in_move(here: str, error: str, there: str) -> str:
+    """In "ask", after a turn ended on `here`'s refused sign-in (`error`,
+    2026-11-24): ask_here()'s answer to moving this conversation to
+    `there`, with the message that failed carried on there, asked for
+    SIGN_IN_ASK; no answer or a no reopens it on `here`."""
+    return ask_here(f"{here}'s sign-in was refused ({error}): each message there fails at once. Move this chat to "
+                    f"{there} and carry on?",
+                    f"y move · n stay on {here} · q quit Longhaul",
+                    f"longhaul reopens this chat on {here}", time.time() + SIGN_IN_ASK,
+                    f"move to {there}", f"{here}'s sign-in was refused. Answer in longhaul's terminal: move to {there}?",
+                    f"No answer, so longhaul reopens this chat on {here}.",
+                    no_answer=f"No answer means stay on {here}.")
+
+
 def ask_to_start(here: str, kind: str | None, resets_at: float, there: str, cap: int | None = None) -> str:
     """In "ask", before a conversation reopened on `here` waits for its
     limit to lift at `resets_at` (the ask-first plan of 2026-10-29: at a
@@ -2620,6 +2704,27 @@ def limit_gone(names) -> "callable":
     return gone
 
 
+def sign_in_back(names) -> "callable":
+    """For a wait (wait_until()'s `changed`): whether any of `names`,
+    passed over for a refused sign-in (sign_in_refused()), is no longer:
+    `longhaul login` signed it in again (forget_sign_in_failure()), so
+    the wait ends for the caller to decide again (2026-11-24).
+    SIGN_IN_FAILED is read only when it has changed (file_mark())."""
+    path, names = LONGHAUL_HOME / SIGN_IN_FAILED, list(names)
+    seen = [file_mark(path)]
+
+    def back() -> bool:
+        if not names:
+            return False
+        mark = file_mark(path)
+        if mark == seen[0]:
+            return False
+        seen[0] = mark
+        them = [{"name": n} for n in names]
+        return bool(set(names) - set(sign_in_refused(them, readings(them))))
+    return back
+
+
 def wait_until(until: float, what: str, changed=lambda: False) -> bool:
     """Wait until `until`: True to carry on, False on Ctrl+C. `changed` is
     asked every few seconds, and True from it ends the wait early, for the
@@ -2653,7 +2758,7 @@ def stop(proc: subprocess.Popen) -> None:
 
 def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
               may_reconnect=lambda: True, claim=lambda sid: True, leave=lambda w: False,
-              at_cap=lambda: False) -> str:
+              at_cap=lambda: False, sign_in=lambda found: False) -> str:
     while proc.poll() is None:
         try:
             proc.wait(timeout=POLL)
@@ -2670,6 +2775,9 @@ def supervise(proc: subprocess.Popen, w: Watch, other_has_room=lambda: False,
             if w.should_switch():
                 stop(proc)
                 return "limit"
+            if w.should_leave_sign_in(sign_in):  # a refused sign-in: each message there fails at once (2026-11-24)
+                stop(proc)
+                return "sign_in"
             if w.should_reconnect():
                 if may_reconnect():
                     stop(proc)
@@ -3693,6 +3801,8 @@ def run(opts) -> int:
     allowed_ids: set[str] = set()
     carry, new_id = None, None
     off_told: set = set()  # (account, what) said by leave(), each once
+    sign_in_told: dict = {}  # account -> when sign_in() last said its refused sign-in keeps the chat there
+    sign_in_declined: dict = {}  # account -> when its move was asked and not taken (no, or no answer)
     left = None  # `carry` when the account waited for was dropped since (the loop's top)
 
     def refresh() -> set:
@@ -3749,13 +3859,30 @@ def run(opts) -> int:
         if mode != "ask" or not kept_here or any(state["limited_until"].get(n, 0) <= now for n in kept_here):
             return None
         skip = {a["name"] for a in accounts if a["name"] in kept_here or not account_allowed(a, top)}
+        refused = sign_in_refused(accounts, seen)  # one whose sign-in was refused is offered last (2026-11-24)
         while True:
-            i, until = pick(accounts, state, 0, skip=skip, seen=seen, top=top)
+            i, until = pick(accounts, state, 0, skip=skip, seen=seen, top=top, refused=refused)
             if i is None or until:
                 return None
             if signed_in_as_expected(accounts[i]):
                 return i
             skip.add(accounts[i]["name"])
+
+    def moved_off_sign_in(here: str, found: dict, at: int):
+        """Where a chat on `here`, whose sign-in was just refused (`found`),
+        would move (2026-11-24): pick()'s answer, never back to `here`, nor
+        to another account refused too, signed in as someone else or not
+        allowed here, a cap counting as a limit. (index, None) for one with
+        room, (index, until) when each is at its limit or its cap until
+        then, (None, None) for none."""
+        now, seen = time.time(), readings(accounts)
+        skip = set(wrong) | set(denied) | set(sign_in_refused(accounts, seen)) | {here}
+        nxt, wait = pick(accounts, with_caps(load_state(), accounts, seen, now), (at + 1) % len(accounts), skip=skip,
+                         seen=seen, top=top)
+        if nxt is not None and not wait and not signed_in_as_expected(accounts[nxt]):
+            wrong.add(accounts[nxt]["name"])  # as the launch's own choice adds it: never offered again
+            return moved_off_sign_in(here, found, at)
+        return nxt, wait
 
     def run_elsewhere(state: dict, seen: dict, first: str, resets_at: float):
         """Before waiting for `first` to reset at `resets_at`: when
@@ -3802,8 +3929,10 @@ def run(opts) -> int:
         as before (no, no answer, no terminal, no account with room)."""
         nonlocal prompt
         skip = wrong | {stay}
+        refused = sign_in_refused(accounts, seen)  # one whose sign-in was refused is offered last (2026-11-24)
         while True:
-            i, until = pick(accounts, state, (names.index(stay) + 1) % len(names), skip=skip, seen=seen, top=top)
+            i, until = pick(accounts, state, (names.index(stay) + 1) % len(names), skip=skip, seen=seen, top=top,
+                            refused=refused)
             if i is None or until:
                 return None
             if signed_in_as_expected(accounts[i]):
@@ -3891,6 +4020,10 @@ def run(opts) -> int:
         # nothing of it is written, so a cap raised or removed counts at once.
         recorded = load_state()
         state = with_caps(recorded, accounts, seen, time.time())
+        # And each account whose sign-in was refused in a chat, with no reply
+        # on it since, is passed over by this round's pick() while another is
+        # left (sign_in_refused(), 2026-11-24): a wait beats a chat that fails.
+        refused = sign_in_refused(accounts, seen)
         # Checked before every launch, not once: on 2026-10-15 a sign-in in
         # VS Code moved ~/.claude to the second account while longhaul waited for
         # a reset, and a check made only at start would have carried on as
@@ -3949,12 +4082,12 @@ def run(opts) -> int:
                 reason = "chosen with longhaul use" if names[i] == use_choice else "asked for with --account"
         picked = not chosen
         while not chosen:
-            idx, until = pick(accounts, state, idx, skip=wrong, seen=seen, top=top)
+            idx, until = pick(accounts, state, idx, skip=wrong, seen=seen, top=top, refused=refused)
             if idx is None or until or signed_in_as_expected(accounts[idx]):
                 break
             wrong.add(accounts[idx]["name"])
         if picked and idx is not None:
-            reason = pick_why(accounts, state, idx, until, skip=wrong, seen=seen, top=top)
+            reason = pick_why(accounts, state, idx, until, skip=wrong, seen=seen, top=top, refused=refused)
         if idx is None:
             # "allowed here" with any account denied, as the panel's refusal says:
             # a denied account may well be signed in as expected (final review, Sprint 7, G5).
@@ -3969,9 +4102,13 @@ def run(opts) -> int:
                 which = f"Every account allowed in {home_path(top)}" if denied else "Every account"
                 held = " or its cap" if cap_limits([a for a in accounts if a["name"] not in wrong], seen,
                                                    time.time()) else ""
-                lifted = limit_gone(n for n in names if n not in wrong)
+                # One with room passed over for its refused sign-in is named, with how to sign it in (2026-11-24).
+                out = [n for n in names if n in refused and n not in wrong and n != names[idx]]
+                if out:
+                    held += f", or its sign-in was refused ({', '.join(out)}: `longhaul login {out[0]}` signs it in again)"
+                lifted, back = limit_gone(n for n in names if n not in wrong), sign_in_back(out)
                 if not wait_until(until + RESET_MARGIN, f"{which} is at its limit{held}",
-                                  lambda: bool(refresh()) or lifted()):
+                                  lambda: bool(refresh()) or lifted() or back()):
                     return 0
                 continue
             reason = f"every account allowed here was at its limit, and you said yes to {names[elsewhere]}"
@@ -4024,8 +4161,9 @@ def run(opts) -> int:
             now = time.time()
             fresh = readings(accounts)
             held = blocked(accounts, load_state(), fresh, now)  # one at its cap has no room either (2026-11-24)
+            out = sign_in_refused(accounts, fresh)  # nor one whose sign-in was refused (2026-11-24)
             return any(a["name"] != here and a["name"] not in skip and not is_fallback(a)
-                       and held.get(a["name"], 0) <= now
+                       and held.get(a["name"], 0) <= now and a["name"] not in out
                        and not near_full(fresh.get(a["name"]), now) for a in accounts)
 
         def claim(sid: str, here=acct["name"]) -> bool:
@@ -4083,6 +4221,47 @@ def run(opts) -> int:
             return found is not None and capped(found, read_json(USAGE_DIR / f"{found['name']}.json"),
                                                 time.time()) is not None
 
+        def sign_in(found: dict, launched=acct, at=idx) -> bool:
+            """A turn of this launch ended on a refused sign-in (`found`, the
+            StopFailure hook's row: Watch.sign_in) and Claude is idle
+            (2026-11-24): True to close Claude for the move below, in auto,
+            or in ask to ask there, when another account has room and was
+            not refused too (moved_off_sign_in()). Else nothing closes, and
+            why is said once for this account until a reply comes on it
+            (sign_in_told): never, no account to move to, or in ask a move
+            asked already and not taken (sign_in_declined)."""
+            here = (find_account(launched, accounts) or launched)["name"]
+            nxt, wait = moved_off_sign_in(here, found, at)
+            reading = read_json(USAGE_DIR / f"{here}.json")
+            declined = sign_in_declined.get(here)
+            declined = mode == "ask" and declined is not None and sign_in_failed_at(declined, reading) is not None
+            if mode != "never" and nxt is not None and not wait and not declined:
+                return True
+            told = sign_in_told.get(here)
+            if told is not None and sign_in_failed_at(told, reading) is not None:
+                return False  # said already, and no reply on it since
+            sign_in_told[here] = time.time()
+            shown = label_in(here, accounts)
+            head = f"{shown}'s sign-in was refused ({found['error']})"
+            fix = f"`longhaul login {here}` signs it in again; then send your message again."
+            if mode == "never":
+                msg = f"{head}, and with switching set to never this conversation stays on it. {fix}"
+            elif declined:
+                msg = f"{head}, and you chose to stay on it, so this conversation stays on {shown}. {fix}"
+            elif nxt is None:
+                msg = (f"{head}, and no other account{' allowed here' if denied else ''} can take this conversation, "
+                       f"so it stays on {shown}. {fix}")
+            else:
+                msg = (f"{head}, and every other account{' allowed here' if denied else ''} is at its limit until "
+                       f"{clock(wait)} at the soonest, so this conversation stays on {shown}. {fix}")
+            log(f"sign-in: {w.sid or 'a chat'} stays on {here}, whose sign-in was refused ({found['error']}): "
+                + ("switching is never" if mode == "never" else "you chose to stay on it" if declined
+                   else "no other account can take it" if nxt is None
+                   else f"no other account has room until {clock(wait)}"))
+            later(msg)
+            notify(msg)
+            return False
+
         try:
             # The early move to an account with room happens in "auto" only:
             # to ask, the terminal would close Claude first, and a chat
@@ -4090,7 +4269,7 @@ def run(opts) -> int:
             # 2026-10-29: in "ask", ask at the limit and never early here).
             # The mode as it is now: a saved one is read again (refresh()).
             why = supervise(proc, w, lambda: mode == "auto" and other_has_room(), may_reconnect,
-                            claim=claim, leave=leave, at_cap=at_cap)
+                            claim=claim, leave=leave, at_cap=at_cap, sign_in=sign_in)
         finally:
             if proc.poll() is None:
                 stop(proc)
@@ -4155,8 +4334,9 @@ def run(opts) -> int:
                 if limit.get("uuid"):  # never act on the same stop twice
                     state["handled_limits"] = (state.get("handled_limits", []) + [limit["uuid"]])[-50:]
             state = update_state(mark)
+            fresh = readings(accounts)
             nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong,
-                             seen=readings(accounts), top=top)
+                             seen=fresh, top=top, refused=sign_in_refused(accounts, fresh))
             new = accounts[nxt]["name"]
             every = "every account allowed here" if denied else "every account"
             # As people see them (label_of()): the default sign-in by that name, in what is said and sent.
@@ -4228,7 +4408,8 @@ def run(opts) -> int:
             else:
                 until, cap = held
                 at = f"{old_shown} is {cap_words(cap)} until {clock(until)}"
-                nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong, seen=seen, top=top)
+                nxt, wait = pick(accounts, state, (idx + 1) % len(accounts), skip=wrong, seen=seen, top=top,
+                                 refused=sign_in_refused(accounts, seen))
                 new = accounts[nxt]["name"] if nxt is not None else acct["name"]
                 new_shown = label_in(new, accounts)
                 room = nxt is not None and nxt != idx and not wait
@@ -4266,14 +4447,56 @@ def run(opts) -> int:
                     log(f"{at}; with switching set to {mode} the conversation waits for that reset")
                 if asked:  # the wait this question was about, for start_elsewhere(): asked once
                     asked_for = (stay, state["limited_until"].get(stay, 0))
+        elif why == "sign_in":
+            # A turn ended on a refused sign-in (the StopFailure hook's word:
+            # Watch.sign_in, 2026-11-24) and Claude was idle, so supervise()
+            # closed it: in auto, or in ask to ask here, with another account
+            # with room (sign_in()). As at a limit, by the mode, the message
+            # that failed carried on there (SIGN_IN_CARRY_ON). The failure is
+            # kept as the hook keeps it, so no chooser takes the account again
+            # while another can be used, until a reply on it or a sign-in.
+            found = w.sign_in_left or {"error": "authentication_failed", "at": int(time.time())}
+            here, error = acct["name"], found["error"]
+            with contextlib.suppress(OSError):
+                keep_sign_in_failure(here, found["at"])
+            nxt, wait = moved_off_sign_in(here, found, idx)
+            room = nxt is not None and not wait
+            new = accounts[nxt]["name"] if room else here
+            old_shown, new_shown = label_in(here, accounts), label_in(new, accounts)
+            verdict = decide_move(mode, consent=True, can_ask=room)
+            answer = (ask_sign_in_move(old_shown, error, new_shown) if verdict == "ask"
+                      else "yes" if verdict == "move" and room else "no")
+            if answer == "stop":
+                return stopped()
+            if answer == "yes":
+                then = f"{here}'s sign-in was refused ({error}), and " + ("switching is auto" if mode == "auto"
+                                                                         else "you said yes")
+                prompt = SIGN_IN_CARRY_ON.format(old=old_shown, error=error, new=new_shown)
+                msg = (f"{old_shown}'s sign-in was refused ({error}), so longhaul moved this conversation to "
+                       f"{new_shown}, with a carry-on message." if mode == "auto" else
+                       f"Moving to {new_shown}: reopening this conversation there with a carry-on message.")
+                # Where the loop's top launches: not a pick() again, which a reading written since could send back.
+                idx, stay, forced = nxt, (new if mode != "auto" else None), (new if mode == "auto" else None)
+                say(msg)
+                notify(msg)
+            else:  # "ask" without a yes, or no room left since sign_in() looked: it reopens there, with no message
+                prompt = None
+                then = f"{old_shown}'s sign-in was refused ({error}), and it reopened there"
+                if mode == "auto":  # as said: the loop's top would pass it over, refused, for a wait elsewhere
+                    forced = here
+                else:  # asked once: a later refusal on it is said, not asked again with Claude closed
+                    sign_in_declined[here] = time.time()
+                say(f"{old_shown}'s sign-in was refused ({error}); the conversation reopens there. `longhaul login "
+                    f"{here}` signs it in again.")
         elif why == "move":
             # No carry-on message: Claude was idle, so there is nothing to
             # carry on, and your next message goes to the new account. Only
             # "auto" moves early (the supervise() call above).
             prompt = None
-            used = max((u for u, _ in windows(readings(accounts).get(acct["name"]), time.time())), default=0)
+            fresh = readings(accounts)
+            used = max((u for u, _ in windows(fresh.get(acct["name"]), time.time())), default=0)
             nxt, _ = pick(accounts, load_state(), (idx + 1) % len(accounts), skip=wrong,
-                          seen=readings(accounts), top=top)
+                          seen=fresh, top=top, refused=sign_in_refused(accounts, fresh))
             msg = (f"{acct['name']} is at {used:g}% of its allowance, so while {label} was idle "
                    f"longhaul moved it to {accounts[nxt]['name']}.")
             then = f"{acct['name']} was at {used:g}% of its allowance, and switching is auto"
@@ -4284,7 +4507,9 @@ def run(opts) -> int:
             # leave()'s move in auto, off an account removed or no longer
             # allowed here: as the early move, no carry-on message.
             prompt = None
-            nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=readings(accounts), top=top)
+            fresh = readings(accounts)
+            nxt, _ = pick(accounts, load_state(), idx, skip=wrong, seen=fresh, top=top,
+                          refused=sign_in_refused(accounts, fresh))
             then = f"it ran on {off(acct['name']) or acct['name']}, and switching is auto"
             msg = f"This conversation ran on {off(acct['name']) or acct['name']}, so while {label} was idle longhaul "
             msg += f"moved it to {accounts[nxt]['name']}." if nxt is not None else "moved it."
@@ -4699,7 +4924,8 @@ def status_line(state: dict, paint: bool = False) -> str:
     gives: "account", as shown; "five" and "week", {"used", "resets" (a
     time as clock() shows it)} or None; "ctx", the context in tokens, or
     None; "event", None or {"kind": "question" (to, and at for a carry-on
-    at a reset; cap, for a cap's question), "waiting" (at, on), "stopped" (until), "refused" (where,
+    at a reset; cap, for a cap's question; sign_in true, for a refused
+    sign-in's), "waiting" (at, on), "stopped" (until), "refused" (where,
     by: the accounts that keep the folder), "pending" (to, when: "turn" or
     "open") or "moved" (from, at)}; "update", a newer release, or None. An
     event at a limit, a choice pending or a message stopped takes the place
@@ -4725,7 +4951,8 @@ def status_line(state: dict, paint: bool = False) -> str:
     if kind == "question" and to:
         ask = (f"carry on {at}{'' if to == name else ' on ' + to}?" if at else f"move to {to}?")
         cap = ev.get("cap")
-        held = (f"at cap {cap}%" if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99
+        held = ("sign-in refused" if ev.get("sign_in") is True
+                else f"at cap {cap}%" if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99
                 else "at limit")
         parts = [f"{head} {held}", f"{ask} /accounts"]
     elif kind == "waiting" and at:
@@ -4852,6 +5079,8 @@ def status_event(sid, name: str, record: dict, now: float):
                 and pid > 0 and pid_alive(pid):
             cap = q.get("cap")  # a cap's question (0.3.23): "at cap 25%", not "at limit"
             capped = {"cap": cap} if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99 else {}
+            if q["kind"] == "move" and isinstance(q.get("sign_in"), str) and q["sign_in"]:
+                return {"kind": "question", "to": label_of(q["to"], listed), "sign_in": True}  # "sign-in refused"
             if q["kind"] == "move":
                 return {"kind": "question", "to": label_of(q["to"], listed), **capped}
             at = next((v for v in (as_number(q.get(k)) for k in ("carries_on_at", "to_resets_at", "resets_at"))
@@ -4893,18 +5122,30 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
     acct, entry = session_account(config_dir)
     limits = data.get("rate_limits") or {}
     sid = data.get("session_id")
+    # Only a plain id (GUARD_ID) names a record: anything else would be a
+    # path. Not logged: the status line runs at every update.
+    plain = isinstance(sid, str) and re.fullmatch(GUARD_ID, sid)
+    last_path = USAGE_DIR / "sessions" / f"{sid}.json" if plain else None
+    last = (read_json(last_path) or {}) if plain else {}
+    last = last if isinstance(last, dict) else {}
+    stored = read_json(USAGE_DIR / f"{acct}.json")
+    stored = stored if isinstance(stored, dict) else {}
+    # When a reply last came on the account (replied_at()): now, on this
+    # reading's evidence of one (reply_seen()), else as it was. Never the
+    # reading's own time: after a refused turn the line may still carry the
+    # numbers it had, and a failed sign-in would then be old news at once.
+    replied = now if reply_seen(data, acct, last) else replied_at(stored)
     if limits:
-        write_json(USAGE_DIR / f"{acct}.json", {"at": now, "session": sid, **limits})
+        write_json(USAGE_DIR / f"{acct}.json", {"at": now, "session": sid, **limits, "replied": replied})
     else:  # the first update after a launch comes before any reply
-        stored = read_json(USAGE_DIR / f"{acct}.json") or {}
+        if stored and replied != replied_at(stored):
+            write_json(USAGE_DIR / f"{acct}.json", {**stored, "replied": replied})
         limits = {k: v for k, v in stored.items() if k in ("five_hour", "seven_day")
                   and (v.get("resets_at") or 0) > now}
     five, week = limits.get("five_hour") or {}, limits.get("seven_day") or {}
 
-    # Only a plain id (GUARD_ID) names a record: anything else would be a
-    # path. Not logged: the status line runs at every update.
     record = {}
-    if isinstance(sid, str) and re.fullmatch(GUARD_ID, sid):
+    if plain:
         cost, ctx, cache = dict_at(data, "cost"), dict_at(data, "context_window"), dict_at(data, "prompt_cache")
         row = {"at": round(now, 1), "session": sid, "account": acct,
                "cost": round(float(cost.get("total_cost_usd") or 0), 4),
@@ -4920,8 +5161,6 @@ def record_usage(data: dict, config_dir, now: float | None = None) -> str:
         ) if v is not None})
         if data.get("proc"):  # the panel relay knows which claude this was
             row["proc"] = data["proc"]
-        last_path = USAGE_DIR / "sessions" / f"{sid}.json"
-        last = read_json(last_path) or {}
         record = last
         # ctx too: a /compact shrinks the context but leaves the cost alone.
         if any(row.get(k) != last.get(k) for k in ("account", "cost", "five", "week", "proc", "ctx", "model")):
@@ -12725,13 +12964,22 @@ def sign_in_failed(sid: str, config_dir, now: float) -> None:
         if account is None:
             return
         log(SIGN_IN_LOGGED.format(account=account, sid=sid))
-        path = LONGHAUL_HOME / SIGN_IN_FAILED
-        with locked("sign-in-failed"):
-            kept = sign_in_rows(read_json(path), sign_in_names())
-            kept[account] = int(now)
-            write_json(path, kept)
+        keep_sign_in_failure(account, now)
     except OSError as e:
         log(f"sign-in: {account or 'the account'}'s failure was not kept: {e.strerror or e}")
+
+
+def keep_sign_in_failure(account: str, now: float) -> None:
+    """`account`'s failure at `now` kept in SIGN_IN_FAILED, under its lock,
+    the newest time kept: the hook's (sign_in_failed()), and a panel
+    relay's, which sees the turn's error in the stream and may act before
+    the hook has written (Relay.tend_sign_in(), 2026-11-24). Raises
+    OSError for its caller to log."""
+    path = LONGHAUL_HOME / SIGN_IN_FAILED
+    with locked("sign-in-failed"):
+        kept = sign_in_rows(read_json(path), sign_in_names())
+        kept[account] = max(kept.get(account, 0), int(now))
+        write_json(path, kept)
 
 
 def forget_sign_in_failure(name: str) -> None:
@@ -12758,13 +13006,93 @@ def forget_sign_in_failure(name: str) -> None:
 
 def sign_in_failed_at(failed, reading):
     """When an account's sign-in failed in a chat (its entry of
-    SIGN_IN_FAILED, `failed`), while that is still news: after its last
-    usage reading (`reading`), which a successful reply writes. None when
-    there is no such failure, or a reply came since. A setup that signed
-    it in has forgotten it already."""
+    SIGN_IN_FAILED, `failed`), while that is still news: after the last
+    reply on it that its usage reading (`reading`) has evidence of
+    (replied_at()). None when there is no such failure, or a reply came
+    since. A setup or `longhaul login` that signed it in has forgotten it
+    already."""
     failed = as_number(failed)
-    replied = as_number(reading.get("at")) if isinstance(reading, dict) else None
+    replied = replied_at(reading)
     return failed if failed is not None and (replied is None or failed > replied) else None
+
+
+def replied_at(reading):
+    """When a reply last came on an account, as its usage reading
+    (`reading`, USAGE_DIR/<name>.json) says: its "replied", which
+    record_usage() sets only on evidence of a reply (reply_seen()), else
+    None. Not the reading's "at" (2026-11-24): Claude Code's status line
+    runs after a refused turn too, and Longhaul cannot know whether it then
+    still carries the last numbers it had, so a reading taken after a
+    failed sign-in would make the failure old news at once and every
+    chooser would take the account again. A reading written before 0.3.24
+    has no "replied", and its "at" stands for it, as it did then."""
+    if not isinstance(reading, dict):
+        return None
+    return as_number(reading.get("replied") if "replied" in reading else reading.get("at"))
+
+
+def reply_seen(data: dict, acct: str, last: dict) -> bool:
+    """Whether a status-line reading (`data`, for account `acct`) shows a
+    reply on that account since the chat's last record (`last`, its
+    usage/sessions record): the panel relay's own word ("longhaul_reply",
+    a turn with Claude's reply in it, Relay.note_cost()), or the chat's
+    cost risen since a record on the same account. A refused request costs
+    nothing; a reply does, a subagent's too, and each proves the account's
+    sign-in works. A first reading after a move, whose record is the old
+    account's, is no evidence: the next reply is."""
+    if data.get("longhaul_reply") is True:
+        return True
+    if not last or key_of(last.get("account")) != acct:
+        return False
+    before, cost = as_number(last.get("cost")), as_number(dict_at(data, "cost").get("total_cost_usd"))
+    return before is not None and cost is not None and round(cost, 4) > before
+
+
+def sign_in_refused(accounts: list[dict], seen: dict | None) -> dict:
+    """{name: when} for each of `accounts` whose sign-in failed in a chat
+    and is still news (sign_in_failed_at(), by its reading in `seen`,
+    readings()'s): what every chooser passes over while another account
+    can be used (pick()'s `refused`, 2026-11-24). {} when SIGN_IN_FAILED is
+    not there or not in its shape."""
+    names = {a["name"] for a in accounts}
+    failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), names)
+    seen = seen or {}
+    found = {}
+    for name, at in failed.items():
+        when = sign_in_failed_at(at, seen.get(name))
+        if when is not None:
+            found[name] = when
+    return found
+
+
+def refused_words(names) -> str:
+    """"personal-1's sign-in was refused", or for several "personal-1's
+    and work's sign-ins were refused": how a chooser's reason names the
+    accounts it passed over for a refused sign-in."""
+    names = list(names)
+    owners = " and ".join(f"{n}'s" for n in names)
+    return f"{owners} sign-in was refused" if len(names) == 1 else f"{owners} sign-ins were refused"
+
+
+def refused_text(name: str, when: float, listed: bool = True) -> str:
+    """What status, the doctor and /accounts say of an account whose
+    sign-in was refused (sign_in_refused()): when, that the choosers pass
+    it over until it replies again or is signed in again, and the command
+    that signs it in again (`longhaul login NAME`, setup NAME --relogin:
+    `longhaul setup NAME` alone signs nothing in when the email matches,
+    and a refused sign-in is one whose email does). Without a list of
+    accounts there is nothing to pass it over for: Claude Code's own
+    sign-in, which /login signs in again."""
+    if not listed:
+        return f"its sign-in was refused at {clock(when)}: {DEFAULT_RELOGIN}"
+    return f"{refused_said(when)}: `longhaul login {name}`"
+
+
+def refused_said(when: float) -> str:
+    """refused_text()'s words before the command, for the doctor, whose
+    step names it apart."""
+    return (f"its sign-in was refused at {clock(when)}, so Longhaul passes it over while another account can be "
+            "used, until it replies again or is signed in again")
 
 
 def stop_hook(event: str) -> int:
@@ -14814,17 +15142,21 @@ def choose_for_panel(accounts: list[dict], binary: str, start: int = 0, state: d
     returns; (None, None) when no account is signed in as it should be.
     `top`: the chat's repository, for pick()'s preferred accounts (none
     for a short job). `reasons`, a list, gets pick_why()'s words for the
-    one chosen."""
+    one chosen. An account whose sign-in was refused in a chat, with no
+    reply on it since (sign_in_refused()), is passed over while another is
+    left (2026-11-24), by every chooser of the panel and of longhaul pipe
+    that comes here."""
     state = load_state() if state is None else state
     wrong = set() if wrong is None else wrong
     seen = readings(accounts)
+    refused = sign_in_refused(accounts, seen)
     while True:
-        i, until = pick(accounts, state, start, skip=wrong, seen=seen, top=top)
+        i, until = pick(accounts, state, start, skip=wrong, seen=seen, top=top, refused=refused)
         if i is None:
             return None, None
         if signed_in_cached(accounts[i], binary):
             if reasons is not None:
-                reasons.append(pick_why(accounts, state, i, until, skip=wrong, seen=seen, top=top))
+                reasons.append(pick_why(accounts, state, i, until, skip=wrong, seen=seen, top=top, refused=refused))
             return i, until
         wrong.add(accounts[i]["name"])
 
@@ -15240,6 +15572,9 @@ class Relay:
         self.question, self.question_for = None, {}
         self.carry, self.carry_for = None, {}
         self.replied_at = 0.0
+        # Whether the turn under way has had Claude's own reply (main_reply()),
+        # for note_cost(): the evidence that the account's sign-in works.
+        self.turn_replied = False
         # A chat reopened by id on an account at its limit (0.3.4): that
         # limit's reset, which wrap() sets for ask_at_start() to ask about;
         # and the panel's user messages held from claude meanwhile, a list
@@ -15261,6 +15596,13 @@ class Relay:
         # for what: {"account", "cap", "until", "decided", "told", "recheck"}
         # (tend_cap()); None when no cap holds them.
         self.cap_hold: dict | None = None
+        # A refused sign-in (2026-11-24): the main thread's turn that ended
+        # on one of SIGN_IN_ERRORS, {"account", "error", "at"}, set on
+        # claude's reader (turn_ended()) for tend_sign_in() to act on once;
+        # and, by account, when it last said a chat stays on a refused one,
+        # said again only after a reply since (tell_sign_in()).
+        self.sign_in_seen: dict | None = None
+        self.sign_in_told: dict = {}
 
     # -- the pipes
 
@@ -15483,12 +15825,15 @@ class Relay:
                     self.hold_if_limit(line)
                 if main_reply(line):
                     self.replied_at = time.time()  # work went on: carry_on() and tend() read it
+                    self.turn_replied = True  # this turn's reading is a reply's (note_cost())
                     self.end_hold("a reply came")
                 error = main_error(line)
                 if error:
                     self.turn_error = error
                 if has_type(line, "result"):
-                    self.note_cost(child, line)
+                    if self.turn_error not in SIGN_IN_ERRORS:
+                        # A refused turn has no cost and no reply to note (2026-11-24).
+                        self.note_cost(child, line)
                     if no_limit_result(line):
                         self.end_hold("the turn ended with no limit stop")
                     self.turn_ended(line)
@@ -15588,8 +15933,11 @@ class Relay:
     def turn_ended(self, line: bytes) -> None:
         """A result line, on claude's reader: the turn ended. On a server
         error of the main thread's (main_error()), when, for tend_retry();
-        with no error, the streak of those is over (2026-11-06)."""
+        with no error, the streak of those is over (2026-11-06). On a
+        refused sign-in (SIGN_IN_ERRORS), which account, the word and when,
+        for tend_sign_in() (2026-11-24)."""
         error, self.turn_error = self.turn_error, None
+        self.turn_replied = False
         try:
             msg = json.loads(line)
         except (ValueError, RecursionError):
@@ -15601,6 +15949,8 @@ class Relay:
                 self.retry_streak = 0
             elif error == "server_error":
                 self.server_error_at = time.time()
+            elif error in SIGN_IN_ERRORS:
+                self.sign_in_seen = {"account": self.running_on()["name"], "error": error, "at": time.time()}
 
     def limit_ours(self, limit) -> bool | None:
         """Whether the conversation file's limit stop `limit` is this relay's
@@ -15653,8 +16003,11 @@ class Relay:
         if msg.get("type") != "result" or not self.limits:
             return
         try:
+            # longhaul_reply: Claude replied in this turn, the evidence that the account's sign-in works
+            # (reply_seen(), 2026-11-24).
             record_usage({"session_id": msg.get("session_id"), "rate_limits": self.limits, "proc": child.pid,
-                          "cost": {"total_cost_usd": msg.get("total_cost_usd") or 0}},
+                          "cost": {"total_cost_usd": msg.get("total_cost_usd") or 0},
+                          "longhaul_reply": self.turn_replied},
                          str(config_of(self.running_on())))
         except Exception as e:
             log(f"panel usage not recorded: {e!r}")
@@ -15797,6 +16150,14 @@ class Relay:
         q, c = self.question, self.carry
         if q and self.question_for.get("cap") is not None:
             return  # a cap's question: tend_cap() decides it again (refresh() marked it)
+        if q and self.question_for.get("sign_in"):
+            if self.mode == "auto" and self.swap:  # auto saved since: decided again, as a move
+                about = self.question_for
+                log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: switching is auto")
+                self.drop_question()
+                with self.cond:
+                    self.sign_in_seen = {"account": q["from"], "error": about["sign_in"], "at": about["since"]}
+            return
         auto = self.mode == "auto" and self.swap
         if not ((q and (auto or q["kind"] == "first_reset")) or (c and not q and auto and c["why"] != "answered")):
             return
@@ -16026,7 +16387,7 @@ class Relay:
             self.let_go_user()
 
     def ask(self, limit: dict, since: float, state: dict | None = None, reopened: bool = False,
-            cap: int | None = None) -> None:
+            cap: int | None = None, sign_in: str | None = None) -> None:
         """Write this chat's question (QUESTIONS) and say it: "move" when an
         account other than this one has room now, "first_reset" when every
         account allowed here is at its limit, naming the one that resets
@@ -16036,17 +16397,26 @@ class Relay:
         answered and the notification's words tell apart. `cap`: asked
         because this chat's account is at its cap (tend_cap(), 2026-11-24):
         a move question only, "cap" in its file and "limit" "cap"; with no
-        other account with room none is asked, and the caller holds."""
+        other account with room none is asked, and the caller holds.
+        `sign_in`: asked because this chat's turn ended on a refused sign-in
+        (tend_sign_in(), 2026-11-24), the error's word: a move question
+        only, "sign_in" in its file, "limit" "sign-in" and no reset; never
+        to this account or another refused too. Move carries the message
+        that failed on there; wait stays."""
         here_idx, sid = self.idx, self.watch.sid
         here = self.accounts[here_idx]
         state = load_state() if state is None else state
         path = chat_file(QUESTIONS, sid)
+        wrong = set(self.bad)
+        if sign_in is not None:
+            wrong |= set(sign_in_refused(self.accounts, readings(self.accounts))) | {here["name"]}
         nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), state,
-                                      wrong=set(self.bad), top=self.top)
-        if path is None or nxt is None or (nxt == here_idx and not until) or (cap is not None and until):
+                                      wrong=wrong, top=self.top)
+        held = cap is not None or sign_in is not None
+        if path is None or nxt is None or (nxt == here_idx and not until) or (held and until):
             why = ("the chat has no id yet" if path is None
                    else "no account allowed here is signed in as expected" if nxt is None
-                   else "no other account has room" if cap is not None
+                   else "no other account has room" if held
                    else f"{here['name']} has room again")
             log(f"question: none asked in {sid or 'a chat'}: {why}; the chat stays as it is")
             return
@@ -16064,16 +16434,22 @@ class Relay:
              "carries_on_at": carry_time(at), "choices": ["yes", "no"] if until else ["move", "wait"]}
         if cap is not None:  # the pane words it for the cap (hooks/question.ts)
             q["cap"] = cap
+        if sign_in is not None:  # and for a refused sign-in: no reset, and nothing waits for one
+            q.update(sign_in=sign_in, resets_at=0, carries_on_at=None)
         try:
             write_private(path, q)
         except OSError as e:
             log(f"question: could not ask in {sid} ({e!r}); the chat stays as it is")
             return
         self.question, self.question_for = q, {"limit": limit, "since": since, "to": nxt, "reopened": reopened,
-                                               "cap": cap}
+                                               "cap": cap, "sign_in": sign_in}
         # Said as people see them (label_in()); the log and the question keep the keys.
         shown, there_shown = label_in(here["name"], self.accounts), label_in(there, self.accounts)
-        if cap is not None:
+        if sign_in is not None:
+            log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} ({here['name']}'s sign-in "
+                f"was refused: {sign_in})")
+            said = f"{shown}'s sign-in was refused ({sign_in}). Move this chat to {there_shown} and carry on?"
+        elif cap is not None:
             log(f"question: asked {sid} ({q['id']}) to move from {here['name']} to {there} ({here['name']} is "
                 f"{cap_words(cap)} until {clock(resets)}); its messages wait for the answer")
             said = f"{shown} is {cap_words(cap)} until {clock(resets)}. Move this chat to {there_shown} now?"
@@ -16092,7 +16468,9 @@ class Relay:
                 f"({here['name']}'s {limit['kind']} limit resets {clock(resets)})")
             said = (f"{shown} hit its {limit['kind']} limit (resets {clock(resets)}). "
                     f"Move this chat to {there_shown} and carry on?")
-        then = (f"your next message waits for the answer, and with no answer it goes on {shown} at that reset"
+        then = (f"with no answer the chat stays on {shown}, where `longhaul login {here['name']}` signs it in again"
+                if sign_in is not None else
+                f"your next message waits for the answer, and with no answer it goes on {shown} at that reset"
                 if cap is not None else
                 "your messages wait for the answer, and with no answer nothing moves" if reopened and not until
                 else f"with no answer the chat stays on {shown}")
@@ -16114,8 +16492,17 @@ class Relay:
             self.reconsider()
         self.tend_lifted()
         self.tend_cap()
+        self.tend_sign_in()
         if self.question and self.question_for.get("cap") is not None:
             self.read_answer()  # a cap's question: its reset and a cap changed are tend_cap()'s
+        elif self.question and self.question_for.get("sign_in"):
+            if self.replied_at > self.question_for["since"]:  # a reply on it: its sign-in works again
+                q = self.question
+                log(f"question: {q['chat']}'s question ({q['id']}) is withdrawn: a reply came on {q['from']}, so its "
+                    "sign-in works again")
+                self.drop_question()
+            else:
+                self.read_answer()
         elif self.question:
             if self.replied_at > self.question_for["since"]:
                 q, limit = self.question, self.question_for["limit"]
@@ -16189,9 +16576,10 @@ class Relay:
         if self.carry:
             log(f"wait: {self.carry['chat']}'s carry-on on {self.carry['account']} is cancelled: {name} was chosen")
             self.drop_carry()
-        # A reopen's question, or a cap's: nothing was cut off.
+        # A reopen's question, or a cap's: nothing was cut off. A refused sign-in's: its message got no answer.
         limit = None if about.get("reopened") or about.get("cap") is not None else about.get("limit")
-        text = (CARRY_ON.format(old=here, kind=limit["kind"], new=name) if limit
+        text = (SIGN_IN_CARRY_ON.format(old=here, error=about["sign_in"], new=name) if about.get("sign_in")
+                else CARRY_ON.format(old=here, kind=limit["kind"], new=name) if limit
                 else USE_CHOSEN.format(old=here, new=name))
         if self.move_to(nxt, text):
             note_session_account(sid, name)
@@ -16320,31 +16708,145 @@ class Relay:
                    f"until {clock(when)}. To send it sooner: `longhaul cap {name} off` (or a higher cap), or move the "
                    "chat in /accounts.")
 
-    def move_off_cap(self, to: int, cap: int, until: float, how: str) -> None:
-        """The chat moves off an account at its cap to accounts[to], while
-        idle (move_to() with no carry-on message: nothing was cut off, and the
-        held messages go there); the record moves too, so a reopen starts
-        there. An account that cannot take it now (unready()) is decided
-        again at the next round, never a move unasked."""
-        here, sid = self.accounts[self.idx], self.watch.sid or "a chat"
-        new = self.accounts[to]["name"]
+    def move_between_turns(self, to: int, text: str | None, topic: str, off: str, why: str, said: str) -> bool:
+        """A move of the chat while it is idle, off an account it may not go
+        on with, to accounts[to]: a cap's (move_off_cap()) and a refused
+        sign-in's (move_off_sign_in()), one path. An account that cannot take
+        it now (unready()) is logged under `topic`, and nothing moves; else
+        move_to() with `text` (None: no carry-on message), the record moved
+        too, so a reopen starts there, the log's line (`off`: the account
+        left, and why), the start line (`why`) and the notification
+        (`said`). True when the chat runs there."""
+        sid, new = self.watch.sid or "a chat", self.accounts[to]["name"]
         problem = self.unready(to)
         if problem:
-            log(f"cap: {sid} does not move to {new}: {problem}")
-            if self.cap_hold is not None:
-                self.cap_hold["decided"] = False
-            return
-        if not self.move_to(to, None):
+            log(f"{topic}: {sid} does not move to {new}: {problem}")
+            return False
+        if not self.move_to(to, text):
+            return False
+        note_session_account(sid, new)
+        log(f"{topic}: {sid} moved, while idle, from {off}, to {new}")
+        start_logged(sid, "moves to", new, home_path(self.top or os.getcwd()), why)
+        notify(said)
+        return True
+
+    def move_off_cap(self, to: int, cap: int, until: float, how: str) -> None:
+        """The chat moves off an account at its cap to accounts[to], while
+        idle (move_between_turns() with no carry-on message: nothing was cut
+        off, and the held messages go there). An account that cannot take it
+        now is decided again at the next round, never a move unasked."""
+        here = self.accounts[self.idx]["name"]
+        if not self.move_between_turns(
+                to, None, "cap", f"{here}, {cap_words(cap)} until {clock(until)}",
+                f"{here} reached its cap ({cap}%), and {how}",
+                f"{label_in(here, self.accounts)} is {cap_words(cap)} until {clock(until)}; the panel chat moved to "
+                f"{label_in(self.accounts[to]['name'], self.accounts)} while it was idle."):
             if self.cap_hold is not None:
                 self.cap_hold["decided"] = False  # it stayed: decided again, with that account in bad
             return
-        note_session_account(sid, new)
-        log(f"cap: {sid} moved, while idle, from {here['name']}, {cap_words(cap)} until {clock(until)}, to {new}")
-        start_logged(sid, "moves to", new, home_path(self.top or os.getcwd()),
-                     f"{here['name']} reached its cap ({cap}%), and {how}")
-        notify(f"{label_in(here['name'], self.accounts)} is {cap_words(cap)} until {clock(until)}; the panel chat "
-               f"moved to {label_in(new, self.accounts)} while it was idle.")
         self.end_cap_hold(None)
+
+    # -- a refused sign-in (2026-11-24: three chats moved at amie's limit to
+    # personal-1, whose API refused every turn with oauth_org_not_allowed, and
+    # nothing moved them off)
+
+    def tend_sign_in(self) -> None:
+        """Each round: a turn of the main thread that ended on a refused
+        sign-in (turn_ended(): SIGN_IN_ERRORS, main_error()'s word), acted on
+        once, between turns, as at a usage limit (decide_sign_in()). First the
+        failure is kept in SIGN_IN_FAILED, as the StopFailure hook keeps it,
+        which may not have run yet: every chooser then passes the account
+        over. Nothing is done for a chat that has moved since or had a reply
+        since (its sign-in works), nor in longhaul pipe, whose driver's
+        consent is for moves at a limit; a question, carry-on or cap hold open
+        decides first, as its own."""
+        with self.cond:
+            seen = self.sign_in_seen
+        if seen is None or self.swapping or self.paused or self.watch.status != "idle" or self.watch.agents_busy():
+            return  # between turns only: a move would stop a turn or a background agent
+        with self.cond:
+            self.sign_in_seen = None
+        here, sid = self.running_on()["name"], self.watch.sid or "a chat"
+        if here != seen["account"] or self.replied_at > seen["at"]:
+            return
+        try:
+            keep_sign_in_failure(here, seen["at"])
+        except OSError as e:
+            log(f"sign-in: {here}'s failure was not kept: {e.strerror or e}")
+        why = ("longhaul pipe moves a session at a limit only" if self.says else "its question decides" if self.question
+               else "its carry-on decides" if self.carry else "its cap decides" if self.cap_hold is not None else None)
+        if why:
+            log(f"sign-in: {sid}'s turn on {here} was refused ({seen['error']}); nothing more is done: {why}")
+            return
+        self.refresh()
+        self.decide_sign_in(seen)
+
+    def decide_sign_in(self, seen: dict) -> None:
+        """decide_move()'s verdict for a chat whose turn ended on a refused
+        sign-in (`seen`), once: auto moves it to an account with room, the
+        message that failed carried on there (move_off_sign_in()); ask asks
+        (ask() with `sign_in`: move, or stay on it); never, or no account to
+        move to, stays, said once (tell_sign_in()). An account to move to is
+        never this one, nor another whose sign-in was refused too: no loop."""
+        here_idx = self.idx
+        here = self.accounts[here_idx]
+        verdict = decide_move(self.mode, consent=self.swap, can_ask=not self.says)
+        others = set(sign_in_refused(self.accounts, readings(self.accounts))) - {here["name"]}
+        nxt, until = choose_for_panel(self.accounts, self.binary, (here_idx + 1) % len(self.accounts), load_state(),
+                                      wrong=set(self.bad) | others | {here["name"]}, top=self.top)
+        if verdict != "stay" and nxt is not None and not until:
+            if verdict == "move":
+                self.move_off_sign_in(nxt, seen["error"], "switching is auto")
+            else:  # ask() logs why when it asks nothing
+                self.ask({"resets_at": 0, "kind": "sign-in", "type": None}, seen["at"], sign_in=seen["error"])
+            return
+        self.tell_sign_in(seen["error"], verdict, nxt, until, others)
+
+    def tell_sign_in(self, error: str, verdict: str, nxt, until, others) -> None:
+        """The chat stays on an account whose sign-in was refused: said once
+        (a notification and a log line), and again only after a reply has
+        come in this chat since, with why and the command that signs it in
+        again: never (`verdict` stay), or nowhere to move (`nxt` None: none
+        other allowed here, signed in as expected and not refused too, the
+        names `others`; `until`: each at its limit or its cap till then)."""
+        here, sid = self.accounts[self.idx], self.watch.sid or "a chat"
+        name, shown = here["name"], label_in(here["name"], self.accounts)
+        why = (f"switching is {self.mode}" if verdict == "stay" else "no other account can take it" if nxt is None
+               else f"no other account has room until {clock(until)}")
+        log(f"sign-in: {sid} stays on {name}, whose sign-in was refused ({error}): {why}")
+        told = self.sign_in_told.get(name)
+        if told is not None and self.replied_at <= told:
+            return
+        self.sign_in_told[name] = time.time()
+        allowed = " allowed here" if self.denied else ""
+        fix = f"`longhaul login {name}` signs it in again; then send your message again."
+        if verdict == "stay":
+            notify(f"{shown}'s sign-in was refused ({error}): every message on it fails. Switching is {self.mode}, so "
+                   f"the chat stays on {shown}. {fix} To let Longhaul move it, {panel_switch_fix()}.")
+        elif nxt is None:
+            too = f" ({refused_words(sorted(others))} too)" if others else ""
+            notify(f"{shown}'s sign-in was refused ({error}), and no other account{allowed} can take this chat{too}, "
+                   f"so it stays on {shown}. {fix}")
+        else:
+            notify(f"{shown}'s sign-in was refused ({error}), and every other account{allowed} is at its limit until "
+                   f"{clock(until)} at the soonest, so the chat stays on {shown}. {fix}")
+
+    def move_off_sign_in(self, to: int, error: str, how: str) -> None:
+        """The chat moves off an account whose sign-in was refused (`error`)
+        to accounts[to], while idle (move_between_turns()), with
+        SIGN_IN_CARRY_ON: the message that failed got no answer, and Claude
+        Code keeps it in the conversation, so it is carried on there."""
+        here, new = self.accounts[self.idx]["name"], self.accounts[to]["name"]
+        shown, new_shown = label_in(here, self.accounts), label_in(new, self.accounts)
+        if not self.move_between_turns(
+                to, SIGN_IN_CARRY_ON.format(old=shown, error=error, new=new_shown), "sign-in",
+                f"{here}, whose sign-in was refused ({error})", f"{here}'s sign-in was refused ({error}), and {how}",
+                f"{shown}'s sign-in was refused ({error}); the panel chat moved to {new_shown} and carries on there. "
+                f"`longhaul login {here}` signs {here} in again."):
+            # It stays (the log says why): said, so a Move answered is not lost in silence. The next
+            # refused turn decides again.
+            notify(f"{shown}'s sign-in was refused ({error}), and the chat could not move to {new_shown} now, so it "
+                   f"stays on {shown}. `longhaul login {here}` signs it in again; then send your message again.")
 
     def lifted_by_reply(self, sid: str, limit: dict) -> None:
         """A reply came on this chat's account after its limit: the account
@@ -16378,8 +16880,8 @@ class Relay:
             return
         self.state_mark = mark
         q, c = self.question, self.carry
-        if q and self.question_for.get("cap") is not None:
-            q = None  # a cap's question waits for no recorded limit: tend_cap() looks after it
+        if q and (self.question_for.get("cap") is not None or self.question_for.get("sign_in")):
+            q = None  # a cap's or a refused sign-in's question waits for no recorded limit
         if not (q or c):
             return
         about = self.question_for if q else self.carry_for
@@ -16492,6 +16994,13 @@ class Relay:
         self.drop_question()
         log(f"question: {q['chat']} answered {choice} ({q['id']})")
         limit, since, to = about["limit"], about["since"], about["to"]
+        if about.get("sign_in"):  # a refused sign-in's (tend_sign_in()): the message that failed goes on there
+            if choice == "move":
+                self.move_off_sign_in(to, about["sign_in"], "you answered move")
+            else:
+                log(f"sign-in: {q['chat']} stays on {q['from']}, whose sign-in was refused ({about['sign_in']}), as "
+                    "answered")
+            return
         if about.get("cap") is not None:  # a cap's question (tend_cap()): nothing was cut off
             if choice == "move":
                 self.move_off_cap(to, about["cap"], limit["resets_at"], "you answered move")
@@ -16869,6 +17378,7 @@ class Relay:
             marks = transcript_size(sid)
             handled = load_state().get("handled_limits", [])
             self.limits = {}  # readings so far were the old account's
+            self.turn_replied = False  # and so was a reply in a turn the swap cut off
             child = self.start_claude(nxt, sid)
             if child is None:
                 self.bad.add(new)
@@ -18921,8 +19431,7 @@ def status(opts) -> int:
             print(f"       should be {want}: longhaul will not use this account until `longhaul setup` signs it in")
         when = sign_in_failed_at(failed.get(acct["name"]), reading)
         if when is not None:  # a chat's turn ended on it (the StopFailure hook), and no reply has come since
-            print(f"       its sign-in failed at {clock(when)}: "
-                  + (f"run longhaul setup {acct['name']} --relogin" if accounts_listed else DEFAULT_RELOGIN))
+            print(f"       {refused_text(acct['name'], when, accounts_listed)}")
         allowed = repositories_of(acct)
         if allowed is None:
             print(f"       {REPOSITORIES_JUNK}; longhaul will not use this account anywhere")
@@ -19099,7 +19608,11 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     (2026-11-24) is cap_of(), null for none; capped_until is when it is
     free of its cap when it is at its cap now (capped()), else null; a cap
     is no recorded limit, so limited_until never holds it, and use_here is
-    "capped" where `longhaul use` refuses it for that, after "limited"."""
+    "capped" where `longhaul use` refuses it for that, after "limited".
+    sign_in_refused (2026-11-24), beside sign_in_failed_at and null with
+    it, is what status says of it (refused_text()): that every chooser
+    passes it over while another account can be used, until a reply or a
+    sign-in, and the command that signs it in again."""
     if not isinstance(a, dict):  # an answer that is JSON but not an object
         a = {"unknown": True, "why": "the answer was not an object"}
     unknown = bool(a.get("unknown"))
@@ -19113,6 +19626,7 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
     as_expected = None if signed_in is None else signed_in and (want is None or got.lower() == want.lower())
     limited = until is not None and until > now
     at_cap = capped(acct, reading, now)
+    refused_at = sign_in_failed_at(failed.get(acct["name"]), reading)
     use_here = (None if allowed_here is None else "this_chat" if this_chat
                 else "not_allowed" if acct["name"] not in allowed_here else "limited" if limited
                 else "capped" if at_cap is not None else "not_signed_in" if as_expected is False else "ok")
@@ -19122,7 +19636,9 @@ def status_account(acct: dict, a, state: dict, now: float, this_chat: bool, fail
         "signed_in": signed_in,
         "as_expected": as_expected,
         "check_failed": str(a["why"]) if unknown and a.get("why") is not None else None,
-        "sign_in_failed_at": sign_in_failed_at(failed.get(acct["name"]), reading),
+        "sign_in_failed_at": refused_at,
+        "sign_in_refused": None if refused_at is None else refused_text(acct["name"], refused_at, listed is not None
+                                                                        and bool(listed)),
         "plan": plan if signed_in and isinstance(plan, str) else None,
         "limited_until": until if limited else None,
         "five_hour": status_window(reading, "five_hour", now),
@@ -20788,7 +21304,10 @@ def doctor_accounts(quick: bool = False) -> dict:
     the last `longhaul connections` kept, says when the connections were
     checked and how many are not on every account (connections_said()):
     the doctor never runs claude for it. Not quick, another names the
-    ~/.claude-* folders no account uses (doctor_leftovers())."""
+    ~/.claude-* folders no account uses (doctor_leftovers()). An account
+    whose sign-in was refused in a chat, with no reply on it since, is
+    warned of: every chooser passes it over until it replies again or is
+    signed in again, with `longhaul login NAME` as the step (2026-11-24)."""
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
     if problem:
@@ -20800,6 +21319,7 @@ def doctor_accounts(quick: bool = False) -> dict:
         return doctor_result(f"one subscription: the {DEFAULT_LABEL} ({home_path(str(DEFAULT_CONFIG))}), with no "
                              "accounts.json; `longhaul add` adds another", kind="skip")
     items, now = [], time.time()
+    failed = sign_in_rows(read_json(LONGHAUL_HOME / SIGN_IN_FAILED), {a["name"] for a in accounts})
     for a in accounts:
         folder = home_path(str(config_of(a)))
         # "(fallback)": used only when the others have no room; "cap 25%": how much of it is used (2026-11-24),
@@ -20822,6 +21342,9 @@ def doctor_accounts(quick: bool = False) -> dict:
                           f"`longhaul folders {a['name']} --add PATH`"))
         else:
             items.append(("ok", f"{named}: {folder}, {where_allowed(a)}", None))
+        when = sign_in_failed_at(failed.get(a["name"]), read_json(USAGE_DIR / f"{a['name']}.json"))
+        if when is not None:  # a chat's turn ended on it, and no reply since: passed over (2026-11-24)
+            items.append(("warn", f"{a['name']}: {refused_said(when)}", f"`longhaul login {a['name']}`"))
     same = "keep one of them, or give the other its own subscription"
     twins, with_default = same_email(accounts)
     for names in twins:

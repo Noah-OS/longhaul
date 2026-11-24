@@ -237,6 +237,8 @@ function clean(s: any): LonghaulStatus {
   const accounts = (s.accounts as any[]).filter(a => a && typeof a === 'object' && typeof a.name === 'string')
     .map(a => ({ name: a.name as string, email: str(a.email), signed_in: flag(a.signed_in), as_expected: flag(a.as_expected),
       check_failed: str(a.check_failed), sign_in_failed_at: num(a.sign_in_failed_at), plan: str(a.plan),
+      // What status says of a refused sign-in (2026-11-24): passed over until it replies or is signed in again.
+      ...(typeof a.sign_in_refused === 'string' && a.sign_in_refused ? { sign_in_refused: a.sign_in_refused } : {}),
       limited_until: num(a.limited_until), five_hour: win(a.five_hour), week: win(a.week), only_in: strs(a.only_in),
       kept_out_by: strs(a.kept_out_by) ?? [], ...(typeof a.fallback === 'boolean' ? { fallback: a.fallback } : {}),
       // Its cap and when it is free of it (2026-11-24), only when the record
@@ -1080,6 +1082,16 @@ function roomNow(a: LonghaulAccount): boolean {
     && !((a.five_hour?.used ?? 0) >= 100 || (a.week?.used ?? 0) >= 100)
 }
 
+// What the page says of a sign-in that failed in a chat: status's own
+// sentence (2026-11-24: every choice of an account passes it over until it
+// replies again or is signed in again, and the command for that), the first
+// letter raised; from an older longhaul.py, which gives none, when alone.
+function refusedLine(a: LonghaulAccount, nowMs: number, listed: boolean): string {
+  const said = typeof a.sign_in_refused === 'string' ? a.sign_in_refused.trim() : ''
+  if (said) return mask(`${said.charAt(0).toUpperCase()}${said.slice(1)}${/[.!?]$/.test(said) ? '' : '.'}`)
+  return `Its sign-in failed at ${clock(a.sign_in_failed_at!, nowMs)}.` + (listed ? '' : ' Sign in again with /login in Claude Code.')
+}
+
 // An account's line in the list: its plan, its sign-in unless that is
 // fine and the limit says more, then the limit, or room now and the use of
 // its open windows. "checking…" is no warning: nothing is known wrong yet.
@@ -1553,8 +1565,7 @@ function accountPage($: any, c: Ctx): any {
       {roomNow(a) && <Text>{`room now, seen ${clock(a.reading_at!, c.nowMs)}`}</Text>}
       {lines.map(line => <Text>{line}</Text>)}
       {typeof a.sign_in_failed_at === 'number' && (
-        <Text color="warning">{`Its sign-in failed at ${clock(a.sign_in_failed_at, c.nowMs)}.`
-          + (listed ? '' : ' Sign in again with /login in Claude Code.')}</Text>
+        <Text color="warning">{refusedLine(a, c.nowMs, listed)}</Text>
       )}
       {/* Facts, in normal weight: dim is for hints (M8). */}
       <Text>{where(a)}</Text>

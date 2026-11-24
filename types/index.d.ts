@@ -18,6 +18,12 @@ export type LonghaulAccount = {
   // When a chat on it last stopped on a failed sign-in (epoch seconds; S3).
   // Optional: an older longhaul.py does not give it.
   sign_in_failed_at?: number | null
+  // What status says of it while sign_in_failed_at is a number
+  // (2026-11-24): every choice of an account passes it over while another
+  // can be used, until it replies again or is signed in again, and the
+  // command that signs it in again. Optional: an older longhaul.py does not
+  // give it, and the pane then says when it failed alone.
+  sign_in_refused?: string | null
   plan: string | null
   limited_until: number | null // epoch seconds
   five_hour: LonghaulWindow | null
@@ -201,6 +207,11 @@ export type LonghaulQuestion = {
   // with no carry-on, and wait holds the chat's next message until the
   // reset. Optional: absent for a limit's question, and from an older relay.
   cap?: number | null
+  // A move question asked because a turn on `from` ended on a refused
+  // sign-in (2026-11-24): the error's word (oauth_org_not_allowed), "limit"
+  // "sign-in", and no reset (resets_at 0). Move carries the message that
+  // failed on there; wait stays. Optional: absent for a limit's question.
+  sign_in?: string | null
   choices: string[] // move: move, wait; first_reset: yes, no
 }
 

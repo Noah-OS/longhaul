@@ -124,7 +124,8 @@ async function update($: any, lh: string): Promise<string | undefined> {
 // their lines, and both test suites check each one. The state: account, as
 // shown; five and week, { used, resets (a time as clock() shows it) } or
 // null; ctx, the context in tokens, or null; event, null or { kind:
-// 'question' (to, and at for a carry-on at a reset), 'waiting' (at, on),
+// 'question' (to, and at for a carry-on at a reset; cap, or sign_in true
+// for a refused sign-in's), 'waiting' (at, on),
 // 'stopped' (until), 'refused' (where, by), 'pending' (to, when: 'turn' or
 // 'open') or 'moved' (from, at) }; update, a newer release, or null; plain,
 // true for words in place of the glyphs (LONGHAUL_PLAIN=1, M8: ", " for
@@ -150,7 +151,7 @@ export function line(state: unknown): string {
   const owners = by.filter(n => text(n) !== null) as string[]
   let parts: string[] | null = null
   if (kind === 'question' && to)
-    parts = [`${name} ${capOf(ev.cap) ? `at cap ${ev.cap}%` : 'at limit'}`, `${at ? `carry on ${at}${to === name ? '' : ` on ${to}`}?` : `move to ${to}?`} /accounts`]
+    parts = [`${name} ${ev.sign_in === true ? 'sign-in refused' : capOf(ev.cap) ? `at cap ${ev.cap}%` : 'at limit'}`, `${at ? `carry on ${at}${to === name ? '' : ` on ${to}`}?` : `move to ${to}?`} /accounts`]
   else if (kind === 'waiting' && at) {
     const on = text(ev.on)
     parts = [`${name} at limit`, `carries on ${at}${on && on !== name ? ` on ${on}` : ''}`]
@@ -205,6 +206,9 @@ async function event($: any, lh: string, sid: string, name: string, nowMs: numbe
   const { asked, waiting } = found()
   if (asked) {
     const cap = capOf(asked.cap) ? { cap: asked.cap } : {}
+    // A refused sign-in's (2026-11-24): "sign-in refused", not "at limit".
+    if (asked.kind === 'move' && typeof asked.sign_in === 'string')
+      return { kind: 'question', to: shown(asked.to, names), sign_in: true }
     if (asked.kind === 'move') return { kind: 'question', to: shown(asked.to, names), ...cap }
     return { kind: 'question', to: shown(asked.to, names), ...cap,
       at: clock(asked.carries_on_at ?? asked.to_resets_at ?? asked.resets_at, nowMs) }

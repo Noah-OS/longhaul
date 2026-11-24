@@ -23251,6 +23251,65 @@ class Stops(unittest.TestCase):
     def sign_ins_logged(self) -> list:
         return [line[20:] for line in self.log().splitlines() if line[20:].startswith("sign-in")]
 
+    def test_only_a_reply_makes_a_failed_sign_in_old_news(self):
+        # 2026-11-24: the status line runs after a refused turn too, and may
+        # still carry the last numbers it had; a reading then must not say
+        # the sign-in works, or every chooser takes the account again. Only
+        # a reply's evidence does: the chat's cost risen on that account, or
+        # the panel relay's word that its turn had Claude's reply.
+        folders = self.two_accounts()
+        usage = self.home / "usage"
+        for patcher in (mock.patch.object(longhaul, "USAGE_DIR", usage),
+                        mock.patch.object(longhaul, "LEDGER", self.home / "ledger.jsonl"),
+                        mock.patch.object(longhaul, "LABELS", self.home / "labels.json")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        resets = time.time() + 3600
+        limits = {"five_hour": {"used_percentage": 12, "resets_at": resets},
+                  "seven_day": {"used_percentage": 40, "resets_at": resets + 86400}}
+
+        def reading(cost, sid=self.SID, folder=folders["work"], **more):
+            longhaul.record_usage({"session_id": sid, "cost": {"total_cost_usd": cost}, "rate_limits": limits,
+                                   **more}, str(folder))
+            return json.loads((usage / "work.json").read_text())
+
+        def refused():
+            return longhaul.sign_in_refused([{"name": "personal-1"}, {"name": "work"}],
+                                            longhaul.readings([{"name": "personal-1"}, {"name": "work"}]))
+
+        first = reading(0.25)
+        self.assertIsNone(first["replied"], "a first reading is no evidence of a reply")
+        self.send_in(folders["work"], self.failure("oauth_org_not_allowed"))
+        when = self.failed()["work"]
+        after = reading(0.25)
+        self.assertGreater(after["at"], when, "a reading after the failure, as the line may write")
+        self.assertIsNone(after["replied"])
+        self.assertEqual(refused(), {"work": when}, "the same numbers and no cost: still news")
+        self.assertEqual(longhaul.sign_in_failed_at(when, after), when)
+        # Another chat's first reading on the account is no evidence either:
+        # its record was another account's, or there was none.
+        self.assertIsNone(reading(5.0, sid="9b0e0c11-0000-4000-8000-000000000001")["replied"])
+        self.assertEqual(set(refused()), {"work"})
+        # The cost risen on the same account: a reply came, so it works again.
+        time.sleep(1.05)  # the failure is kept in whole seconds
+        replied = reading(0.31)
+        self.assertGreater(replied["replied"], when)
+        self.assertEqual(refused(), {}, "a reply since")
+        # Carried by the next readings with no reply in them, as it was.
+        self.assertEqual(reading(0.31)["replied"], replied["replied"])
+        # The relay's word counts with no cost risen, and on a first reading.
+        time.sleep(1.05)
+        self.send_in(folders["work"], self.failure("authentication_failed"))
+        self.assertEqual(set(refused()), {"work"})
+        time.sleep(1.05)
+        self.assertGreater(reading(0.0, sid="9b0e0c11-0000-4000-8000-000000000002",
+                                   longhaul_reply=True)["replied"], self.failed()["work"])
+        self.assertEqual(refused(), {})
+        # A reading from before 0.3.24 has no "replied": its "at" stands for it.
+        (usage / "work.json").write_text(json.dumps({"at": time.time() + 5, **limits}))
+        self.assertEqual(refused(), {})
+        self.assertGreater(reading(0.31)["replied"], self.failed()["work"], "and is carried on as that")
+
     def test_a_failed_sign_in_is_kept_under_the_chats_account(self):
         self.assertEqual(longhaul.SIGN_IN_FAILED, "sign-in-failed.json")
         self.assertEqual(longhaul.SIGN_IN_ERRORS, ("authentication_failed", "oauth_org_not_allowed"))
@@ -23390,7 +23449,9 @@ class Stops(unittest.TestCase):
         self.assertIn("longhaul stop-failure | longhaul quota-note", longhaul.__doc__)
         usage = " ".join(longhaul.__doc__.split())
         self.assertIn(f"A failed sign-in also marks the chat's account in LONGHAUL_HOME/{longhaul.SIGN_IN_FAILED}, "
-                      "for status and /accounts.", usage, "the S3 mark, said where the hook is")
+                      "for status, /accounts and every choice of an account, which passes it over while another can "
+                      "be used, until a reply on it or a sign-in.", usage,
+                      "the S3 mark, said where the hook is, and what the choosers do with it (2026-11-24)")
         shim = (HERE / "bin" / "longhaul").read_text()
         for command in ("stop-failure", "quota-note"):
             self.assertNotIn(command, shim)
@@ -25899,6 +25960,85 @@ class CapPick(unittest.TestCase):
             self.assertIn("every other account is at its limit or its cap", text, "work at its cap is no place to go")
 
 
+class SignInPick(unittest.TestCase):
+    """A refused sign-in (2026-11-24: a move at amie's limit sent three
+    chats to personal-1, whose API refused every turn with
+    oauth_org_not_allowed, and nothing moved them off): pick() passes an
+    account in `refused` over while any other outside `skip` is left, even
+    one at its limit, since a wait beats a chat whose every message fails;
+    when every one left is refused, the usual rules choose among them.
+    pick_why() says it, names only."""
+
+    NOW = 1_800_000_000.0
+
+    def pick(self, accounts, limited=None, start=0, skip=(), refused=(), seen=None):
+        return longhaul.pick(accounts, {"limited_until": limited or {}}, start, now=self.NOW, skip=skip, seen=seen,
+                             refused=refused)
+
+    def why(self, accounts, limited=None, skip=(), refused=(), seen=None):
+        i, until = self.pick(accounts, limited, skip=skip, refused=refused, seen=seen)
+        return accounts[i]["name"], longhaul.pick_why(accounts, {"limited_until": limited or {}}, i, until, skip=skip,
+                                                      seen=seen, now=self.NOW, refused=refused)
+
+    def test_a_refused_account_is_passed_over_while_another_has_room(self):
+        accounts = [{"name": "amie"}, {"name": "personal-1"}, {"name": "work"}]
+        self.assertEqual(self.pick(accounts, start=1), (1, None), "first in turn, with nothing refused")
+        self.assertEqual(self.pick(accounts, start=1, refused={"personal-1": self.NOW - 60}), (2, None))
+        self.assertEqual(self.pick(accounts, {"amie": self.NOW + 600}, start=1, refused=("personal-1",)), (2, None),
+                         "amie at its limit: work, never personal-1")
+
+    def test_one_at_its_limit_is_waited_for_before_a_refused_one_is_taken(self):
+        accounts = [{"name": "amie"}, {"name": "personal-1"}]
+        until = self.NOW + 600
+        self.assertEqual(self.pick(accounts, {"amie": until}, start=1, refused=("personal-1",)), (0, until),
+                         "personal-1 has room, but each message there fails at once: wait for amie")
+        self.assertEqual(self.pick(accounts, {"amie": until}, start=1), (1, None), "not refused: it has room")
+
+    def test_when_every_one_left_is_refused_the_usual_rules_choose_among_them(self):
+        accounts = [{"name": "amie"}, {"name": "personal-1"}, {"name": "work"}]
+        both = ("personal-1", "work")
+        self.assertEqual(self.pick(accounts, skip={"amie"}, refused=both), (1, None), "first in turn of the two")
+        until = self.NOW + 600
+        self.assertEqual(self.pick(accounts, {"personal-1": until}, skip={"amie"}, refused=both), (2, None))
+        self.assertEqual(self.pick(accounts, skip={"amie", "work"}, refused=both), (1, None), "the only one left")
+        self.assertEqual(self.pick(accounts, skip={"amie", "personal-1", "work"}, refused=both), (None, None))
+
+    def test_a_refused_fallback_and_a_refused_preferred_account_are_passed_over_too(self):
+        accounts = [{"name": "amie", "fallback": True}, {"name": "personal-1"}]
+        self.assertEqual(self.pick(accounts, refused=("personal-1",)), (0, None), "the fallback beats a refused one")
+        top = "/scratch/acme"
+        liked = [{"name": "amie"}, {"name": "personal-1", "preferred": [top]}]
+        self.assertEqual(longhaul.pick(liked, {"limited_until": {}}, 0, now=self.NOW, top=top), (1, None))
+        self.assertEqual(longhaul.pick(liked, {"limited_until": {}}, 0, now=self.NOW, top=top,
+                                       refused=("personal-1",)), (0, None), "preferred, but refused")
+
+    def test_pick_why_names_the_accounts_passed_over_for_a_refused_sign_in(self):
+        a, p, w = {"name": "amie"}, {"name": "personal-1"}, {"name": "work"}
+        self.assertEqual(self.why([a, p], refused=("personal-1",)),
+                         ("amie", "it had room, and personal-1's sign-in was refused"))
+        self.assertEqual(self.why([p, a, w], {"work": self.NOW + 600}, refused=("personal-1",)),
+                         ("amie", "it had room, work was at its limit, and personal-1's sign-in was refused"))
+        self.assertEqual(self.why([p, w, a], refused=("personal-1", "work")),
+                         ("amie", "it had room, and personal-1's and work's sign-ins were refused"))
+        until = self.NOW + 600
+        self.assertEqual(self.why([a, p], {"amie": until}, refused=("personal-1",)),
+                         ("amie", "every account was at its limit or had its sign-in refused, and amie resets first, "
+                                  f"at {longhaul.clock(until)}"))
+        self.assertEqual(self.why([a, p], skip={"amie"}, refused=("personal-1",)),
+                         ("personal-1", "the only account signed in as expected"))
+        self.assertEqual(self.why([a, p, w], skip={"amie"}, refused=("personal-1", "work")),
+                         ("personal-1", "every account signed in as expected had its sign-in refused, so personal-1 "
+                                        "is tried again"))
+        self.assertEqual(self.why([{"name": "amie", "fallback": True}, p], refused=("personal-1",)),
+                         ("amie", "a fallback, and no other account allowed here had room (personal-1's sign-in was "
+                                  "refused)"))
+        self.assertEqual(self.why([a, p]), ("amie", "it had room, and it comes first in turn"), "nothing refused")
+
+    def test_refused_words_names_one_or_several(self):
+        self.assertEqual(longhaul.refused_words(["personal-1"]), "personal-1's sign-in was refused")
+        self.assertEqual(longhaul.refused_words(["personal-1", "work"]), "personal-1's and work's sign-ins were refused")
+
+
 class CapTerminal(unittest.TestCase):
     """The strict cap in a terminal chat (the owner, 2026-11-24), against
     the fake Claude: Max has a cap of 25, Pro none. The status line's
@@ -26286,6 +26426,254 @@ class CapRelay(unittest.TestCase):
         q = self.question()
         self.assertEqual(q["kind"], "first_reset", "every account is at its limit or its cap")
         self.assertEqual(q["to"], "Pro")
+
+
+class SignInRelay(unittest.TestCase):
+    """A refused sign-in in a VS Code panel chat (2026-11-24: a move at
+    amie's limit sent three chats to personal-1, whose API refused every
+    turn with oauth_org_not_allowed, and nothing moved them off): the
+    relay, driven in this process on the test's clock as KeepWorking
+    drives it, with the swap stood in for. A turn that ends on a refused
+    sign-in (its assistant line's "error", then an is_error result) is
+    acted on once, between turns: auto moves the chat with
+    SIGN_IN_CARRY_ON, ask asks (move, or stay), never or nowhere to move
+    stays and says so once. The failure is kept for every chooser, so
+    nothing moves the chat back onto it. PanelKeepWorking runs the real
+    wrapper."""
+
+    Clock, Watch = KeepWorking.Clock, KeepWorking.Watch
+    setUp = KeepWorking.setUp
+    later = KeepWorking.later
+    question = KeepWorking.question
+    answer = KeepWorking.answer
+    said = KeepWorking.said
+    log_text = KeepWorking.log_text
+    stream = KeepWorking.stream
+    REPLY = KeepWorking.REPLY
+
+    def relay(self, mode="ask", **kw):
+        (self.home / "accounts.json").write_text(json.dumps(self.accounts))
+        r = KeepWorking.relay(self, mode=mode, **kw)
+        r.live = longhaul.LiveSettings(r.accounts, mode, None, None, "panel")  # accounts.json as it is now
+        return r
+
+    def refused(self, r, error="oauth_org_not_allowed"):
+        """A turn of r's claude refused as Claude Code streams it: the
+        main thread's assistant line with the error, then a result line
+        that is an error (403), through the reader."""
+        self.stream(r, {**self.REPLY, "error": error,
+                        "message": {**self.REPLY["message"], "model": "<synthetic>"}},
+                    {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 403,
+                     "session_id": "sid-k", "total_cost_usd": 0})
+
+    def failed(self) -> dict:
+        path = self.home / longhaul.SIGN_IN_FAILED
+        return json.loads(path.read_text()) if path.is_file() else {}
+
+    def carry_on(self, old="Max", new="Pro", error="oauth_org_not_allowed"):
+        return longhaul.SIGN_IN_CARRY_ON.format(old=old, error=error, new=new)
+
+    # -- auto
+
+    def test_auto_moves_between_turns_with_the_carry_on_and_keeps_the_failure(self):
+        r = self.relay("auto")
+        r.limits = {"five_hour": {"used_percentage": 12, "resets_at": self.clock.at + 3600}}
+        self.refused(r)
+        self.assertEqual(r.sign_in_seen, {"account": "Max", "error": "oauth_org_not_allowed", "at": self.clock.at})
+        self.assertFalse((self.home / "usage" / "Max.json").exists(),
+                         "note_cost() skipped: a refused turn has no cost and no reply")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", self.carry_on())], "the message that failed is carried on there")
+        self.assertEqual(self.failed(), {"Max": int(self.clock.at)}, "kept for every chooser")
+        self.assertIn("sign-in: sid-k moved, while idle, from Max, whose sign-in was refused (oauth_org_not_allowed), "
+                      "to Pro", self.log_text())
+        self.assertEqual(self.notes, ["Max's sign-in was refused (oauth_org_not_allowed); the panel chat moved to Pro "
+                                      "and carries on there. `longhaul login Max` signs Max in again."])
+        r.tend()
+        self.assertEqual(len(r.moves), 1, "once")
+        self.assertIsNone(self.question(), "auto asks nothing")
+
+    def test_auto_waits_while_claude_is_busy_or_an_agent_works(self):
+        r = self.relay("auto")
+        self.refused(r)
+        r.watch.status = "busy"
+        r.tend()
+        r.watch.status = "idle"
+        r.watch.agents_busy = lambda: True
+        r.tend()
+        self.assertEqual(r.moves, [], "a move would stop the turn or the agent")
+        r.watch.agents_busy = lambda: False
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", self.carry_on())])
+
+    def test_nothing_moves_back_onto_the_refused_account_at_the_next_limit(self):
+        r = self.relay("auto")
+        self.refused(r)
+        r.tend()
+        self.assertEqual(r.idx, 1)
+        # Pro at its limit now: Max has room, but every message there fails, so the chat waits for Pro.
+        KeepWorking.stop(self, r, resets_in=3600)
+        r.tend()
+        self.assertEqual([to for to, _ in r.moves], ["Pro"], "never back to Max")
+        self.assertEqual(longhaul.choose_for_panel(self.accounts, "claude", 1, longhaul.load_state()),
+                         (1, self.clock.at + 3600), "the panel's chooser waits for Pro too")
+
+    def test_a_reply_since_or_a_move_since_does_nothing(self):
+        r = self.relay("auto")
+        self.refused(r)
+        self.later(5)
+        self.stream(r, self.REPLY)  # its sign-in works again (a /login in Claude Code)
+        r.tend()
+        self.assertEqual((r.moves, self.notes), ([], []))
+        self.refused(r)
+        r.idx = 1  # moved since (longhaul use)
+        r.tend()
+        self.assertEqual((r.moves, self.notes), ([], []))
+
+    def test_a_refused_turn_on_the_new_account_moves_on_never_back(self):
+        self.accounts.append({"name": "Team", "config_dir": str(self.tmp / "team"), "email": "third@example.com"})
+        r = self.relay("auto")
+        self.refused(r)
+        r.tend()
+        self.later(30)
+        self.refused(r, "authentication_failed")  # Pro refuses too
+        r.tend()
+        self.assertEqual([to for to, _ in r.moves], ["Pro", "Team"])
+        self.assertEqual(r.moves[1][1], self.carry_on("Pro", "Team", "authentication_failed"))
+        self.later(30)
+        self.refused(r)  # and Team: nowhere left that was not refused
+        r.tend()
+        self.assertEqual(len(r.moves), 2, "never back to Max or Pro")
+        self.assertIn("Team's sign-in was refused (oauth_org_not_allowed), and no other account can take this chat "
+                      "(Max's and Pro's sign-ins were refused too), so it stays on Team.", self.notes[-1])
+
+    # -- nowhere to move, and never
+
+    def test_auto_with_every_other_account_at_its_limit_stays_and_says_so_once(self):
+        until = self.clock.at + 1800
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": until}}))
+        r = self.relay("auto")
+        self.refused(r)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertEqual(self.notes, [f"Max's sign-in was refused (oauth_org_not_allowed), and every other account is "
+                                      f"at its limit until {longhaul.clock(until)} at the soonest, so the chat stays "
+                                      "on Max. `longhaul login Max` signs it in again; then send your message again."])
+        self.later(10)
+        self.refused(r)
+        r.tend()
+        self.assertEqual(len(self.notes), 1, "said once")
+        self.assertEqual(self.log_text().count("sign-in: sid-k stays on Max, whose sign-in was refused"), 2,
+                         "logged each time")
+
+    def test_auto_with_no_other_account_signed_in_as_expected_stays(self):
+        self.strangers.add("Pro")
+        r = self.relay("auto")
+        self.refused(r)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertEqual(self.notes, ["Max's sign-in was refused (oauth_org_not_allowed), and no other account can "
+                                      "take this chat, so it stays on Max. `longhaul login Max` signs it in again; "
+                                      "then send your message again."])
+
+    def test_never_stays_and_says_it_once_until_a_reply_comes(self):
+        r = self.relay("never")
+        self.refused(r)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertEqual(len(self.notes), 1)
+        self.assertTrue(self.notes[0].startswith("Max's sign-in was refused (oauth_org_not_allowed): every message on "
+                                                 "it fails. Switching is never, so the chat stays on Max. `longhaul "
+                                                 "login Max` signs it in again; then send your message again. To let "
+                                                 "Longhaul move it, "), self.notes[0])
+        self.later(10)
+        self.refused(r)
+        r.tend()
+        self.assertEqual(len(self.notes), 1, "said once")
+        self.later(10)
+        self.stream(r, self.REPLY)
+        self.later(10)
+        self.refused(r)
+        r.tend()
+        self.assertEqual(len(self.notes), 2, "a reply came since: said again")
+        self.assertIsNone(self.question())
+
+    def test_longhaul_pipe_only_logs(self):
+        r = self.relay("auto", says=True)
+        r.say_in_stream = lambda obj: None
+        self.refused(r)
+        r.tend()
+        self.assertEqual((r.moves, self.notes), ([], []))
+        self.assertIn("sign-in: sid-k's turn on Max was refused (oauth_org_not_allowed); nothing more is done: "
+                      "longhaul pipe moves a session at a limit only", self.log_text())
+
+    # -- ask
+
+    def test_ask_asks_and_move_carries_the_message_that_failed_on_there(self):
+        r = self.relay("ask")
+        self.refused(r)
+        r.tend()
+        q = self.question()
+        self.assertEqual((q["kind"], q["from"], q["to"], q["limit"], q["sign_in"], q["resets_at"], q["carries_on_at"],
+                          q["choices"]),
+                         ("move", "Max", "Pro", "sign-in", "oauth_org_not_allowed", 0, None, ["move", "wait"]))
+        self.assertNotIn("cap", q)
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("Max's sign-in was refused (oauth_org_not_allowed). Move this chat to Pro and carry on? Answer "
+                      "in Longhaul's pane in the panel; with no answer the chat stays on Max, where `longhaul login "
+                      "Max` signs it in again.", self.notes[0])
+        self.assertEqual(longhaul.status_event("sid-k", "Max", {}, self.clock.at),
+                         {"kind": "question", "to": "Pro", "sign_in": True})
+        self.assertEqual(longhaul.status_line({"account": "Max", "five": None, "week": None, "ctx": None,
+                                               "event": {"kind": "question", "to": "Pro", "sign_in": True},
+                                               "update": None}),
+                         "Max sign-in refused · move to Pro? /accounts")
+        r.tend()
+        self.assertEqual(r.moves, [], "no move unasked")
+        self.assertEqual(self.answer("sid-k", q["id"], "move")[0], 0)
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", self.carry_on())])
+        self.assertIsNone(self.question())
+
+    def test_ask_wait_stays_and_the_next_refused_turn_asks_again(self):
+        r = self.relay("ask")
+        self.refused(r)
+        r.tend()
+        q = self.question()
+        self.assertEqual(self.answer("sid-k", q["id"], "wait")[0], 0)
+        r.tend()
+        self.assertEqual((r.moves, self.question()), ([], None))
+        self.assertIn("sign-in: sid-k stays on Max, whose sign-in was refused (oauth_org_not_allowed), as answered",
+                      self.log_text())
+        self.later(10)
+        self.refused(r)
+        r.tend()
+        self.assertEqual(self.question()["sign_in"], "oauth_org_not_allowed", "each refused turn offers the move")
+
+    def test_ask_question_is_withdrawn_when_a_reply_comes_and_asks_once_meanwhile(self):
+        r = self.relay("ask")
+        self.refused(r)
+        r.tend()
+        first = self.question()
+        self.later(10)
+        self.refused(r)  # sent again while the question is open: it fails again
+        r.tend()
+        self.assertEqual(self.question()["id"], first["id"], "its question decides: one question")
+        self.later(10)
+        self.stream(r, self.REPLY)
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertIn(f"question: sid-k's question ({first['id']}) is withdrawn: a reply came on Max, so its sign-in "
+                      "works again", self.log_text())
+
+    def test_ask_with_nowhere_to_move_asks_nothing_and_says_it(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": self.clock.at + 1800}}))
+        r = self.relay("ask")
+        self.refused(r)
+        r.tend()
+        self.assertIsNone(self.question())
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("every other account is at its limit until", self.notes[0])
 
 
 class Connections(unittest.TestCase):
@@ -27007,7 +27395,8 @@ class StatusJson(unittest.TestCase):
     (fake_stream.py) answers `auth status --json` from FAKE_EMAILS, a map of
     config folder to email ("default" for ~/.claude)."""
 
-    ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
+    ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "sign_in_refused",
+                    "plan",
                     "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "cap", "capped_until",
                     "folder", "this_chat", "preferred", "use_here", "reading_at", "label"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
@@ -27142,15 +27531,18 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(self.files(), before, "it writes nothing, not even the log")
         self.assertEqual(found["accounts"][0], {
             "name": "personal-1", "email": "f…@example.com", "signed_in": True, "as_expected": True,
-            "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
+            "check_failed": None, "sign_in_failed_at": None, "sign_in_refused": None, "plan": "max",
+            "limited_until": None, "five_hour": None,
             "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "cap": None, "capped_until": None,
             "folder": "~/.claude-personal-1", "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None,
             "label": "personal-1"})
         self.assertEqual(list(found["accounts"][0]), [
-            "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
+            "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "sign_in_refused", "plan",
+            "limited_until",
             "five_hour", "week", "only_in", "kept_out_by", "fallback", "cap", "capped_until", "folder", "this_chat",
             "preferred", "use_here", "reading_at", "label"],
-            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it, "
+            "the screen's order: sign_in_failed_at after check_failed, sign_in_refused after it (2026-11-24), "
+            "kept_out_by after only_in, fallback after it, "
             "then cap and capped_until (2026-11-24); preferred and use_here after them (2026-11-11), reading_at "
             "(2026-11-13), then label last (Q11)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
@@ -27468,7 +27860,8 @@ class StatusJson(unittest.TestCase):
                 self.assertEqual((found["listed"], found["here"], found["problem"]), (False, None, None))
                 self.assertEqual(found["accounts"], [{
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
-                    "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
+                    "check_failed": None, "sign_in_failed_at": None, "sign_in_refused": None, "plan": "max",
+                    "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
                     "cap": None, "capped_until": None, "folder": "~/claude", "this_chat": False, "preferred": [],
                     "use_here": None, "reading_at": None, "label": "default sign-in"}])
@@ -27560,12 +27953,20 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         lines = out.stdout.splitlines()
         [work] = [i for i, line in enumerate(lines) if line.startswith("work ")]
-        self.assertEqual(lines[work + 1], f"       its sign-in failed at {longhaul.clock(then)}: "
-                                          "run longhaul setup work --relogin", "the line under its account")
-        self.assertEqual(out.stdout.count("sign-in failed"), 1, "personal-1's sign-in has not failed")
+        self.assertEqual(lines[work + 1], f"       its sign-in was refused at {longhaul.clock(then)}, so Longhaul passes "
+                                          "it over while another account can be used, until it replies again or is "
+                                          "signed in again: `longhaul login work`",
+                         "the line under its account: what every chooser does with it, and the command (2026-11-24)")
+        self.assertEqual(out.stdout.count("sign-in was refused"), 1, "personal-1's sign-in has not failed")
         (self.home / "usage").mkdir()
+        # A reading taken since with no reply in it (2026-11-24): still news.
+        (self.home / "usage" / "work.json").write_text(json.dumps({"at": then + 60, "replied": then - 60}))
+        self.assertIn("sign-in was refused", self.longhaul("status").stdout, "a reading is no reply")
+        (self.home / "usage" / "work.json").write_text(json.dumps({"at": then + 60, "replied": then + 60}))
+        self.assertNotIn("sign-in was refused", self.longhaul("status").stdout, "a reply since: it works again")
+        # A reading from before 0.3.24 has no "replied": its time stands for it, as it did then.
         (self.home / "usage" / "work.json").write_text(json.dumps({"at": then + 60}))
-        self.assertNotIn("sign-in failed", self.longhaul("status").stdout, "a reply since: it works again")
+        self.assertNotIn("sign-in was refused", self.longhaul("status").stdout, "an older reading's time")
 
     def test_an_invalid_switch_mode_is_null_with_the_reason(self):
         self.write_accounts({"name": "personal-1"})

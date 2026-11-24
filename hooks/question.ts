@@ -67,8 +67,11 @@ export function cleanQuestion(v: any, chat: string): LonghaulQuestion | null {
   // A move question asked at a cap (2026-11-24): its cap, a whole number
   // from 1 to 99 as longhaul.py's cap_of() takes it; any other is a limit's.
   const cap = kind === 'move' && Number.isInteger(v.cap) && v.cap >= 1 && v.cap <= 99 ? v.cap as number : null
+  // One asked at a refused sign-in (2026-11-24): the error's word.
+  const signIn = kind === 'move' ? word(v.sign_in) : null
   return { id: v.id, chat, relay_pid: pid, asked_at: num(v.asked_at) ?? 0, kind, from, limit, resets_at: resets, to,
-    to_resets_at: toResets, carries_on_at: num(v.carries_on_at), ...(cap !== null ? { cap } : {}), choices: [...choices] }
+    to_resets_at: toResets, carries_on_at: num(v.carries_on_at), ...(cap !== null ? { cap } : {}),
+    ...(signIn !== null ? { sign_in: signIn } : {}), choices: [...choices] }
 }
 
 export function cleanWait(v: any, chat: string, now: number): LonghaulWait | null {
@@ -154,8 +157,14 @@ export function inTime(seconds: number, nowMs: number): string {
 // label says what it does. At a cap (2026-11-24) nothing was cut off: the
 // question names the cap and when the account is free of it, Move moves now
 // with no carry-on, and Wait holds the chat's next message until that reset,
-// in the relay's words (Relay.ask()).
+// in the relay's words (Relay.ask()). At a refused sign-in (2026-11-24)
+// there is no reset: Move carries the message that failed on there, Wait
+// stays on the account, which `longhaul login` signs in again.
 export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels: Record<string, string> } {
+  if (q.kind === 'move' && typeof q.sign_in === 'string') {
+    return { says: `${q.from}'s sign-in was refused (${q.sign_in}). Move this chat to ${q.to} and carry on?`,
+      labels: { move: 'Move and carry on', wait: `Stay on ${q.from}` } }
+  }
   if (q.kind === 'move' && typeof q.cap === 'number') {
     const at = clock(q.resets_at, nowMs)
     return { says: q.resets_at > 0 ? `${q.from} is at its cap (${q.cap}%) until ${at}. Move this chat to ${q.to} now?`
@@ -178,6 +187,7 @@ export function asks(q: LonghaulQuestion, nowMs: number): { says: string; labels
 // The pop-up that says a question waits, for a pane that may not have opened.
 export function waits(q: LonghaulQuestion): string {
   const what = q.kind === 'first_reset' && q.to !== q.from ? 'every account is at its limit'
+    : q.kind === 'move' && typeof q.sign_in === 'string' ? `${q.from}'s sign-in was refused`
     : q.kind === 'move' && typeof q.cap === 'number' ? `${q.from} is at its cap (${q.cap}%)`
     : `${q.from} hit its ${q.limit} limit`
   return `Longhaul: ${what}. A question waits: type /accounts if it did not open.`
