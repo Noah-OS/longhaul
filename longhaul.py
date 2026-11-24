@@ -2499,8 +2499,9 @@ def relink(acct: dict) -> None:
 
 def prepare(acct: dict, chat: bool = True) -> None:
     """The account's folder before a launch: links back in place and, for
-    a chat, MCP servers copied across. One process at a time; a failure
-    is logged and the launch goes on (the folder only gets tidier)."""
+    a chat, every account's MCP servers made the same (sync_mcp()). One
+    process at a time; a failure is logged and the launch goes on (the
+    folder only gets tidier)."""
     try:
         with locked("folders"):
             relink(acct)
@@ -2510,63 +2511,310 @@ def prepare(acct: dict, chat: bool = True) -> None:
         log(f"{acct['name']}: could not tidy its folder: {e!r}")
 
 
+# Under LONGHAUL_HOME: the MCP servers as sync_mcp() last shared them, each
+# server as a hash of its configuration, never the configuration itself
+# (its headers or env may hold a token): the set, and what each account's
+# .claude.json held then. It tells a server removed on one account from
+# one added on another (mcp_plan()).
+MCP_RECORD = "mcp-shared.json"
+
+
 def sync_mcp(acct: dict) -> None:
-    """`claude mcp add` writes to ~/.claude.json, which the second account
-    does not share (it holds the sign-in): user scope at its top level,
-    local scope (the default) under projects[<folder>]. Copy both across
-    before each launch, so a connection added once (Linear, CodeGraph) is
-    there on both accounts. ~/.claude.json is the source; servers only the
-    second account has are kept. A project the account has never opened
-    gets ~/.claude.json's whole entry for it, as `longhaul setup` gives it."""
-    if not acct.get("config_dir") or config_of(acct) == DEFAULT_CONFIG:
+    """`claude mcp add` and `claude mcp remove` write to the .claude.json
+    of the account they run on, which no other account shares (it holds
+    the sign-in): user scope at its top level, local scope (the default)
+    under projects[<folder>]. Before each launch, make every account's
+    servers the same, ~/.claude.json's (the default sign-in's) among them,
+    so that a connection added, changed or removed on any account is so
+    on all of them (the owner, 2026-11-24: "an MCP server is connected
+    once and is shared between the accounts"). Before, servers went one
+    way, from ~/.claude.json to the account launching: one added on a
+    second account reached no other, and one removed came back.
+
+    `acct` is the account launching, shared with even when the list does
+    not name it. Only `mcpServers` changes: the sign-in, every other key,
+    and what Claude Code keeps per account outside the file (a remote
+    server's OAuth sign-in, claude.ai's connectors) stay as they are. A
+    file that is missing (an account not signed in yet) is nothing to
+    share; one there but unreadable, or not an object, is left alone and
+    worth a line. The caller holds the "folders" lock."""
+    files = mcp_files(acct)
+    if files is None:
+        log("MCP servers not shared this time: accounts.json is not readable")
         return
-    path = config_of(acct) / ".claude.json"
-    src, dst = read_json(DEFAULT_GLOBAL_JSON), read_json(path)
-    for name, data in ((DEFAULT_GLOBAL_JSON, src), (path, dst)):
-        if not isinstance(data, dict):
-            # Missing is nothing to share, or not signed in yet (`longhaul
-            # setup` copies them); there but unreadable is worth a line.
-            if name.exists():
-                log(f"{acct['name']}: MCP servers not shared: {name} could not be read as an object")
-            return
-    if not mcp_missing(src, dst):
+    if len(files) < 2:
+        return  # one sign-in: nothing to share with
+    found, unread = [], set()
+    for path, label, default in files:
+        data = read_json(path)
+        key = os.path.realpath(path)
+        if isinstance(data, dict):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            found.append({"path": path, "key": key, "label": label, "default": default, "data": data, "mtime": mtime})
+        elif os.path.exists(path):
+            # Claude Code may be halfway through saving it: what it held at
+            # the last share is kept, so the next read takes up from there.
+            unread.add(key)
+            log(f"MCP servers not shared with {label}: {path} could not be read as an object")
+    if len(found) < 2:
         return
-    # Claude Code writes this file often; read it again right before the
-    # write so as little as possible of a change made meanwhile is lost.
-    # Half written, it is left alone: writing back the copy read a moment
-    # ago would undo what Claude saved since.
-    dst = read_json(path)
-    if not isinstance(dst, dict):
-        log(f"{acct['name']}: MCP servers not shared this time: {path} changed as longhaul read it")
-        return
-    changed = mcp_missing(src, dst)
-    for folder, name in changed:
-        here, there = dst, src
-        if folder is not None:
-            if not isinstance(dst.get("projects"), dict):
-                dst["projects"] = {}
-            if not isinstance(dst["projects"].get(folder), dict):
-                dst["projects"][folder] = src["projects"][folder]
-            here, there = dst["projects"][folder], src["projects"][folder]
-        if not isinstance(here.get("mcpServers"), dict):
-            here["mcpServers"] = {}
-        here["mcpServers"][name] = there["mcpServers"][name]
-    write_json(path, dst)
-    path.chmod(0o600)
-    say(f"{acct['name']}: shared MCP servers "
-        + ", ".join(name if folder is None else f"{name} (in {folder})" for folder, name in changed))
+    record = mcp_record()
+    plan = mcp_plan(found, record)
+    # A folder an account has never opened gets ~/.claude.json's whole
+    # entry for it, as `longhaul setup` gives it; read before any change.
+    whole = next((dict(dict_at(f["data"], "projects")) for f in found if f["default"]), {})
+    final = {k: mcp_hash(config) for k, (config, _) in plan.items() if config is not MCP_KEEP and config is not None}
+    keep = [k for k, (config, _) in plan.items() if config is MCP_KEEP]
+    shared = {**final, **{k: record["shared"][k] for k in keep}}
+    old = record["files"] if record else {}
+    held, done = {}, set()  # held: what each file holds once shared, as the record keeps it
+    for f in found:
+        entries = {} if f["default"] else whole
+        servers = mcp_servers(f["data"]) if keep else {}
+        mine = {k: mcp_hash(servers[k]) for k in keep if k in servers}  # left as each file has them
+        if mcp_apply(f["data"], plan, entries):
+            # Claude Code writes this file often; read it again right before
+            # the write so as little as possible of a change made meanwhile
+            # is lost. Half written, it is left alone: writing back the copy
+            # read a moment ago would undo what Claude saved since.
+            fresh = read_json(f["path"])
+            if not isinstance(fresh, dict):
+                log(f"MCP servers not shared with {f['label']} this time: {f['path']} changed as longhaul read it")
+                unread.add(f["key"])
+                continue
+            changed = mcp_apply(fresh, plan, entries)
+            if changed:
+                try:
+                    write_json(f["path"], fresh)
+                    f["path"].chmod(0o600)
+                except OSError as e:
+                    log(f"MCP servers not shared with {f['label']} this time: {f['path']} could not be written "
+                        f"({e.strerror or type(e).__name__})")
+                    unread.add(f["key"])
+                    continue
+                done |= changed
+        held[f["key"]] = {**final, **mine}
+    for key in unread & set(old):  # what a file left alone held at the last share
+        held[key] = old[key]
+    mcp_keep_record(record, shared, held, bool(done))
+    if done:
+        say("MCP servers shared between the accounts: "
+            + ", ".join(f"{mcp_name(k)} {plan[k][1]}" for k in sorted(done, key=mcp_order)))
 
 
-def mcp_missing(src: dict, dst: dict) -> list:
-    """(project folder, or None for user scope; server name) for each MCP
-    server in ~/.claude.json that this account lacks or has otherwise."""
-    out = [(None, k) for k, v in sorted(dict_at(src, "mcpServers").items())
-           if dict_at(dst, "mcpServers").get(k) != v]
-    theirs = dict_at(dst, "projects")
-    for folder, entry in sorted(dict_at(src, "projects").items()):
-        out += [(folder, k) for k, v in sorted(dict_at(entry, "mcpServers").items())
-                if dict_at(theirs.get(folder), "mcpServers").get(k) != v]
+def mcp_files(acct: dict):
+    """(path, label, whether it is ~/.claude.json) for each .claude.json
+    to share between: ~/.claude.json first (the default sign-in's, named
+    after the account that uses ~/.claude, if one does), then each
+    account's in its folder, then `acct`'s if the list lacks it; each file
+    once. None when accounts.json cannot be read: shared among some files
+    only, the others would leave the record, and a server one of them
+    removed meanwhile would come back from it."""
+    accounts, problem = read_accounts_file()
+    if problem:
+        return None
+    usable = [a for a in accounts + [acct] if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)]
+    on_default = lambda a: not a.get("config_dir") or config_of(a) == DEFAULT_CONFIG  # noqa: E731
+    label = next((a["name"] for a in accounts if a in usable and on_default(a)), f"the {DEFAULT_LABEL}")
+    found, seen = [(DEFAULT_GLOBAL_JSON, label, True)], {os.path.realpath(DEFAULT_GLOBAL_JSON)}
+    for a in usable:
+        path = config_of(a) / ".claude.json"
+        if on_default(a) or os.path.realpath(path) in seen:
+            continue
+        seen.add(os.path.realpath(path))
+        found.append((path, a["name"], False))
+    return found
+
+
+# mcp_plan()'s word for a server it leaves as each file has it: the copy
+# shared last is in no file it can read this time.
+MCP_KEEP = object()
+
+
+def mcp_plan(files: list, record) -> dict:
+    """What each server becomes in every file: {(folder, or None for user
+    scope; name): (its configuration, None to remove it, or MCP_KEEP;
+    what the line says, "from Pro" or "removed on Team")}.
+
+    Each file is held against what it held at the last share (the
+    record). A server it holds otherwise was added or changed there, and
+    goes to every file; two files that changed one server differently:
+    the file saved last wins. A server it held then and lacks now was
+    removed there, and goes from every file, unless another file changed
+    it: keeping it loses nothing, and the removal can be made again. A
+    file with no entry for the folder removes nothing there. A file new
+    to the record (an account added, or signed in, since) removes nothing
+    either, and only what it adds counts: where its copy of a server
+    differs, it was not changed there but kept from before (a folder an
+    account left long ago), and the shared copy goes to it. With no
+    record (the first share after the update) every file's servers are
+    joined and none removed; where copies differ, ~/.claude.json's wins,
+    as it did as the only source."""
+    held = {f["key"]: mcp_servers(f["data"]) for f in files}
+    hashes = {f["key"]: {k: mcp_hash(v) for k, v in held[f["key"]].items()} for f in files}
+    opened = {f["key"]: {folder for folder, entry in dict_at(f["data"], "projects").items() if isinstance(entry, dict)}
+              for f in files}
+    last = lambda group: max(group, key=lambda f: (f["mtime"], f["default"]))  # noqa: E731
+    keys = set().union(*held.values())
+    if record:
+        keys |= set(record["shared"]).union(*(record["files"].get(f["key"], {}) for f in files))
+    plan = {}
+    for key in sorted(keys, key=mcp_order):
+        holders = [f for f in files if key in held[f["key"]]]
+        if record is None:
+            src = next((f for f in holders if f["default"]), None) or last(holders)
+            plan[key] = (held[src["key"]][key], f"from {src['label']}")
+            continue
+        changed, removed = [], []
+        for f in files:
+            mine, now = record["files"].get(f["key"]), hashes[f["key"]].get(key)
+            if mine is None:  # new to the record
+                if now is not None and key not in record["shared"]:
+                    changed.append(f)
+            elif now is not None and now != mine.get(key):
+                changed.append(f)
+            elif now is None and key in mine and (key[0] is None or key[0] in opened[f["key"]]):
+                removed.append(f)
+        names = lambda group: hook_and([f["label"] for f in group])  # noqa: E731
+        if changed:
+            src = last(changed)
+            if removed:
+                log(f"MCP server {mcp_name(key)} was removed on {names(removed)} and changed on {names(changed)}; "
+                    f"{src['label']}'s copy is kept")
+            elif len({hashes[f["key"]][key] for f in changed}) > 1:
+                log(f"MCP server {mcp_name(key)} was changed on {names(changed)}; {src['label']}'s copy is kept, "
+                    "as its file was saved last")
+            plan[key] = (held[src["key"]][key], f"from {src['label']}")
+        elif removed:
+            plan[key] = (None, f"removed on {names(removed)}")
+        elif key not in record["shared"]:
+            plan[key] = (None, "removed")  # at a share a file here missed
+        else:
+            src = next((f for f in holders if hashes[f["key"]][key] == record["shared"][key]), None)
+            plan[key] = (held[src["key"]][key], f"from {src['label']}") if src else (MCP_KEEP, "")
+    return plan
+
+
+def mcp_apply(data: dict, plan: dict, entries: dict) -> set:
+    """Make `data` (a .claude.json) hold the servers `plan` says, changing
+    nothing else in it; the plan's keys it changed. A folder it has no
+    entry for gets `entries`' (~/.claude.json's) whole entry, or one with
+    its servers only, and only when there is a server to put there."""
+    changed = set()
+    for key, (config, _) in plan.items():
+        if config is MCP_KEEP:
+            continue
+        folder, name = key
+        if folder is None:
+            here = data
+        else:
+            projects = data.get("projects")
+            here = projects.get(folder) if isinstance(projects, dict) else None
+            if not isinstance(here, dict):
+                if config is None:
+                    continue
+                if not isinstance(projects, dict):
+                    data["projects"] = projects = {}
+                here = projects[folder] = dict(dict_at(entries, folder))
+                here["mcpServers"] = {}
+        servers = here.get("mcpServers")
+        if config is None:
+            if isinstance(servers, dict) and name in servers:
+                del servers[name]
+                changed.add(key)
+        elif not isinstance(servers, dict) or name not in servers or servers[name] != config:
+            if not isinstance(servers, dict):
+                here["mcpServers"] = servers = {}
+            servers[name] = config
+            changed.add(key)
+    return changed
+
+
+def mcp_servers(data: dict) -> dict:
+    """{(folder, or None for user scope; name): configuration} of a .claude.json."""
+    found = {(None, name): config for name, config in dict_at(data, "mcpServers").items()}
+    for folder, entry in dict_at(data, "projects").items():
+        found.update({(folder, name): config for name, config in dict_at(entry, "mcpServers").items()})
+    return found
+
+
+def mcp_hash(config) -> str:
+    """A server's configuration as the record keeps it: enough to tell a
+    change, and nothing of what it holds."""
+    import hashlib  # here, not at the top: see index_key()
+    return hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+
+
+def mcp_order(key) -> tuple:
+    """User scope first, then each folder, by name."""
+    return (key[0] is not None, key[0] or "", key[1])
+
+
+def mcp_name(key) -> str:
+    return key[1] if key[0] is None else f"{key[1]} (in {key[0]})"
+
+
+def mcp_nested(flat: dict) -> dict:
+    """{(folder, name): hash} in .claude.json's own shape, for the record."""
+    out = {"mcpServers": {}, "projects": {}}
+    for (folder, name), value in sorted(flat.items(), key=lambda kv: mcp_order(kv[0])):
+        (out["mcpServers"] if folder is None else out["projects"].setdefault(folder, {}))[name] = value
     return out
+
+
+def mcp_flat(nested) -> dict:
+    """mcp_nested() read back; what is not a hash is passed over."""
+    found = {(None, n): h for n, h in dict_at(nested, "mcpServers").items() if isinstance(h, str)}
+    for folder, servers in dict_at(nested, "projects").items():
+        if isinstance(servers, dict):
+            found.update({(folder, n): h for n, h in servers.items() if isinstance(h, str)})
+    return found
+
+
+def mcp_record():
+    """MCP_RECORD as {"shared": {key: hash}, "files": {path: {key: hash}}}
+    (mcp_flat()); None when there is none (the first share after the
+    update) or it cannot be read, which is logged: either way the files
+    are joined and nothing is removed."""
+    path = LONGHAUL_HOME / MCP_RECORD
+    try:
+        found = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        found = None
+    if not isinstance(found, dict) or found.get("version") != 1:
+        log(f"MCP servers: {MCP_RECORD} could not be read; shared as the first time, nothing removed")
+        return None
+    return {"shared": mcp_flat(found.get("shared")),
+            "files": {k: mcp_flat(v) for k, v in dict_at(found, "files").items() if isinstance(v, dict)}}
+
+
+def mcp_keep_record(record, shared: dict, held: dict, wrote: bool) -> None:
+    """MCP_RECORD written whole (0600) when what it says changed, or a
+    file was written, with the time: when the servers were last shared.
+    One that cannot be written is logged and the one before stays: read
+    against it, what this share gave each file reads as added or removed
+    on all of them alike, which changes nothing."""
+    if record is not None and not wrote and record["shared"] == shared and record["files"] == held:
+        return
+    try:
+        write_json(LONGHAUL_HOME / MCP_RECORD, {
+            "version": 1, "shared_at": time.time(), "shared": mcp_nested(shared),
+            "files": {path: mcp_nested(hashes) for path, hashes in sorted(held.items())}})
+    except OSError as e:
+        log(f"MCP servers: {MCP_RECORD} could not be written ({e.strerror or type(e).__name__})")
+
+
+def mcp_shared_at():
+    """When the MCP servers were last shared between the accounts, from
+    MCP_RECORD, or None when they never have been. Only reads."""
+    found = read_json(LONGHAUL_HOME / MCP_RECORD)
+    at = found.get("shared_at") if isinstance(found, dict) else None
+    return at if isinstance(at, (int, float)) and not isinstance(at, bool) else None
 
 
 def reopen_delay(crashes: int, base: int) -> int:
@@ -15676,7 +15924,7 @@ class Relay:
         every quarter second, not after INIT_WAIT: a claude that dies at
         start-up would otherwise hold the panel for 90 s)."""
         acct = self.accounts[idx]
-        prepare(acct)  # the target's links and MCP servers, as before any launch
+        prepare(acct)  # the target's links, and every account's MCP servers alike, as before any launch
         init_id = self.next_id("initialize")
         hide = {"ids": {init_id}, "init_id": init_id, "auth": True}
         self.answered.clear()
@@ -16327,7 +16575,8 @@ def setup(opts) -> int:
         if added:
             write_json(dst_path, dst)
             dst_path.chmod(0o600)
-        sync_mcp(acct)
+        with locked("folders"):  # as before a launch: one process at a time shares
+            sync_mcp(acct)
         say(f"{acct['name']}: {got} ({status.get('subscriptionType')}) in {folder}")
 
     seen = [e for e in emails.values() if e]
@@ -19557,9 +19806,10 @@ def doctor_accounts(quick: bool = False) -> dict:
     one used only when the others have no room (2026-11-06); and two
     accounts that sign in as one email (the default sign-in among them)
     are one subscription with one allowance, so a switch between them
-    never helps (the owner's Mac, 2026-10-25). Names, never emails. Not
-    quick, a line said and not judged names the ~/.claude-* folders no
-    account uses (doctor_leftovers())."""
+    never helps (the owner's Mac, 2026-10-25). Names, never emails. Once
+    MCP servers have been shared between the accounts, a line said and not
+    judged says when last (mcp_shared_at()). Not quick, another names the
+    ~/.claude-* folders no account uses (doctor_leftovers())."""
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
     if problem:
@@ -19603,6 +19853,10 @@ def doctor_accounts(quick: bool = False) -> dict:
                 and a.get("config_dir") and os.path.realpath(config_of(a)) != on_default:
             items.append(("warn", f"{a['name']} and the default sign-in ({home_path(str(DEFAULT_CONFIG))}) are one "
                                   "subscription (same email): a switch between them never helps", same))
+    shared = mcp_shared_at()  # said once they have been (sync_mcp(), 2026-11-24), not judged
+    if shared is not None:
+        items.append((None, f"MCP servers are shared both ways between the accounts before each chat; last shared "
+                            f"{clock(shared)}", None))
     left = [] if quick else doctor_leftovers(accounts)
     if left:
         them = "it" if len(left) == 1 else "them"

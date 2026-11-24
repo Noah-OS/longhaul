@@ -2,6 +2,14 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+MCP servers are shared both ways between your accounts.
+
+### Changed
+
+- **An MCP server added, changed or removed on any account reaches all of them before the next chat starts**, the default sign-in (`~/.claude.json`) among them: user-scope servers, and a folder's own (local scope). Before, servers went one way, from the default sign-in to the account a chat started on: one added in a chat on a second account stayed there, and one removed came back at the next chat. Only the servers' settings (`mcpServers`) are shared, never the sign-in or any other key of `.claude.json`. Sign-ins to remote servers (OAuth via `/mcp`) and claude.ai connectors stay per account, as Claude Code keeps them. When two accounts changed one server differently, the one whose file was saved last wins, and Longhaul's log says so; a server changed on one account and removed on another is kept as changed. To tell a removal from an addition, Longhaul keeps the servers as last shared in `~/.longhaul/mcp-shared.json`, readable only by you: each server's name and a hash of its settings, never the settings, which may hold a token. The first chat after the update joins every account's servers and removes none; where two copies differ, the default sign-in's wins. A file that is missing (an account not signed in yet) or cannot be read is left alone. The terminal says what was shared or removed and from which account, by name only, and `longhaul doctor` says under Accounts when the servers were last shared.
+
 ## 0.3.22 - 2026-11-23
 
 `longhaul inspect` starts with three lines in short, and small fixes to 0.3.21's one name for the default sign-in.

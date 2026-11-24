@@ -17007,7 +17007,8 @@ class Pieces(unittest.TestCase):
         with mock.patch.object(longhaul, "read_json", side_effect=[src, {"oauthAccount": {}}, None]), \
                 mock.patch.object(longhaul, "write_json") as write, mock.patch.object(longhaul, "LONGHAUL_HOME", pro / "relay"):
             longhaul.sync_mcp({"name": "Pro", "config_dir": str(pro)})
-        write.assert_not_called()
+        # Only Longhaul's own record of the share is written (2026-11-24), never Pro's file.
+        self.assertNotIn(pro / ".claude.json", [c.args[0] for c in write.call_args_list])
         self.assertIn("changed as longhaul read it", (pro / "relay" / "longhaul.log").read_text())
 
     def test_mcp_sync_leaves_an_accounts_file_that_is_not_an_object_alone(self):
@@ -17270,6 +17271,368 @@ class Pieces(unittest.TestCase):
         self.assertEqual(longhaul.where_allowed(odd), f"nowhere ({longhaul.REPOSITORIES_JUNK})")
         self.assertEqual(longhaul.may_not_text(odd, "/x", [odd]), f"Odd may not be used in /x ({longhaul.REPOSITORIES_JUNK})")
         self.assertIn(f"Odd nowhere ({longhaul.REPOSITORIES_JUNK}). ", longhaul.no_account_text("/x", [odd]))
+
+
+class McpBothWays(unittest.TestCase):
+    """MCP servers shared both ways between the accounts (the owner,
+    2026-11-24: "an MCP server is connected once and is shared between
+    the accounts"). Before each chat sync_mcp() makes every account's
+    .claude.json hold the same servers, ~/.claude.json's (the default
+    sign-in's) included, so one added, changed or removed on any account
+    is so on all of them. Before, they went one way, from ~/.claude.json
+    to the account launching: a server added on a second account reached
+    no other, and one removed came back. The record of the last share
+    (MCP_RECORD) tells a removal from an addition."""
+
+    CODEGRAPH = {"type": "stdio", "command": "codegraph", "args": ["serve", "--mcp"]}
+    LINEAR = {"type": "http", "url": "https://mcp.linear.app/mcp"}
+    GITHUB = {"type": "http", "url": "https://api.githubcopilot.com/mcp/",
+              "headers": {"Authorization": "Bearer ghp-0123456789abcdef"}}
+    DB = {"type": "stdio", "command": "pg-mcp", "env": {"PGPASSWORD": "pw-0123456789"}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.main = self.tmp / ".claude.json"
+        self.folders = {"Pro": self.tmp / ".claude-pro", "Team": self.tmp / ".claude-team"}
+        for folder in self.folders.values():
+            folder.mkdir()
+        for name, value in (("LONGHAUL_HOME", self.home), ("DEFAULT_CONFIG", self.tmp / ".claude"),
+                            ("DEFAULT_GLOBAL_JSON", self.main), ("QUIET", True)):
+            patcher = mock.patch.object(longhaul, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.listed = [{"name": "Pro", "config_dir": str(self.folders["Pro"])},
+                       {"name": "Team", "config_dir": str(self.folders["Team"])}]
+        self.write_accounts()
+        self.saved = time.time() - 1000  # each save a second after the last: the newer file is the one saved later
+        both = {"codegraph": self.CODEGRAPH, "linear": self.LINEAR}
+        for who, path in self.files().items():
+            self.write(path, self.signed_in(who, both))
+
+    def write_accounts(self):
+        (self.home / "accounts.json").write_text(json.dumps(self.listed))
+
+    def add_account(self, name) -> Path:
+        folder = self.tmp / f".claude-{name.lower()}"
+        folder.mkdir()
+        self.folders[name] = folder
+        self.listed.append({"name": name, "config_dir": str(folder)})
+        self.write_accounts()
+        return folder / ".claude.json"
+
+    def files(self) -> dict:
+        return {"main": self.main, **{who: folder / ".claude.json" for who, folder in self.folders.items()}}
+
+    @staticmethod
+    def signed_in(who, servers, **keys) -> dict:
+        """A .claude.json as Claude Code keeps it: the sign-in, a few of its
+        other keys, and the servers."""
+        return {"oauthAccount": {"emailAddress": f"{who.lower()}@example.com", "accountUuid": f"uuid-{who}"},
+                "userID": f"user-{who}", "numStartups": 7, "tipsHistory": {"mcp-intro": 3},
+                "mcpServers": dict(servers), **keys}
+
+    def write(self, path, data):
+        """`path` as Claude Code saves it, a second after the save before."""
+        path.write_text(data if isinstance(data, str) else json.dumps(data, indent=2))
+        self.saved += 1
+        os.utime(path, (self.saved, self.saved))
+
+    def read(self, who) -> dict:
+        return json.loads(self.files()[who].read_text())
+
+    def edit(self, who, change):
+        data = self.read(who)
+        change(data)
+        self.write(self.files()[who], data)
+
+    def servers(self, who, folder=None) -> dict:
+        data = self.read(who)
+        return (data["projects"][folder] if folder else data).get("mcpServers")
+
+    def acct(self, who) -> dict:
+        if who == "main":
+            return {"name": longhaul.DEFAULT_KEY, "config_dir": None}
+        return {"name": who, "config_dir": str(self.folders[who])}
+
+    def share(self, on="Pro"):
+        """A chat starting on `on`."""
+        longhaul.sync_mcp(self.acct(on))
+
+    def said(self) -> list:
+        log = self.home / "longhaul.log"
+        return [line.split(" ", 2)[2] for line in log.read_text().splitlines()] if log.exists() else []
+
+    def assert_everywhere(self, servers, folder=None):
+        for who in self.files():
+            self.assertEqual(self.servers(who, folder), servers, who)
+
+    def test_a_server_added_on_a_second_account_reaches_the_default_sign_in_and_a_third_account(self):
+        self.share()
+        self.edit("Pro", lambda d: d["mcpServers"].update(github=self.GITHUB))
+        self.share(on="Team")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR, "github": self.GITHUB})
+        self.assertIn("MCP servers shared between the accounts: github from Pro", self.said())
+
+    def test_a_server_removed_on_one_account_is_removed_from_every_account(self):
+        self.share()
+        self.edit("Team", lambda d: d["mcpServers"].pop("linear"))
+        self.share(on="Pro")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH})
+        self.assertIn("MCP servers shared between the accounts: linear removed on Team", self.said())
+        # Removed on the default sign-in, it no longer comes back from the others.
+        self.edit("main", lambda d: d["mcpServers"].pop("codegraph"))
+        self.share(on="Team")
+        self.assert_everywhere({})
+        self.assertIn("MCP servers shared between the accounts: codegraph removed on the default sign-in", self.said())
+        # And it stays removed: the next chat writes nothing.
+        marks = {who: path.stat().st_mtime_ns for who, path in self.files().items()}
+        self.share(on="Pro")
+        self.assertEqual({who: path.stat().st_mtime_ns for who, path in self.files().items()}, marks)
+
+    def test_a_server_changed_on_one_account_wins_over_the_record(self):
+        self.share()
+        moved = {"type": "http", "url": "https://mcp.linear.app/v2"}
+        self.edit("Pro", lambda d: d["mcpServers"].update(linear=moved))
+        self.share(on="Team")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": moved})
+        self.assertIn("MCP servers shared between the accounts: linear from Pro", self.said())
+
+    def test_two_accounts_changing_one_server_the_file_saved_last_wins_and_the_log_says_so(self):
+        self.share()
+        a, b, c, d = ({"type": "http", "url": f"https://mcp.linear.app/{v}"} for v in "abcd")
+        self.edit("Pro", lambda data: data["mcpServers"].update(linear=a))
+        self.edit("Team", lambda data: data["mcpServers"].update(linear=b))  # a second later
+        self.share(on="Pro")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": b})
+        self.assertIn("MCP server linear was changed on Pro and Team; Team's copy is kept, as its file was saved last",
+                      self.said())
+        # The time decides, not the order of the accounts.
+        self.edit("Team", lambda data: data["mcpServers"].update(linear=c))
+        self.edit("Pro", lambda data: data["mcpServers"].update(linear=d))
+        self.share(on="Team")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": d})
+        self.assertNotIn("mcp.linear.app", (self.home / "longhaul.log").read_text(), "names only, never a configuration")
+
+    def test_a_server_changed_on_one_account_and_removed_on_another_is_kept_as_changed(self):
+        # Keeping is the side that loses nothing: the removal can be made again.
+        self.share()
+        moved = {"type": "http", "url": "https://mcp.linear.app/v2"}
+        self.edit("Pro", lambda d: d["mcpServers"].update(linear=moved))
+        self.edit("Team", lambda d: d["mcpServers"].pop("linear"))
+        self.share()
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": moved})
+        self.assertIn("MCP server linear was removed on Team and changed on Pro; Pro's copy is kept", self.said())
+
+    def test_the_first_share_after_the_update_joins_every_accounts_servers_and_removes_none(self):
+        # No record yet. Servers a second account kept to itself join the
+        # rest; where two copies differ, ~/.claude.json's wins, as it did
+        # when it was the only source, even against a copy saved later.
+        own = {"type": "sse", "url": "https://own.example.com/sse"}
+        self.write(self.main, self.signed_in("main", {"codegraph": self.CODEGRAPH, "linear": self.LINEAR}))
+        self.write(self.files()["Pro"], self.signed_in("Pro", {"codegraph": {"command": "old-codegraph"}, "own": own}))
+        self.write(self.files()["Team"], self.signed_in("Team", {}))
+        self.share(on="Team")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR, "own": own})
+        self.assertIn("MCP servers shared between the accounts: codegraph from the default sign-in, "
+                      "linear from the default sign-in, own from Pro", self.said())
+
+    def test_a_projects_own_server_is_shared_both_ways(self):
+        self.edit("main", lambda d: d.update(projects={"/work/a": {
+            "mcpServers": {"db": self.DB}, "hasTrustDialogAccepted": True, "allowedTools": ["Bash(npm test)"]}}))
+        self.edit("Pro", lambda d: d.update(projects={"/work/a": {"mcpServers": {"db": self.DB},
+                                                                   "lastSessionId": "pro-session"}}))
+        self.share()
+        self.assertEqual(self.read("Team")["projects"]["/work/a"], self.read("main")["projects"]["/work/a"],
+                         "a folder Team never opened gets ~/.claude.json's whole entry, as setup gives it")
+        # Pro adds one in /work/a, and one in /work/b, a folder only Pro has opened.
+        self.edit("Pro", lambda d: (d["projects"]["/work/a"]["mcpServers"].update(linear=self.LINEAR),
+                                    d["projects"].update({"/work/b": {"mcpServers": {"gh": self.GITHUB},
+                                                                      "lastSessionId": "pro-b",
+                                                                      "hasTrustDialogAccepted": True}})))
+        self.share(on="Team")
+        self.assert_everywhere({"db": self.DB, "linear": self.LINEAR}, "/work/a")
+        for who in ("main", "Team"):
+            self.assertEqual(self.read(who)["projects"]["/work/b"], {"mcpServers": {"gh": self.GITHUB}},
+                             f"{who}: only the servers, nothing else of Pro's")
+        self.assertTrue(self.read("main")["projects"]["/work/a"]["hasTrustDialogAccepted"])
+        self.assertEqual(self.read("Pro")["projects"]["/work/a"]["lastSessionId"], "pro-session")
+        self.assertIn("MCP servers shared between the accounts: linear (in /work/a) from Pro, gh (in /work/b) from Pro",
+                      self.said())
+        # Removed in a folder on Team: removed there on every account.
+        self.edit("Team", lambda d: d["projects"]["/work/a"]["mcpServers"].pop("db"))
+        self.share()
+        self.assert_everywhere({"linear": self.LINEAR}, "/work/a")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR})
+        self.assertIn("MCP servers shared between the accounts: db (in /work/a) removed on Team", self.said())
+
+    def test_a_file_missing_unreadable_or_not_an_object_is_left_alone_and_the_rest_still_share(self):
+        gone, broken = self.add_account("Gone"), self.add_account("Broken")
+        self.write(broken, "{not json")
+        self.write(self.files()["Team"], "[1, 2]")
+        self.edit("Pro", lambda d: d["mcpServers"].update(github=self.GITHUB))
+        self.share()
+        for who in ("main", "Pro"):
+            self.assertEqual(self.servers(who), {"codegraph": self.CODEGRAPH, "linear": self.LINEAR,
+                                                 "github": self.GITHUB}, who)
+        self.assertEqual(self.files()["Team"].read_text(), "[1, 2]")
+        self.assertEqual(broken.read_text(), "{not json")
+        self.assertFalse(gone.exists(), "an account not signed in yet gets no file")
+        said = self.said()
+        for who, path in (("Team", self.files()["Team"]), ("Broken", broken)):
+            self.assertEqual(said.count(f"MCP servers not shared with {who}: {path} could not be read as an object"), 1)
+        self.assertFalse(any("Gone" in line for line in said), "a missing file is nothing to say")
+
+    def test_an_account_whose_file_could_not_be_read_takes_the_changes_it_missed_and_brings_nothing_back(self):
+        # Claude Code may be halfway through saving a file as longhaul reads
+        # it. The record keeps what each file held at the last share, so the
+        # file is not taken to have added what it only still holds.
+        self.share()
+        whole = self.files()["Team"].read_text()
+        self.write(self.files()["Team"], '{"oauthAccount": {')
+        self.edit("Pro", lambda d: d["mcpServers"].pop("linear"))
+        self.share()
+        self.assertEqual(self.servers("main"), {"codegraph": self.CODEGRAPH})
+        self.assertEqual(self.files()["Team"].read_text(), '{"oauthAccount": {')
+        self.write(self.files()["Team"], whole)  # whole again: it still holds linear
+        self.share(on="Team")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH})
+
+    def test_an_account_signed_in_after_the_last_share_gets_the_servers_and_removes_nothing(self):
+        self.share()
+        new = self.add_account("New")
+        self.share()
+        self.assertFalse(new.exists())
+        self.write(new, {"oauthAccount": {"emailAddress": "new@example.com"}, "userID": "user-new"})  # its first sign-in
+        self.share(on="New")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR})
+        self.assertEqual(self.read("New")["oauthAccount"], {"emailAddress": "new@example.com"})
+
+    def test_an_account_added_back_with_an_old_file_adds_what_it_has_alone_and_takes_the_shared_copies(self):
+        # A folder kept from an account removed long ago holds copies from
+        # then. Its file is the newest (Claude Code saved it at the sign-in),
+        # but its old copy of a server was never changed there.
+        self.share()
+        own = {"type": "sse", "url": "https://own.example.com/sse"}
+        back = self.add_account("Back")
+        self.write(back, self.signed_in("Back", {"codegraph": {"command": "old-codegraph"}, "own": own}))
+        self.share(on="Back")
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR, "own": own})
+        self.assertIn("MCP servers shared between the accounts: codegraph from the default sign-in, linear from the "
+                      "default sign-in, own from Back", self.said())
+
+    def test_no_other_key_of_any_claude_json_changes_and_each_stays_private(self):
+        def without_servers(data):
+            data = json.loads(json.dumps(data))
+            data.pop("mcpServers", None)
+            for entry in data.get("projects", {}).values():
+                entry.pop("mcpServers", None)
+            return data
+
+        for who in self.files():
+            self.edit(who, lambda d: d.update(projects={
+                "/work/a": {"mcpServers": {}, "allowedTools": [], "lastSessionId": f"{who}-a", "lastCost": 1.5},
+                "/work/b": {"mcpServers": {"db": self.DB}, "hasTrustDialogAccepted": who != "Team"}},
+                customApiKeyResponses={"approved": [], "rejected": []}, hasCompletedOnboarding=True))
+        self.share()
+        before = {who: without_servers(self.read(who)) for who in self.files()}
+        self.edit("Pro", lambda d: (d["mcpServers"].update(github=self.GITHUB),
+                                    d["projects"]["/work/a"]["mcpServers"].update(linear=self.LINEAR)))
+        self.edit("Team", lambda d: (d["mcpServers"].pop("codegraph"), d["projects"]["/work/b"]["mcpServers"].pop("db")))
+        before["Pro"], before["Team"] = without_servers(self.read("Pro")), without_servers(self.read("Team"))
+        self.share()
+        for who in self.files():
+            self.assertEqual(without_servers(self.read(who)), before[who], who)
+            self.assertEqual(self.files()[who].stat().st_mode & 0o777, 0o600, f"{who}: written 0600")
+        self.assert_everywhere({"linear": self.LINEAR, "github": self.GITHUB})
+        self.assert_everywhere({"linear": self.LINEAR}, "/work/a")
+        self.assert_everywhere({}, "/work/b")
+
+    def test_the_record_is_private_and_holds_names_and_hashes_never_a_configuration(self):
+        self.edit("Pro", lambda d: d.update(projects={"/work/b": {"mcpServers": {"db": self.DB}}}))
+        self.edit("Team", lambda d: d["mcpServers"].update(github=self.GITHUB))
+        self.share()
+        record = self.home / longhaul.MCP_RECORD
+        self.assertEqual(longhaul.MCP_RECORD, "mcp-shared.json")
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        text = record.read_text()
+        kept = json.loads(text)
+        self.assertEqual(sorted(kept["shared"]["mcpServers"]), ["codegraph", "github", "linear"])
+        self.assertEqual(sorted(kept["shared"]["projects"]["/work/b"]), ["db"])
+        for secret in ("ghp-0123456789abcdef", "pw-0123456789", "mcp.linear.app", "--mcp", "pg-mcp"):
+            self.assertNotIn(secret, text)
+            self.assertNotIn(secret, (self.home / "longhaul.log").read_text())
+        self.assertEqual(sorted(kept["files"]), sorted(os.path.realpath(p) for p in self.files().values()))
+        # Written whole, through a temporary file: none is left beside it.
+        self.assertEqual(sorted(p.name for p in self.home.iterdir() if "mcp" in p.name), ["mcp-shared.json"])
+
+    def test_nothing_is_written_when_every_account_holds_the_same_servers(self):
+        self.share()
+        record = self.home / longhaul.MCP_RECORD
+        self.assertTrue(record.exists(), "the first share keeps the record, with nothing to copy")
+        marks = {p: p.stat().st_mtime_ns for p in [*self.files().values(), record]}
+        self.share(on="Team")
+        self.share(on="main")
+        self.assertEqual({p: p.stat().st_mtime_ns for p in marks}, marks)
+        self.assertFalse(any(line.startswith("MCP servers shared") for line in self.said()))
+
+    def test_a_chat_on_the_default_sign_in_shares_too(self):
+        # Before, sync_mcp() returned at once for ~/.claude: what Pro added never reached it.
+        self.share()
+        self.edit("Pro", lambda d: d["mcpServers"].update(github=self.GITHUB))
+        longhaul.prepare(self.acct("main"))
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR, "github": self.GITHUB})
+
+    def test_with_one_sign_in_there_is_nothing_to_share_and_no_record(self):
+        (self.home / "accounts.json").unlink()
+        mark = self.main.stat().st_mtime_ns
+        self.share(on="main")
+        self.assertFalse((self.home / longhaul.MCP_RECORD).exists())
+        self.assertEqual(self.main.stat().st_mtime_ns, mark)
+
+    def test_a_server_added_while_longhaul_shares_is_kept_and_reaches_the_others_at_the_next_chat(self):
+        # Claude Code saves .claude.json often: each file is read again
+        # right before it is written, and only the servers being shared
+        # change in it.
+        self.share()
+        self.edit("Pro", lambda d: d["mcpServers"].update(github=self.GITHUB))
+        real, team, reads = longhaul.read_json, self.files()["Team"], []
+
+        def reading(path):
+            if Path(path) == team:
+                reads.append(path)
+                if len(reads) == 2:  # the read right before the write: Claude Code saved a server meanwhile
+                    self.edit("Team", lambda d: d["mcpServers"].update(db=self.DB))
+            return real(path)
+
+        with mock.patch.object(longhaul, "read_json", side_effect=reading):
+            self.share()
+        self.assertEqual(self.servers("Team"), {"codegraph": self.CODEGRAPH, "linear": self.LINEAR,
+                                                "github": self.GITHUB, "db": self.DB})
+        self.share()
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR, "github": self.GITHUB, "db": self.DB})
+
+    def test_an_unreadable_record_shares_as_the_first_time_and_removes_nothing(self):
+        self.share()
+        (self.home / longhaul.MCP_RECORD).write_text("{half")
+        self.edit("Team", lambda d: d["mcpServers"].pop("linear"))
+        self.share()
+        self.assert_everywhere({"codegraph": self.CODEGRAPH, "linear": self.LINEAR})
+        self.assertIn("MCP servers: mcp-shared.json could not be read; shared as the first time, nothing removed",
+                      self.said())
+        self.assertEqual(json.loads((self.home / longhaul.MCP_RECORD).read_text())["version"], 1, "kept again")
+
+    def test_the_doctor_says_servers_are_shared_both_ways_and_when_last(self):
+        def mcp_items():
+            return [item for item in longhaul.doctor_accounts(quick=True)["items"] if "MCP" in item[1]]
+
+        self.assertEqual(mcp_items(), [], "nothing shared yet: nothing said")
+        self.share()
+        at = json.loads((self.home / longhaul.MCP_RECORD).read_text())["shared_at"]
+        self.assertEqual(mcp_items(), [(None, "MCP servers are shared both ways between the accounts before each "
+                                              f"chat; last shared {longhaul.clock(at)}", None)])
+        self.assertEqual(longhaul.doctor_accounts(quick=True)["mark"], "ok", "said, not judged")
 
 
 class PickPreferred(unittest.TestCase):

@@ -172,6 +172,8 @@ A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own;
 
 **Keep an account as a fallback.** In `/accounts`, open the account and press **Use as fallback**; in a terminal, `longhaul fallback work on` (`off` makes it a normal account again; `longhaul add NAME EMAIL --fallback` marks a new one). A fallback is used only when no other account allowed in that folder has room: at a limit the chat moves to a normal account first, the early move never goes to it, and a chat already on it stays there.
 
+**What the accounts share.** Your history, memory, settings, skills, plugins and MCP servers are one set for every account. An MCP server added, changed or removed on any account (`claude mcp add`, `claude mcp remove`), user-scope or a folder's own, reaches all of them before the next chat starts. Sign-ins to remote servers (OAuth via `/mcp`) and claude.ai connectors stay per account, as Claude Code keeps them.
+
 **From a terminal**, `longhaul` starts a chat (`-c` continues the latest, `-r <id>` resumes one) that it watches and moves at a limit. A chat moved to another account takes that account's connectors and artifacts, not the first one's. [Account switching](https://github.com/Noah-OS/longhaul/wiki/Account-Switching) has the rest.
 
 ## 5. From the VS Code chat
