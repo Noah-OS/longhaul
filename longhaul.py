@@ -4347,7 +4347,7 @@ def status_line(state: dict, paint: bool = False) -> str:
     gives: "account", as shown; "five" and "week", {"used", "resets" (a
     time as clock() shows it)} or None; "ctx", the context in tokens, or
     None; "event", None or {"kind": "question" (to, and at for a carry-on
-    at a reset), "waiting" (at, on), "stopped" (until), "refused" (where,
+    at a reset; cap, for a cap's question), "waiting" (at, on), "stopped" (until), "refused" (where,
     by: the accounts that keep the folder), "pending" (to, when: "turn" or
     "open") or "moved" (from, at)}; "update", a newer release, or None. An
     event at a limit, a choice pending or a message stopped takes the place
@@ -4372,7 +4372,10 @@ def status_line(state: dict, paint: bool = False) -> str:
     parts = None
     if kind == "question" and to:
         ask = (f"carry on {at}{'' if to == name else ' on ' + to}?" if at else f"move to {to}?")
-        parts = [f"{head} at limit", f"{ask} /accounts"]
+        cap = ev.get("cap")
+        held = (f"at cap {cap}%" if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99
+                else "at limit")
+        parts = [f"{head} {held}", f"{ask} /accounts"]
     elif kind == "waiting" and at:
         on = word("on")
         parts = [f"{head} at limit", f"carries on {at}{' on ' + on if on and on != name else ''}"]
@@ -4495,12 +4498,14 @@ def status_event(sid, name: str, record: dict, now: float):
         pid = q.get("relay_pid")
         if q.get("kind") in ("move", "first_reset") and isinstance(pid, int) and not isinstance(pid, bool) \
                 and pid > 0 and pid_alive(pid):
+            cap = q.get("cap")  # a cap's question (0.3.23): "at cap 25%", not "at limit"
+            capped = {"cap": cap} if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 99 else {}
             if q["kind"] == "move":
-                return {"kind": "question", "to": label_of(q["to"], listed)}
+                return {"kind": "question", "to": label_of(q["to"], listed), **capped}
             at = next((v for v in (as_number(q.get(k)) for k in ("carries_on_at", "to_resets_at", "resets_at"))
                        if v is not None), None)
             if at is not None:
-                return {"kind": "question", "to": label_of(q["to"], listed), "at": clock(at)}
+                return {"kind": "question", "to": label_of(q["to"], listed), "at": clock(at), **capped}
     w = read_json(chat_file(WAITS, sid))
     until = as_number(w.get("until")) if isinstance(w, dict) else None
     if until is not None and w.get("chat") == sid and isinstance(w.get("account"), str) and w["account"] \

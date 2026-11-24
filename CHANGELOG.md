@@ -2,6 +2,12 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+### Fixed
+
+- **While a cap's question is open, the status line says the cap, not a limit**: "personal at cap 25% · move to work? /accounts", in the terminal and in the VS Code panel's status entry. In 0.3.23 it read "personal at limit · …" though the account still had room.
+
 ## 0.3.23 - 2026-11-24
 
 A cap per account, and MCP servers shared both ways between your accounts.

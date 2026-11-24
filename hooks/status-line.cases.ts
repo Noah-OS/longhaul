@@ -60,6 +60,10 @@ export const CASES: StatusLineCase[] = [
      "given": {"account": "work", "five": {"used": 12, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
                "ctx": 88000, "event": null, "update": "0.3.9"},
      "line": "work · 5h 12% · wk 40% · ctx 88k · update 0.3.9"},
+    {"state": "At its cap, question open",
+     "given": {"account": "personal", "five": {"used": 26, "resets": "14:00"}, "week": {"used": 40, "resets": "Fri 02:00"},
+               "ctx": 88000, "event": {"kind": "question", "to": "work", "cap": 25}, "update": null},
+     "line": "personal at cap 25% · move to work? /accounts"},
 
     {"state": "The week near full: its reset, as the 5 hours'",
      "given": {"account": "work", "five": {"used": 12, "resets": "14:00"}, "week": {"used": 75, "resets": "Fri 02:00"},

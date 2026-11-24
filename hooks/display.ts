@@ -137,6 +137,7 @@ export const DEFAULT_NAME = 'default sign-in' // ~/.claude's own sign-in, "main"
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const text = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null)
 const halfUp = (v: number): number => Math.floor(v + 0.5) // as longhaul.py's half_up()
+const capOf = (v: unknown): boolean => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 99 // a cap's question
 const obj = (v: unknown): Record<string, any> => (v && typeof v === 'object' && !Array.isArray(v) ? v as any : {})
 
 export function line(state: unknown): string {
@@ -149,7 +150,7 @@ export function line(state: unknown): string {
   const owners = by.filter(n => text(n) !== null) as string[]
   let parts: string[] | null = null
   if (kind === 'question' && to)
-    parts = [`${name} at limit`, `${at ? `carry on ${at}${to === name ? '' : ` on ${to}`}?` : `move to ${to}?`} /accounts`]
+    parts = [`${name} ${capOf(ev.cap) ? `at cap ${ev.cap}%` : 'at limit'}`, `${at ? `carry on ${at}${to === name ? '' : ` on ${to}`}?` : `move to ${to}?`} /accounts`]
   else if (kind === 'waiting' && at) {
     const on = text(ev.on)
     parts = [`${name} at limit`, `carries on ${at}${on && on !== name ? ` on ${on}` : ''}`]
@@ -203,8 +204,9 @@ async function event($: any, lh: string, sid: string, name: string, nowMs: numbe
   const nowS = nowMs / 1000
   const { asked, waiting } = found()
   if (asked) {
-    if (asked.kind === 'move') return { kind: 'question', to: shown(asked.to, names) }
-    return { kind: 'question', to: shown(asked.to, names),
+    const cap = capOf(asked.cap) ? { cap: asked.cap } : {}
+    if (asked.kind === 'move') return { kind: 'question', to: shown(asked.to, names), ...cap }
+    return { kind: 'question', to: shown(asked.to, names), ...cap,
       at: clock(asked.carries_on_at ?? asked.to_resets_at ?? asked.resets_at, nowMs) }
   }
   if (waiting) return { kind: 'waiting', at: clock(waiting.until, nowMs), on: shown(waiting.account, names) }

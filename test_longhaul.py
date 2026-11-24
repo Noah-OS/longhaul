@@ -2459,6 +2459,21 @@ class StatusLineState(unittest.TestCase):
                                      "relay_pid": 2 ** 22 + 12345})
         self.assertFalse(self.line(self.reading(five=100), on="personal").startswith("personal at limit · move"))
 
+    def test_at_its_cap_with_a_question_open_it_says_the_cap_not_a_limit(self):
+        # 0.3.23's cap question read "personal at limit · move to work?" while the account had room left.
+        self.chat_file("questions", {"id": "q-0123456789ab", "chat": self.SID, "relay_pid": os.getpid(),
+                                     "asked_at": int(self.now), "kind": "move", "from": "personal", "limit": "cap",
+                                     "cap": 25, "resets_at": self.now + 3600, "to": "work", "to_resets_at": None,
+                                     "carries_on_at": None, "choices": ["move", "wait"]})
+        self.assertEqual(self.line(self.reading(five=26), on="personal"),
+                         "personal at cap 25% · move to work? /accounts")
+        for odd in ("25", 0, 100, True, 2.5):  # not a cap as cap_of() takes one: a limit's words
+            with self.subTest(cap=odd):
+                self.chat_file("questions", {**json.loads((self.home / "questions" / f"{self.SID}.json").read_text()),
+                                             "cap": odd})
+                self.assertEqual(self.line(self.reading(five=26), on="personal"),
+                                 "personal at limit · move to work? /accounts")
+
     def test_at_a_limit_waiting_to_carry_on(self):
         until = self.now + 3660
         self.chat_file("waits", {"chat": self.SID, "until": until, "account": "work", "why": "answered"})
