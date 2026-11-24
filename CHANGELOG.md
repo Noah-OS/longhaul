@@ -4,6 +4,14 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ## Unreleased
 
+### Added
+
+- **`longhaul connections`: which claude.ai connector or server sign-in each account lacks.** Since 0.3.23 the MCP servers' settings are shared between your accounts, but two things cannot be: claude.ai connectors, which are kept per claude.ai account, and sign-ins to servers (OAuth via `/mcp`), which Claude Code keeps per account. `longhaul connections` shows where each one is, so you can add or sign in to each once per account; it copies nothing and changes no setting. It runs `claude mcp list` on the default sign-in and on each account (each folder once), all at once and from an empty folder, so no project's servers are read. That command connects to each server to check it, so it takes a while: up to 90 seconds an account, and an account that takes longer, or fails, is named and left out. The report fits 80 columns: the connections missing on some account first, then those that need a sign-in or fail on one, then the rest on one line ("fine on every account: Claude Docs, Linear"); which accounts sign in as one email, and so hold the same connectors; and where to add a connector (claude.ai → Settings → Connectors) or sign in (`/mcp` in a chat on that account). A connector numbered on two accounts, "شات (2)" on one and "شات (3)" on the other, is taken as one kind and shown as "شات (2) / شات (3)"; two by one name on one account stay two. Only names and states are shown or kept, never a server's command or address, which may hold a path, a host or a token. `--json` gives the same as one JSON object, and `LONGHAUL_PLAIN=1` says "OK on" for ✔. The result is kept in `~/.longhaul/connections.json`, readable only by you, and `longhaul doctor` says under Accounts when you last checked and how many connections are not on every account ("Connections: last checked 14:05; 3 connections are not on every account"), from that file, without running `claude`. It runs in a terminal: a chat's Claude cannot run it.
+
+### Changed
+
+- **`longhaul -h` names `longhaul connections` in place of `longhaul allow ID`**, to stay on one screen. The refusal that calls for `allow` names it in full, and `longhaul help allow` has it.
+
 ### Fixed
 
 - **While a cap's question is open, the status line says the cap, not a limit**: "personal at cap 25% · move to work? /accounts", in the terminal and in the VS Code panel's status entry. In 0.3.23 it read "personal at limit · …" though the account still had room.

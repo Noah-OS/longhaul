@@ -179,6 +179,26 @@ Usage:
                           cap is checked from the status line's reading after
                           each request, so a long turn can pass it by a little.
                           /accounts does it with buttons
+  longhaul connections [--json]
+                          which claude.ai connector or server sign-in each
+                          account lacks. Connectors are kept per claude.ai
+                          account and sign-ins to servers per account, so
+                          neither can be shared as the servers' settings are:
+                          this shows where each is, and copies nothing and
+                          changes nothing. It runs `claude mcp list` on the
+                          default sign-in and on each account's folder, all at
+                          once and from an empty folder; that connects to each
+                          server to check it, so it takes a while (at most 90 s
+                          an account: one slower, or failing, is named and left
+                          out). The ones missing somewhere come first, then
+                          those to sign in to or failing, then the rest on one
+                          line, with where to add a connector (claude.ai,
+                          Settings, Connectors) or sign in (/mcp in a chat on
+                          that account). Names and states only, never a
+                          server's command or address; kept in
+                          LONGHAUL_HOME/connections.json, for the doctor's
+                          line. --json: the same as one JSON object. In a
+                          terminal: a chat's Claude cannot run it
   longhaul use NAME [--chat ID] the chat this runs in, or chat ID (a short id
                           works), runs on NAME from now on: a VS Code panel
                           chat moves the next time Claude is idle in it, any
@@ -453,7 +473,9 @@ Usage:
                           first in place of the check, cross and warning signs,
                           ", " in place of the middle dot, and no mark on the
                           focused line; in /accounts, the doctor, the status
-                          line and the panel's status entry
+                          line and the panel's status entry; and in `longhaul
+                          connections`, "OK on" for the check, "; " for the
+                          dot and words for the arrow
   longhaul pipe [--name L] [--account A] [--swap] [--switch MODE] [--no-git-sign-in] -- ARGS
                           another program drives claude over stream-json. At
                           a limit the session moves only with --swap and
@@ -485,6 +507,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -3029,6 +3052,335 @@ def mcp_shared_at():
     found = read_json(LONGHAUL_HOME / MCP_RECORD)
     at = found.get("shared_at") if isinstance(found, dict) else None
     return at if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+# ---------------------------------------------------------------- connections
+
+# `longhaul connections` (the owner, 2026-11-24: "a connection is connected
+# once and shared"). sync_mcp() shares the servers' settings between the
+# accounts, but two things cannot be shared: a claude.ai connector, kept per
+# claude.ai account at Anthropic, and a sign-in to a server (OAuth via
+# /mcp), kept per account by Claude Code. This runs `claude mcp list` on
+# each sign-in and shows which is missing, or not signed in, where, so each
+# is fixed once per account. It only reads: it never changes a setting.
+CONNECTIONS = "connections.json"  # under LONGHAUL_HOME: the last check, names and classes only, for the doctor
+# How long `claude mcp list` may take on one sign-in: it connects to each
+# server to check it, and one that does not answer holds it up.
+CONNECTIONS_TIMEOUT = setting("LONGHAUL_CONNECTIONS_TIMEOUT", 90, float, minimum=1)
+# A server's state, by what a person does about it: nothing; sign in
+# (/mcp); reconnect or fix it; let it run (pending approval, disabled,
+# blocked by policy); and a status this version does not know.
+CONNECTION_CLASSES = ("connected", "needs_sign_in", "failing", "off", "other")
+# The report's words before the sign-ins a connection is so on, after "✔"
+# for the connected ones; "missing" for a sign-in that answered without it.
+CONNECTION_WORDS = {"needs_sign_in": "sign in on", "failing": "failing on", "off": "not enabled on",
+                    "other": "state unknown on", "missing": "missing on"}
+CONNECTOR_PREFIX = "claude.ai "  # how `claude mcp list` names a claude.ai connector; the report leaves it out
+CONNECTIONS_NEVER = ("Connections: never checked; `longhaul connections` shows which connector or sign-in is "
+                     "missing on which account")
+
+
+def connection_class(status: str) -> str:
+    """CONNECTION_CLASSES's word for the status `claude mcp list` prints
+    after a server's " - ": "✔ Connected" ("✓ Connected" in older
+    versions), "! Needs authentication", "! Connected · tools fetch
+    failed", "✘ Failed to connect", "✘ Connection error", "⏸ Pending
+    approval", "⊘ Disabled for this project", "✘ Blocked by enterprise
+    managed policy". Read by its words, else by its first mark; a detail
+    after " — " is not read."""
+    text = status.split(" — ", 1)[0].strip()
+    words = text.lstrip("✔✓✘✗!⏸⊘⚠? ").casefold()
+    if "fetch failed" in words or words.startswith(("failed", "connection error", "error")):
+        return "failing"
+    if words.startswith(("needs auth", "needs sign")):
+        return "needs_sign_in"
+    if words.startswith(("pending approval", "disabled", "blocked")):
+        return "off"
+    if words.startswith("connected"):
+        return "connected"
+    return {"✔": "connected", "✓": "connected", "✘": "failing", "✗": "failing", "⏸": "off",
+            "⊘": "off"}.get(text[:1], "other")
+
+
+def connections_parse(text: str) -> list:
+    """The servers in `claude mcp list`'s output, as [{"name", "class"}] in
+    its order. A server's line is NAME: COMMAND-OR-URL (TRANSPORT) - STATUS:
+    its name is before the first ": ", its status after the last " - "
+    that reads as one (a detail after the status may hold " - " too). The
+    command or address and the detail may hold paths, hosts or tokens, so
+    they are never kept. A line without ": " and " - " (the first one,
+    "Checking MCP server health…") is no server; a name twice is kept once."""
+    servers, seen = [], set()
+    for line in text.splitlines():
+        name, sep, rest = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).strip().partition(": ")
+        name = shown(name.strip(), 80)
+        if not sep or " - " not in rest or not name or name in seen:
+            continue
+        statuses = rest.split(" - ")[1:]
+        status = next((s for s in reversed(statuses) if connection_class(s) != "other"), statuses[-1])
+        seen.add(name)
+        servers.append({"name": name, "class": connection_class(status)})
+    return servers
+
+
+def connections_sign_ins(accounts: list) -> list:
+    """The sign-ins to check, each config folder once, as {"name",
+    "label", "acct"}: the default sign-in first (~/.claude, run with
+    CLAUDE_CONFIG_DIR unset; called after the account on the list whose
+    folder resolves to ~/.claude, if one does, as mcp_files() calls it),
+    then each account on the list in its order. An account whose folder
+    another sign-in already has is that sign-in; one whose config_dir is
+    not text is passed over, as sync_mcp() passes it."""
+    usable = [a for a in accounts if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)]
+    seen = {os.path.realpath(DEFAULT_CONFIG)}
+    named = next((a["name"] for a in usable if os.path.realpath(config_of(a)) in seen), None)
+    found = [{"name": named or DEFAULT_KEY, "label": named or DEFAULT_LABEL,
+              "acct": {"name": named or DEFAULT_KEY, "config_dir": None}}]
+    for a in usable:
+        where = os.path.realpath(config_of(a))
+        if where not in seen:
+            seen.add(where)
+            found.append({"name": a["name"], "label": a["name"], "acct": a})
+    return found
+
+
+def connections_check(acct: dict) -> dict:
+    """`claude mcp list` on one sign-in (`acct`, as env_for() takes it):
+    {"status": "ok", "servers": connections_parse()'s}, or "timeout" or
+    "failed" with "why" and no servers. Run without a chat's variables
+    (env_for()), so it is not taken for this chat; from a fresh empty
+    folder, so no project's .mcp.json and no folder's own servers are
+    read; with nothing on stdin; and stopped after CONNECTIONS_TIMEOUT.
+    What it prints on stderr may name a server's address: it is never
+    read. A folder that is not there is not signed in: claude is not run
+    on it, which could make it."""
+    folder = config_of(acct)
+    if not folder.is_dir():
+        fix = f" (`longhaul setup {acct['name']}`)" if acct.get("config_dir") else ""
+        return {"status": "failed", "why": f"{home_path(str(folder))} is missing{fix}", "servers": []}
+    with tempfile.TemporaryDirectory(prefix="longhaul-connections-") as empty:
+        try:
+            done = subprocess.run([CLAUDE, "mcp", "list"], cwd=empty, env=env_for(acct), stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
+                                  timeout=CONNECTIONS_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "why": f"`claude mcp list` did not answer within {CONNECTIONS_TIMEOUT:g} s",
+                    "servers": []}
+        except OSError as e:
+            return {"status": "failed", "why": f"claude could not be run ({e.strerror or type(e).__name__})",
+                    "servers": []}
+    if done.returncode != 0:
+        return {"status": "failed", "why": f"`claude mcp list` failed (exit code {done.returncode})", "servers": []}
+    return {"status": "ok", "servers": connections_parse(done.stdout)}
+
+
+def connection_shown(name: str) -> str:
+    """A connection's name in the report: a connector's without its
+    "claude.ai " (CONNECTOR_PREFIX)."""
+    return name[len(CONNECTOR_PREFIX):] if name.startswith(CONNECTOR_PREFIX) else name
+
+
+def connections_compare(checked: list) -> list:
+    """The report's rows, in its order, from each sign-in's check
+    (`checked`: {"label", "status", "servers"}, in the sign-ins' order):
+    per connection, its name as shown, its names as `claude mcp list`
+    gives them, the labels of the sign-ins it is on in each class, and
+    "missing": those that answered without it. A sign-in that did not
+    answer is in none. Names are matched whole; then rows of one name but
+    for a number, "شات (2)" and "شات (3)", on no sign-in in common are
+    taken as one, the row on the most sign-ins first: claude.ai numbers a
+    connector whose name another of that account's has, so on two
+    accounts the same kind may carry two numbers, while two by one name on
+    one account are two (the owner's lists, 2026-11-24). Those missing on
+    a sign-in come first, then those not connected on one, then the rest,
+    each part by name."""
+    answered = [c for c in checked if c["status"] == "ok"]
+    on = collections.defaultdict(dict)  # name: {label: class}
+    for c in answered:
+        for server in c["servers"]:
+            on[server["name"]].setdefault(c["label"], server["class"])
+    kinds = collections.defaultdict(list)  # a name but for its number: [[names], {label: class}]
+    for name in sorted(on, key=lambda n: (-len(on[n]), n.casefold(), n)):
+        same = kinds[re.sub(r" \(\d+\)$", "", name)]
+        mate = next((k for k in same if not set(k[1]) & set(on[name])), None)
+        if mate:
+            mate[0].append(name)
+            mate[1].update(on[name])
+        else:
+            same.append([[name], dict(on[name])])
+    rows = []
+    for names, where in (k for same in kinds.values() for k in same):
+        names = sorted(names, key=lambda n: (n.casefold(), n))
+        row = {"name": " / ".join(map(connection_shown, names)), "names": names}
+        for kind in CONNECTION_CLASSES:
+            row[kind] = [c["label"] for c in answered if where.get(c["label"]) == kind]
+        row["missing"] = [c["label"] for c in answered if c["label"] not in where]
+        rows.append(row)
+    shown_as = collections.Counter(r["name"] for r in rows)
+    for r in rows:  # a server named as a connector is shown without the prefix: both keep their whole names
+        if shown_as[r["name"]] > 1:
+            r["name"] = " / ".join(r["names"])
+
+    def rank(r):
+        return 0 if r["missing"] else 1 if any(r[k] for k in CONNECTION_CLASSES[1:]) else 2
+
+    return sorted(rows, key=lambda r: (rank(r), r["name"].casefold(), r["name"]))
+
+
+def connections_same_email(accounts: list, sign_ins: list) -> list:
+    """The sign-ins that are one claude.ai account, by the doctor's
+    same_email(), as lists of their labels in the sign-ins' order: they
+    hold the same connectors. An account is the sign-in whose folder it
+    uses."""
+    label_at = {os.path.realpath(config_of(s["acct"])): s["label"] for s in sign_ins}
+    order = [s["label"] for s in sign_ins]
+    of = {a["name"]: label_at.get(os.path.realpath(config_of(a))) for a in accounts
+          if a.get("config_dir") is None or isinstance(a.get("config_dir"), str)}
+    twins, with_default = same_email(accounts)
+    groups = [{of.get(n) for n in names} for names in twins]
+    if with_default:
+        mine = next((g for g in groups if g & {of.get(n) for n in with_default}), None)
+        if mine is None:
+            mine = set()
+            groups.append(mine)
+        mine |= {order[0]} | {of.get(n) for n in with_default}
+    found = []
+    for g in groups:
+        labels = [label for label in order if label in g]
+        if len(labels) > 1 and labels not in found:
+            found.append(labels)
+    return found
+
+
+def connections_row(name: str, parts: list, width: int, sep: str) -> list:
+    """One connection's lines: its name in a column `width` wide (a longer
+    name has a line of its own), then its parts joined by `sep` while they
+    fit 80 columns; a part that does not starts the next line, under the
+    first, and one too long for a line is wrapped."""
+    indent = " " * (width + 4)
+    lines = [] if len(name) <= width else [f"  {name}"]
+    prefix = f"  {name.ljust(width)}  " if len(name) <= width else indent
+    current = ""
+    for part in parts + [None]:
+        if part is not None and current and len(prefix) + len(current) + len(sep) + len(part) <= 80:
+            current += sep + part
+            continue
+        if current:
+            lines.extend(textwrap.wrap(current, 80, initial_indent=prefix, subsequent_indent=indent,
+                                       break_on_hyphens=False, break_long_words=False))
+            prefix = indent
+        current = part
+    return lines
+
+
+def connections_lines(result: dict) -> list:
+    """The report a person reads in one go, within 80 columns: the
+    connections missing on some sign-in, then those that need a sign-in or
+    fail on one, then those fine everywhere on one line; the sign-ins not
+    checked, and why; which are one claude.ai account; and where each is
+    fixed, by hand, once per account. With LONGHAUL_PLAIN=1, or a terminal
+    that cannot show the marks, "OK on" for ✔, "; " for ·, and words for →
+    (doctor_marks()). No colour, so nothing is said by colour alone."""
+    plain = doctor_marks()[0] is DOCTOR_PLAIN
+    sep, ok, then = ("; ", "OK on ", ", then ") if plain else (" · ", "✔ ", " → ")
+
+    def said(text):
+        return textwrap.wrap(text, 80, break_on_hyphens=False, break_long_words=False)
+
+    rows = result["connections"]
+    lines = ["Connections on each account (claude mcp list, checked now)"]
+    worth = [r for r in rows if r["missing"] or any(r[k] for k in CONNECTION_CLASSES[1:])]
+    width = min(max((len(r["name"]) for r in worth), default=0), 24)
+    for r in worth:
+        parts = [ok + ", ".join(r["connected"])] if r["connected"] else []
+        parts += [f"{CONNECTION_WORDS[k]} {', '.join(r[k])}" for k in (*CONNECTION_CLASSES[1:], "missing") if r[k]]
+        lines += connections_row(r["name"], parts, width, sep)
+    fine = [r["name"] for r in rows if r not in worth]
+    if fine:
+        lines += textwrap.wrap("fine on every account: " + ", ".join(fine), 80, initial_indent="  ",
+                               subsequent_indent="    ", break_on_hyphens=False, break_long_words=False)
+    for c in result["accounts"]:
+        if c["status"] != "ok":
+            lines += said(f"Not checked on {c['label']}: {c['why']}.")
+    if not any(c["status"] == "ok" for c in result["accounts"]):
+        lines += said("No account answered: nothing to compare, and the last check is kept.")
+    for labels in result["same_email"]:
+        lines += said(f"{hook_and(labels)} are one claude.ai account (same email): they hold the same connectors.")
+    if any(r["missing"] for r in rows):
+        lines += said(f"Add a connector at claude.ai{then}Settings{then}Connectors, signed in as that account.")
+    if any(r["needs_sign_in"] or r["failing"] for r in rows):
+        lines += said("To sign in to one, or reconnect it: /mcp in a chat on that account.")
+    return lines
+
+
+def connections_cmd(opts) -> int:
+    """`longhaul connections [--json]` (the owner, 2026-11-24): `claude mcp
+    list` on every sign-in (connections_sign_ins()), all at once, each
+    stopped after CONNECTIONS_TIMEOUT; then the report (connections_lines()),
+    or with --json the same as one JSON object: {"checked_at", "accounts":
+    [{"name", "label", "status": ok|timeout|failed, "servers": [{"name",
+    "class"}], "why" when not ok}], "connections": connections_compare()'s
+    rows, "same_email": [[labels]]}. Names and classes only, never a
+    command or an address. Kept, with "version", in LONGHAUL_HOME/
+    CONNECTIONS (0600) for the doctor, when one sign-in answered at least;
+    exit 1 when none did. In a terminal: bin/longhaul runs it from no chat,
+    since it runs a claude per account. It changes no setting."""
+    accounts, problem = read_accounts_file()
+    if problem:
+        print(f"longhaul connections: {unreadable_text(problem)}", file=sys.stderr)
+        return 2
+    sign_ins = connections_sign_ins(accounts)
+    if not opts.json and sys.stderr.isatty():
+        print(f"Running `claude mcp list` on {plural(len(sign_ins), 'sign-in')} at once; it connects to each server "
+              f"to check it, so this can take up to {CONNECTIONS_TIMEOUT:g} s…", file=sys.stderr, flush=True)
+    found = [None] * len(sign_ins)
+
+    def check(i):
+        found[i] = connections_check(sign_ins[i]["acct"])
+
+    threads = [threading.Thread(target=check, args=(i,), daemon=True) for i in range(len(sign_ins))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    checked = [{"name": s["name"], "label": s["label"], **f} for s, f in zip(sign_ins, found)]
+    result = {"checked_at": time.time(), "accounts": checked, "connections": connections_compare(checked),
+              "same_email": connections_same_email(accounts, sign_ins)}
+    answered = any(c["status"] == "ok" for c in checked)
+    if answered:
+        try:
+            write_json(LONGHAUL_HOME / CONNECTIONS, {"version": 1, **result})
+        except OSError as e:
+            print(f"longhaul connections: the result was not kept ({e.strerror or type(e).__name__})", file=sys.stderr)
+    if opts.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print("\n".join(connections_lines(result)))
+    return 0 if answered else 1
+
+
+def connections_said() -> str:
+    """The doctor's line under Accounts, from the last check kept in
+    CONNECTIONS, never from a claude run: when it was, and how many
+    connections were not on every account, else how many needed a sign-in
+    or failed on one; CONNECTIONS_NEVER with none, or one it cannot read."""
+    found = read_json(LONGHAUL_HOME / CONNECTIONS)
+    at = found.get("checked_at") if isinstance(found, dict) else None
+    rows = found.get("connections") if isinstance(found, dict) else None
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not isinstance(rows, list):
+        return CONNECTIONS_NEVER
+    rows = [r for r in rows if isinstance(r, dict)]
+    missing = sum(1 for r in rows if r.get("missing"))
+    trouble = sum(1 for r in rows if any(r.get(k) for k in CONNECTION_CLASSES[1:]))
+    when = f"Connections: last checked {clock(at)}; "
+    if missing:
+        return when + f"{missing} connection{'s are' if missing > 1 else ' is'} not on every account; " \
+                      "`longhaul connections` to see"
+    if trouble:
+        one = trouble == 1
+        return when + f"{trouble} need{'s' * one} a sign-in or fail{'s' * one} on some account; " \
+                      "`longhaul connections` to see"
+    return when + "each is on every account and connected"
+
 
 
 def reopen_delay(crashes: int, base: int) -> int:
@@ -20404,6 +20756,25 @@ def doctor_default_email():
     return email.strip().casefold() if isinstance(email, str) and email.strip() else None
 
 
+def same_email(accounts: list) -> tuple:
+    """Who signs in as one email, by accounts.json's emails and the default
+    sign-in's (doctor_default_email()), compared in any case and never
+    shown or logged: (the lists of two or more accounts' names that share
+    one, the names of the accounts on a folder of their own that share the
+    default sign-in's). Two such are one subscription (the doctor) and one
+    claude.ai account, with one set of connectors (`longhaul connections`)."""
+    by_email = collections.defaultdict(list)
+    for a in accounts:
+        if isinstance(a.get("email"), str) and a["email"].strip():
+            by_email[a["email"].strip().casefold()].append(a["name"])
+    default = doctor_default_email()
+    on_default = os.path.realpath(DEFAULT_CONFIG)
+    with_default = [a["name"] for a in accounts
+                    if default and isinstance(a.get("email"), str) and a["email"].strip().casefold() == default
+                    and a.get("config_dir") and os.path.realpath(config_of(a)) != on_default]
+    return [names for names in by_email.values() if len(names) > 1], with_default
+
+
 def doctor_accounts(quick: bool = False) -> dict:
     """7. The accounts: accounts.json readable, each account's folder
     there, the folders each is kept for, "(fallback)" after the name of
@@ -20411,9 +20782,12 @@ def doctor_accounts(quick: bool = False) -> dict:
     after one with a cap, and until when it is at it (2026-11-24); and two
     accounts that sign in as one email (the default sign-in among them)
     are one subscription with one allowance, so a switch between them
-    never helps (the owner's Mac, 2026-10-25). Names, never emails. Once
-    MCP servers have been shared between the accounts, a line said and not
-    judged says when last (mcp_shared_at()). Not quick, another names the
+    never helps (the owner's Mac, 2026-10-25; same_email()). Names, never
+    emails. Once MCP servers have been shared between the accounts, a line
+    said and not judged says when last (mcp_shared_at()); another, from
+    the last `longhaul connections` kept, says when the connections were
+    checked and how many are not on every account (connections_said()):
+    the doctor never runs claude for it. Not quick, another names the
     ~/.claude-* folders no account uses (doctor_leftovers())."""
     accounts, problem = read_accounts_file()
     where = home_path(str(LONGHAUL_HOME / "accounts.json"))
@@ -20449,25 +20823,18 @@ def doctor_accounts(quick: bool = False) -> dict:
         else:
             items.append(("ok", f"{named}: {folder}, {where_allowed(a)}", None))
     same = "keep one of them, or give the other its own subscription"
-    by_email = collections.defaultdict(list)
-    for a in accounts:
-        if isinstance(a.get("email"), str) and a["email"].strip():
-            by_email[a["email"].strip().casefold()].append(a["name"])
-    for names in by_email.values():
-        if len(names) > 1:
-            items.append(("warn", f"{' and '.join(names)} are one subscription (same email): a switch between them "
-                                  "never helps", same))
-    default = doctor_default_email()
-    on_default = os.path.realpath(DEFAULT_CONFIG)
-    for a in accounts:
-        if default and isinstance(a.get("email"), str) and a["email"].strip().casefold() == default \
-                and a.get("config_dir") and os.path.realpath(config_of(a)) != on_default:
-            items.append(("warn", f"{a['name']} and the default sign-in ({home_path(str(DEFAULT_CONFIG))}) are one "
-                                  "subscription (same email): a switch between them never helps", same))
+    twins, with_default = same_email(accounts)
+    for names in twins:
+        items.append(("warn", f"{' and '.join(names)} are one subscription (same email): a switch between them "
+                              "never helps", same))
+    for name in with_default:
+        items.append(("warn", f"{name} and the default sign-in ({home_path(str(DEFAULT_CONFIG))}) are one "
+                              "subscription (same email): a switch between them never helps", same))
     shared = mcp_shared_at()  # said once they have been (sync_mcp(), 2026-11-24), not judged
     if shared is not None:
         items.append((None, f"MCP servers are shared both ways between the accounts before each chat; last shared "
                             f"{clock(shared)}", None))
+    items.append((None, connections_said(), None))  # from the last check kept, never a claude run (2026-11-24)
     left = [] if quick else doctor_leftovers(accounts)
     if left:
         them = "it" if len(left) == 1 else "them"
@@ -21786,7 +22153,9 @@ HELP_HOOKS_SAID = "The plugin's hooks, its pane and other programs run these; yo
 # types, by what they are for, one line each with their most common
 # options; at most 50 lines of 80 columns in all (a test holds it there).
 # Each command here has its entries in the Usage block, which `help
-# COMMAND` prints, and a test checks that too.
+# COMMAND` prints, and a test checks that too. `longhaul allow ID` made
+# room for `longhaul connections` (2026-11-24): the refusal that calls for
+# it names it in full, and `help allow` has it.
 HELP_GROUPS = (
     ("Start Claude here, with Remote Control on", (
         ("longhaul", "a new chat"),
@@ -21802,7 +22171,7 @@ HELP_GROUPS = (
         ("longhaul folders NAME", "the folders NAME runs only in: --add PATH"),
         ("longhaul fallback NAME on", "NAME only when no other account has room"),
         ("longhaul cap NAME 25", "use at most 25% of NAME's 5-hour and week"),
-        ("longhaul allow ID", "let a refused chat's prompts through"),
+        ("longhaul connections", "which connector or sign-in each account lacks"),
         ("longhaul remove NAME", "NAME off the list; its sign-in folder kept"))),
     ("At a limit", (
         ("longhaul switch ask|auto|wait", "ask first, move by itself, or stay and wait"),
@@ -21911,7 +22280,7 @@ def main(argv: list[str]) -> int:
                             "stop-failure", "quota-note", "trial",
                             "vscode", "models", "update", "doctor", "precompact", "uninstall", "filter",
                             "models-hook", "allow", "switch", "answer", "use", "repair", "panel", "activity",
-                            "login"):
+                            "login", "connections"):
         cmd, rest = argv[0], argv[1:]
         p = argparse.ArgumentParser(prog=f"longhaul {cmd}")
         if cmd in CODEX_HOOK_COMMANDS:
@@ -21998,6 +22367,10 @@ def main(argv: list[str]) -> int:
                            help="a whole number from 1 to 99: the share of each of its windows, the 5-hour and the "
                                 "weekly one, that Longhaul uses before it treats the account as at its limit until "
                                 "that window resets; off: no cap (with neither: its cap and where it stands)")
+        if cmd == "connections":
+            p.add_argument("--json", action="store_true",
+                           help="the same as one JSON object: each account's state and servers, by name and class "
+                                "only, and the comparison")
         if cmd == "folders":
             p.add_argument("name", help="the account (with no option: where it may be used; it only reads)")
             p.add_argument("--add", action="append", metavar="PATH",
@@ -22117,7 +22490,7 @@ def main(argv: list[str]) -> int:
                 "quota-note": quota_note, "precompact": precompact, "filter": filter_cmd, "models-hook": models_hook,
                 "trial": trial, "update": update, "doctor": doctor, "uninstall": uninstall, "allow": allow_cmd,
                 "switch": switch_cmd, "answer": answer_cmd, "use": use_cmd, "repair": repair,
-                "panel": panel_cmd, "activity": activity}[cmd](opts)
+                "panel": panel_cmd, "activity": activity, "connections": connections_cmd}[cmd](opts)
 
     extra: list[str] = []
     if "--" in argv:

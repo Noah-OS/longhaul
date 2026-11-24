@@ -24656,7 +24656,7 @@ class RemoveDeleteFolder(unittest.TestCase):
         said = "left over, used by no account: ~/.claude-empty (0 KB), ~/.claude-old (3 KB); delete them by hand if " \
                "nothing else uses them"
         self.assertIn((None, said, None), full["items"])
-        self.assertEqual(full["items"][:2], quick["items"])
+        self.assertEqual(full["items"][:3], quick["items"], "the same lines, the connections' among them, first")
         self.assertIn((None, "left over, used by no account: ~/.claude-empty (0 KB), ~/.claude-max (1 KB), "
                              "~/.claude-old (3 KB); delete them by hand if nothing else uses them", None), fewer["items"])
         self.assertFalse((self.home / "longhaul.log").exists(), "nothing logged")
@@ -25104,7 +25104,7 @@ class Folders(unittest.TestCase):
         items = {text: mark for mark, text, *_ in c["items"]}
         self.assertEqual(items, {"personal-1: ~/.claude-personal-1, everywhere (its folders include /)": "ok",
                                  "spare: ~/.claude-spare, used nowhere: personal-1 keeps every folder": "warn",
-                                 "work: ~/.claude-work, only in ~/work": "ok"})
+                                 "work: ~/.claude-work, only in ~/work": "ok", longhaul.CONNECTIONS_NEVER: None})
         self.assertIn("`longhaul folders spare --add PATH`", c["step"])
 
 
@@ -25577,7 +25577,8 @@ class Fallback(unittest.TestCase):
                 mock.patch.object(longhaul, "DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"):
             c = longhaul.doctor_accounts()
         self.assertEqual([text for _, text, *_ in c["items"]], ["personal-1: ~/.claude-personal-1, anywhere",
-                                                               "work (fallback): ~/.claude-work, only in ~/work"])
+                                                               "work (fallback): ~/.claude-work, only in ~/work",
+                                                               longhaul.CONNECTIONS_NEVER])
 
 
 class Cap(unittest.TestCase):
@@ -25772,7 +25773,7 @@ class Cap(unittest.TestCase):
         self.assertEqual([text for _, text, *_ in c["items"]], [
             "personal: ~/.claude-personal, anywhere",
             f"work (cap 25%, at it until {longhaul.clock(resets)}): ~/.claude-work, anywhere",
-            "team (fallback, cap 50%): ~/.claude-team, anywhere"])
+            "team (fallback, cap 50%): ~/.claude-team, anywhere", longhaul.CONNECTIONS_NEVER])
 
     def test_status_json_gives_each_accounts_cap_and_until_when_it_is_at_it(self):
         self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
@@ -26285,6 +26286,419 @@ class CapRelay(unittest.TestCase):
         q = self.question()
         self.assertEqual(q["kind"], "first_reset", "every account is at its limit or its cap")
         self.assertEqual(q["to"], "Pro")
+
+
+class Connections(unittest.TestCase):
+    """`longhaul connections` (the owner, 2026-11-24: "a connection is
+    connected once and shared"). sync_mcp() shares the servers' settings,
+    but a claude.ai connector is kept per claude.ai account, at Anthropic,
+    and a sign-in to a server per account, by Claude Code: neither can be
+    shared. This runs `claude mcp list` on each sign-in and shows which is
+    missing where, by name and state only, never a server's command or
+    address. Every path is scratch, HOME too; the claude is fake_claude.py,
+    which prints each config folder's fake-mcp-list.txt."""
+
+    SECRET = "sk-ant-oat01-T0kenShapedSecret_0123456789abcdef"
+    URL = f"https://mcp.example.com/v1/sse?access_token={SECRET}&team=amie"
+    LEAKS = (SECRET, "mcp.example.com", "access_token", "/opt/tools", "SdkError", "Request to", "(HTTP)", "(stdio)")
+
+    # The report for the owner's five sign-ins (five()): what is missing
+    # somewhere first, then what needs a sign-in or fails, then the rest on
+    # one line; each part on the row's line while it fits 80 columns.
+    FIVE = [
+        "Connections on each account (claude mcp list, checked now)",
+        "  Canva              ✔ amie, unix",
+        "                     missing on default sign-in, personal-1, personal-2",
+        "  ElevenLabs (2)     sign in on default sign-in, personal-1, personal-2",
+        "                     missing on amie, unix",
+        "  Gmail              ✔ personal-1, personal-2 · failing on default sign-in",
+        "                     missing on amie, unix",
+        "  Slack              ✔ default sign-in, personal-1 · sign in on amie",
+        "                     failing on personal-2 · missing on unix",
+        "  zid                failing on unix",
+        "                     missing on default sign-in, amie, personal-1, personal-2",
+        "  شات (2) / شات (3)  ✔ amie, unix",
+        "                     missing on default sign-in, personal-1, personal-2",
+        "  fine on every account: Claude Docs, codegraph, Linear",
+        "default sign-in and personal-2 are one claude.ai account (same email): they hold",
+        "the same connectors.",
+        "Add a connector at claude.ai → Settings → Connectors, signed in as that account.",
+        "To sign in to one, or reconnect it: /mcp in a chat on that account.",
+    ]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        (self.tmp / "claude").mkdir()
+
+    def env(self, **extra_env):
+        env = dict(os.environ, HOME=str(self.tmp), LONGHAUL_HOME=str(self.home),
+                   LONGHAUL_DEFAULT_CONFIG_DIR=str(self.tmp / "claude"),
+                   LONGHAUL_DEFAULT_GLOBAL_JSON=str(self.tmp / "claude.json"),
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_claude.py"), LONGHAUL_NO_NOTIFY="1")
+        for k in ("LONGHAUL_PLAIN", "LONGHAUL_CONNECTIONS_TIMEOUT", "CLAUDE_CONFIG_DIR", *Checkpoint.SESSION_VARS,
+                  *longhaul.SESSION_ENV):
+            env.pop(k, None)
+        env.update(extra_env)
+        return env
+
+    def longhaul(self, *args, **extra_env):
+        return subprocess.run([sys.executable, str(HERE / "longhaul.py"), *args], env=self.env(**extra_env),
+                              cwd=str(self.tmp), capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+
+    def write_accounts(self, *accounts):
+        (self.home / "accounts.json").write_text(json.dumps(list(accounts)))
+
+    def listing(self, folder: str, *servers, **how):
+        """`claude mcp list`'s lines for the config folder `folder`, under
+        the scratch HOME: each connector at the fake URL with its token,
+        each other server a command holding the token; `how`, the fake's
+        sleep, exit and stderr."""
+        path = self.tmp / folder
+        path.mkdir(parents=True, exist_ok=True)
+        lines = [f"{name}: " + (f"{self.URL} (HTTP)" if name.startswith("claude.ai ")
+                                else f"/opt/tools/{name} serve --token {self.SECRET} (stdio)") + f" - {status}\n"
+                 for name, status in servers]
+        (path / "fake-mcp-list.txt").write_text("".join(lines))
+        if how:
+            (path / "fake-mcp-list.json").write_text(json.dumps(how))
+
+    def calls(self) -> list:
+        path = self.home / "mcp-calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def five(self):
+        """The owner's five sign-ins as his lists showed them (2026-11-24):
+        the default sign-in and personal-2 sign in as one email; amie and
+        unix hold other connectors; one connector is numbered on each of
+        two accounts. The commands and addresses are the fake URL."""
+        self.write_accounts({"name": "amie", "config_dir": "~/.claude-amie", "email": "amie@example.com"},
+                            {"name": "unix", "config_dir": "~/.claude-unix", "email": "unix@example.com"},
+                            {"name": "personal-1", "config_dir": "~/.claude-personal-1", "email": "one@example.com"},
+                            {"name": "personal-2", "config_dir": "~/.claude-personal-2", "email": "me@example.com"})
+        (self.tmp / "claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "Me@Example.com"}}))
+        ok, auth = "✔ Connected", "! Needs authentication"
+        docs, linear, graph = ("claude.ai Claude Docs", ok), ("claude.ai Linear", ok), ("codegraph", ok)
+        self.listing("claude", docs, ("claude.ai Slack", ok), ("claude.ai ElevenLabs (2)", auth),
+                     ("claude.ai Gmail", f"! Connected · tools fetch failed — Request to {self.URL} failed"),
+                     linear, graph)
+        self.listing(".claude-amie", docs, ("claude.ai Canva", ok), ("claude.ai Slack", auth), linear,
+                     ("claude.ai شات (2)", ok), graph)
+        self.listing(".claude-unix", ("claude.ai Claude Docs", "✓ Connected"), ("claude.ai Canva", ok), linear,
+                     ("claude.ai شات (3)", ok), ("claude.ai zid", f"✘ Failed to connect — SdkError dialing {self.URL}"),
+                     graph)
+        self.listing(".claude-personal-1", docs, ("claude.ai Slack", ok), ("claude.ai ElevenLabs (2)", auth),
+                     ("claude.ai Gmail", ok), linear, graph)
+        self.listing(".claude-personal-2", docs,
+                     ("claude.ai Slack", f'✘ Failed to connect — MCP server "claude.ai Slack" - {self.URL} refused'),
+                     ("claude.ai ElevenLabs (2)", auth), ("claude.ai Gmail", ok), linear, graph)
+
+    def test_each_status_claude_mcp_list_prints_is_read_as_a_name_and_a_class_only(self):
+        text = "\n".join([
+            "Checking MCP server health…", "",
+            f"claude.ai Claude Docs: {self.URL} (HTTP) - ✔ Connected",
+            f"claude.ai ElevenLabs (2): {self.URL} (HTTP) - ! Needs authentication",
+            f"claude.ai Gmail: {self.URL} (HTTP) - ! Connected · tools fetch failed — Re…",
+            f'claude.ai Slack: {self.URL} (HTTP) - ✘ Failed to connect — MCP server "claude.ai Slack" - {self.URL}',
+            f"claude.ai zid: {self.URL} (HTTP) - ✘ Failed to connect — SdkError dialing {self.URL}",
+            "old: npx -y old-server (stdio) - ✓ Connected",
+            "broken: node server.js (stdio) - ✘ Connection error",
+            "project-one: node a.js (stdio) - ⏸ Pending approval (run `claude` to approve)",
+            "quiet: node b.js (stdio) - ⊘ Disabled for this project (re-enable via /mcp)",
+            f"banned: {self.URL} (HTTP) - ✘ Blocked by enterprise managed policy",
+            "odd: node c.js (stdio) - ? Something new",
+            f"claude.ai شات (2): {self.URL} (HTTP) - ✔ Connected",
+            "with-colon: node -e \"console.log('a: b - c')\" (stdio) - ✔ Connected",
+            "\x1b[32mtinted\x1b[0m: node d.js (stdio) - \x1b[32m✔ Connected\x1b[0m",
+            "a line with neither separator",
+            "No MCP servers configured. Use `claude mcp add` to add a server.",
+            "nameless - ✔ Connected"])
+        found = longhaul.connections_parse(text)
+        self.assertEqual(found, [
+            {"name": "claude.ai Claude Docs", "class": "connected"},
+            {"name": "claude.ai ElevenLabs (2)", "class": "needs_sign_in"},
+            {"name": "claude.ai Gmail", "class": "failing"},
+            {"name": "claude.ai Slack", "class": "failing"},
+            {"name": "claude.ai zid", "class": "failing"},
+            {"name": "old", "class": "connected"},
+            {"name": "broken", "class": "failing"},
+            {"name": "project-one", "class": "off"},
+            {"name": "quiet", "class": "off"},
+            {"name": "banned", "class": "off"},
+            {"name": "odd", "class": "other"},
+            {"name": "claude.ai شات (2)", "class": "connected"},
+            {"name": "with-colon", "class": "connected"},
+            {"name": "tinted", "class": "connected"}])
+        kept = json.dumps(found, ensure_ascii=False)
+        for leak in (self.SECRET, "mcp.example.com", "npx", "node", "SdkError", "Re…", "(HTTP)"):
+            self.assertNotIn(leak, kept)
+        for status, kind in (("✔ Connected", "connected"), ("✓ Connected", "connected"),
+                             ("! Needs authentication", "needs_sign_in"), ("✘ Failed to connect", "failing"),
+                             ("✘ Connection error", "failing"), ("! Connected · tools fetch failed — x", "failing"),
+                             ("⏸ Pending approval (run `claude` to approve)", "off"),
+                             ("⊘ Disabled for this project (re-enable via /mcp)", "off"),
+                             ("✘ Blocked by enterprise managed policy", "off"), ("✘ Something else", "failing"),
+                             ("✔ Something else", "connected"), ("Starting…", "other"), ("", "other")):
+            self.assertEqual(longhaul.connection_class(status), kind, status)
+
+    def test_the_report_for_five_accounts_puts_what_is_missing_first_then_what_fails_then_the_rest(self):
+        self.five()
+        out = self.longhaul("connections")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout.splitlines(), self.FIVE)
+        self.assertLessEqual(max(len(line) for line in self.FIVE), 80)
+        self.assertNotIn("\x1b", out.stdout, "no colour, so no meaning in colour alone")
+        # One run per sign-in, read-only: nothing written but the result and the fake's own notes.
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ["accounts.json", "connections.json",
+                                                                       "mcp-calls.jsonl"])
+
+    def test_commands_and_addresses_never_reach_the_report_the_json_or_the_saved_file(self):
+        self.five()
+        self.listing(".claude-unix", ("claude.ai Canva", "✔ Connected"),
+                     stderr=f"Error: could not reach {self.URL}\n", exit=1)
+        said = [self.longhaul("connections"), self.longhaul("connections", "--json"),
+                self.longhaul("connections", LONGHAUL_PLAIN="1")]
+        saved = self.home / "connections.json"
+        texts = [o.stdout + o.stderr for o in said] + [saved.read_text()]
+        log = self.home / "longhaul.log"
+        texts.append(log.read_text() if log.exists() else "")
+        for text in texts:
+            for leak in self.LEAKS:
+                self.assertNotIn(leak, text)
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600, "only you can read it")
+        found = json.loads(saved.read_text())
+        self.assertEqual({k for a in found["accounts"] for s in a["servers"] for k in s}, {"name", "class"})
+
+    def test_the_default_sign_in_runs_with_no_config_dir_each_account_with_its_own_once_from_an_empty_folder(self):
+        amie = self.tmp / ".claude-amie"
+        self.write_accounts({"name": "Max", "config_dir": None}, {"name": "amie", "config_dir": "~/.claude-amie"},
+                            {"name": "amie-again", "config_dir": str(amie)},
+                            {"name": "also-default", "config_dir": str(self.tmp / "claude")},
+                            {"name": "odd", "config_dir": 7})
+        self.listing("claude", ("claude.ai Canva", "✔ Connected"))
+        self.listing(".claude-amie", ("claude.ai Canva", "! Needs authentication"))
+        # Run from a chat's terminal: its variables, another account's folder among them, reach no claude.
+        out = self.longhaul("connections", CLAUDECODE="1", CLAUDE_CODE_ENTRYPOINT="cli", CLAUDE_CODE_SESSION_ID="s1",
+                            CLAUDE_CONFIG_DIR=str(amie))
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        calls = self.calls()
+        self.assertEqual(sorted(str(c["config"]) for c in calls), sorted(["None", str(amie)]),
+                         "the default sign-in with CLAUDE_CONFIG_DIR unset; each folder once")
+        for c in calls:
+            self.assertEqual(c["session"], [], "none of the chat's variables")
+            self.assertTrue(c["cwd_empty"], "a fresh empty folder: no project's .mcp.json or local scope")
+            self.assertFalse(Path(c["cwd"]).exists(), "and removed after")
+            self.assertNotEqual(os.path.realpath(c["cwd"]), str(self.tmp))
+        self.assertEqual(len({c["cwd"] for c in calls}), 2, "a folder each")
+        # The account on ~/.claude is the default sign-in, called by its name.
+        self.assertEqual(out.stdout.splitlines(), [
+            "Connections on each account (claude mcp list, checked now)",
+            "  Canva  ✔ Max · sign in on amie",
+            "To sign in to one, or reconnect it: /mcp in a chat on that account."])
+
+    def test_a_timeout_or_a_failure_on_one_account_is_said_and_the_others_are_compared(self):
+        self.write_accounts({"name": "slow", "config_dir": "~/.claude-slow"},
+                            {"name": "crashes", "config_dir": "~/.claude-crashes"},
+                            {"name": "gone", "config_dir": "~/.claude-gone"},
+                            {"name": "fine", "config_dir": "~/.claude-fine"})
+        self.listing("claude", ("claude.ai Canva", "✔ Connected"))
+        self.listing(".claude-slow", ("claude.ai Linear", "✔ Connected"), sleep=60)
+        self.listing(".claude-crashes", ("claude.ai Linear", "✔ Connected"), exit=1,
+                     stderr=f"Traceback: {self.URL}\n")
+        self.listing(".claude-fine", ("claude.ai Linear", "✔ Connected"))
+        began = time.monotonic()
+        out = self.longhaul("connections", LONGHAUL_CONNECTIONS_TIMEOUT="2")
+        self.assertLess(time.monotonic() - began, 30, "the slow one is stopped at its timeout")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(out.stdout.splitlines(), [
+            "Connections on each account (claude mcp list, checked now)",
+            "  Canva   ✔ default sign-in · missing on fine",
+            "  Linear  ✔ fine · missing on default sign-in",
+            "Not checked on slow: `claude mcp list` did not answer within 2 s.",
+            "Not checked on crashes: `claude mcp list` failed (exit code 1).",
+            "Not checked on gone: ~/.claude-gone is missing (`longhaul setup gone`).",
+            "Add a connector at claude.ai → Settings → Connectors, signed in as that account."])
+        self.assertEqual(sorted(str(c["config"]) for c in self.calls()),
+                         sorted(["None", *(str(self.tmp / f".claude-{n}") for n in ("slow", "crashes", "fine"))]),
+                         "none for a folder that is not there")
+        found = json.loads((self.home / "connections.json").read_text())
+        self.assertEqual([(a["label"], a["status"]) for a in found["accounts"]],
+                         [("default sign-in", "ok"), ("slow", "timeout"), ("crashes", "failed"), ("gone", "failed"),
+                          ("fine", "ok")])
+        # Every account failing: said, exit 1, and the last good check kept.
+        before = (self.home / "connections.json").read_text()
+        for folder in ("claude", ".claude-fine"):
+            self.listing(folder, ("claude.ai Canva", "✔ Connected"), exit=3)
+        out = self.longhaul("connections", LONGHAUL_CONNECTIONS_TIMEOUT="2")
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("No account answered", out.stdout)
+        self.assertEqual((self.home / "connections.json").read_text(), before)
+
+    def test_the_accounts_are_checked_at_once(self):
+        self.write_accounts(*({"name": n, "config_dir": f"~/.claude-{n}"} for n in ("a", "b", "c", "d")))
+        for folder in ("claude", ".claude-a", ".claude-b", ".claude-c", ".claude-d"):
+            self.listing(folder, ("claude.ai Canva", "✔ Connected"), sleep=3)
+        began = time.monotonic()
+        out = self.longhaul("connections")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertLess(time.monotonic() - began, 12, "five runs of 3 s side by side, not one after another")
+        started = [c["started"] for c in self.calls()]
+        self.assertEqual(len(started), 5)
+        self.assertLess(max(started) - min(started), 2.5, "each started before the first ended")
+        self.assertEqual(out.stdout.splitlines()[1:], ["  fine on every account: Canva"])
+
+    def test_plain_says_words_where_the_report_draws_marks(self):
+        self.five()
+        out = self.longhaul("connections", LONGHAUL_PLAIN="1")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        lines = out.stdout.splitlines()
+        for mark in ("✔", "·", "→"):
+            self.assertNotIn(mark, out.stdout)
+        self.assertIn("  Gmail              OK on personal-1, personal-2; failing on default sign-in", lines)
+        self.assertIn("  Canva              OK on amie, unix", lines)
+        self.assertIn("Add a connector at claude.ai, then Settings, then Connectors, signed in as that", lines)
+        self.assertLessEqual(max(map(len, lines)), 80)
+        self.assertEqual(len(lines), len(self.FIVE) + 1, "the same report, one line longer for the words")
+
+    def test_json_gives_the_same_as_one_object_with_names_and_classes_only(self):
+        self.five()
+        out = self.longhaul("connections", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        found = json.loads(out.stdout)
+        self.assertEqual(set(found), {"checked_at", "accounts", "connections", "same_email"})
+        self.assertAlmostEqual(found["checked_at"], time.time(), delta=60)
+        self.assertEqual([(a["name"], a["label"], a["status"]) for a in found["accounts"]],
+                         [("main", "default sign-in", "ok"), ("amie", "amie", "ok"), ("unix", "unix", "ok"),
+                          ("personal-1", "personal-1", "ok"), ("personal-2", "personal-2", "ok")])
+        self.assertEqual(found["accounts"][1]["servers"], [
+            {"name": "claude.ai Claude Docs", "class": "connected"}, {"name": "claude.ai Canva", "class": "connected"},
+            {"name": "claude.ai Slack", "class": "needs_sign_in"}, {"name": "claude.ai Linear", "class": "connected"},
+            {"name": "claude.ai شات (2)", "class": "connected"}, {"name": "codegraph", "class": "connected"}])
+        rows = {r["name"]: r for r in found["connections"]}
+        self.assertEqual(list(rows), ["Canva", "ElevenLabs (2)", "Gmail", "Slack", "zid", "شات (2) / شات (3)",
+                                      "Claude Docs", "codegraph", "Linear"], "the report's order")
+        self.assertEqual(rows["Slack"], {"name": "Slack", "names": ["claude.ai Slack"],
+                                         "connected": ["default sign-in", "personal-1"], "needs_sign_in": ["amie"],
+                                         "failing": ["personal-2"], "off": [], "other": [], "missing": ["unix"]})
+        self.assertEqual(rows["شات (2) / شات (3)"]["names"], ["claude.ai شات (2)", "claude.ai شات (3)"])
+        self.assertEqual(rows["شات (2) / شات (3)"]["connected"], ["amie", "unix"])
+        self.assertEqual(found["same_email"], [["default sign-in", "personal-2"]])
+        saved = json.loads((self.home / "connections.json").read_text())
+        self.assertEqual(saved, {"version": 1, **found}, "the saved file holds the same")
+        for leak in self.LEAKS:
+            self.assertNotIn(leak, out.stdout)
+
+    def test_two_connections_by_one_name_on_one_account_stay_two(self):
+        # ElevenLabs and ElevenLabs (2) on one account are two connections;
+        # a number alone on each of two accounts is probably the same kind.
+        self.write_accounts({"name": "a", "config_dir": "~/.claude-a"}, {"name": "b", "config_dir": "~/.claude-b"})
+        self.listing("claude", ("claude.ai ElevenLabs", "✔ Connected"), ("claude.ai ElevenLabs (2)", "✔ Connected"))
+        self.listing(".claude-a", ("claude.ai ElevenLabs (2)", "✔ Connected"))
+        self.listing(".claude-b", ("claude.ai ElevenLabs (3)", "✔ Connected"))
+        out = self.longhaul("connections", "--json")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        rows = [(r["name"], r["names"], r["connected"], r["missing"]) for r in json.loads(out.stdout)["connections"]]
+        # The default's two stay two; b's (3), on no account that holds a
+        # (2), joins the (2) that is on the most accounts.
+        self.assertEqual(rows, [
+            ("ElevenLabs", ["claude.ai ElevenLabs"], ["default sign-in"], ["a", "b"]),
+            ("ElevenLabs (2) / ElevenLabs (3)", ["claude.ai ElevenLabs (2)", "claude.ai ElevenLabs (3)"],
+             ["default sign-in", "a", "b"], [])])
+
+    def test_the_doctor_says_when_last_checked_from_the_file_and_never_runs_claude(self):
+        self.write_accounts({"name": "amie", "config_dir": str(self.tmp / ".claude-amie")})
+        (self.tmp / ".claude-amie").mkdir()
+        patches = [mock.patch.object(longhaul, name, value) for name, value in (
+            ("LONGHAUL_HOME", self.home), ("HOME", self.tmp), ("DEFAULT_CONFIG", self.tmp / "claude"),
+            ("DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"), ("USAGE_DIR", self.home / "usage"))]
+        patches += [mock.patch.object(longhaul.subprocess, name, side_effect=AssertionError(f"ran {name}"))
+                    for name in ("run", "Popen", "check_output", "call")]
+        patches.append(mock.patch.dict(os.environ, {"HOME": str(self.tmp)}))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        def said():
+            for quick in (True, False):
+                c = longhaul.doctor_accounts(quick=quick)
+                found = [(mark, text) for mark, text, _ in c["items"] if text.startswith("Connections")]
+                self.assertEqual(len(found), 1, c["items"])
+                self.assertIsNone(found[0][0], "said, not judged")
+            return found[0][1]
+
+        self.assertEqual(said(), "Connections: never checked; `longhaul connections` shows which connector or "
+                                 "sign-in is missing on which account")
+        at = time.time() - 3600
+        rows = [{"name": "Canva", "missing": ["amie"]}, {"name": "Slack", "missing": ["default sign-in"]},
+                {"name": "Gmail", "missing": [], "failing": ["amie"]}, {"name": "Linear", "missing": []}]
+        (self.home / "connections.json").write_text(json.dumps({"version": 1, "checked_at": at, "connections": rows}))
+        self.assertEqual(said(), f"Connections: last checked {longhaul.clock(at)}; 2 connections are not on every "
+                                 "account; `longhaul connections` to see")
+        (self.home / "connections.json").write_text(json.dumps({"version": 1, "checked_at": at,
+                                                                "connections": rows[2:]}))
+        self.assertEqual(said(), f"Connections: last checked {longhaul.clock(at)}; 1 needs a sign-in or fails on "
+                                 "some account; `longhaul connections` to see")
+        (self.home / "connections.json").write_text(json.dumps({"version": 1, "checked_at": at,
+                                                                "connections": rows[3:]}))
+        self.assertEqual(said(), f"Connections: last checked {longhaul.clock(at)}; each is on every account and "
+                                 "connected")
+        (self.home / "connections.json").write_text("{half")
+        self.assertIn("never checked", said(), "a file it cannot read is no check")
+        self.assertEqual(longhaul.doctor_accounts()["mark"], "ok")
+
+    def test_an_unreadable_list_runs_nothing_and_no_list_checks_the_default_sign_in_alone(self):
+        (self.home / "accounts.json").write_text("[{\"name\": \"a\"},]")
+        self.listing("claude", ("claude.ai Canva", "✔ Connected"))
+        out = self.longhaul("connections")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("accounts.json is not readable", out.stdout + out.stderr)
+        self.assertEqual(self.calls(), [])
+        (self.home / "accounts.json").unlink()
+        out = self.longhaul("connections")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual([c["config"] for c in self.calls()], [None])
+        self.assertEqual(out.stdout.splitlines()[1:], ["  fine on every account: Canva"])
+
+    def test_dash_h_help_and_the_usage_block_name_it_and_the_shim_refuses_it(self):
+        doc = longhaul.__doc__
+        self.assertIn("longhaul connections [--json]", doc)
+        self.assertLess(doc.index("longhaul cap [NAME"), doc.index("longhaul connections [--json]"))
+        self.assertLess(doc.index("longhaul connections [--json]"), doc.index("longhaul use NAME"))
+        out = self.longhaul("connections", "-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul connections [-h] [--json]", out.stdout)
+        screen = self.longhaul("-h").stdout
+        self.assertIn("longhaul connections", screen)
+        self.assertLessEqual(len(screen.splitlines()), 50, "-h keeps to one screen")
+        entry = self.longhaul("help", "connections")
+        self.assertEqual((entry.returncode, entry.stderr), (0, ""))
+        self.assertTrue(entry.stdout.startswith("  longhaul connections [--json]"), entry.stdout)
+        words = " ".join(entry.stdout.split())
+        for said in ("claude mcp list", "connects to each server", "per claude.ai account", "copies nothing"):
+            self.assertIn(said, words)
+        readme = " ".join((HERE / "README.md").read_text().split())
+        self.assertIn("longhaul connections", readme)
+        unreleased = (HERE / "CHANGELOG.md").read_text().split("\n## ")[1]
+        self.assertTrue(unreleased.startswith("Unreleased"), unreleased[:40])
+        self.assertIn("### Added", unreleased)
+        self.assertIn("longhaul connections", unreleased)
+        self.assertIn("### Fixed", unreleased, "the status line's fix is kept")
+        # bin/longhaul runs it from no chat: it runs a claude per account, so it is a terminal's.
+        self.five()
+        env = {k: v for k, v in self.env().items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1",
+                   LONGHAUL_CLAUDE_BIN=str(HERE / "fake_claude.py"))
+        for args in (("connections",), ("connections", "--json")):
+            out = subprocess.run([str(HERE / "bin" / "longhaul"), *args], capture_output=True, text=True, env=env,
+                                 timeout=30)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("Ask the user to run it in a terminal.", out.stderr, args)
+        self.assertEqual(self.calls(), [], "no claude ran")
+        self.assertFalse((self.home / "connections.json").exists())
+        out = subprocess.run([str(HERE / "bin" / "longhaul"), "help", "connections"], capture_output=True, text=True,
+                             env=env, timeout=30)
+        self.assertEqual((out.returncode, out.stdout), (0, entry.stdout), "help only prints, from a chat too")
 
 
 class Use(unittest.TestCase):
@@ -30604,7 +31018,8 @@ class Doctor(unittest.TestCase):
         c = longhaul.doctor_accounts()
         self.assertEqual(c["mark"], "ok")
         self.assertEqual(self.items(c), {"Max: ~/.claude-max, anywhere": "ok",
-                                         "Work: ~/.claude-work, only in ~/work": "ok"})
+                                         "Work: ~/.claude-work, only in ~/work": "ok",
+                                         longhaul.CONNECTIONS_NEVER: None}, "the last said, not judged")
         shutil.rmtree(self.user / ".claude-work")
         c = longhaul.doctor_accounts()
         self.assertEqual(c["mark"], "bad")

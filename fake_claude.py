@@ -32,7 +32,8 @@ that stop: a second on, with the status file still saying busy.
 `file:<name>=<text>` writes <text> to LONGHAUL_HOME/<name> while Claude
 runs, as a mode or an account saved meanwhile is, then acts out the plan's
 next step in the same launch.
-`--version` prints FAKE_VERSION.
+`--version` prints FAKE_VERSION. `mcp list` prints the config folder's
+fake-mcp-list.txt and runs no step of the plan (see there).
 """
 
 import datetime as dt
@@ -61,6 +62,28 @@ if args[:2] == ["auth", "status"]:
     email = emails.get(key, os.environ.get(key))
     print(json.dumps({"loggedIn": bool(email), "email": email, "subscriptionType": "max"}))
     sys.exit(0)
+
+if args[:2] == ["mcp", "list"]:
+    # `claude mcp list`, as `longhaul connections` runs it on each sign-in:
+    # a first line, then what the test left in this config folder,
+    # fake-mcp-list.txt, as Claude Code prints its servers. Its
+    # fake-mcp-list.json may say {"sleep": seconds, "exit": code, "stderr":
+    # text}. Each call is noted in LONGHAUL_HOME/mcp-calls.jsonl: the config
+    # folder, the folder it ran in and whether that was empty, which of a
+    # chat's variables reached it, and when it started and ended.
+    started = time.time()
+    how_file, listing = cfg / "fake-mcp-list.json", cfg / "fake-mcp-list.txt"
+    how = json.loads(how_file.read_text()) if how_file.exists() else {}
+    note = {"config": os.environ.get("CLAUDE_CONFIG_DIR"), "cwd": os.getcwd(), "cwd_empty": not os.listdir("."),
+            "session": sorted(k for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID")
+                              if k in os.environ), "started": started}
+    with (home / "mcp-calls.jsonl").open("a") as f:
+        f.write(json.dumps(note) + "\n")
+    time.sleep(how.get("sleep", 0))
+    sys.stdout.write("Checking MCP server health…\n\n" + (listing.read_text() if listing.exists() else
+                                                          "No MCP servers configured. Use `claude mcp add` to add a server.\n"))
+    sys.stderr.write(how.get("stderr", ""))
+    sys.exit(how.get("exit", 0))
 
 with (home / "calls.jsonl").open("a") as f:
     f.write(json.dumps({"args": args, "config": os.environ.get("CLAUDE_CONFIG_DIR"),

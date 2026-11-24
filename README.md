@@ -174,6 +174,23 @@ A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own;
 
 **What the accounts share.** Your history, memory, settings, skills, plugins and MCP servers are one set for every account. An MCP server added, changed or removed on any account (`claude mcp add`, `claude mcp remove`), user-scope or a folder's own, reaches all of them before the next chat starts. Sign-ins to remote servers (OAuth via `/mcp`) and claude.ai connectors stay per account, as Claude Code keeps them.
 
+**See which connector or sign-in each account lacks.** claude.ai connectors are kept per claude.ai account, and sign-ins to servers per account, so Longhaul cannot share them. `longhaul connections` shows where each one is, so you can add or sign in to each once per account; it copies nothing and changes no setting. In a terminal, it runs `claude mcp list` on the default sign-in and on each account, all at once and from an empty folder. That command connects to each server to check it, so it takes a while: up to 90 seconds an account, and an account that takes longer, or fails, is named and left out. Then it lists the connections missing on some account first, then those to sign in to or failing, then the rest on one line:
+
+```
+Connections on each account (claude mcp list, checked now)
+  Canva              ✔ amie, unix
+                     missing on default sign-in, personal-1, personal-2
+  Slack              ✔ default sign-in, personal-1 · sign in on amie
+                     failing on personal-2 · missing on unix
+  fine on every account: Claude Docs, Linear
+default sign-in and personal-2 are one claude.ai account (same email): they hold
+the same connectors.
+Add a connector at claude.ai → Settings → Connectors, signed in as that account.
+To sign in to one, or reconnect it: /mcp in a chat on that account.
+```
+
+It shows names and states only, never a server's command or address, which may hold a token. `--json` gives the same as JSON. The result is kept in `~/.longhaul/connections.json`, readable only by you, so `longhaul doctor` says under Accounts when you last checked and how many connections are not on every account, without running `claude`. A chat's Claude cannot run it.
+
 **Use only part of an account.** A cap is the share of an account's usage Longhaul lets your chats take: one number, for both its 5-hour window and its weekly one. In a terminal:
 
 ```
@@ -230,7 +247,7 @@ The switches are environment variables, read at each hook and command; `longhaul
 | `LONGHAUL_API_RETRY` | on | `off`: no carry-on in the VS Code panel a minute after a turn stopped on an API server error |
 | `LONGHAUL_LOG` | routine lines left out | `debug`: every line, reminder checks below the threshold and short panel jobs included |
 | `LONGHAUL_UPDATE_CHECK` | on | `off`: no daily release check, and no `update` word in the status line |
-| `LONGHAUL_PLAIN` | off | `1`: words for a screen reader where Longhaul draws marks: OK, Failed and Warning first in place of ✔ ✘ ⚠, `, ` in place of ` · `, and no `›` on the focused line; in `/accounts`, `longhaul doctor`, `longhaul status` and the status line |
+| `LONGHAUL_PLAIN` | off | `1`: words for a screen reader where Longhaul draws marks: OK, Failed and Warning first in place of ✔ ✘ ⚠, `, ` in place of ` · `, and no `›` on the focused line; in `/accounts`, `longhaul doctor`, `longhaul status` and the status line; in `longhaul connections`, "OK on" for ✔ and `; ` for ` · ` |
 
 `longhaul models [guide|on|off|cap MODEL]` sets Auto Model. The full list of commands: `longhaul help all` (`longhaul -h` shows the usual ones on one screen), or [Commands](https://github.com/Noah-OS/longhaul/wiki/Commands).
 
