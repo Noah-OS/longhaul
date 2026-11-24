@@ -2,6 +2,14 @@
 
 All notable changes to Longhaul are recorded here. The format follows Keep a Changelog; the version is the plugin's, from `.claude-plugin/plugin.json`. Each release bumps the version in both `plugin.json` and `marketplace.json` (a test keeps them equal): users on a cached copy get an update only when the string changes.
 
+## Unreleased
+
+### Added
+
+- **A cap per account: use only part of it.** `longhaul cap work 25` lets your chats use at most 25% of `work`, of both its 5-hour window and its weekly one. Once either window reaches the cap, `work` is treated exactly as if it were at its limit until that window resets: no new chat starts on it, `longhaul use` refuses it, and a chat on it leaves it between turns, once Claude is idle and no background agent works, by the switching mode. In `auto` the chat moves to an account with room, with no carry-on message, since nothing was cut off; in `ask` it asks first, in the terminal or in `/accounts` ("work is at its cap (25%) until Fri 02:00. Move this chat to personal?"); in `never` it waits for the reset. When every account is at its cap or its limit, the chat waits for the first one free, as at a limit. In the VS Code panel, the message you send next is held, not sent to Claude on the capped account, until the reset, or until you move the chat or change the cap; one notification says when it goes and how to send it sooner. `longhaul cap work 50` raises it and `longhaul cap work off` removes it, and either frees the account at once, with no `longhaul clear`; `longhaul cap` lists each account's cap and where it stands now ("work: cap 25% (now 18% of its week)"). `longhaul status`, `status --json` (`cap` and `capped_until` for each account), the doctor and `/accounts` show it: the account's page says "Cap: 25% (now 18% of its week)" or "Cap: none", with buttons for 25, 50 and 75% and none, and its row "capped until Fri 02:00" while it is. A chat's own Claude cannot set it: like the fallback mark, it changes in a terminal or with the buttons.
+
+  The limits: the cap is checked from the status line's reading, written after each request, so a long turn can pass it by a little; a capped account waits for its window's reset, which for the weekly window can be days; and the default sign-in with no list of accounts has no cap.
+
 ## 0.3.22 - 2026-11-23
 
 `longhaul inspect` starts with three lines in short, and small fixes to 0.3.21's one name for the default sign-in.

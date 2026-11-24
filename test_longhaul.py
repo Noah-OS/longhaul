@@ -25202,6 +25202,713 @@ class Fallback(unittest.TestCase):
                                                                "work (fallback): ~/.claude-work, only in ~/work"])
 
 
+class Cap(unittest.TestCase):
+    """`longhaul cap [NAME [PERCENT|off]]` (the owner, 2026-11-24: "I want to
+    set how much of each account I use: e.g. I only take 25% of this
+    account's usage"): one number per account, a share of both its 5-hour
+    and its weekly window, read and set without a hand edit, written as
+    `longhaul fallback` writes. Every path is scratch, HOME too; no claude
+    runs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.home = self.tmp / "home"
+        (self.home / "usage").mkdir(parents=True)
+        self.path = self.home / "accounts.json"
+
+    write_accounts = Fallback.write_accounts
+    accounts = Fallback.accounts
+    log = Fallback.log
+    files = Fallback.files
+    env = Fallback.env
+    longhaul = Fallback.longhaul
+    said = Fallback.said
+
+    def reading(self, name, five=None, five_in=3600, week=None, week_in=86400):
+        now = time.time()
+        data = {"at": now}
+        if five is not None:
+            data["five_hour"] = {"used_percentage": five, "resets_at": now + five_in}
+        if week is not None:
+            data["seven_day"] = {"used_percentage": week, "resets_at": now + week_in}
+        (self.home / "usage" / f"{name}.json").write_text(json.dumps(data))
+        return data
+
+    def test_with_no_word_it_lists_each_cap_and_where_it_stands_and_writes_nothing(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "work", "config_dir": "~/.claude-work", "cap": 25},
+                            {"name": "spare", "cap": 50}, {"name": "team", "cap": 40},
+                            {"name": "odd", "cap": "25"})
+        self.reading("work", five=10, week=18)
+        capped = self.reading("team", five=45, five_in=600, week=41, week_in=7200)["seven_day"]["resets_at"]
+        before = self.files()
+        out = self.longhaul("cap")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        lines = self.said(out)
+        self.assertEqual(lines[:5], [
+            "personal: no cap",
+            "work: cap 25% (now 18% of its week)",
+            "spare: cap 50% (no usage reading yet)",
+            f"team: cap 40%, at it until {longhaul.clock(capped)} (now 45% of its 5 hours)",
+            "odd: no cap (its cap field is not a whole number from 1 to 99)"])
+        self.assertTrue(any("longhaul cap NAME off" in line for line in lines[5:]), lines)
+        # One account, by name in any case.
+        out = self.longhaul("cap", "WORK")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.said(out), ["work: cap 25% (now 18% of its week)"])
+        self.assertEqual(self.files(), before, "it only reads: no lock, no log")
+
+    def test_set_and_off_write_the_cap_keep_the_other_keys_and_the_order_with_one_log_line_each(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal", "email": "first@example.com"},
+                            {"name": "work", "config_dir": "~/.claude-work", "email": "work@example.com",
+                             "fallback": True, "note": "a key longhaul does not know"})
+        out = self.longhaul("cap", "work", "25")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        self.assertEqual(self.accounts(), [
+            {"name": "personal", "config_dir": "~/.claude-personal", "email": "first@example.com"},
+            {"name": "work", "config_dir": "~/.claude-work", "email": "work@example.com", "fallback": True,
+             "note": "a key longhaul does not know", "cap": 25}])
+        self.assertEqual(self.said(out), ["longhaul set work's cap to 25%", "work: cap 25% (no usage reading yet)"])
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600, "written as add writes it: only you can read it")
+        self.assertEqual(self.log(), ["set work's cap to 25%"], "one log line per change, nothing else")
+        before = self.path.read_bytes()
+        out = self.longhaul("cap", "work", "25%")  # a % typed after it is the same number
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.said(out)[0], "longhaul work's cap is 25% already")
+        self.assertEqual(self.path.read_bytes(), before, "nothing to change, nothing written")
+        out = self.longhaul("cap", "work", "60")
+        self.assertEqual(self.said(out)[0], "longhaul set work's cap to 60%")
+        self.assertEqual(list(self.accounts()[1].items())[-1], ("cap", 60), "in its place")
+        out = self.longhaul("cap", "work", "off")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.accounts()[1], {"name": "work", "config_dir": "~/.claude-work",
+                                              "email": "work@example.com", "fallback": True,
+                                              "note": "a key longhaul does not know"})
+        self.assertEqual(self.said(out), ["longhaul removed work's cap", "work: no cap"])
+        before = self.path.read_bytes()
+        out = self.longhaul("cap", "personal", "off")
+        self.assertEqual(self.said(out), ["longhaul personal has no cap already", "personal: no cap"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.log(), ["set work's cap to 25%", "set work's cap to 60%", "removed work's cap"])
+
+    def test_zero_a_hundred_or_more_and_anything_not_a_whole_number_is_refused_in_one_line(self):
+        self.write_accounts({"name": "work", "cap": 25})
+        before = self.path.read_bytes()
+        for value in ("0", "100", "150", "abc", "2.5", "25 %", "%", "on", "-5"):
+            with self.subTest(value):
+                out = self.longhaul("cap", "work", value)
+                self.assertEqual((out.returncode, out.stdout), (2, ""), value)
+                self.assertEqual(len(out.stderr.strip().splitlines()), 1, out.stderr)
+                if value != "-5":  # argparse's own refusal of an option it does not know
+                    self.assertIn("a whole number from 1 to 99, or off", out.stderr)
+                self.assertEqual(self.path.read_bytes(), before, "nothing written")
+        self.assertEqual(self.log(), [], "no change logged")
+        for value in ("1", "99"):
+            self.assertEqual(self.longhaul("cap", "work", value).returncode, 0, value)
+        self.assertEqual(self.accounts()[0]["cap"], 99)
+
+    def test_an_unknown_name_an_unreadable_file_or_no_list_writes_nothing_and_exits_2(self):
+        self.write_accounts({"name": "personal"}, {"name": "work", "cap": 25})
+        before = self.path.read_bytes()
+        for argv in (("nobody",), ("nobody", "25"), ("nobody", "off")):
+            with self.subTest(argv):
+                out = self.longhaul("cap", *argv)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("no account called nobody; the accounts are personal, work", out.stdout)
+                self.assertEqual(self.path.read_bytes(), before, "nothing written")
+        for case, text in unreadable_accounts({"name": "work", "cap": 25}).items():
+            with self.subTest(case):
+                self.path.write_text(text)
+                for argv in ((), ("work",), ("work", "25"), ("work", "off")):
+                    out = self.longhaul("cap", *argv)
+                    self.assertEqual(out.returncode, 2, out.stdout)
+                    self.assertIn("accounts.json is not readable: ", out.stdout)
+                    self.assertEqual(self.path.read_text(), text, "never written over")
+        # No list: the default sign-in alone, which has no cap and takes none.
+        self.path.unlink()
+        out = self.longhaul("cap")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.said(out), ["default sign-in: no cap (there is no list of accounts: `longhaul add` "
+                                          "adds one, and each account on it may have a cap)"])
+        for argv in (("main", "25"), ("main",)):
+            out = self.longhaul("cap", *argv)
+            self.assertEqual(out.returncode, 2)
+            self.assertIn("no account called main; there is no list of accounts yet: `longhaul add` adds one", out.stdout)
+        self.assertFalse(self.path.exists())
+
+    def test_the_usage_block_names_it_after_fallback_the_screen_names_it_and_the_shim_refuses_it(self):
+        doc = longhaul.__doc__
+        self.assertIn("longhaul cap [NAME [PERCENT|off]]", doc)
+        self.assertLess(doc.index("longhaul fallback NAME"), doc.index("longhaul cap [NAME"))
+        self.assertLess(doc.index("longhaul cap [NAME"), doc.index("longhaul use NAME"))
+        out = self.longhaul("cap", "-h")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("usage: longhaul cap [-h] [NAME] [PERCENT|off]", out.stdout)
+        screen = self.longhaul("-h").stdout
+        self.assertIn("longhaul cap NAME 25", screen)
+        help_cap = self.longhaul("help", "cap")
+        self.assertEqual((help_cap.returncode, help_cap.stderr), (0, ""))
+        self.assertTrue(help_cap.stdout.startswith("  longhaul cap [NAME [PERCENT|off]]"), help_cap.stdout)
+        # bin/longhaul runs no cap form, as it runs no fallback: /accounts runs longhaul.py itself.
+        self.write_accounts({"name": "work", "cap": 25})
+        before = self.files()
+        env = {k: v for k, v in self.env().items() if not k.startswith("LONGHAUL_") or k == "LONGHAUL_INDEX"}
+        env.update(LONGHAUL_HOME=str(self.home), LONGHAUL_NO_NOTIFY="1")
+        for args in (("cap",), ("cap", "work"), ("cap", "work", "25"), ("cap", "work", "off")):
+            out = subprocess.run([str(HERE / "bin" / "longhaul"), *args], capture_output=True, text=True, env=env,
+                                 timeout=30)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("Ask the user to run it in a terminal.", out.stderr, args)
+        self.assertEqual(self.files(), before, "a refused form writes nothing")
+
+    def test_status_says_the_cap_and_at_its_cap_until_apart_from_a_limit_and_the_doctor_names_it(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "work", "config_dir": "~/.claude-work", "cap": 25},
+                            {"name": "team", "config_dir": "~/.claude-team", "cap": 50, "fallback": True})
+        resets = self.reading("work", five=30, week=12)["five_hour"]["resets_at"]
+        self.reading("team", five=10, week=20)
+        lines = self.said(self.longhaul("status"))
+        [at] = [i for i, line in enumerate(lines) if line.startswith("work ")]
+        self.assertTrue(lines[at].endswith(f"at its cap (25%) until {longhaul.clock(resets)}   "
+                                           f"[{self.tmp}/.claude-work]"), lines[at])
+        self.assertIn("       cap: 25% of each window (now 30% of its 5 hours); `longhaul cap work off` or a higher cap "
+                      "lets it be used now", lines[at + 1:at + 4])
+        [team] = [i for i, line in enumerate(lines) if line.startswith("team ")]
+        self.assertIn("available", lines[team])
+        self.assertIn("       cap: 50% of each window (now 20% of its week)", lines[team + 1:team + 5])
+        [mine] = [i for i, line in enumerate(lines) if line.startswith("personal ")]
+        self.assertNotIn("cap", "\n".join(lines[mine:at]), "no cap: nothing said")
+        # A recorded limit later than the cap's reset is the limit, said as one.
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"work": resets + 7200}}))
+        lines = self.said(self.longhaul("status"))
+        [at] = [i for i, line in enumerate(lines) if line.startswith("work ")]
+        self.assertIn(f"at its limit until {longhaul.clock(resets + 7200)}", lines[at])
+        for name in ("personal", "work", "team"):
+            (self.tmp / f".claude-{name}").mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), mock.patch.object(longhaul, "HOME", self.tmp), \
+                mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), \
+                mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"), \
+                mock.patch.object(longhaul, "DEFAULT_CONFIG", self.tmp / "claude"), \
+                mock.patch.object(longhaul, "DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"):
+            c = longhaul.doctor_accounts()
+        self.assertEqual([text for _, text, *_ in c["items"]], [
+            "personal: ~/.claude-personal, anywhere",
+            f"work (cap 25%, at it until {longhaul.clock(resets)}): ~/.claude-work, anywhere",
+            "team (fallback, cap 50%): ~/.claude-team, anywhere"])
+
+    def test_status_json_gives_each_accounts_cap_and_until_when_it_is_at_it(self):
+        self.write_accounts({"name": "personal", "config_dir": "~/.claude-personal"},
+                            {"name": "work", "config_dir": "~/.claude-work", "cap": 25},
+                            {"name": "team", "config_dir": "~/.claude-team", "cap": 50})
+        resets = self.reading("work", five=30, week=12)["five_hour"]["resets_at"]
+        self.reading("team", five=10, week=20)
+        out = self.longhaul("status", "--json", "--no-check")
+        self.assertEqual((out.returncode, out.stderr), (0, ""), out.stdout)
+        found = {a["name"]: a for a in json.loads(out.stdout)["accounts"]}
+        self.assertEqual({n: (a["cap"], a["capped_until"]) for n, a in found.items()},
+                         {"personal": (None, None), "work": (25, resets), "team": (50, None)})
+        self.assertIsNone(found["work"]["limited_until"], "a cap is no recorded limit")
+        self.assertEqual(found["work"]["use_here"], "capped", "use refuses it, as it refuses one at its limit")
+
+
+class CapPick(unittest.TestCase):
+    """The strict cap (the owner, 2026-11-24): an account at its cap (an
+    open window of its latest reading at or over the cap) is treated
+    exactly as one at its limit until that window resets, by every place
+    that picks an account; raising or removing the cap frees it at once,
+    and a reading whose window has reset never caps."""
+
+    NOW = 1_800_000_000.0
+
+    def acct(self, name, cap=None, **more):
+        return {"name": name, "config_dir": f"/scratch/{name}", **({"cap": cap} if cap is not None else {}), **more}
+
+    def seen(self, five=None, five_in=3600, week=None, week_in=86400):
+        out = {"at": self.NOW - 60}
+        if five is not None:
+            out["five_hour"] = {"used_percentage": five, "resets_at": self.NOW + five_in}
+        if week is not None:
+            out["seven_day"] = {"used_percentage": week, "resets_at": self.NOW + week_in}
+        return out
+
+    def test_capped_is_the_last_reset_of_the_open_windows_at_or_over_the_cap(self):
+        work = self.acct("work", 25)
+        self.assertIsNone(longhaul.capped(work, self.seen(five=24.9, week=10), self.NOW))
+        self.assertEqual(longhaul.capped(work, self.seen(five=25, week=10), self.NOW), self.NOW + 3600)
+        self.assertEqual(longhaul.capped(work, self.seen(five=10, week=30), self.NOW), self.NOW + 86400)
+        self.assertEqual(longhaul.capped(work, self.seen(five=40, week=30), self.NOW), self.NOW + 86400,
+                         "both over: free only once the later one resets")
+        self.assertIsNone(longhaul.capped(self.acct("personal"), self.seen(five=99, week=99), self.NOW), "no cap")
+        for junk in (None, [], "x", {"five_hour": "x"}, {"five_hour": {"used_percentage": "50", "resets_at": "y"}}):
+            self.assertIsNone(longhaul.capped(work, junk, self.NOW), junk)
+
+    def test_a_reading_whose_window_has_reset_never_caps(self):
+        work = self.acct("work", 25)
+        stale = self.seen(five=90, five_in=-10, week=10)
+        self.assertIsNone(longhaul.capped(work, stale, self.NOW))
+        i, until = longhaul.pick([work, self.acct("personal")], {"limited_until": {}}, 0, now=self.NOW,
+                                 seen={"work": stale})
+        self.assertEqual((i, until), (0, None), "the stale reading leaves work free, first in turn")
+
+    def test_only_a_whole_number_from_1_to_99_is_a_cap(self):
+        for value, cap in ((25, 25), (1, 1), (99, 99), (0, None), (100, None), (25.0, None), ("25", None),
+                           (True, None), (None, None), ([25], None)):
+            self.assertEqual(longhaul.cap_of({"name": "x", "cap": value}), cap, value)
+        self.assertIsNone(longhaul.cap_of({"name": "x"}))
+        self.assertIsNone(longhaul.cap_of(dict(longhaul.STAND_IN)), "the default sign-in with no list has none")
+
+    def test_pick_passes_over_a_capped_account_and_takes_it_again_once_its_window_resets(self):
+        work, personal = self.acct("work", 25), self.acct("personal")
+        seen = {"work": self.seen(five=30, five_in=600, week=10), "personal": self.seen(week=50, week_in=6 * 86400)}
+        # work's room expires first, which made it the one picked before.
+        self.assertEqual(longhaul.pick([work, personal], {"limited_until": {}}, 0, now=self.NOW, seen=seen), (1, None))
+        self.assertEqual(longhaul.pick([work, personal], {"limited_until": {}}, 0, now=self.NOW + 601, seen=seen),
+                         (0, None), "its 5-hour window has reset: free again")
+
+    def test_raising_or_removing_the_cap_frees_the_account_at_once(self):
+        seen = {"work": self.seen(five=30, five_in=600), "personal": self.seen(five=50, five_in=7200)}
+        for work in (self.acct("work", 35), self.acct("work")):
+            self.assertEqual(longhaul.pick([work, self.acct("personal")], {"limited_until": {}}, 0, now=self.NOW,
+                                           seen=seen), (0, None), work)
+
+    def test_every_account_capped_or_limited_waits_for_the_earliest_usable_time(self):
+        work, personal = self.acct("work", 25), self.acct("personal")
+        seen = {"work": self.seen(five=30, five_in=1800)}
+        state = {"limited_until": {"personal": self.NOW + 3600}}
+        self.assertEqual(longhaul.pick([work, personal], state, 0, now=self.NOW, seen=seen), (0, self.NOW + 1800))
+        state = {"limited_until": {"personal": self.NOW + 600}}
+        self.assertEqual(longhaul.pick([work, personal], state, 0, now=self.NOW, seen=seen), (1, self.NOW + 600))
+        why = longhaul.pick_why([work, personal], {"limited_until": {"personal": self.NOW + 3600}}, 0,
+                                self.NOW + 1800, seen=seen, now=self.NOW)
+        self.assertEqual(why, f"every account was at its limit or its cap, and work resets first, at "
+                              f"{longhaul.clock(self.NOW + 1800)}")
+
+    def test_strict_even_when_it_is_the_only_account_with_room(self):
+        work = self.acct("work", 25)
+        seen = {"work": self.seen(five=30, five_in=1800)}
+        self.assertEqual(longhaul.pick([work], {"limited_until": {}}, 0, now=self.NOW, seen=seen), (0, self.NOW + 1800))
+        self.assertEqual(longhaul.pick([work, self.acct("personal")], {"limited_until": {"personal": self.NOW + 99}}, 0,
+                                       now=self.NOW, seen=seen), (1, self.NOW + 99))
+
+    def test_a_cap_never_reaches_state_json_so_clear_is_not_needed_for_it(self):
+        work = self.acct("work", 25)
+        seen = {"work": self.seen(five=30)}
+        state = {"limited_until": {}}
+        longhaul.pick([work, self.acct("personal")], state, 0, now=self.NOW, seen=seen)
+        self.assertEqual(state, {"limited_until": {}}, "pick() reads; nothing is recorded")
+        self.assertEqual(longhaul.blocked([work], state, seen, self.NOW), {"work": self.NOW + 3600})
+        self.assertEqual(longhaul.blocked([work], {"limited_until": {"work": self.NOW + 9000}}, seen, self.NOW),
+                         {"work": self.NOW + 9000}, "the later of a limit and a cap")
+
+    def test_the_chats_at_limit_sentence_says_it_is_at_its_cap_until_the_reset(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "usage").mkdir()
+        (tmp / "usage" / "work.json").write_text(json.dumps(self.seen(five=30, five_in=1800)))
+        accounts = [self.acct("work", 25), self.acct("personal")]
+        with mock.patch.object(longhaul, "USAGE_DIR", tmp / "usage"):
+            for mode, said in (("auto", "work is at its cap (25%) until {at}: this chat moves to personal once Claude "
+                                        "is idle."),
+                               ("ask", "work is at its cap (25%) until {at}: this chat asks you before moving to "
+                                       "personal, and its next message waits for the answer."),
+                               ("never", "work is at its cap (25%) until {at}: this chat's next message waits for that "
+                                         "reset.")):
+                text = longhaul.at_limit_text(accounts, {"limited_until": {}}, 0, "/scratch/x", mode, now=self.NOW)
+                self.assertTrue(text.startswith(said.format(at=longhaul.clock(self.NOW + 1800))), (mode, text))
+                self.assertIn("At a limit", text, "the limit's own sentence follows")
+            text = longhaul.at_limit_text(accounts, {"limited_until": {}}, 1, "/scratch/x", "auto", now=self.NOW)
+            self.assertTrue(text.startswith("At a limit"), "personal has no cap: no cap sentence first")
+            self.assertIn("every other account is at its limit or its cap", text, "work at its cap is no place to go")
+
+
+class CapTerminal(unittest.TestCase):
+    """The strict cap in a terminal chat (the owner, 2026-11-24), against
+    the fake Claude: Max has a cap of 25, Pro none. The status line's
+    reading crosses the cap while Claude runs (the plan's file: step
+    writes it, as the status line does after a request); once Claude is
+    idle and no background agent writes, the chat leaves Max as the early
+    move does, with no carry-on, in auto; in ask and never it does as at a
+    limit. A new launch never starts on a capped account."""
+
+    setUp = Loop.setUp
+    run_longhaul = Loop.run_longhaul
+    reading = Loop.reading
+    state = Loop.state
+
+    def capped_max(self, cap=25):
+        (self.home / "accounts.json").write_text(json.dumps(
+            [{"name": "Max", "config_dir": None, "cap": cap}, {"name": "Pro", "config_dir": str(self.pro)}]))
+
+    def crossing(self, five=30, five_in=3600):
+        """The plan step that writes Max's reading at `five`% while Claude runs: the reset it names."""
+        (self.home / "usage").mkdir(exist_ok=True)
+        now = time.time()
+        reading = {"at": now, "five_hour": {"used_percentage": five, "resets_at": now + five_in},
+                   "seven_day": {"used_percentage": 10, "resets_at": now + 86400}}
+        return f"file:usage/Max.json={json.dumps(reading)}", now + five_in
+
+    def test_in_auto_a_capped_idle_chat_moves_to_an_account_with_room_with_no_carry_on(self):
+        self.capped_max()
+        step, resets = self.crossing()
+        out, calls = self.run_longhaul([step, "idle_wait", "exit"], "--account", "Max")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertFalse(any(a.startswith("The ") for a in calls[1]["args"]), "idle: no carry-on message")
+        self.assertIn(f"Max is at its cap (25%) until {longhaul.clock(resets)}, so while ", out.stdout)
+        self.assertIn("longhaul moved it to Pro.", out.stdout)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: cap", log)
+        self.assertNotIn("limited_until", (self.home / "state.json").read_text()
+                         if (self.home / "state.json").exists() else "", "a cap is never recorded as a limit")
+
+    def test_a_capped_chat_is_not_left_while_an_agent_works(self):
+        self.capped_max()
+        step, _ = self.crossing()
+        out, calls = self.run_longhaul([step, "idle_wait_agents"], "--account", "Max", runs=1)
+        self.assertEqual(len(calls), 1, out.stdout)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: completed", log)
+        self.assertNotIn("ended: cap", log)
+
+    def test_below_its_cap_the_chat_stays(self):
+        self.capped_max()
+        step, _ = self.crossing(five=24)
+        out, calls = self.run_longhaul([step, "idle_wait"], "--account", "Max", runs=1)
+        self.assertIn("Max ended: completed", (self.home / "longhaul.log").read_text())
+
+    def test_in_never_a_capped_chat_waits_for_the_windows_reset_then_reopens_there_with_no_message(self):
+        self.capped_max()
+        started = time.time()
+        step, resets = self.crossing(five_in=3)
+        out, calls = self.run_longhaul([step, "idle_wait", "exit"], "--account", "Max", LONGHAUL_SWITCH="never")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertGreaterEqual(time.time() - started, 3, "not reopened before the reset")
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertFalse(any(a.startswith("The ") for a in calls[1]["args"]), "nothing was cut off: no message")
+        self.assertIn("Max is at its cap (25%), and with switching set to never the conversation stays on it "
+                      "(`longhaul cap Max off` lets it go on now). Waiting until", out.stdout)
+        self.assertIn("Max ended: cap", (self.home / "longhaul.log").read_text())
+
+    def test_in_never_cap_off_meanwhile_ends_the_wait_at_once(self):
+        self.capped_max()
+        step, _ = self.crossing(five_in=3600)
+        free = json.dumps([{"name": "Max", "config_dir": None}, {"name": "Pro", "config_dir": str(self.pro)}])
+        done = threading.Event()
+
+        def cap_off():  # `longhaul cap Max off`, typed while the terminal waits for the hour's reset
+            log = self.home / "longhaul.log"
+            while not done.wait(0.05):
+                if log.exists() and "Max ended: cap" in log.read_text():
+                    time.sleep(0.5)
+                    (self.home / "accounts.json").write_text(free)
+                    return
+        writer = threading.Thread(target=cap_off, daemon=True)
+        writer.start()
+        started = time.time()
+        try:
+            out, calls = self.run_longhaul([step, "idle_wait", "exit"], "--account", "Max", LONGHAUL_SWITCH="never",
+                                           timeout=40)
+        finally:
+            done.set()
+            writer.join(5)
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertLess(time.time() - started, 30, "not the hour's wait")
+        self.assertIn("the wait ends early", (self.home / "longhaul.log").read_text())
+        self.assertFalse(any(a.startswith("The ") for a in calls[1]["args"]))
+
+    def test_in_ask_a_capped_chat_asks_and_a_yes_moves_it_with_no_carry_on(self):
+        self.capped_max()
+        step, resets = self.crossing()
+        out, calls = self.run_longhaul([step, "idle_wait", "exit"], "--account", "Max", LONGHAUL_SWITCH="ask",
+                                       answer=b"y")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stdout + out.stderr)
+        self.assertFalse(any(a.startswith("The ") for a in calls[1]["args"]), "no carry-on message")
+        self.assertIn(f"Max is at its cap (25%) until {longhaul.clock(resets)}", out.stdout)
+        self.assertIn("Move this chat to Pro now?", out.stdout)
+
+    def test_in_ask_a_no_waits_for_the_reset_and_reopens_on_the_capped_account(self):
+        self.capped_max()
+        step, _ = self.crossing(five_in=3)
+        out, calls = self.run_longhaul([step, "idle_wait", "exit"], "--account", "Max", LONGHAUL_SWITCH="ask",
+                                       answer=b"n")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stdout + out.stderr)
+        self.assertEqual(out.stdout.count("Move this chat to Pro now?"), 1, "asked once, not again at the wait")
+        self.assertFalse(any(a.startswith("The ") for a in calls[1]["args"]))
+
+    def test_a_new_launch_never_starts_on_a_capped_account_and_account_says_why(self):
+        self.capped_max()
+        self.reading("Max", five=30)
+        _, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual(calls[0]["config"], str(self.pro))
+        out, calls = self.run_longhaul(["exit"], "--account", "Max", runs=1)
+        self.assertEqual(calls[-1]["config"], str(self.pro))
+        self.assertIn("Max is at its cap (25%) until", out.stdout)
+        self.assertIn("picking an account", out.stdout)
+
+    def test_a_reading_older_than_its_window_never_caps_a_launch(self):
+        self.capped_max()
+        self.reading("Max", five=90, five_in=-10)
+        _, calls = self.run_longhaul(["exit"], "--account", "Max", runs=1)
+        self.assertIsNone(calls[0]["config"])
+
+    def test_every_account_capped_or_limited_waits_for_the_earliest_usable_time(self):
+        self.capped_max()
+        self.reading("Max", five=30, five_in=2)
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": time.time() + 3600}}))
+        started = time.time()
+        out, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual([c["config"] for c in calls], [None], out.stdout + out.stderr)
+        self.assertGreaterEqual(time.time() - started, 2)
+        self.assertIn("Every account is at its limit or its cap. Waiting until", out.stdout)
+
+    def test_strict_with_a_single_account_at_its_cap(self):
+        (self.home / "accounts.json").write_text(json.dumps([{"name": "Max", "config_dir": None, "cap": 25}]))
+        self.reading("Max", five=30, five_in=2)
+        started = time.time()
+        out, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual([c["config"] for c in calls], [None], out.stdout + out.stderr)
+        self.assertGreaterEqual(time.time() - started, 2, "waited for its window's reset")
+
+
+class CapRelay(unittest.TestCase):
+    """The strict cap in a VS Code panel chat (the owner, 2026-11-24): the
+    relay, driven in this process on a clock of the test's own as
+    KeepWorking drives it, with the swap stood in for. Max has a cap of
+    25, Pro none; Max's reading crosses the cap at a turn's end. Between
+    turns, while Claude is idle and no background agent works: auto moves
+    the chat with no carry-on, ask asks (move now, or wait for the reset),
+    never holds the next message the panel sends until the reset, or until
+    a move or a cap change frees it, and says so once. PanelCap runs the
+    real wrapper."""
+
+    Clock, Watch = KeepWorking.Clock, KeepWorking.Watch
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / "usage").mkdir(parents=True)
+        self.clock, self.notes, self.strangers = self.Clock(float(int(time.time()))), [], set()
+        for patcher in (mock.patch.object(longhaul, "LONGHAUL_HOME", self.home),
+                        mock.patch.object(longhaul, "USAGE_DIR", self.home / "usage"),
+                        mock.patch.object(longhaul, "CONFIG", self.home / "config.json"),
+                        mock.patch.object(longhaul, "VSCODE_CONFIG", self.home / "vscode.json"),
+                        mock.patch.dict(os.environ, {"LONGHAUL_SWITCH": ""}),
+                        mock.patch.object(longhaul, "RESET_MARGIN", 60),
+                        mock.patch.object(longhaul, "time", self.clock),
+                        mock.patch.object(longhaul, "notify", self.notes.append),
+                        mock.patch.object(longhaul, "signed_in_cached",
+                                          lambda acct, binary: acct["name"] not in self.strangers)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.accounts = [{"name": "Max", "config_dir": str(self.tmp / "max"), "email": "first@example.com", "cap": 25},
+                         {"name": "Pro", "config_dir": str(self.tmp / "pro"), "email": "second@example.com"}]
+        self.write_accounts(self.accounts)
+
+    def write_accounts(self, accounts):
+        (self.home / "accounts.json").write_text(json.dumps(accounts))
+
+    def relay(self, mode="ask"):
+        r = KeepWorking.relay(self, mode=mode)
+        r.live = longhaul.LiveSettings(r.accounts, mode, None, None, "panel")  # accounts.json as it is now
+        return r
+
+    def reading(self, name="Max", five=30, five_in=3600, week=10):
+        (self.home / "usage" / f"{name}.json").write_text(json.dumps({
+            "at": self.clock.at, "five_hour": {"used_percentage": five, "resets_at": self.clock.at + five_in},
+            "seven_day": {"used_percentage": week, "resets_at": self.clock.at + 6 * 86400}}))
+        return self.clock.at + five_in
+
+    later = KeepWorking.later
+    question = KeepWorking.question
+    answer = KeepWorking.answer
+    said = KeepWorking.said
+    log_text = KeepWorking.log_text
+
+    def typed(self, r, text="next"):
+        """A message the panel sends: held (True) or let through to claude (False)."""
+        line = json.dumps({"type": "user", "uuid": str(uuid.uuid4()), "session_id": "", "parent_tool_use_id": None,
+                           "message": {"role": "user", "content": [{"type": "text", "text": text}]}}).encode() + b"\n"
+        if r.held is not None and r.hold_user(line):
+            return True
+        r.queue.append(line)
+        return False
+
+    # -- auto
+
+    def test_auto_moves_between_turns_to_an_account_with_room_with_no_carry_on(self):
+        r = self.relay("auto")
+        resets = self.reading()
+        r.hold_at_cap()  # the turn's result line: the panel's next message is held from now
+        self.assertTrue(self.typed(r, "typed at the turn's end"))
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)], "no carry-on: nothing was cut off")
+        self.assertIsNone(r.held, "the held message goes with the move")
+        self.assertEqual(self.said(r), ["typed at the turn's end"], "to the claude the move started")
+        self.assertIn(f"cap: sid-k moved, while idle, from Max, {longhaul.cap_words(25)} until "
+                      f"{longhaul.clock(resets)}, to Pro", self.log_text())
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn("Max is at its cap (25%)", self.notes[0])
+        self.assertNotIn("limited_until", (self.home / "state.json").read_text()
+                         if (self.home / "state.json").exists() else "", "a cap is never recorded as a limit")
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)], "once")
+
+    def test_auto_waits_while_claude_is_busy_or_an_agent_works_and_holds_meanwhile(self):
+        r = self.relay("auto")
+        self.reading()
+        r.watch.status = "busy"
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertTrue(self.typed(r), "held already: no turn starts on Max")
+        r.watch.status = "idle"
+        r.watch.agents_busy = lambda: True
+        r.tend()
+        self.assertEqual(r.moves, [], "a move would stop the agent")
+        r.watch.agents_busy = lambda: False
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)])
+        self.assertEqual(self.said(r), ["next"])
+
+    def test_below_its_cap_nothing_is_held_or_moved(self):
+        r = self.relay("auto")
+        self.reading(five=24)
+        r.hold_at_cap()
+        r.tend()
+        self.assertEqual((r.moves, r.held, self.notes), ([], None, []))
+        self.assertFalse(self.typed(r))
+
+    def test_auto_with_nowhere_to_move_holds_until_the_first_account_free_then_moves(self):
+        (self.home / "state.json").write_text(json.dumps({"limited_until": {"Pro": self.clock.at + 1800}}))
+        r = self.relay("auto")
+        self.reading(five_in=3600)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertTrue(self.typed(r))
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn(f"waits until {longhaul.clock(self.clock.at + 1800)}", self.notes[0])
+        self.later(1801)
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)], "Pro is free first: the chat goes there")
+        self.assertEqual(self.said(r), ["next"])
+
+    # -- ask
+
+    def test_ask_asks_and_move_moves_with_no_carry_on_the_held_message_with_it(self):
+        r = self.relay("ask")
+        resets = self.reading()
+        r.tend()
+        q = self.question()
+        self.assertEqual((q["kind"], q["from"], q["to"], q["limit"], q["cap"], q["choices"]),
+                         ("move", "Max", "Pro", "cap", 25, ["move", "wait"]))
+        self.assertEqual(q["resets_at"], int(resets))
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn(f"Max is at its cap (25%) until {longhaul.clock(resets)}. Move this chat to Pro now?",
+                      self.notes[0])
+        self.assertTrue(self.typed(r), "held while the question is open")
+        self.assertEqual(self.answer("sid-k", q["id"], "move")[0], 0)
+        r.tend()
+        self.assertEqual(r.moves, [("Pro", None)])
+        self.assertIsNone(self.question())
+        self.assertEqual(self.said(r), ["next"])
+
+    def test_ask_wait_holds_the_next_message_until_the_reset_then_sends_it(self):
+        r = self.relay("ask")
+        resets = self.reading(five_in=600)
+        r.tend()
+        q = self.question()
+        self.assertEqual(self.answer("sid-k", q["id"], "wait")[0], 0)
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertTrue(self.typed(r))
+        self.later(300)
+        r.tend()
+        self.assertEqual(self.said(r), [], "not before the reset")
+        self.later(301)  # past the window's reset: Max is under its cap again
+        r.tend()
+        self.assertIsNone(r.held)
+        self.assertEqual(self.said(r), ["next"], "to the claude on Max: nothing moved")
+        self.assertEqual(r.moves, [])
+        self.assertNotIn(longhaul.CARRY_ON_SAME.split(",")[0], " ".join(self.said(r)), "no carry-on message")
+        self.assertLess(self.clock.at, resets + 60, "at the reset itself")
+
+    # -- never
+
+    def test_never_holds_the_next_message_says_so_once_and_sends_it_at_the_reset(self):
+        r = self.relay("never")
+        resets = self.reading(five_in=600)
+        r.hold_at_cap()
+        r.tend()
+        self.assertEqual(r.moves, [])
+        self.assertIsNone(self.question(), "never asks nothing")
+        self.assertTrue(self.typed(r, "one"))
+        self.assertTrue(self.typed(r, "two"))
+        r.tend()
+        r.tend()
+        self.assertEqual(len(self.notes), 1, "said once")
+        self.assertIn(f"Max is at its cap (25%) until {longhaul.clock(resets)}", self.notes[0])
+        self.assertIn("`longhaul cap Max off`", self.notes[0])
+        self.assertIn("/accounts", self.notes[0])
+        self.assertEqual(self.said(r), [])
+        self.later(601)
+        r.tend()
+        self.assertIsNone(r.held)
+        self.assertEqual(self.said(r), ["one", "two"], "in their order, on Max")
+        self.assertIn("cap: sid-k holds its next message: Max is at its cap (25%) until", self.log_text())
+
+    def test_never_lets_the_held_message_go_at_once_after_cap_off(self):
+        r = self.relay("never")
+        self.reading()
+        r.tend()
+        self.assertTrue(self.typed(r))
+        self.later(5)
+        self.write_accounts([{k: v for k, v in self.accounts[0].items() if k != "cap"}, self.accounts[1]])
+        r.tend()
+        self.assertIsNone(r.held)
+        self.assertEqual(self.said(r), ["next"])
+        self.assertEqual(r.moves, [])
+
+    def test_raising_the_cap_frees_it_and_a_later_crossing_holds_again(self):
+        r = self.relay("never")
+        self.reading(five=30)
+        r.tend()
+        self.later(5)
+        self.write_accounts([{**self.accounts[0], "cap": 50}, self.accounts[1]])
+        r.tend()
+        self.assertIsNone(r.held)
+        self.reading(five=55)
+        r.hold_at_cap()
+        r.tend()
+        self.assertEqual(r.held, [])
+        self.assertEqual(len(self.notes), 2, "a new crossing is said again")
+
+    def test_longhaul_use_moves_a_held_chat_and_its_message_goes_there(self):
+        r = self.relay("never")
+        self.reading()
+        r.tend()
+        self.assertTrue(self.typed(r))
+        (self.home / "uses").mkdir()
+        (self.home / "uses" / "sid-k.json").write_text(json.dumps({"id": "u-1", "chat": "sid-k", "account": "Pro",
+                                                                   "at": int(self.clock.at)}))
+        r.tend()
+        r.tend()
+        self.assertEqual(len(r.moves), 1)
+        self.assertEqual(r.moves[0][0], "Pro")
+        self.assertEqual(r.moves[0][1], longhaul.USE_CHOSEN.format(old="Max", new="Pro"), "the choice's own words")
+        r.tend()
+        self.assertIsNone(r.held)
+
+    def test_a_limit_question_never_treats_a_cap_as_its_own(self):
+        # Pro at its cap is no place for a limit's move: the question offers nothing to move to.
+        self.accounts[0].pop("cap")
+        self.accounts[1]["cap"] = 25
+        self.write_accounts(self.accounts)
+        r = self.relay("ask")
+        self.reading("Pro", five=30, five_in=1800)
+        KeepWorking.stop(self, r)
+        q = self.question()
+        self.assertEqual(q["kind"], "first_reset", "every account is at its limit or its cap")
+        self.assertEqual(q["to"], "Pro")
+
+
 class Use(unittest.TestCase):
     """`longhaul use NAME [--chat ID]` (the owner, 2026-11-11: "I need to be
     able to manually choose the account I work on, per session"): the
@@ -25509,8 +26216,8 @@ class StatusJson(unittest.TestCase):
     config folder to email ("default" for ~/.claude)."""
 
     ACCOUNT_KEYS = {"name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan",
-                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat",
-                    "preferred", "use_here", "reading_at", "label"}
+                    "limited_until", "five_hour", "week", "only_in", "kept_out_by", "fallback", "cap", "capped_until",
+                    "folder", "this_chat", "preferred", "use_here", "reading_at", "label"}
     KEYS = {"accounts", "listed", "here", "switch", "switch_problem", "panel_switch", "vscode", "panel_paused", "problem",
             "chat", "line", "checked", "switch_source", "panel_switch_source", "at_limit"}
 
@@ -25644,14 +26351,16 @@ class StatusJson(unittest.TestCase):
         self.assertEqual(found["accounts"][0], {
             "name": "personal-1", "email": "f…@example.com", "signed_in": True, "as_expected": True,
             "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None, "five_hour": None,
-            "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "folder": "~/.claude-personal-1",
-            "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None, "label": "personal-1"})
+            "week": None, "only_in": [], "kept_out_by": [], "fallback": False, "cap": None, "capped_until": None,
+            "folder": "~/.claude-personal-1", "this_chat": False, "preferred": [], "use_here": "ok", "reading_at": None,
+            "label": "personal-1"})
         self.assertEqual(list(found["accounts"][0]), [
             "name", "email", "signed_in", "as_expected", "check_failed", "sign_in_failed_at", "plan", "limited_until",
-            "five_hour", "week", "only_in", "kept_out_by", "fallback", "folder", "this_chat", "preferred", "use_here",
-            "reading_at", "label"],
-            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it; "
-            "preferred and use_here after them (2026-11-11), reading_at (2026-11-13), then label last (Q11)")
+            "five_hour", "week", "only_in", "kept_out_by", "fallback", "cap", "capped_until", "folder", "this_chat",
+            "preferred", "use_here", "reading_at", "label"],
+            "the screen's order: sign_in_failed_at after check_failed, kept_out_by after only_in, fallback after it, "
+            "then cap and capped_until (2026-11-24); preferred and use_here after them (2026-11-11), reading_at "
+            "(2026-11-13), then label last (Q11)")
         self.assertEqual([a["name"] for a in found["accounts"]], ["personal-1", "work"], "in the file's order")
         self.assertEqual(found["accounts"][1]["only_in"], ["~/work"])
         self.assertEqual({k: found[k] for k in self.KEYS - {"accounts"}}, {
@@ -25969,8 +26678,8 @@ class StatusJson(unittest.TestCase):
                     "name": longhaul.STAND_IN["name"], "email": None, "signed_in": True, "as_expected": True,
                     "check_failed": None, "sign_in_failed_at": None, "plan": "max", "limited_until": None,
                     "five_hour": None, "week": None, "only_in": [], "kept_out_by": [], "fallback": False,
-                    "folder": "~/claude", "this_chat": False, "preferred": [], "use_here": None, "reading_at": None,
-                    "label": "default sign-in"}])
+                    "cap": None, "capped_until": None, "folder": "~/claude", "this_chat": False, "preferred": [],
+                    "use_here": None, "reading_at": None, "label": "default sign-in"}])
                 self.assertNotIn("solo@example.com", out.stdout)
 
     def test_an_accounts_file_that_cannot_be_read_is_said_in_problem_with_exit_2(self):

@@ -119,7 +119,7 @@ Longhaul can run your chats across several of your own Claude subscriptions. Eac
 **See your accounts:** type `/accounts` in a chat, in the terminal or in the VS Code panel. It opens a list, as `/mcp` does:
 
 - above them, why this chat runs on its account, when Longhaul's log says (for example "This chat: work. Why: ~/clients prefers work, and it had room.");
-- a row per account: its plan, its sign-in, its week's use or its limit, then, on a line under it, where it may be used (its folders by name, or by their number where they do not fit 80 columns) and whether it is the fallback;
+- a row per account: its plan, its sign-in, its week's use or its limit, then, on a line under it, where it may be used (its folders by name, or by their number where they do not fit 80 columns), whether it is the fallback, and "capped until Fri 02:00" while it is at its cap;
 - `+ Add account`;
 - `Activity`: what Longhaul did by itself today, and why, this chat first (see [Day to day](#3-day-to-day));
 - `Settings`: what a chat does at a usage limit (**Ask me first**, **Move automatically** or **Stay and wait**), with what this chat would do now and where that choice is set; the VS Code panel on or off; and forgetting the recorded limits.
@@ -172,6 +172,16 @@ A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own;
 
 **Keep an account as a fallback.** In `/accounts`, open the account and press **Use as fallback**; in a terminal, `longhaul fallback work on` (`off` makes it a normal account again; `longhaul add NAME EMAIL --fallback` marks a new one). A fallback is used only when no other account allowed in that folder has room: at a limit the chat moves to a normal account first, the early move never goes to it, and a chat already on it stays there.
 
+**Use only part of an account.** A cap is the share of an account's usage Longhaul lets your chats take: one number, for both its 5-hour window and its weekly one. In a terminal:
+
+```
+longhaul cap work 25
+```
+
+`work` is then used up to 25% of each window. Once either window reaches 25%, `work` is treated as if it were at its limit until that window resets: no new chat starts on it, and a chat on it leaves it between turns, while Claude is idle and no background agent works, by the switching mode: `auto` moves it to an account with room, with no message in the chat, since nothing was cut off; `ask` asks first ("work is at its cap (25%) until Fri 02:00. Move this chat to personal?"); `never` holds your next message until the reset. When every account is at its cap or its limit, the chat waits for the first one to reset, as at a limit. `longhaul cap work 50` raises it and `longhaul cap work off` removes it, and either frees the account at once; `longhaul cap` lists each account's cap and where it stands now. In `/accounts`, an account's page says "Cap: 25% (now 18% of its week)" or "Cap: none", with buttons to set 25, 50 or 75% or none; `longhaul status` and the doctor say it too. In the VS Code panel, a message held for a cap waits in the panel and goes at the reset, or as soon as you move the chat or change the cap; a notification says when, and how to send it sooner.
+
+The limits, honestly: the cap is checked from the status line's reading, written after each request, so a long turn can pass it by a little before the chat leaves; a capped account waits for its window's reset, which can be days for the weekly one; and the default sign-in with no list of accounts has no cap.
+
 **From a terminal**, `longhaul` starts a chat (`-c` continues the latest, `-r <id>` resumes one) that it watches and moves at a limit. A chat moved to another account takes that account's connectors and artifacts, not the first one's. [Account switching](https://github.com/Noah-OS/longhaul/wiki/Account-Switching) has the rest.
 
 ## 5. From the VS Code chat
@@ -187,7 +197,7 @@ A `"switch"` key in `~/.longhaul/vscode.json` gives the panel a mode of its own;
 - install or remove the status line, and turn Claude Code's auto-update for Longhaul on or off;
 - forget the recorded limits, or one account's (`longhaul clear NAME`), allow a refused chat (`longhaul allow`), and uninstall (with `--purge` only after it says that this deletes `~/.longhaul`).
 
-What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The fallback mark changes with the button in `/accounts` or `longhaul fallback` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
+What stays in a terminal: starting a chat with `longhaul`, the trials, and the Advisor's probe record. The fallback mark and the cap change with the buttons in `/accounts`, or `longhaul fallback` and `longhaul cap` in a terminal, not from `/longhaul:manage`. The question at a limit is yours to answer, with the buttons in `/accounts`: they run `longhaul answer`, which the plugin refuses to run for a chat's Claude.
 
 ## 6. Codex
 
