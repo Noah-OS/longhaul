@@ -14,6 +14,7 @@ All notable changes to Longhaul are recorded here. The format follows Keep a Cha
 
 ### Fixed
 
+- **A chat on an account whose sign-in is refused moves off it, and no choice of an account sends one there again.** When a turn ends because the account's sign-in was refused (`authentication_failed` or `oauth_org_not_allowed`), Longhaul now acts on it between turns, as at a usage limit: in auto the chat moves to another account and carries on the message that failed; in ask a question offers the move, in the terminal and in the VS Code panel's pane; in never, or with no account to move to, it stays and says so once, with `longhaul login NAME` to sign the account in again. Until a reply comes on that account or it is signed in again, every choice of an account passes it over while another can be used, even one at its limit, since a wait beats a chat whose every message fails. Only a reply counts as one, not the status line's next reading, which may come after a refused turn too. `longhaul status`, `status --json` (`sign_in_refused`), the doctor, the status line and `/accounts` say it. In 0.3.23 the failure was only marked: on 2026-11-24 a move at one account's limit sent three chats to another whose API refused every turn, and nothing moved them off it.
 - **While a cap's question is open, the status line says the cap, not a limit**: "personal at cap 25% · move to work? /accounts", in the terminal and in the VS Code panel's status entry. In 0.3.23 it read "personal at limit · …" though the account still had room.
 
 ## 0.3.23 - 2026-11-24
