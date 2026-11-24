@@ -273,6 +273,63 @@ class Loop(unittest.TestCase):
         self.assertIn("Pro ended: completed", log)
         self.assertNotIn("not a limit stop", log)
 
+    # A refused sign-in (2026-11-24: a move at amie's limit sent three chats
+    # to personal-1, whose API refused every turn with oauth_org_not_allowed,
+    # and nothing moved them off). fake_claude runs the real StopFailure hook.
+
+    SIGN_IN_CARRY_ON = ("The Max account's sign-in was refused (oauth_org_not_allowed), so longhaul reopened this "
+                        "conversation on the Pro account.")
+
+    def test_a_refused_sign_in_in_auto_moves_and_carries_the_message_on(self):
+        out, calls = self.run_longhaul(["stop_failure:oauth_org_not_allowed", "stay", "exit"], "--account", "Max")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertTrue(calls[1]["args"][-1].startswith(self.SIGN_IN_CARRY_ON), calls[1]["args"][-1])
+        self.assertIn("Max's sign-in was refused (oauth_org_not_allowed), so longhaul moved this conversation to Pro, "
+                      "with a carry-on message.", out.stdout)
+        self.assertEqual(set(json.loads((self.home / longhaul.SIGN_IN_FAILED).read_text())), {"Max"},
+                         "kept for every chooser")
+        log = (self.home / "longhaul.log").read_text()
+        self.assertIn("Max ended: sign_in (session sid-1", log)
+        self.assertIn("Pro ended: completed", log)
+        self.assertIn("sign-in was refused (oauth_org_not_allowed), and switching is auto", log, "the start line's why")
+
+    def test_a_refused_sign_in_is_passed_over_at_the_next_launch(self):
+        self.run_longhaul(["stop_failure:oauth_org_not_allowed", "stay", "exit"], "--account", "Max")
+        out, calls = self.run_longhaul(["exit"], runs=1)
+        self.assertEqual([c["config"] for c in calls[-1:]], [str(self.pro)], "first in turn is Max, but refused")
+        self.assertIn("it had room, and Max's sign-in was refused", (self.home / "longhaul.log").read_text())
+
+    def test_a_refused_sign_in_in_never_stays_and_says_so(self):
+        out, calls = self.run_longhaul(["stop_failure:oauth_org_not_allowed", "idle_wait", "exit"], "--account", "Max",
+                                       runs=1, LONGHAUL_SWITCH="never")
+        self.assertEqual([c["config"] for c in calls], [None], out.stderr)
+        said = ("Max's sign-in was refused (oauth_org_not_allowed), and with switching set to never this conversation "
+                "stays on it. `longhaul login Max` signs it in again; then send your message again.")
+        self.assertEqual(out.stdout.count(said), 1, out.stdout)
+        log = (self.home / "longhaul.log").read_text()
+        self.assertEqual(log.count("sign-in: sid-1 stays on Max, whose sign-in was refused (oauth_org_not_allowed): "
+                                   "switching is never"), 1, "once, however often the watcher looks")
+        self.assertNotIn("ended: sign_in", log)
+
+    def test_a_refused_sign_in_in_ask_moves_on_a_yes(self):
+        out, calls = self.run_longhaul(["stop_failure:oauth_org_not_allowed", "stay", "exit"], "--account", "Max",
+                                       LONGHAUL_SWITCH="ask", answer=b"y")
+        self.assertEqual([c["config"] for c in calls], [None, str(self.pro)], out.stderr)
+        self.assertTrue(calls[1]["args"][-1].startswith(self.SIGN_IN_CARRY_ON), calls[1]["args"][-1])
+        self.assertIn("Max's sign-in was refused (oauth_org_not_allowed): each message there fails at once. Move this "
+                      "chat to Pro and carry on?", out.stdout)
+        self.assertIn("Moving to Pro: reopening this conversation there with a carry-on message.", out.stdout)
+
+    def test_a_refused_sign_in_in_ask_stays_on_a_no(self):
+        out, calls = self.run_longhaul(["stop_failure:oauth_org_not_allowed", "stay", "exit"], "--account", "Max",
+                                       LONGHAUL_SWITCH="ask", answer=b"n")
+        self.assertEqual([c["config"] for c in calls], [None, None], out.stderr)
+        self.assertEqual(calls[1]["args"][:2], ["--resume", "sid-1"])
+        self.assertNotIn(self.SIGN_IN_CARRY_ON[:40], " ".join(calls[1]["args"]), "no carry-on message")
+        self.assertIn("Max's sign-in was refused (oauth_org_not_allowed); the conversation reopens there. `longhaul "
+                      "login Max` signs it in again.", out.stdout)
+
     def test_a_rate_limit_stop_failure_below_the_limit_is_a_passing_rate_limit(self):
         self.reading("Max", five=60, week=90)
         out, calls = self.run_longhaul(["stop_failure:rate_limit", "exit"], "--account", "Max")
@@ -19000,6 +19057,25 @@ class PanelKeepWorking(StreamHarness):
         self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
         self.assertEqual(sorted(os.listdir(self.relay / "questions")), [], "the question and its answer are gone")
 
+    def test_a_refused_sign_in_in_auto_moves_and_carries_the_message_on(self):
+        # 2026-11-24: personal-1's API refused every turn with
+        # oauth_org_not_allowed and nothing moved the chats off it. Now the
+        # turn's error moves the chat between turns, with SIGN_IN_CARRY_ON.
+        self.plan(["sign_in_error", "reply"])
+        p = self.start(LONGHAUL_SWITCH="auto")
+        self.initialize(p)
+        self.wait_for(lambda m: m.get("type") == "control_response")
+        result = self.wait_for(self.result_for(self.user(p, "build it")))
+        self.assertEqual((result["is_error"], result["api_error_status"]), (True, 403))
+        self.carry_on("The Max account's sign-in was refused (oauth_org_not_allowed), so longhaul reopened this "
+                      "conversation on the Pro account.")
+        self.assertEqual([c["config"] for c in self.calls()], [str(self.max), str(self.pro)])
+        self.assertEqual(set(json.loads((self.relay / longhaul.SIGN_IN_FAILED).read_text())), {"Max"},
+                         "kept for every chooser")
+        self.assertIn("sign-in: sid-1 moved, while idle, from Max, whose sign-in was refused (oauth_org_not_allowed), "
+                      "to Pro", self.log_text())
+        self.assertFalse((self.relay / "questions" / "sid-1.json").exists(), "auto asks nothing")
+
     def test_wait_carries_on_on_the_same_claude_at_the_reset(self):
         # A second to the reset (the wait's file is KeepWorking's to read).
         p, q = self.limit_and_question(FAKE_RESET_IN="1", LONGHAUL_RESET_MARGIN="0")
@@ -27967,6 +28043,40 @@ class StatusJson(unittest.TestCase):
         # A reading from before 0.3.24 has no "replied": its time stands for it, as it did then.
         (self.home / "usage" / "work.json").write_text(json.dumps({"at": then + 60}))
         self.assertNotIn("sign-in was refused", self.longhaul("status").stdout, "an older reading's time")
+
+    def test_a_refused_sign_in_is_said_in_sign_in_refused_and_warned_of_by_the_doctor(self):
+        # 2026-11-24: what status says of it is what every chooser does with
+        # it: passed over while another account can be used, until a reply
+        # on it or a sign-in, and the command for that.
+        self.write_accounts(*({"name": n, "config_dir": str(self.folder(n))} for n in ("personal-1", "work")))
+        then = int(time.time()) - 120
+        (self.home / longhaul.SIGN_IN_FAILED).write_text(json.dumps({"personal-1": then}))
+        said = (f"its sign-in was refused at {longhaul.clock(then)}, so Longhaul passes it over while another account "
+                "can be used, until it replies again or is signed in again: `longhaul login personal-1`")
+        found = self.by_name(self.read(self.status()))
+        self.assertEqual((found["personal-1"]["sign_in_failed_at"], found["personal-1"]["sign_in_refused"]),
+                         (then, said))
+        self.assertEqual((found["work"]["sign_in_failed_at"], found["work"]["sign_in_refused"]), (None, None))
+        usage = self.home / "usage"
+        usage.mkdir()
+        (usage / "personal-1.json").write_text(json.dumps({"at": then + 60, "replied": None}))
+        self.assertEqual(self.by_name(self.read(self.status()))["personal-1"]["sign_in_refused"], said,
+                         "a reading since with no reply in it")
+        for name in ("personal-1", "work"):
+            self.folder(name).mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), mock.patch.object(longhaul, "HOME", self.tmp), \
+                mock.patch.object(longhaul, "LONGHAUL_HOME", self.home), mock.patch.object(longhaul, "USAGE_DIR", usage), \
+                mock.patch.object(longhaul, "DEFAULT_CONFIG", self.default), \
+                mock.patch.object(longhaul, "DEFAULT_GLOBAL_JSON", self.tmp / "claude.json"):
+            c = longhaul.doctor_accounts(quick=True)
+            self.assertEqual(c["mark"], "warn", c)
+            self.assertIn(("warn", f"personal-1: {said[:-len(': `longhaul login personal-1`')]}",
+                           "`longhaul login personal-1`"), c["items"])
+            self.assertIn("`longhaul login personal-1`", c["step"])
+            self.assertFalse(any(text.startswith("work: its sign-in") for _, text, *_ in c["items"]))
+            (usage / "personal-1.json").write_text(json.dumps({"at": then + 60, "replied": then + 60}))
+            c = longhaul.doctor_accounts(quick=True)
+            self.assertFalse(any("sign-in was refused" in text for _, text, *_ in c["items"]), "a reply since")
 
     def test_an_invalid_switch_mode_is_null_with_the_reason(self):
         self.write_accounts({"name": "personal-1"})

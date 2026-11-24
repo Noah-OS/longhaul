@@ -171,6 +171,18 @@ test("the question and the carry-on take the entry's place while they are open, 
   expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in · 5h 23% · wk 51% · ctx 612k · update 0.3.3')
 })
 
+test("a refused sign-in's question says sign-in refused in place of at limit", async ($, on) => {
+  // 2026-11-24: asked by the relay after a turn ended on a refused sign-in;
+  // "sign_in" in its file, and no reset.
+  const w = world(on)
+  w.alive.add(RELAY)
+  expect(await start($, w)).toBe(`${BARE} · update 0.3.3`)
+  write(w, `${HOME}/questions/${SID}.json`, { ...QUESTION, limit: 'sign-in', resets_at: 0, carries_on_at: null,
+    sign_in: 'oauth_org_not_allowed' })
+  await w.clock.advance(3000)
+  expect(w.statuses[w.statuses.length - 1]).toBe('default sign-in sign-in refused · move to personal-2? /accounts · update 0.3.3')
+})
+
 test("a question its relay left behind, or another chat's, adds nothing", async ($, on) => {
   const w = world(on)
   write(w, `${HOME}/questions/${SID}.json`, QUESTION) // its relay, killed, runs no more

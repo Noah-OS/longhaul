@@ -6,7 +6,7 @@ system/init at the first message, assistant and result lines), writes the
 session and conversation files Claude Code writes, and acts out
 stream_plan.json, one step per user message across launches:
 
-  reply | limit | limit_sub | limit_then_sub | rejected_event | rejected_event_sub
+  reply | limit | limit_sub | limit_then_sub | rejected_event | rejected_event_sub | sign_in_error
 
 limit_sub is a subagent's limit stop, its line a sidechain's, and the
 main turn goes on. rejected_event is a rejected rate_limit_event that no
@@ -18,7 +18,10 @@ audit of 2026-11-05, #10). limit_then_sub is a limit stop followed, a second
 later, by lines that are no reply of the chat's: a subagent's assistant
 line (parent_tool_use_id set) and a <synthetic> one (the log audit of
 2026-11-05, #3). A limit resets in FAKE_RESET_IN seconds (an hour unless
-set).
+set). sign_in_error is a turn the API refused on a sign-in it does not
+allow (2026-11-24): the main thread's assistant line with "error"
+oauth_org_not_allowed, then a result that is an error, status 403, at no
+cost; the transcript gets no line of it.
 
 Without --input-format stream-json it is a short job: it records the call
 and prints one line. `auth status --json` answers from FAKE_EMAILS, a JSON
@@ -168,7 +171,15 @@ for raw in sys.stdin:
     after_limit = step == "limit_then_sub"
     if after_limit:
         step = "limit"
-    if step == "limit":
+    if step == "sign_in_error":
+        emit({"type": "assistant", "error": "oauth_org_not_allowed", "is_api_error_message": True, "session_id": sid,
+              "parent_tool_use_id": None, "user_message_uuid": msg["uuid"],
+              "message": {"model": "<synthetic>", "role": "assistant",
+                          "content": [{"type": "text", "text": "OAuth authentication is not allowed for this organization"}]}})
+        emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 403,
+              "result": "OAuth authentication is not allowed for this organization", "session_id": sid,
+              "user_message_uuid": msg["uuid"], "total_cost_usd": cost})
+    elif step == "limit":
         line = {"type": "assistant", "isSidechain": False, "isApiErrorMessage": True, "error": "rate_limit",
                 "timestamp": now(), "sessionId": sid, "uuid": f"limit-{os.getpid()}-{uuid.uuid4().hex[:6]}",
                 "quotaLimits": {"status": "rejected", "resetsAt": time.time() + float(os.environ.get("FAKE_RESET_IN", "3600")),

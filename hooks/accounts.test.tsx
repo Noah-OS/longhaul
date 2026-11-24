@@ -1910,6 +1910,25 @@ both('a sign-in that failed in a chat: the line says so, the page says when, and
   await ui.unmount()
 })
 
+both('a refused sign-in: the page says status\'s own sentence, that every choice passes it over, and the command', async ($, on, surface) => {
+  // 2026-11-24: status --json's sign_in_refused, beside sign_in_failed_at;
+  // without it (an older longhaul.py) the page says when it failed alone.
+  const w = world(on)
+  const failed = AT - 3 * HOUR
+  const said = `its sign-in was refused at ${clock(failed)}, so Longhaul passes it over while another account can be `
+    + 'used, until it replies again or is signed in again: `longhaul login personal-1`'
+  w.status = done(JSON.stringify({ ...STATUS, accounts: [{ ...ACCOUNTS[0], sign_in_failed_at: failed, sign_in_refused: said },
+    ACCOUNTS[1]] }))
+  const { ui } = await opened($, w, surface)
+  expect((await ui.find({ key: 'row-personal-1' }))?.text).toMatch(/max · sign-in failed · 5h 40% · week 12%/)
+  await open(ui, 'row-personal-1')
+  const all = await texts(ui)
+  expect(all).toContain(`I${said.slice(1)}.`)
+  expect(all).not.toContain(`Its sign-in failed at ${clock(failed)}.`)
+  expect((await ui.find({ key: 'signin-personal-1' }))?.text).toBe('Sign in')
+  await ui.unmount()
+})
+
 // An account's folders (the owner, 2026-11-05: "I can't edit the accounts"):
 // the Folders part of its page runs `longhaul.py folders NAME ...`, one
 // action at a time, and reads the rows again after each.
@@ -2500,6 +2519,36 @@ both('a cap question pops up in its own words', async ($, on, surface) => {
   await w.clock.advance(3000)
   expect(w.opened).toEqual([OPEN])
   expect(w.toasts).toEqual(['Longhaul: personal-1 is at its cap (25%). A question waits: type /accounts if it did not open.'])
+})
+
+// A refused sign-in's question (2026-11-24): asked by the relay after a
+// turn on this chat's account ended on a refused sign-in, "sign_in" in its
+// file (the error's word), "limit" "sign-in" and no reset. Move carries
+// the message that failed on there; Wait stays.
+const SIGN_IN_QUESTION = { ...QUESTION, id: 'q-5196a0123456', limit: 'sign-in', resets_at: 0, carries_on_at: null,
+  sign_in: 'oauth_org_not_allowed' }
+
+both("a refused sign-in's question: what was refused, Move and carry on, and Stay", async ($, on, surface) => {
+  const w = world(on)
+  write(w, QUESTION_FILE, SIGN_IN_QUESTION)
+  const { ui } = await opened($, w, surface)
+  expect((await texts(ui))[0]).toBe("personal-1's sign-in was refused (oauth_org_not_allowed). Move this chat to work-2 and carry on?")
+  expect((await ui.find({ key: 'answer-move' }))?.text).toBe('Move and carry on')
+  expect((await ui.find({ key: 'answer-wait' }))?.text).toBe('Stay on personal-1')
+  expect(await over(ui, 80, true)).toEqual([])
+  await ui.press({ key: 'answer-move' })
+  expect(after(w)).toEqual([['answer', SID, 'q-5196a0123456', 'move']])
+  await ui.unmount()
+})
+
+both("a refused sign-in's question pops up in its own words", async ($, on, surface) => {
+  const w = world(on)
+  await $.session.start({ cwd: '/scratch/code/x', surface, isInteractive: true })
+  await w.clock.advance(3000)
+  write(w, QUESTION_FILE, SIGN_IN_QUESTION)
+  await w.clock.advance(3000)
+  expect(w.opened).toEqual([OPEN])
+  expect(w.toasts).toEqual(["Longhaul: personal-1's sign-in was refused. A question waits: type /accounts if it did not open."])
 })
 
 both('a carry-on scheduled for a reset shows on the list until its file goes', async ($, on, surface) => {
